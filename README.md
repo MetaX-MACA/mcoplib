@@ -279,13 +279,13 @@ def fused_mla_normal_rotary_emb(
     Answer: Please execute the environment variable script env.sh before compiling: cd /code/dir/mcoplib/ && source env.sh
 
 ## Release
-### Release 0.2.0
+### Release 0.3.1
 - add cv op kernel
 - support sglang 0.5.6 op 
 - optimize mcoplib project build 
 - support mxbench for auto test op kernel `s perfromance
 - support profiler tools check op kernel `s perfromance
-- support for vllm 0.12.0  op kernels
+- support for vllm 0.13.0  op kernels
 - support Project-customized op kernels
 - support k-transformer op kernels
 - support verl op kernels
