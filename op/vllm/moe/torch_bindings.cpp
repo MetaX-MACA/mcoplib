@@ -19,10 +19,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
       "moe_align_block_size(Tensor topk_ids, int num_experts,"
       "                     int block_size, Tensor! sorted_token_ids,"
       "                     Tensor! experts_ids,"
-      "                     Tensor! num_tokens_post_pad) -> ()");
+      "                     Tensor! num_tokens_post_pad,"
+      "                     Tensor? maybe_expert_map) -> ()");
   m.impl("moe_align_block_size", torch::kCUDA, &moe_align_block_size);
 
-   // Aligning the number of tokens to be processed by each expert such
+  // Aligning the number of tokens to be processed by each expert such
   // that it is divisible by the block size, but for the batched case.
   m.def(
       "batched_moe_align_block_size(int max_tokens_per_batch,"
@@ -46,7 +47,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
       "                     Tensor !experts_ids,"
       "                     Tensor !num_tokens_post_pad,"
       "                     Tensor !adapter_enabled,"
-      "                     Tensor !lora_ids) -> () ");
+      "                     Tensor !lora_ids,"
+      "                     Tensor? maybe_expert_map) -> () ");
   m.impl("moe_lora_align_block_size", torch::kCUDA, &moe_lora_align_block_size);
   
   m.def(
