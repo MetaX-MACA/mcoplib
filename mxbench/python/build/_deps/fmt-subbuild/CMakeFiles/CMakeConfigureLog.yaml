@@ -1,0 +1,220 @@
+
+---
+events:
+  -
+    kind: "find-v1"
+    backtrace:
+      - "/opt/conda/lib/python3.10/site-packages/cmake/data/share/cmake-4.2/Modules/CMakeDetermineSystem.cmake:12 (find_program)"
+      - "CMakeLists.txt:16 (project)"
+    mode: "program"
+    variable: "CMAKE_UNAME"
+    description: "Path to a program."
+    settings:
+      SearchFramework: "NEVER"
+      SearchAppBundle: "NEVER"
+      CMAKE_FIND_USE_CMAKE_PATH: true
+      CMAKE_FIND_USE_CMAKE_ENVIRONMENT_PATH: true
+      CMAKE_FIND_USE_SYSTEM_ENVIRONMENT_PATH: true
+      CMAKE_FIND_USE_CMAKE_SYSTEM_PATH: true
+      CMAKE_FIND_USE_INSTALL_PREFIX: true
+    names:
+      - "uname"
+    candidate_directories:
+      - "/root/cu-bridge/bin/"
+      - "/root/cu-bridge/CUDA_DIR/bin/"
+      - "/usr/local/cuda/bin/"
+      - "/opt/maca/mxgpu_11vm/bin/"
+      - "/opt/maca/bin/"
+      - "/opt/maca/tools/cu-bridge/tools/"
+      - "/opt/maca/tools/cu-bridge/bin/"
+      - "/opt/mxdriver/bin/"
+      - "/opt/maca/ompi/bin/"
+      - "/opt/maca/mxgpu_llvm/bin/"
+      - "/opt/conda/bin/"
+      - "/opt/conda/condabin/"
+      - "/opt/maca/ucx/bin/"
+      - "/usr/local/sbin/"
+      - "/usr/local/bin/"
+      - "/usr/sbin/"
+      - "/usr/bin/"
+      - "/sbin/"
+      - "/bin/"
+    searched_directories:
+      - "/root/cu-bridge/bin/uname"
+      - "/root/cu-bridge/CUDA_DIR/bin/uname"
+      - "/usr/local/cuda/bin/uname"
+      - "/opt/maca/mxgpu_11vm/bin/uname"
+      - "/opt/maca/bin/uname"
+      - "/opt/maca/tools/cu-bridge/tools/uname"
+      - "/opt/maca/tools/cu-bridge/bin/uname"
+      - "/opt/mxdriver/bin/uname"
+      - "/opt/maca/ompi/bin/uname"
+      - "/opt/maca/mxgpu_llvm/bin/uname"
+      - "/opt/conda/bin/uname"
+      - "/opt/conda/condabin/uname"
+      - "/opt/maca/ucx/bin/uname"
+      - "/usr/local/sbin/uname"
+      - "/usr/local/bin/uname"
+      - "/usr/sbin/uname"
+    found: "/usr/bin/uname"
+    search_context:
+      ENV{PATH}:
+        - "/root/cu-bridge/bin"
+        - "/root/cu-bridge/CUDA_DIR/bin"
+        - "/usr/local/cuda/bin"
+        - "/opt/maca/mxgpu_11vm/bin"
+        - "/opt/maca/bin"
+        - "/opt/maca/tools/cu-bridge/tools"
+        - "/opt/maca/tools/cu-bridge/bin"
+        - "/opt/mxdriver/bin"
+        - "/opt/maca/ompi/bin"
+        - "/usr/local/cuda/bin"
+        - "/opt/maca/mxgpu_11vm/bin"
+        - "/opt/maca/bin"
+        - "/opt/maca/tools/cu-bridge/tools"
+        - "/opt/maca/tools/cu-bridge/bin"
+        - "/opt/mxdriver/bin"
+        - "/opt/maca/ompi/bin"
+        - "/usr/local/cuda/bin"
+        - "/opt/maca/mxgpu_11vm/bin"
+        - "/opt/maca/bin"
+        - "/opt/maca/tools/cu-bridge/tools"
+        - "/opt/maca/tools/cu-bridge/bin"
+        - "/opt/mxdriver/bin"
+        - "/opt/maca/ompi/bin"
+        - "/root/cu-bridge/CUDA_DIR/bin"
+        - "/opt/maca/mxgpu_llvm/bin"
+        - "/opt/maca/bin"
+        - "/opt/maca/tools/cu-bridge/tools"
+        - "/opt/maca/tools/cu-bridge/bin"
+        - "/opt/maca/mxgpu_llvm/bin"
+        - "/opt/maca/bin"
+        - "/opt/maca/tools/cu-bridge/tools"
+        - "/opt/maca/tools/cu-bridge/bin"
+        - "/opt/conda/bin"
+        - "/opt/conda/condabin"
+        - "/opt/maca/bin"
+        - "/opt/maca/mxgpu_llvm/bin"
+        - "/opt/maca/ompi/bin"
+        - "/opt/maca/ucx/bin"
+        - "/opt/mxdriver/bin"
+        - "/usr/local/sbin"
+        - "/usr/local/bin"
+        - "/usr/sbin"
+        - "/usr/bin"
+        - "/sbin"
+        - "/bin"
+  -
+    kind: "message-v1"
+    backtrace:
+      - "/opt/conda/lib/python3.10/site-packages/cmake/data/share/cmake-4.2/Modules/CMakeDetermineSystem.cmake:212 (message)"
+      - "CMakeLists.txt:16 (project)"
+    message: |
+      The system is: Linux - 5.15.0-88-generic - x86_64
+...
+
+---
+events:
+  -
+    kind: "find-v1"
+    backtrace:
+      - "/opt/conda/lib/python3.10/site-packages/cmake/data/share/cmake-4.2/Modules/CMakeDetermineSystem.cmake:12 (find_program)"
+      - "CMakeLists.txt:16 (project)"
+    mode: "program"
+    variable: "CMAKE_UNAME"
+    description: "Path to a program."
+    settings:
+      SearchFramework: "NEVER"
+      SearchAppBundle: "NEVER"
+      CMAKE_FIND_USE_CMAKE_PATH: true
+      CMAKE_FIND_USE_CMAKE_ENVIRONMENT_PATH: true
+      CMAKE_FIND_USE_SYSTEM_ENVIRONMENT_PATH: true
+      CMAKE_FIND_USE_CMAKE_SYSTEM_PATH: true
+      CMAKE_FIND_USE_INSTALL_PREFIX: true
+    names:
+      - "uname"
+    candidate_directories:
+      - "/opt/conda/bin/"
+      - "/opt/conda/sbin/"
+      - "/opt/conda/"
+      - "/root/cu-bridge/bin/"
+      - "/root/cu-bridge/CUDA_DIR/bin/"
+      - "/usr/local/cuda/bin/"
+      - "/opt/maca/mxgpu_11vm/bin/"
+      - "/opt/maca/bin/"
+      - "/opt/maca/tools/cu-bridge/tools/"
+      - "/opt/maca/tools/cu-bridge/bin/"
+      - "/opt/mxdriver/bin/"
+      - "/opt/maca/ompi/bin/"
+      - "/opt/conda/bin/"
+      - "/opt/conda/condabin/"
+      - "/opt/maca/mxgpu_llvm/bin/"
+      - "/opt/maca/ucx/bin/"
+      - "/usr/local/sbin/"
+      - "/usr/local/bin/"
+      - "/usr/sbin/"
+      - "/usr/bin/"
+      - "/sbin/"
+      - "/bin/"
+    searched_directories:
+      - "/opt/conda/bin/uname"
+      - "/opt/conda/sbin/uname"
+      - "/opt/conda/uname"
+      - "/root/cu-bridge/bin/uname"
+      - "/root/cu-bridge/CUDA_DIR/bin/uname"
+      - "/usr/local/cuda/bin/uname"
+      - "/opt/maca/mxgpu_11vm/bin/uname"
+      - "/opt/maca/bin/uname"
+      - "/opt/maca/tools/cu-bridge/tools/uname"
+      - "/opt/maca/tools/cu-bridge/bin/uname"
+      - "/opt/mxdriver/bin/uname"
+      - "/opt/maca/ompi/bin/uname"
+      - "/opt/conda/bin/uname"
+      - "/opt/conda/condabin/uname"
+      - "/opt/maca/mxgpu_llvm/bin/uname"
+      - "/opt/maca/ucx/bin/uname"
+      - "/usr/local/sbin/uname"
+      - "/usr/local/bin/uname"
+      - "/usr/sbin/uname"
+    found: "/usr/bin/uname"
+    search_context:
+      ENV{CMAKE_PREFIX_PATH}:
+        - "/opt/conda"
+      ENV{PATH}:
+        - "/root/cu-bridge/bin"
+        - "/root/cu-bridge/CUDA_DIR/bin"
+        - "/usr/local/cuda/bin"
+        - "/opt/maca/mxgpu_11vm/bin"
+        - "/opt/maca/bin"
+        - "/opt/maca/tools/cu-bridge/tools"
+        - "/opt/maca/tools/cu-bridge/bin"
+        - "/opt/mxdriver/bin"
+        - "/opt/maca/ompi/bin"
+        - "/usr/local/cuda/bin"
+        - "/opt/maca/mxgpu_11vm/bin"
+        - "/opt/maca/bin"
+        - "/opt/maca/tools/cu-bridge/tools"
+        - "/opt/maca/tools/cu-bridge/bin"
+        - "/opt/mxdriver/bin"
+        - "/opt/maca/ompi/bin"
+        - "/opt/conda/bin"
+        - "/opt/conda/condabin"
+        - "/opt/maca/bin"
+        - "/opt/maca/mxgpu_llvm/bin"
+        - "/opt/maca/ompi/bin"
+        - "/opt/maca/ucx/bin"
+        - "/opt/mxdriver/bin"
+        - "/usr/local/sbin"
+        - "/usr/local/bin"
+        - "/usr/sbin"
+        - "/usr/bin"
+        - "/sbin"
+        - "/bin"
+  -
+    kind: "message-v1"
+    backtrace:
+      - "/opt/conda/lib/python3.10/site-packages/cmake/data/share/cmake-4.2/Modules/CMakeDetermineSystem.cmake:212 (message)"
+      - "CMakeLists.txt:16 (project)"
+    message: |
+      The system is: Linux - 5.15.0-88-generic - x86_64
+...
