@@ -1,4 +1,4 @@
-# Python »º´æÎÄ¼þ
+# Python ï¿½ï¿½ï¿½ï¿½ï¿½Ä¼ï¿½
 __pycache__/
 *.py[cod]
 *.pyo
@@ -12,11 +12,11 @@ build/
 *.spec
 mxbench/build/
 profiles/
-# pip »º´æ
+# pip ï¿½ï¿½ï¿½ï¿½
 pip-log.txt
 pip-delete-this-directory.txt
 
-# C++ / CUDA ±àÒë²úÎï
+# C++ / CUDA ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
 *.o
 *.obj
 *.so
@@ -28,31 +28,31 @@ pip-delete-this-directory.txt
 *.cuo
 *.ptx
 
-# VSCode ÉèÖÃ
+# VSCode ï¿½ï¿½ï¿½ï¿½
 .vscode/
 
-# Jupyter Notebook ¼ì²éµã
+# Jupyter Notebook ï¿½ï¿½ï¿½ï¿½
 .ipynb_checkpoints
 
-# °²×°¿ª·¢¹¤¾ßµÄ²úÎï
+# ï¿½ï¿½×°ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ßµÄ²ï¿½ï¿½ï¿½
 *.egg-info/
 .eggs/
 *.whl
 
-# PyTorch Extensions »º´æ
+# PyTorch Extensions ï¿½ï¿½ï¿½ï¿½
 torch_extensions/
 
-# ÏµÍ³Ïà¹Ø
+# ÏµÍ³ï¿½ï¿½ï¿½
 .DS_Store
 Thumbs.db
 
-# »·¾³ÅäÖÃ
+# ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
 .env
 .venv/
 venv/
 env/
 .deps
-# ±àÒëÖÐ¼äÎÄ¼þ
+# ï¿½ï¿½ï¿½ï¿½ï¿½Ð¼ï¿½ï¿½Ä¼ï¿½
 *.log
 *.tmp
 *.bak
@@ -64,6 +64,7 @@ build/bin
 build/
 mxbench/install/
 mxbench/python/build/
+mxbench/python/_deps/
 mxbench/python/dist/
 dist/
 compile_commands.json
