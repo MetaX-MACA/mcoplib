@@ -280,7 +280,7 @@ def fused_mla_normal_rotary_emb(
 ## Release
 ### Release 0.2.0
 - add cv op kernel
-- support sglang 0.5.6 op 
+- support sglang 0.5.7 op 
 - optimize mcoplib project build 
 - support mxbench for auto test op kernel `s perfromance
 - support profiler tools check op kernel `s perfromance

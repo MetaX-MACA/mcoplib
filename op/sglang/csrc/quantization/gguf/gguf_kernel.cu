@@ -810,28 +810,28 @@ torch::Tensor ggml_moe_a8_vec(
   return Y;
 }
 
-int64_t ggml_moe_get_block_size(int64_t type) {
-  switch (type) {
-    case 2:
-      return MOE_X_Q4_0;
-    case 3:
-      return MOE_X_Q4_1;
-    case 6:
-      return MOE_X_Q5_0;
-    case 7:
-      return MOE_X_Q5_1;
-    case 8:
-      return MOE_X_Q8_0;
-    case 10:
-      return MOE_X_Q2_K;
-    case 11:
-      return MOE_X_Q3_K;
-    case 12:
-      return MOE_X_Q4_K;
-    case 13:
-      return MOE_X_Q5_K;
-    case 14:
-      return MOE_X_Q6_K;
-  }
-  return 0;
-}
+// int64_t ggml_moe_get_block_size(int64_t type) {
+//   switch (type) {
+//     case 2:
+//       return MOE_X_Q4_0;
+//     case 3:
+//       return MOE_X_Q4_1;
+//     case 6:
+//       return MOE_X_Q5_0;
+//     case 7:
+//       return MOE_X_Q5_1;
+//     case 8:
+//       return MOE_X_Q8_0;
+//     case 10:
+//       return MOE_X_Q2_K;
+//     case 11:
+//       return MOE_X_Q3_K;
+//     case 12:
+//       return MOE_X_Q4_K;
+//     case 13:
+//       return MOE_X_Q5_K;
+//     case 14:
+//       return MOE_X_Q6_K;
+//   }
+//   return 0;
+// }

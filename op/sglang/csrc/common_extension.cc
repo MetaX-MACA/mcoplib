@@ -99,7 +99,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor pos_ids, bool interleave, bool enable_pdl, "
       "Tensor? v, Tensor!? k_buffer, Tensor!? v_buffer, Tensor? kv_cache_loc) -> ()");
   m.impl("apply_rope_pos_ids_cos_sin_cache", torch::kCUDA, &apply_rope_pos_ids_cos_sin_cache);
-  
+  m.def(
+      "rotary_embedding(Tensor positions, Tensor! query,"
+      "                 Tensor!? key, int head_size,"
+      "                 Tensor cos_sin_cache, bool is_neox) -> ()");
+  m.impl("rotary_embedding", torch::kCUDA, &rotary_embedding);
   m.def("fused_mla_absorb_rotary_emb(Tensor q, Tensor w_kc, Tensor latent_cache, Tensor cos_sin_cache, "
       "Tensor positions, Tensor norm_weight, Tensor! q_input, Tensor! k_input, Tensor! v_input, int q_len, int num_local_heads,"
       "int kv_lora_rank, int qk_rope_head_dim, int qk_nope_head_dim) -> int");
@@ -285,7 +289,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "fused_qk_norm_rope(Tensor! qkv, int num_heads_q, "
       "int num_heads_k, int num_heads_v, int head_dim, float eps, "
       "Tensor q_weight, Tensor k_weight, float base, "
-      "bool is_neox, Tensor position_ids, float factor, float low, float high, float attention_factor) -> ()");
+      "bool is_neox, Tensor position_ids, float factor, float low, float high, float attention_factor, int rotary_dim) "
+      "-> ()");
   m.impl("fused_qk_norm_rope", torch::kCUDA, &fused_qk_norm_rope);
 
   m.def("fused_moe_gate_opt(Tensor gating_outputs, Tensor correction_bias, Tensor! out_routing_weights, Tensor! out_selected_experts, "
@@ -586,7 +591,14 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 //   m.def("ggml_moe_get_block_size(int type) -> int");
 //   m.impl("ggml_moe_get_block_size", torch::kCUDA, &ggml_moe_get_block_size);
 
+//   m.def(
+//       "ggml_moe_a8_vec(Tensor X, Tensor W, "
+//       "Tensor topk_ids, int top_k, "
+//       "int type, SymInt row, SymInt tokens) -> Tensor");
+//   m.impl("ggml_moe_a8_vec", torch::kCUDA, &ggml_moe_a8_vec);
 
+//   m.def("ggml_moe_get_block_size(int type) -> int");
+//   m.impl("ggml_moe_get_block_size", torch::kCUDA, &ggml_moe_get_block_size);
   m.def(
       "cutlass_scaled_mm(Tensor! out, Tensor a,"
       "                  Tensor b, Tensor a_scales,"
@@ -676,6 +688,15 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   m.def("mx_awq_dequantize(Tensor out, Tensor _scaling_factors, Tensor _zeros, int split_k_iter, int thx, int thy) -> Tensor");
   m.impl("mx_awq_dequantize", torch::kCUDA, &mx_awq_dequantize);
+  m.def(
+      "timestep_embedding(Tensor input,"
+      "Tensor output,"
+      "int dim,"
+      "bool flip_sin_to_cos,"
+      "float downscale_freq_shift,"
+      "float scale,"
+      "int max_period) -> Tensor");
+  m.impl("timestep_embedding", torch::kCUDA, &timestep_embedding);
 
 }
 

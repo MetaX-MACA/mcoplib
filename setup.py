@@ -613,7 +613,7 @@ def write_git_info_file(target_path):
                 f'GIT_BRANCH = {branch!r}\n'
                 f'GIT_COMMIT = {commit!r}\n'
                 f'Vllm Op Version = 0.13.0\n'
-                f'SGlang Op Version  = 0.5.6\n'
+                f'SGlang Op Version  = 0.5.7\n'
             )         
     os.makedirs(os.path.dirname(target_path), exist_ok=True)
     with open(target_path, "w", encoding="utf-8") as f:

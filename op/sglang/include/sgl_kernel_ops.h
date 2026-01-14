@@ -158,6 +158,14 @@ void apply_rope_pos_ids_cos_sin_cache(
     const std::optional<at::Tensor>& v_buffer,
     const std::optional<at::Tensor>& kv_cache_loc);
 
+void rotary_embedding(
+    torch::Tensor& positions,
+    torch::Tensor& query,
+    std::optional<torch::Tensor> key,
+    int64_t head_size,
+    torch::Tensor& cos_sin_cache,
+    bool is_neox);
+
 int64_t fused_mla_absorb_rotary_emb(at::Tensor& q, at::Tensor& w_kc, at::Tensor& latent_cache, at::Tensor& cos_sin_cache,
                                 at::Tensor& positions, at::Tensor& norm_weight, at::Tensor& q_input, at::Tensor& k_input, at::Tensor& v_input, 
                                 int64_t q_len, int64_t num_local_heads, int64_t kv_lora_rank, int64_t qk_rope_head_dim, int64_t qk_nope_head_dim);
@@ -419,7 +427,8 @@ void fused_qk_norm_rope(
     double factor,
     double low,
     double high,
-    double attention_factor);
+    double attention_factor,
+    int64_t rotary_dim);
 
 // void cutlass_fp4_group_mm(
 //     torch::Tensor& output,
@@ -885,10 +894,10 @@ torch::Tensor ggml_moe_a8(
     int64_t top_k,
     int64_t tokens);
 
-torch::Tensor ggml_moe_a8_vec(
-    torch::Tensor X, torch::Tensor W, torch::Tensor topk_ids, int64_t top_k, int64_t type, int64_t row, int64_t tokens);
+// torch::Tensor ggml_moe_a8_vec(
+//     torch::Tensor X, torch::Tensor W, torch::Tensor topk_ids, int64_t top_k, int64_t type, int64_t row, int64_t tokens);
 
-int64_t ggml_moe_get_block_size(int64_t type);
+// int64_t ggml_moe_get_block_size(int64_t type);
 
 /*
  * From csrc/spatial
@@ -1059,3 +1068,14 @@ void cutlass_scaled_mm_azp(torch::Tensor& out, torch::Tensor const& a,
                            std::optional<torch::Tensor> const& bias);
 
 torch::Tensor mx_awq_dequantize(torch::Tensor _kernel, torch::Tensor _scaling_factors, torch::Tensor _zeros, int64_t split_k_iters, int64_t thx, int64_t thy);
+/*
+ * From csrc/sgl_diffusion/elementwise
+ */
+torch::Tensor timestep_embedding(
+    const torch::Tensor& t,
+    torch::Tensor& output,
+    int64_t dim,
+    bool flip_sin_to_cos,
+    double downscale_freq_shift,
+    double scale,
+    int64_t max_period);
