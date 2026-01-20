@@ -1,0 +1,12 @@
+{
+    "device_id": 0,
+    "device_name": "MetaX C280",
+    "batch_size": 131072,
+    "kv_lora_rank": 512,
+    "pe_dim": 64,
+    "block_size": 16,
+    "num_blocks": 8192,
+    "kv_cache_dtype": "auto",
+    "dtype": "float16",
+    "samples": 10000
+}

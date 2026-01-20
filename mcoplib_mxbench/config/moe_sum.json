@@ -1,0 +1,9 @@
+{
+    "device_id": 0,
+    "device_name": "MetaX C500/C550",
+    "batch_size": 16384,
+    "top_k": 2,
+    "hidden_size": 4096,
+    "dtype": "float16",
+    "samples": 10000
+}

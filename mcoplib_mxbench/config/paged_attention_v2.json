@@ -1,0 +1,14 @@
+{
+    "device_id": 0,
+    "device_name": "MetaX C280",
+    "batch_size": 64,
+    "num_heads": 32,
+    "num_kv_heads": 8,
+    "head_size": 128,
+    "block_size": 16,
+    "max_seq_len": 2048,
+    "num_blocks": 8192,
+    "dtype": "float16",
+    "kv_cache_dtype": "auto",
+    "samples": 10000
+}
