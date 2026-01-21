@@ -228,7 +228,7 @@ def create_benchmark_wrapper(op_instance):
             device=torch.cuda.device(dev_id)
         )
         launcher = op_instance.prepare_and_get_launcher(dev_id, tc_s)
-        state.exec(launcher, sync=True)
+        state.exec(launcher)
     return benchmark_func
 
 
@@ -277,14 +277,12 @@ def parse_time_val(val_str):
 
 def format_duration(seconds):
     if seconds is None: return "N/A"
-    if seconds < 1e-7: return f"{seconds*1e9:.3f} ns"
-    elif seconds < 1e-4: return f"{seconds*1e6:.3f} us"
-    elif seconds < 1.0: return f"{seconds*1e3:.3f} ms"
-    else: return f"{seconds:.3f} s"
+    # 强制统一转换为 us (微秒)
+    return f"{seconds * 1e6:.3f} us"
 
 def get_row_key(row_dict, header):
     # 排除了常见数值列，dtype 不在其中，因此会自动成为 key 的一部分
-    exclude = ["Samples", "CPU Time", "GPU Time", "Noise", "Elem/s", "GlobalMem", "BWUtil", "Acc_Pass", "Max_Diff", "Cos_Dist"]
+    exclude = ["Samples", "CPU Time", "GPU Time", "Noise", "Elem/s", "GlobalMem", "BWUtil", "Acc_Pass", "Max_Diff", "Cos_Dist","Batch GPU"]
     key_cols = [h for h in header if not any(x in h for x in exclude) and h != "Skipped"]
     return tuple(row_dict.get(k, "") for k in key_cols)
 
@@ -337,7 +335,7 @@ def perform_smart_update(temp_csv_path, target_csv_path):
         key = get_row_key(new_row, combined_header)
         match_idx = history_map.get(key, -1)
         
-        new_time = parse_time_val(new_row.get("GPU Time (sec)", ""))
+        new_time = parse_time_val(new_row.get("Batch GPU (sec)", ""))
         
         d_type = new_row.get("dtype", "")
         op_str = get_op_display_name(new_row)
@@ -345,7 +343,7 @@ def perform_smart_update(temp_csv_path, target_csv_path):
 
         if match_idx >= 0:
             old_row = final_rows[match_idx]
-            old_time = parse_time_val(old_row.get("GPU Time (sec)", ""))
+            old_time = parse_time_val(old_row.get("Batch GPU (sec)", ""))
             
             if new_time is not None and old_time is not None and old_time > 0:
                 ratio = (old_time - new_time) / old_time
@@ -434,7 +432,7 @@ def perform_comparison(cur_raw, hist_raw):
     
     for row in cur_rows:
         key = get_row_key(row, dummy_header)
-        gpu = parse_time_val(row.get("GPU Time (sec)", ""))
+        gpu = parse_time_val(row.get("Batch GPU (sec)", ""))
         cpu = parse_time_val(row.get("CPU Time (sec)", ""))
         op_name = get_op_display_name(row)
         d_type = row.get("dtype", "-")
@@ -451,7 +449,7 @@ def perform_comparison(cur_raw, hist_raw):
 
         print(f" {op_name} | {row.get('Shape', '')} | {d_type}")
         print("-" * 95)
-        print(row_fmt.format("Type", "GPU Time", "Ratio", "CPU Time", "Ratio", ""))
+        print(row_fmt.format("Type", "Batch GPU", "Ratio", "CPU Time", "Ratio", ""))
         print("-" * 95)
         print(row_fmt.format("Current", format_duration(gpu), "-", format_duration(cpu), "-", ""))
         
@@ -464,7 +462,7 @@ def perform_comparison(cur_raw, hist_raw):
 
         if matches:
             _, h_row = matches[-1] 
-            h_gpu = parse_time_val(h_row.get("GPU Time (sec)", ""))
+            h_gpu = parse_time_val(h_row.get("Batch GPU (sec)", ""))
             h_cpu = parse_time_val(h_row.get("CPU Time (sec)", ""))
             
             # 计算比值 (Base / Current)
@@ -550,16 +548,12 @@ if __name__ == "__main__":
         if temp_csv: 
             run_args.extend(["--csv", temp_csv])
 
-        # =======================================================
-        # [配置优化]
-        # 去掉了可能不支持的 --warmup，改用 --min-time
-        # 并配合上面的 create_benchmark_wrapper 中的手动预热
-        # =======================================================
         
         # 设置最小运行时间为 1 秒，确保采集足够的样本以获得稳定平均值
         run_args.extend(["--min-time", "1.5"])
-        run_args.extend(["--timeout", "60"])
-            
+        run_args.extend(["--timeout", "600"])
+        run_args.extend(["--throttle-threshold", "0"])
+        #run_args.extend(["--warmup", "100"]) #预热100次
         # 把剩余未知参数加进去
         run_args.extend(unknown)
         
