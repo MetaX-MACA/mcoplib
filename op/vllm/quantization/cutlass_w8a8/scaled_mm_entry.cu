@@ -52,6 +52,45 @@ void cutlass_moe_mm(
       ". Required capability: 90");
 }
 
+void cutlass_moe_bf16_mm(
+    torch::Tensor& out, torch::Tensor const& a, torch::Tensor const& b,
+    torch::Tensor const& moe_weight,
+    torch::Tensor const& token_ids, torch::Tensor const& expert_ids,
+    torch::Tensor const& num_tokens_post_padded, int64_t num_valid_tokens,
+    int64_t topk, bool mul_routed_weight) {
+
+    cutlass_moe_mm_sm75(out, a, b, moe_weight, token_ids, expert_ids,
+                        num_tokens_post_padded, num_valid_tokens,
+                        topk, mul_routed_weight);
+
+    return;
+}
+
+void cutlass_moe_bf16_mm(
+    torch::Tensor& out, torch::Tensor const& a, torch::Tensor const& b,
+    torch::Tensor const& moe_weight,
+    torch::Tensor const& token_ids, torch::Tensor const& expert_ids,
+    torch::Tensor const& num_tokens_post_padded, int64_t num_valid_tokens,
+    int64_t topk, bool mul_routed_weight) {
+
+    cutlass_moe_mm_sm75(out, a, b, moe_weight, token_ids, expert_ids,
+                        num_tokens_post_padded, num_valid_tokens,
+                        topk, mul_routed_weight);
+
+    return;
+}
+
+void cutlass_moe_mm_w8a8(torch::Tensor const& a, torch::Tensor const& b, torch::Tensor& c,
+                         torch::Tensor const& a_scales, torch::Tensor const& b_scales, torch::Tensor const& moe_weight,
+                         torch::Tensor const& token_ids, torch::Tensor const& expert_ids,
+                         torch::Tensor const& num_tokens_post_padded,
+                         int64_t N, int64_t K, int64_t EM, int64_t num_valid_tokens, int64_t topk, bool mul_routed_weight) {
+
+    cutlass_moe_mm_w8a8_sm75(a, b, c, a_scales, b_scales, moe_weight, token_ids, expert_ids,
+                            num_tokens_post_padded, N, K, EM, num_valid_tokens, topk, mul_routed_weight);
+}
+
+
 void get_cutlass_moe_mm_data(
     const torch::Tensor& topk_ids, torch::Tensor& expert_offsets,
     torch::Tensor& problem_sizes1, torch::Tensor& problem_sizes2,
