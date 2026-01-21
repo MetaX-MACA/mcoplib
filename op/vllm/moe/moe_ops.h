@@ -27,7 +27,12 @@ void moe_lora_align_block_size(
     torch::Tensor sorted_token_ids, torch::Tensor expert_ids,
     torch::Tensor num_tokens_post_pad, torch::Tensor adapter_enabled,
     torch::Tensor lora_ids);
-    
+
+std::tuple<torch::Tensor, torch::Tensor> grouped_topk(
+    torch::Tensor const& scores, int64_t n_group, int64_t topk_group,
+    int64_t topk, bool renormalize, double routed_scaling_factor,
+    torch::Tensor const& bias, int64_t scoring_func);
+
 void fused_moe_kernel(const torch::Tensor& A, const torch::Tensor& B,
                       const torch::Tensor& C, const torch::Tensor& topk_weights,
                       const torch::Tensor& topk_ids,
