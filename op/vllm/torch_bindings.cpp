@@ -254,6 +254,24 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def("awq_to_gptq_4bit(Tensor qweight) -> Tensor");
   ops.impl("awq_to_gptq_4bit", torch::kCUDA, &awq_to_gptq_4bit);
 
+  // CUTLASS moe gemm
+  ops.def("cutlass_moe_mm_gemm_kernel_m_w8a8(int num_valid_tokens, int N, int K, int group) -> int");
+  ops.impl("cutlass_moe_mm_gemm_kernel_m_w8a8", &cutlass_moe_mm_gemm_kernel_m_w8a8);
+  
+  ops.def(
+      "cutlass_moe_mm_w8a8(Tensor a, Tensor b, Tensor c, Tensor a_scales, Tensor b_scales, Tensor moe_weight,"
+      "Tensor token_ids, Tensor expert_ids, Tensor num_tokens_post_padded,"
+      "int N, int K, int EM, int num_valid_tokens, int topk, bool mul_routed_weight) -> ()");
+  ops.impl("cutlass_moe_mm_w8a8", torch::kCUDA, &cutlass_moe_mm_w8a8);
+  
+  ops.def(
+      "cutlass_moe_bf16_mm(Tensor! out, Tensor a, Tensor b,"
+      "Tensor moe_weight,"
+      "Tensor token_ids, Tensor expert_ids, Tensor num_tokens_post_padded, int num_valid_tokens,"
+      "int topk, bool mul_routed_weight) -> ()");
+  ops.impl("cutlass_moe_bf16_mm", torch::kCUDA, &cutlass_moe_bf16_mm);
+
+  
   // CUTLASS w8a8 GEMM, supporting symmetric per-tensor or per-row/column
   // quantization, as well as bias
   ops.def(
