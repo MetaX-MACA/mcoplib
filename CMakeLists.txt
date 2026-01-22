@@ -475,7 +475,8 @@ if (BUILD_DEFAULT_OP_SUBMODULE)
       "${MCOPLIB_SRCS_DIR}/fused_add_layernorm_per_token_quant_padding_output.cu"
       "${MCOPLIB_SRCS_DIR}/rms_norm_dynamic_per_token_quant.cu"
       "${MCOPLIB_SRCS_DIR}/fused_moe_gate_deepseek.cu"
-      "${MCOPLIB_SRCS_DIR}/gptq_marlin.cu")
+      "${MCOPLIB_SRCS_DIR}/gptq_marlin.cu"
+      "${MCOPLIB_SRCS_DIR}/moe_fused_gate_opt.cu")
 
   set_source_files_properties(
     "${MCOPLIB_SRCS_DIR}/gptq_marlin.cu"
