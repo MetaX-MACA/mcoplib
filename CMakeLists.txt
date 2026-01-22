@@ -174,6 +174,24 @@ if(DEFINED ENV{DEBUG_LINE_INFO})
   )
 endif()
 
+################cutlass build option################
+
+option(GLOBAL_ENABLE_BUILD_CUTLASS_OP "Build the default op kernels subproject" ON)
+# 如果存在环境变量，则覆盖默认设置
+if(DEFINED ENV{ENABLE_BUILD_CUTLASS_OP})
+    message(STATUS "mcoplib build option ENV ENABLE_BUILD_CUTLASS_OP:$ENV{ENABLE_BUILD_CUTLASS_OP}")
+    string(TOLOWER "$ENV{ENABLE_BUILD_CUTLASS_OP}" _val)
+    if (_val STREQUAL "1" OR _val STREQUAL "on" OR _val STREQUAL "true")
+        set(GLOBAL_ENABLE_BUILD_CUTLASS_OP ON)
+    else()
+        set(GLOBAL_ENABLE_BUILD_CUTLASS_OP OFF)
+    endif()
+endif()
+
+if (GLOBAL_ENABLE_BUILD_CUTLASS_OP)
+    add_definitions(-DENABLE_CUTALASS_OP)
+endif()
+
 #
 # Use FetchContent for C++ dependencies that are compiled as part of vLLM's build process.
 # setup.py will override FETCHCONTENT_BASE_DIR to play nicely with sccache.
@@ -254,12 +272,16 @@ if (BUILD_VLLM_SUBMODULE)
     list(APPEND VLLM_EXT_SRC
       "${VLLM_SRC_DIR}/quantization/awq/gemm_kernels.cu"
       "${VLLM_SRC_DIR}/permute_cols.cu"
-      "${VLLM_SRC_DIR}/quantization/cutlass_w8a8/scaled_mm_entry.cu"
       "${VLLM_SRC_DIR}/quantization/fp4/nvfp4_quant_entry.cu"
-      "${VLLM_SRC_DIR}/quantization/fp4/nvfp4_scaled_mm_entry.cu"
-      "${VLLM_SRC_DIR}/sparse/cutlass/sparse_scaled_mm_entry.cu"
-      "${VLLM_SRC_DIR}/cutlass_extensions/common.cpp"
-      "${VLLM_SRC_DIR}/attention/mla/cutlass_mla_entry.cu")
+      "${VLLM_SRC_DIR}/cutlass_extensions/common.cpp")
+
+    if (GLOBAL_ENABLE_BUILD_CUTLASS_OP)
+      list(APPEND VLLM_EXT_SRC
+        "${VLLM_SRC_DIR}/quantization/cutlass_w8a8/scaled_mm_entry.cu"
+        "${VLLM_SRC_DIR}/quantization/fp4/nvfp4_scaled_mm_entry.cu"
+        "${VLLM_SRC_DIR}/sparse/cutlass/sparse_scaled_mm_entry.cu"
+        "${VLLM_SRC_DIR}/attention/mla/cutlass_mla_entry.cu")
+  endif()
 
     set_gencode_flags_for_srcs(
       SRCS "${VLLM_EXT_SRC}"
@@ -287,7 +309,7 @@ if (BUILD_VLLM_SUBMODULE)
       "7.5;8.0;8.7;8.9+PTX" "${CUDA_ARCHS}")
     # subtract out the archs that are already built for 3x
     list(REMOVE_ITEM SCALED_MM_2X_ARCHS ${SCALED_MM_3X_ARCHS})
-    if (SCALED_MM_2X_ARCHS)
+    if (SCALED_MM_2X_ARCHS AND GLOBAL_ENABLE_BUILD_CUTLASS_OP)
       set(SRCS "${VLLM_SRC_DIR}/quantization/cutlass_w8a8/scaled_mm_c2x.cu")
       set_gencode_flags_for_srcs(
         SRCS "${SRCS}"
@@ -542,12 +564,15 @@ if (BUILD_SGLANG_SUBMODULE)
       "${SGLANG_KERNELS_SRCS_DIR}/csrc/sgl_diffusion/elementwise/timestep_embedding.cu"
       "${SGLANG_KERNELS_SRCS_DIR}/csrc/elementwise/fused_layernorm_dynamic_per_token_quant_custom.cu"
       "${SGLANG_KERNELS_SRCS_DIR}/csrc/elementwise/fused_rotary_emb.cu"
-      #"${SGLANG_KERNELS_SRCS_DIR}/csrc/moe/cutlass_moe/scaled_mm_c2x.cu"
       "${SGLANG_KERNELS_SRCS_DIR}/csrc/moe/kimi_k2_moe_fused_gate.cu"
       "${SGLANG_KERNELS_SRCS_DIR}/csrc/moe/fused_qknorm_rope_kernel.cu"
       "${SGLANG_KERNELS_SRCS_DIR}/csrc/moe/moe_topk_sigmoid_kernels.cu"
       "${SGLANG_KERNELS_SRCS_DIR}/csrc/mamba/causal_conv1d.cu")
-      #"${SGLANG_KERNELS_SRCS_DIR}/csrc/cutlass_w8a8/scaled_mm_entry.cu")
+  if (GLOBAL_ENABLE_BUILD_CUTLASS_OP)
+    list(APPEND MCOPLIB_SGLANG_KERNEL_SRC
+      "${SGLANG_KERNELS_SRCS_DIR}/csrc/moe/cutlass_moe/scaled_mm_c2x.cu"
+      "${SGLANG_KERNELS_SRCS_DIR}/csrc/cutlass_w8a8/scaled_mm_entry.cu")
+  endif()
 
   set_gencode_flags_for_srcs(
     SRCS "${MCOPLIB_SGLANG_KERNEL_SRC}"
