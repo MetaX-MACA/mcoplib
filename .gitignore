@@ -85,3 +85,5 @@ compile_commands.json
 *.cap
 *.pcapng
 *.txt
+CLAUDE.md
+.claude/
