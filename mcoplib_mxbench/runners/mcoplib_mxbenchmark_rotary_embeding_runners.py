@@ -28,7 +28,7 @@ class Rotary_embedding_runner(OpBenchmarkBase):
         state.add_summary("dtype", self.config.get("dtype", str(self.dtype)))
         
         # 记录形状信息
-        shape_str = f"(Tokens:{self.batch_size}, Heads:{self.total_head_num}, Dim:{self.head_size})"
+        shape_str = f"(Tokens:{self.batch_size} Heads:{self.total_head_num} Dim:{self.head_size})"
         state.add_summary("Shape", shape_str)
         
         # 计算元素总数 (packed_qkv的大小)

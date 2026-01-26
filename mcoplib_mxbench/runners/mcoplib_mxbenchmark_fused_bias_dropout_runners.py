@@ -15,8 +15,6 @@ class Fused_bias_dropout_runner(OpBenchmarkBase):
 
     def define_metrics(self, state):
         state.add_summary("Op", self.name)
-        
-        # 【新增】添加 dtype 列
         state.add_summary("dtype", self.config.get("dtype", str(self.dtype)))
         state.add_summary("Shape", f"({self.batch_size} {self.hidden_size})")
         total = self.batch_size * self.hidden_size

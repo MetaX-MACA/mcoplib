@@ -37,12 +37,13 @@ SUPPORTED_OPERATORS = [
     "gelu_quick",
     "fused_add_rms_norm",
     "apply_repetition_penalties",
-    "rms_norm_static_fp8_quant"
+    "rms_norm_static_fp8_quant",
+    "copy_blocks" # 确保新算子在列表中
     # 在这里继续添加新算子...
 ]
 
 # =============================================================================
-#  加载基类
+#  加载逻辑 (Loader)
 # =============================================================================
 def get_base_dir():
     return os.path.dirname(os.path.abspath(__file__))
@@ -100,7 +101,7 @@ def load_operator_runner(op_name):
     with open(target_json_path, 'r', encoding='utf-8') as f:
         config = json.load(f)
 
-# -----------------------------------------------------------
+    # -----------------------------------------------------------
     # 2. 寻找 Runner 文件 (.py)
     # -----------------------------------------------------------
     runners_dir = os.path.join(current_dir, "runners")
@@ -128,14 +129,12 @@ def load_operator_runner(op_name):
             matched_runners = []
             
             # 【策略 A】：先试着用 Config 文件名 (canonical_name) 搜
-            # 例如：用 "fused_rope_fwd_m" 去搜
             if canonical_name:
                 pattern_canon = re.compile(canonical_name, re.IGNORECASE)
                 matched_runners = [f for f in py_files if pattern_canon.search(f)]
 
             # 【策略 B】：如果策略 A 没搜到，或者搜到了 0 个，
-            # 这里的逻辑关键：回退使用用户输入的 op_name 再次搜索！
-            # 例如：用 "fused_rope_fwd" 去搜
+            # 回退使用用户输入的 op_name 再次搜索！
             if not matched_runners and op_name and op_name != canonical_name:
                 print(f"提示: 标准名 '{canonical_name}' 匹配失败，尝试回退使用输入名 '{op_name}' 搜索...")
                 pattern_op = re.compile(op_name, re.IGNORECASE)
@@ -148,7 +147,7 @@ def load_operator_runner(op_name):
         target_runner_file = None
         if len(matched_runners) == 0:
             print(f"Error: 在 runners 目录下找不到相关 Python 文件。")
-            print(f"       已尝试关键词: '{canonical_name}' 和 '{op_name}'")
+            print(f"      已尝试关键词: '{canonical_name}' 和 '{op_name}'")
             sys.exit(1)
         elif len(matched_runners) == 1:
             target_runner_file = matched_runners[0]
@@ -163,6 +162,7 @@ def load_operator_runner(op_name):
             module_base = target_runner_file.replace(".py", "")
             found_module_name = f"runners.{module_base}"
             print(f">> [Runner Match] 锁定 Runner 模块: {module_base}")
+    
     # -----------------------------------------------------------
     # 3. 加载模块与类
     # -----------------------------------------------------------
@@ -188,11 +188,12 @@ def load_operator_runner(op_name):
     return target_cls(canonical_name, config)
 
 # =============================================================================
-#  Benchmark Wrapper
+#  Benchmark Wrapper (集成 Sync Fix)
 # =============================================================================
 def create_benchmark_wrapper(op_instance):
     def benchmark_func(state):
         dev_id = state.get_device()
+        is_verified = False
         
         # 1. 验证 (Verification)
         try:
@@ -200,14 +201,18 @@ def create_benchmark_wrapper(op_instance):
             state.add_summary("Acc_Pass", "Yes" if passed else "No")
             state.add_summary("Cos_Dist", f"{diff_val:.2e}") 
             print(f"\n[ACC Verify] {op_instance.name} -> {'PASS' if passed else 'FAIL'} (1-CosSim: {diff_val:.2e})")
+            is_verified = passed
         except Exception as e:
+            is_verified = False
             print(f"\n[ACC Verify] Error: {e}")
             state.add_summary("Acc_Pass", "Error")
 
-        # ===========================================================
-        # [新增] 手动物理预热 (Manual Warmup)
-        # 不依赖 nvbench 参数，直接在 Python 层跑 10 次，把 GPU 唤醒
-        # ===========================================================
+        if not is_verified:
+            print(f"\n[FATAL] {op_instance.name} verification failed. Terminating all processes...")
+            import os
+            os._exit(0)
+
+        # 2. 手动物理预热 (Manual Warmup)
         print(f"  >> [Warmup] Running 10 iterations to heat up GPU...", end="", flush=True)
         try:
             for _ in range(10):
@@ -216,8 +221,7 @@ def create_benchmark_wrapper(op_instance):
         except Exception as e:
             print(f" (Warmup failed: {e})", end="")
 
-        # 恢复正常的采样数逻辑
-        # 采样数自动补偿 -16 (为了抵消 nvbench 内部可能的预热计数，保持最终报告的 Sample 数与 Config 一致)
+        # 3. 采样数配置
         raw_samples = op_instance.config.get("samples", 100)
         target_samples = max(1, raw_samples - 16) 
         state.set_min_samples(target_samples)
@@ -228,13 +232,27 @@ def create_benchmark_wrapper(op_instance):
             device=torch.cuda.device(dev_id)
         )
         launcher = op_instance.prepare_and_get_launcher(dev_id, tc_s)
-        state.exec(launcher)
+        
+        # 4. 执行测量 (Sync 模式修复)
+        force_sync = getattr(op_instance, '_force_sync', False)
+        
+        if force_sync:
+            try:
+                # 使用关键字参数开启同步
+                state.exec(launcher, sync=True)
+            except TypeError as e:
+                # 兼容性降级
+                print(f"\n[Warning] 'state.exec(..., sync=True)' failed: {e}")
+                print("          Falling back to default async mode.")
+                state.exec(launcher)
+        else:
+            state.exec(launcher)
+
     return benchmark_func
 
 
-
 # =============================================================================
-#  CSV 处理工具
+#  CSV 处理工具 (集成智能时间读取)
 # =============================================================================
 def load_csv_data(filepath):
     if not filepath or not os.path.exists(filepath): return [], []
@@ -289,6 +307,26 @@ def get_row_key(row_dict, header):
 def get_op_display_name(row):
     return row.get("op_name", row.get("Op", row.get("Benchmark", "?")))
 
+def get_effective_gpu_time(row):
+    """
+    [新增] 智能获取 GPU 时间：
+    1. 优先尝试 'Batch GPU (sec)' (Hot/Async 模式)
+    2. 如果没有，回退到 'GPU Time (sec)' (Cold/Sync 模式)
+    """
+    t_batch = parse_time_val(row.get("Batch GPU (sec)", ""))
+    if t_batch is not None: return t_batch
+    
+    t_batch_raw = parse_time_val(row.get("Batch GPU", ""))
+    if t_batch_raw is not None: return t_batch_raw
+
+    t_gpu = parse_time_val(row.get("GPU Time (sec)", ""))
+    if t_gpu is not None: return t_gpu
+        
+    t_gpu_raw = parse_time_val(row.get("GPU Time", ""))
+    if t_gpu_raw is not None: return t_gpu_raw
+        
+    return None
+
 def _write_csv(path, header, rows):
     try:
         target_dir = os.path.dirname(path)
@@ -301,7 +339,7 @@ def _write_csv(path, header, rows):
         print(f"写入CSV失败: {e}")
 
 # =============================================================================
-#  Update / Generate / Compare 逻辑
+#  Update / Generate / Compare 逻辑 (已应用智能时间读取)
 # =============================================================================
 def perform_smart_update(temp_csv_path, target_csv_path):
     print("\n" + "="*80 +f"\n{' Smart Update Mode (>5% Gain) ':^80}\n" + "="*80)
@@ -335,7 +373,8 @@ def perform_smart_update(temp_csv_path, target_csv_path):
         key = get_row_key(new_row, combined_header)
         match_idx = history_map.get(key, -1)
         
-        new_time = parse_time_val(new_row.get("Batch GPU (sec)", ""))
+        # 使用智能获取
+        new_time = get_effective_gpu_time(new_row)
         
         d_type = new_row.get("dtype", "")
         op_str = get_op_display_name(new_row)
@@ -343,7 +382,8 @@ def perform_smart_update(temp_csv_path, target_csv_path):
 
         if match_idx >= 0:
             old_row = final_rows[match_idx]
-            old_time = parse_time_val(old_row.get("Batch GPU (sec)", ""))
+            # 使用智能获取
+            old_time = get_effective_gpu_time(old_row)
             
             if new_time is not None and old_time is not None and old_time > 0:
                 ratio = (old_time - new_time) / old_time
@@ -428,46 +468,53 @@ def perform_comparison(cur_raw, hist_raw):
     print("\n" + "="*95 + "\n" + f"{' Performance Comparison ':^95}" + "\n" + "="*95)
     
     row_fmt = "{:<15} | {:<15} | {:<10} | {:<15} | {:<15} | {:<20}"
+    # 这是当前运行结果的表头结构
     dummy_header = list(cur_rows[0].keys())
     
     for row in cur_rows:
+        # 1. 生成当前数据的指纹
         key = get_row_key(row, dummy_header)
-        gpu = parse_time_val(row.get("Batch GPU (sec)", ""))
+        
+        gpu = get_effective_gpu_time(row)
         cpu = parse_time_val(row.get("CPU Time (sec)", ""))
         op_name = get_op_display_name(row)
         d_type = row.get("dtype", "-")
         
-        # 1. 获取精度验证状态
-        # 在 create_benchmark_wrapper 中定义的 key 是 "Acc_Pass"，值为 "Yes"/"No"
+        # 识别当前展示的时间类型
+        time_label = "Batch GPU"
+        if parse_time_val(row.get("Batch GPU (sec)", "")) is None and \
+           parse_time_val(row.get("GPU Time (sec)", "")) is not None:
+             time_label = "GPU Time (Sync)"
+
         raw_acc = row.get("Acc_Pass", "N/A")
-        if raw_acc == "Yes":
-            acc_status = "Pass"
-        elif raw_acc == "No":
-            acc_status = "Fail"
-        else:
-            acc_status = raw_acc  # 如果是 Error 或其他状态直接显示
+        if raw_acc == "Yes": acc_status = "Pass"
+        elif raw_acc == "No": acc_status = "Fail"
+        else: acc_status = raw_acc
 
         print(f" {op_name} | {row.get('Shape', '')} | {d_type}")
         print("-" * 95)
-        print(row_fmt.format("Type", "Batch GPU", "Ratio", "CPU Time", "Ratio", ""))
+        print(row_fmt.format("Type", time_label, "Ratio", "CPU Time", "Ratio", ""))
         print("-" * 95)
         print(row_fmt.format("Current", format_duration(gpu), "-", format_duration(cpu), "-", ""))
         
         matches = []
         for idx, h_row in enumerate(hist_rows):
-            if get_row_key(h_row, list(h_row.keys())) == key: matches.append((idx, h_row))
+            # =================================================================
+            # [修复点] 强制使用 dummy_header (即当前数据的列结构) 来生成历史数据的 Key
+            # 这样会忽略 CSV 中多余的无关列，确保指纹生成逻辑完全一致
+            # =================================================================
+            if get_row_key(h_row, dummy_header) == key: 
+                matches.append((idx, h_row))
         
-        # 2. 初始化性能比值变量
         perf_ratio_str = "null"
 
         if matches:
             _, h_row = matches[-1] 
-            h_gpu = parse_time_val(h_row.get("Batch GPU (sec)", ""))
+            h_gpu = get_effective_gpu_time(h_row)
             h_cpu = parse_time_val(h_row.get("CPU Time (sec)", ""))
             
             # 计算比值 (Base / Current)
             if gpu and h_gpu:
-                # 记录比值供 Result 使用
                 perf_ratio_str = f"{h_gpu/gpu*100:.2f}%"
                 gr = perf_ratio_str
             else:
@@ -478,7 +525,6 @@ def perform_comparison(cur_raw, hist_raw):
         else:
             print(f"{'Base':<15} | {'N/A':<15} | {'N/A':<10} | {'N/A':<15} | {'N/A':<15} |")
         
-        # 3. 输出 Result 模块
         print("Result:")
         print(f"Acc verify:{acc_status}")
         print(f"Performance verify:{perf_ratio_str}")
@@ -486,9 +532,6 @@ def perform_comparison(cur_raw, hist_raw):
 
 # =============================================================================
 #  Main Execution Block
-# =============================================================================
-# =============================================================================
-#  Main Execution Block (修复缩进版)
 # =============================================================================
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MCOPLIB 算子性能测试框架")

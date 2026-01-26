@@ -1,0 +1,9 @@
+{
+    "device_id": 0,
+    "device_name": "MetaX C280",
+    "m": 8192,
+    "n": 8192,
+    "k": 128,
+    "dtype": "bfloat16",
+    "samples": 1000
+}

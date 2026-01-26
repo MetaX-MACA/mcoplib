@@ -1,0 +1,11 @@
+{
+    "device_id": 0,
+    "device_name": "MetaX C280",
+    "num_layers": 32,
+    "num_blocks": 4096,
+    "block_size": 16,
+    "hidden_dim": 576,
+    "num_pairs": 2048,
+    "dtype": "float16",
+    "samples": 10000
+}

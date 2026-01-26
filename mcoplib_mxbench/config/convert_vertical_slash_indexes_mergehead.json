@@ -1,0 +1,14 @@
+{
+    "device_id": 0,
+    "device_name": "MetaX C280",
+    "batch_size": 1,
+    "num_heads": 4,
+    "context_size": 128,
+    "block_size_m": 64,
+    "block_size_n": 64,
+    "nnz_v": 8,
+    "nnz_s": 8,
+    "causal": true,
+    "dtype": "int32",
+    "samples": 100000
+}

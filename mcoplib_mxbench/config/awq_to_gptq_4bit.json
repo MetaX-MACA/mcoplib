@@ -1,0 +1,9 @@
+{
+    "device_id": 0,
+    "device_name": "MetaX C280",
+    "in_c": 32768,
+    "out_c": 32768,
+    "pack_factor": 8,
+    "dtype": "int32",
+    "samples": 1000
+}

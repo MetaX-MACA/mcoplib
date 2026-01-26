@@ -1,6 +1,6 @@
 {
     "device_id": 0,
-    "device_name": "MetaX C500/C550",
+    "device_name": "MetaX C280",
     "batch_size": 16384,
     "hidden_size": 4096,
     "dtype": "float16",

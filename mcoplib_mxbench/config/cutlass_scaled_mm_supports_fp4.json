@@ -1,0 +1,6 @@
+{
+    "device_id": 0,
+    "device_name": "MetaX C280",
+    "cuda_device_capability": 90,
+    "samples": 50000
+}
