@@ -1,0 +1,9 @@
+{
+    "device_id": 0,
+    "num_tokens": 131072,
+    "block_size": 16,
+    "head_dim": 128,
+    "num_blocks": 16384,
+    "dtype": "float16",
+    "samples": 1000
+}

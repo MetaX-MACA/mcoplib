@@ -1,0 +1,10 @@
+{
+    "device_id": 0,
+    "batch_size": 128,
+    "block_size": 16,
+    "num_heads": 32,
+    "head_size": 128,
+    "seq_len": 256,
+    "dtype": "float16",
+    "samples": 10000
+}
