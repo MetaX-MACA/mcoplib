@@ -38,30 +38,7 @@ def cosine_similarity(a, b):
 def reference_moe_gate(gating_outputs, correction_bias, topk, num_expert_group,
                         topk_group, num_fused_shared_experts=None,
                         routed_scaling_factor=None):
-    """
-    参考实现：用于验证fused_moe_gate_opt的正确性
-
-    该实现严格遵循fused_moe_gate.cuh中的算法逻辑：
-    1. Sigmoid激活
-    2. 加bias
-    3. 基于bias后的值选择topk专家
-    4. 使用sigmoid后的原始值（未加bias）作为权重
-    5. 处理共享专家
-    6. 归一化权重
-
-    Args:
-        gating_outputs: [batch_size, num_experts], 门控网络输出
-        correction_bias: [num_experts], 校正偏置
-        topk: 选择的专家总数
-        num_expert_group: 专家分组数
-        topk_group: 从每组选择的组数
-        num_fused_shared_experts: 共享专家数量
-        routed_scaling_factor: 路由缩放因子
-
-    Returns:
-        normalized_weights: [batch_size, topk], 归一化后的权重
-        selected_indices: [batch_size, topk], 选中的专家索引
-    """
+    
     batch_size = gating_outputs.shape[0]
     num_experts = gating_outputs.shape[1]
     device = gating_outputs.device
@@ -124,6 +101,77 @@ def reference_moe_gate(gating_outputs, correction_bias, topk, num_expert_group,
 
     return normalized_weights, topk_indices
 
+def biased_grouped_topk_impl(
+    hidden_states: torch.Tensor,
+    gating_output: torch.Tensor,
+    correction_bias: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+    num_expert_group: Optional[int] = None,
+    topk_group: Optional[int] = None,
+    num_fused_shared_experts: int = 0,
+    routed_scaling_factor: Optional[float] = None,
+    # num_token_non_padded: Optional[torch.Tensor] = None,
+    # expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+    apply_routed_scaling_factor_on_output: Optional[bool] = False,
+):
+    assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
+
+    scores = gating_output.sigmoid()
+    num_token = scores.shape[0]
+    num_experts = scores.shape[1]
+    scores_for_choice = scores.view(num_token, -1) + correction_bias.unsqueeze(0)
+    group_scores = (
+        scores_for_choice.view(num_token, num_expert_group, -1)
+        .topk(2, dim=-1)[0]
+        .sum(dim=-1)
+    ) # [n, n_group]
+    group_idx = torch.topk(group_scores, k=topk_group, dim=-1, sorted=False)[
+        1
+    ] # [n, top_k_group]
+    group_mask = torch.zeros_like(group_scores) # [n, n_group]
+    group_mask.scatter_(1, group_idx, 1) # [n, n_group]
+    score_mask = (
+        group_mask.unsqueeze(-1)
+        .expand(num_token, num_expert_group, scores.shape[-1] // num_expert_group)
+        .reshape(num_token, -1)
+    ) # [n, e]
+    tmp_scores = scores_for_choice.masked_fill(
+        ~score_mask.bool(), float("-inf")
+    ) # [n, e]
+    # TODO: NPU can't support directly evaluating a comparison for now
+    _, topk_ids = torch.topk(
+        tmp_scores,
+        k=topk,
+        dim=-1,
+        sorted=(True if num_fused_shared_experts > 0 else False),
+    )
+    topk_weights = scores.gather(1, topk_ids)
+
+    if num_fused_shared_experts:
+        topk_ids[:, -1] = torch.randint(
+            low=num_experts,
+            high=num_experts + num_fused_shared_experts,
+            size=(topk_ids.size(0),),
+            dtype=topk_ids.dtype,
+            device=topk_ids.device,
+        )
+        topk_weights[:, -1] = topk_weights[:, :-1].sum(dim=-1) / routed_scaling_factor
+
+    if renormalize:
+        topk_weights_sum = (
+            topk_weights.sum(dim=-1, keepdim=True)
+            if num_fused_shared_experts == 0
+            else topk_weights[:, :-1].sum(dim=-1, keepdim=True)
+        )
+        topk_weights = topk_weights / topk_weights_sum
+        if apply_routed_scaling_factor_on_output:
+             topk_weights *= routed_scaling_factor
+
+    topk_weights, topk_ids = topk_weights.to(torch.float32), topk_ids.to(torch.int32)
+    # topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
+    # _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
+    return topk_weights, topk_ids
 
 def verify_accuracy(output_weights, output_indices, ref_weights, ref_indices,
                     tolerance=0.00001, test_name=""):
@@ -259,7 +307,7 @@ def test_160_experts_no_shared():
     print(f"  ✓ Basic checks passed")
 
     # 计算参考实现
-    ref_weights, ref_indices = reference_moe_gate(
+    ref_weights, ref_indices = biased_grouped_topk_impl(
         gating_outputs, correction_bias, topk,
         num_expert_group=1, topk_group=1,
         num_fused_shared_experts=None,
@@ -344,7 +392,7 @@ def test_160_experts_with_shared():
     print(f"  ✓ Weight sum verified: ~{expected_sum:.3f}")
 
     # 计算参考实现
-    ref_weights, ref_indices = reference_moe_gate(
+    ref_weights, ref_indices = biased_grouped_topk_impl(
         gating_outputs, correction_bias, topk,
         num_expert_group=1, topk_group=1,
         num_fused_shared_experts=num_shared,
