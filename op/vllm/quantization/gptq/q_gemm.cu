@@ -1961,22 +1961,6 @@ bool launch_gemm(int m, int n, int k, int quant_group, const input_tp* dA,
     }
   }
 
-  // #if 0
-  if constexpr (std::is_same_v<input_tp, __maca_bfloat16>) {
-    uint64_t size = m * n;
-    uint64_t block = 512;
-    uint64_t grid = div_ceil(size, block);
-    vectorized_elementwise_fp32tobf16<<<grid, block, 0, stream>>>(
-        (float*)dC_temp, (input_tp*)dC, size);
-  }
-#if 0
-  #ifdef BF16_HIGH_PRECISION
-	  vectorized_elementwise_fp32tobf16<<<grid, block, 0, stream>>>((float*)dC_temp, (input_tp*)dC, size);
-  #else
-          vectorized_elementwise_fp16tobf16<<<grid, block, 0, stream>>>((input_tp*)dC, size);
-  #endif
-#endif
-
   return ret;
 }
 
