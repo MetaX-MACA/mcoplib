@@ -5,7 +5,6 @@
 #include "cuda_compat.h"
 #include "dispatch_utils.h"
 
-#include "quantization/w8a8/fp8/common.cuh"
 #include "quantization/fp8/common.cuh"
 #include "quantization/fp8/metax/quant_utils.cuh"
 
