@@ -34,8 +34,6 @@ class Concat_and_cache_mla_runner(OpBenchmarkBase):
         
         element_size = 2 if self.dtype in [torch.float16, torch.bfloat16] else 4
         
-        # Read: kv_c + k_pe + slot_mapping (int64)
-        # Write: kv_cache (scattered write)
         r_bytes = (input_elems_c + input_elems_pe) * element_size + self.batch_size * 8
         w_bytes = output_elems * element_size
         
@@ -82,8 +80,6 @@ class Concat_and_cache_mla_runner(OpBenchmarkBase):
         
         out_ref = torch.cat([kv_c, k_pe], dim=-1)
         
-        # Extract written data from cache for verification
-        # Assuming slot_mapping maps linearly to flattened cache for this test case
         flat_cache = kv_cache.view(-1, self.total_dim)
         out_op = flat_cache[slot_mapping]
         

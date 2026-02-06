@@ -15,18 +15,10 @@ class Swap_blocks_runner(OpBenchmarkBase):
         state.add_summary("Op", self.name)
         state.add_summary("dtype", self.config.get("dtype", str(self.dtype)))
         state.add_summary("Shape", f"(Blocks={self.num_blocks} Heads={self.num_kv_heads} HeadSize={self.head_size})")
-        
-        # 计算 X (packing factor)
         element_size_bytes = 2 if self.dtype == torch.float16 or self.dtype == torch.bfloat16 else 4
         x = 16 // element_size_bytes
-        
-        # 单个 Block 的元素数量 (pre-packed shape: [Heads, HeadSize//X, BlockSize, X])
-        # Total elements = Heads * (HeadSize/X) * BlockSize * X = Heads * HeadSize * BlockSize
         block_elements = self.num_kv_heads * self.head_size * self.block_size
-        
-        # 此次操作涉及的总元素数 (基于 swap 的对数)
         total_elements = self.num_pairs * block_elements
-        
         state.add_element_count(total_elements)
         state.add_global_memory_reads(total_elements * element_size_bytes)
         state.add_global_memory_writes(total_elements * element_size_bytes)
@@ -36,45 +28,28 @@ class Swap_blocks_runner(OpBenchmarkBase):
             dev = f'cuda:{dev_id}'
             element_size_bytes = 2 if self.dtype == torch.float16 or self.dtype == torch.bfloat16 else 4
             x = 16 // element_size_bytes
-            
-            # 构造 Cache Shape
             cache_shape = (self.num_blocks, self.num_kv_heads, self.head_size // x, self.block_size, x)
-            
             src_cache = torch.randn(cache_shape, dtype=self.dtype, device=dev)
             dst_cache = torch.zeros(cache_shape, dtype=self.dtype, device=dev)
-            
-            # 构造 Mapping (必须在 CPU)
-            # 随机生成 src 和 dst 的索引对
             src_indices = torch.randint(0, self.num_blocks, (self.num_pairs,), device="cpu")
             dst_indices = torch.randint(0, self.num_blocks, (self.num_pairs,), device="cpu")
             mapping_data = torch.stack([src_indices, dst_indices], dim=1).to(torch.int64)
-
             def op_closure():
                 torch.ops._C_cache_ops.swap_blocks(src_cache, dst_cache, mapping_data)
                 return dst_cache
-
         return self.make_launcher(dev_id, op_closure)
 
     def run_verification(self, dev_id):
         dev = f'cuda:{dev_id}'
         element_size_bytes = 2 if self.dtype == torch.float16 or self.dtype == torch.bfloat16 else 4
         x = 16 // element_size_bytes
-        
         cache_shape = (self.num_blocks, self.num_kv_heads, self.head_size // x, self.block_size, x)
-        
         src_cache = torch.randn(cache_shape, dtype=self.dtype, device=dev)
         dst_cache = torch.zeros(cache_shape, dtype=self.dtype, device=dev)
-        
-        # 简单的验证 Mapping
         src_idx = 0
         dst_idx = 5
         mapping_data = torch.tensor([[src_idx, dst_idx]], dtype=torch.int64, device="cpu")
-        
-        # 执行算子
         torch.ops._C_cache_ops.swap_blocks(src_cache, dst_cache, mapping_data)
-        
-        # Python 参考逻辑 (Copy src[src_idx] to dst[dst_idx])
         ref_block = src_cache[src_idx].clone()
         op_block = dst_cache[dst_idx]
-        
         return self.check_diff(op_block, ref_block)

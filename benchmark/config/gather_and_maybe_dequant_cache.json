@@ -1,5 +1,6 @@
 {
     "device_id": 0,
+    "device_name": "MetaX C500",
     "batch_size": 64,
     "block_size": 16,
     "num_kv_heads": 1,

@@ -1,8 +1,9 @@
 {
     "device_id": 0,
-    "num_valid_tokens": 1024,
-    "N": 4096,
-    "K": 2048,
-    "group": 64,
+    "device_name": "MetaX C500",
+    "num_valid_tokens": 4096,
+    "N": 16384,
+    "K": 16384,
+    "group": 128,
     "samples": 1000
 }

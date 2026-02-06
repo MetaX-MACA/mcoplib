@@ -1,10 +1,10 @@
 {
     "device_id": 0,
     "device_name": "MetaX C280",
-    "batch_size": 16,
-    "seq_len": 128,
-    "hidden_size": 1024,
+    "batch_size": 32,
+    "seq_len": 512,
+    "hidden_size": 4096,
     "dtype": "float16",
     "threshold": 0.05,
-    "samples": 100000
+    "samples": 10000
 }

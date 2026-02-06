@@ -9,18 +9,13 @@ RUNNERS_DIR = "runners"
 TARGET_SCRIPT = "mcoplib_mxbenchmark_ops.py"
 OUTPUT_FILE = "teslalloutput.txt"
 
-# 【修改】统计数据保存文件夹
 STATISTICS_DIR = "statistics"
-# 【修改】CSV 文件名
-CSV_FILENAME = "benchmark_results_C500.csv"
-# 【自动生成】完整的保存路径
+CSV_FILENAME = "mcoplib_ops_performance_C500.csv"
 CSV_SAVE_PATH = os.path.join(STATISTICS_DIR, CSV_FILENAME)
 
-# Runner 文件名的前后缀匹配规则
 RUNNER_PREFIX = "mcoplib_mxbenchmark_"
 RUNNER_SUFFIX = "_runners.py"
 
-# 表格预定义的列宽配置
 STD_WIDTHS = [10, 10, 42, 40, 32, 9, 12, 8, 12, 8, 10, 14, 8, 9, 12]
 DEFAULT_EXTRA_WIDTH = 12 
 
@@ -31,6 +26,7 @@ IGNORE_OPS = [
     "copy_blocks",
     "copy_blocks_mla",
     "indexer_k_cache",
+    "mctlass_fused_moe_kernel_w4a16",
     "cp_gather_indexer_k_cache"
 ]
 # =================================================
@@ -56,32 +52,31 @@ def validate_directories():
     missing_in_config = runner_ops - config_ops
 
     if not missing_in_runners and not missing_in_config:
-        print(f"✅ 校验通过：两个文件夹中的算子数量一致 (共 {len(config_ops)} 个)，且名称完全对应。")
+        print(f"[Pass] 校验通过：两个文件夹中的算子数量一致 (共 {len(config_ops)} 个)，且名称完全对应。")
         
-        # 过滤忽略列表中的算子
         all_ops = sorted(list(config_ops))
         if IGNORE_OPS:
             ignored_actual = [op for op in all_ops if op in IGNORE_OPS]
             final_ops = [op for op in all_ops if op not in IGNORE_OPS]
             if ignored_actual:
-                print(f"⚠️  已根据配置忽略以下 {len(ignored_actual)} 个算子: {', '.join(ignored_actual)}")
+                print(f"[Warn]  已根据配置忽略以下 {len(ignored_actual)} 个算子: {', '.join(ignored_actual)}")
             print()
             return True, final_ops
         
         print()
         return True, all_ops
     else:
-        print("❌ 校验失败：config 目录与 runners 目录内的算子不匹配！")
+        print("[Fail] 校验失败：config 目录与 runners 目录内的算子不匹配！")
         print(f"  - Config 数量: {len(config_ops)}")
         print(f"  - Runners 数量: {len(runner_ops)}\n")
         
         if missing_in_runners:
-            print("❗ 以下算子在 config 中存在，但缺少对应的 runner 文件:")
+            print("[!] 以下算子在 config 中存在，但缺少对应的 runner 文件:")
             for op in missing_in_runners:
                 print(f"    - {op}.json -> 缺少 {RUNNER_PREFIX}{op}{RUNNER_SUFFIX}")
         
         if missing_in_config:
-            print("\n❗ 以下算子在 runners 中存在，但缺少对应的 config JSON 文件:")
+            print("\n[!] 以下算子在 runners 中存在，但缺少对应的 config JSON 文件:")
             for op in missing_in_config:
                 print(f"    - {RUNNER_PREFIX}{op}{RUNNER_SUFFIX} -> 缺少 {op}.json")
         
@@ -115,7 +110,6 @@ def align_metax_table(lines):
     return aligned_lines
 
 def run_op_benchmark(op_name):
-    # 【核心修改】：加入 --generate 和 --csv 参数，指向 statistics 目录
     command = [
         sys.executable, 
         TARGET_SCRIPT, 
@@ -128,11 +122,10 @@ def run_op_benchmark(op_name):
     metax_lines = []
 
     try:
-        # capture_output=True 确保我们能拿到子进程的打印信息
         result = subprocess.run(command, capture_output=True, text=True, check=True)
         output_lines = result.stdout.splitlines()
     except subprocess.CalledProcessError as e:
-        print(f"❌ 算子 {op_name} 运行异常！")
+        print(f"[Error] 算子 {op_name} 运行异常！")
         output_lines = e.stdout.splitlines() 
 
     metax_found_idx = -1
@@ -140,7 +133,6 @@ def run_op_benchmark(op_name):
         if "[ACC Verify]" in line:
             acc_verify_line = line.strip()
         
-        # 放宽匹配条件，兼容各种 MetaX 设备输出
         if "### [" in line and "MetaX" in line:
             metax_found_idx = idx
 
@@ -163,13 +155,11 @@ def ensure_output_dir():
             sys.exit(1)
 
 def main():
-    # 1. 先检查算子目录
     is_valid, op_names = validate_directories()
     if not is_valid:
         print("\n请修正文件对应关系后再运行脚本。程序已终止。")
         return
 
-    # 2. 【新增】确保输出目录存在
     ensure_output_dir()
 
     total_ops_count = len(op_names)
@@ -198,9 +188,8 @@ def main():
 
             print(f"[完成] (耗时: {elapsed_time:.2f} 秒)") 
 
-            acc_display = acc_result if acc_result else "未找到 [ACC Verify] 数据"
+            acc_display = acc_result if acc_result else "[ACC Verify]"
             
-            # 控制台输出
             print(f" -> {acc_display}")
             if metax_result:
                 for line in metax_result:
@@ -209,7 +198,6 @@ def main():
                 print("  -> (未捕获到性能表格，数据可能已写入 CSV 或已跳过)")
             print()
 
-            # 文件写入
             f.write(f"[{op_name}] -> {acc_display}  (耗时: {elapsed_time:.2f} 秒)\n")
             if metax_result:
                 for line in metax_result:

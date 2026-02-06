@@ -7,32 +7,36 @@ import importlib
 import argparse
 import tempfile
 import torch
-import difflib  # 用于相似度匹配
+import difflib  # Used for similarity matching
 
 try:
     import cuda.bench._nvbench as bench
 except ImportError:
-    print("错误: 运行环境缺少 nvbench，请检查环境配置。")
+    print("[ERROR] Runtime environment missing 'nvbench'. Please check configuration.")
     sys.exit(1)
 
-# 引入基类以进行类型检查
+# Import base class for type checking
 from mcoplib_mxbenchmark_op_wrapper import OpBenchmarkBase
 import mcoplib_mxbenchmark_op_wrapper
 
 # =============================================================================
-#  全局配置：支持的算子列表
+#  Global Config: Supported Operators
 # =============================================================================
 SUPPORTED_OPERATORS = [
     "apply_repetition_penalties",
     "awq_dequantize",
     "awq_gemm",
     "awq_to_gptq_4bit",
+    "batched_moe_align_block_size",  
     "batched_rotary_embedding",
     "concat_and_cache_mla",
+    "concat_mla_absorb_q",           
+    "concat_mla_k",                  
     "convert_fp8",
-    "convert_vertical_slash_indexes_mergehead",
     "convert_vertical_slash_indexes",
+    "copy_to_gpu_no_ce",             
     "cp_gather_cache",
+    "cp_gather_indexer_k_quant_cache", 
     "cutlass_group_gemm_supported",
     "cutlass_scaled_mm_azp",
     "cutlass_scaled_mm_supports_block_fp8",
@@ -41,10 +45,15 @@ SUPPORTED_OPERATORS = [
     "cutlass_scaled_mm",
     "dynamic_per_token_scaled_fp8_quant",
     "dynamic_scaled_int8_quant",
+    "fast_topk_transform_fused",        
+    "fast_topk_transform_ragged_fused", 
+    "fast_topk",                        
     "fatrelu_and_mul",
     "fused_add_rms_norm_static_fp8_quant",
     "fused_add_rms_norm",
+    "fused_add_rmsnorm",            
     "fused_bias_dropout",
+    "fused_mla_absorb_rotary_emb",   
     "fused_rope_fwd",
     "gather_and_maybe_dequant_cache",
     "gelu_and_mul",
@@ -54,8 +63,12 @@ SUPPORTED_OPERATORS = [
     "gelu_tanh_and_mul",
     "get_cuda_view_from_cpu_tensor",
     "gptq_gemm",
-    "gptq_shuffle",
-    "merge_attn_states",
+    "mctlass_moe_w4a16_gemm_kernel_mnk",   
+    "merge_attn_states",        
+    "merge_state_v2",             
+    "merge_state",               
+    "moe_align_block_size",          
+    "moe_lora_align_block_size",     
     "moe_sum",
     "mul_and_silu",
     "paged_attention_v1",
@@ -64,16 +77,23 @@ SUPPORTED_OPERATORS = [
     "reshape_and_cache",
     "rms_norm_static_fp8_quant",
     "rms_norm",
+    "selective_scan_fwd",            
     "silu_and_mul_quant",
     "silu_and_mul",
     "static_scaled_fp8_quant",
+    "static_scaled_int8_quant",      
+    "swap_blocks",              
     "swigluoai_and_mul",
     "top_k_per_row_decode",
     "top_k_per_row",
-    "topk_softmax"
+    "topk_softmax",
+    "transfer_kv_all_layer_direct_lf_pf",  
+    "transfer_kv_direct",              
+    "transfer_kv_per_layer_direct_pf_lf"  
 ]
+
 # =============================================================================
-#  加载逻辑 (Loader)
+#  Loader Logic
 # =============================================================================
 def get_base_dir():
     return os.path.dirname(os.path.abspath(__file__))
@@ -92,11 +112,11 @@ def load_operator_runner(op_name):
     if current_dir not in sys.path:
         sys.path.append(current_dir)
     # -----------------------------------------------------------
-    # 1. 寻找配置文件 (.json) - 支持模糊搜索
+    # 1. Find Config File (.json) - Supports Fuzzy Search
     # -----------------------------------------------------------
     config_dir = os.path.join(current_dir, "config")
     if not os.path.exists(config_dir):
-        print(f"Error: 配置目录不存在: {config_dir}")
+        print(f"[ERROR] Config directory not found: {config_dir}")
         sys.exit(1)
 
     target_json_path = None
@@ -105,41 +125,40 @@ def load_operator_runner(op_name):
     if os.path.exists(exact_json):
         target_json_path = exact_json
     else:
-        print(f"提示: 未找到精确匹配的配置文件 '{op_name}.json'，尝试模糊搜索 Config...")
+        print(f"[INFO] Exact config match not found for '{op_name}', trying fuzzy search...")
         try:
             pattern = re.compile(op_name, re.IGNORECASE)
             json_files = [f for f in os.listdir(config_dir) if f.endswith(".json")]
             matched_jsons = [f for f in json_files if pattern.search(f)]
 
             if len(matched_jsons) == 0:
-                print(f"Error: 找不到配置文件，且模糊搜索 '{op_name}' 无匹配项。")
+                print(f"[ERROR] Config file not found, and fuzzy search for '{op_name}' yielded no results.")
                 sys.exit(1)
             elif len(matched_jsons) == 1:
                 target_json_path = os.path.join(config_dir, matched_jsons[0])
-                print(f">> [Config Match] 锁定配置文件: {matched_jsons[0]}")
+                print(f"[CONFIG] Selected: {matched_jsons[0]}")
             else:
                 best_matches = difflib.get_close_matches(op_name, matched_jsons, n=1, cutoff=0)
                 best_match = best_matches[0] if best_matches else matched_jsons[0]
-                print(f"Warning: Config 模糊匹配到多个，自动选择最相似项: {best_match}")
+                print(f"[WARN] Multiple config matches found. Auto-selecting best match: {best_match}")
                 target_json_path = os.path.join(config_dir, best_match)
         except re.error as e:
-            print(f"Error: 正则表达式错误: {e}")
+            print(f"[ERROR] Regex error: {e}")
             sys.exit(1)
-    # 无论用户输入什么，只要匹配到了 fused_rope_fwd.json，标准名就是 fused_rope_fwd
+            
     canonical_name = os.path.splitext(os.path.basename(target_json_path))[0]
     
     with open(target_json_path, 'r', encoding='utf-8') as f:
         config = json.load(f)
 
     # -----------------------------------------------------------
-    # 2. 寻找 Runner 文件 (.py)
+    # 2. Find Runner File (.py)
     # -----------------------------------------------------------
     runners_dir = os.path.join(current_dir, "runners")
     if not os.path.exists(runners_dir):
-        print(f"Error: Runners 目录不存在: {runners_dir}")
+        print(f"[ERROR] Runners directory not found: {runners_dir}")
         sys.exit(1)
 
-    # 优先尝试用【标准名】去匹配 Runner，命中率更高
     exact_runner_name = f"mcoplib_mxbenchmark_{canonical_name}_runners"
     found_module_name = None
     
@@ -151,55 +170,52 @@ def load_operator_runner(op_name):
         pass
 
     if not found_module_name:
-        # 如果标准名没找到，进入模糊搜索流程
-        print(f"提示: 未找到标准 Runner '{exact_runner_name}.py'，尝试搜索...")
+        print(f"[INFO] Standard runner '{exact_runner_name}.py' not found, searching...")
         py_files = [f for f in os.listdir(runners_dir) if f.endswith(".py") and f != "__init__.py"]
         
         try:
             matched_runners = []
             
-            # 【策略 A】：先试着用 Config 文件名 (canonical_name) 搜
+            # Strategy A: Config Name
             if canonical_name:
                 pattern_canon = re.compile(canonical_name, re.IGNORECASE)
                 matched_runners = [f for f in py_files if pattern_canon.search(f)]
 
-            # 【策略 B】：如果策略 A 没搜到，或者搜到了 0 个，
-            # 回退使用用户输入的 op_name 再次搜索！
+            # Strategy B: Input Name Fallback
             if not matched_runners and op_name and op_name != canonical_name:
-                print(f"提示: 标准名 '{canonical_name}' 匹配失败，尝试回退使用输入名 '{op_name}' 搜索...")
+                print(f"[INFO] Canonical name match failed, falling back to input name '{op_name}'...")
                 pattern_op = re.compile(op_name, re.IGNORECASE)
                 matched_runners = [f for f in py_files if pattern_op.search(f)]
                 
         except re.error as e:
-            print(f"Error: 正则匹配错误: {e}")
+            print(f"[ERROR] Regex error: {e}")
             matched_runners = []
         
         target_runner_file = None
         if len(matched_runners) == 0:
-            print(f"Error: 在 runners 目录下找不到相关 Python 文件。")
-            print(f"      已尝试关键词: '{canonical_name}' 和 '{op_name}'")
+            print(f"[ERROR] No relevant Python files found in runners directory.")
+            print(f"        Keywords tried: '{canonical_name}' and '{op_name}'")
             sys.exit(1)
         elif len(matched_runners) == 1:
             target_runner_file = matched_runners[0]
         else:
-            # 如果匹配到多个，优先选和 canonical_name 最像的，其次选和 op_name 最像的
             search_key = canonical_name if canonical_name else op_name
             best_matches = difflib.get_close_matches(search_key, matched_runners, n=1, cutoff=0)
             target_runner_file = best_matches[0] if best_matches else matched_runners[0]
-            print(f"Warning: Runner 模糊匹配到多个，自动选择最相似项: {target_runner_file}")
+            print(f"[WARN] Multiple runner matches found. Auto-selecting best match: {target_runner_file}")
 
         if target_runner_file:
             module_base = target_runner_file.replace(".py", "")
             found_module_name = f"runners.{module_base}"
-            print(f">> [Runner Match] 锁定 Runner 模块: {module_base}")
+            print(f"[RUNNER] Selected Module: {module_base}")
     
     # -----------------------------------------------------------
-    # 3. 加载模块与类
+    # 3. Load Module & Class
     # -----------------------------------------------------------
     try:
         module = importlib.import_module(found_module_name)
     except ImportError as e:
-        print(f"\nError: 无法加载模块 '{found_module_name}'\n详情: {e}")
+        print(f"\n[ERROR] Failed to load module '{found_module_name}'\nDetails: {e}")
         sys.exit(1)
 
     target_cls = None
@@ -210,31 +226,31 @@ def load_operator_runner(op_name):
             break
             
     if target_cls is None:
-        print(f"Error: 在 {found_module_name} 中找不到 OpBenchmarkBase 的子类。")
+        print(f"[ERROR] No subclass of OpBenchmarkBase found in {found_module_name}.")
         sys.exit(1)
 
-    print(f">> 加载类: {target_cls.__name__} (Benchmark Name: {canonical_name})")
+    print(f"[LOADER] Loaded Class: {target_cls.__name__} (Benchmark Name: {canonical_name})")
     
     return target_cls(canonical_name, config)
 
 # =============================================================================
-#  Benchmark Wrapper (集成 Sync Fix)
+#  Benchmark Wrapper (Integrated Sync Fix)
 # =============================================================================
 def create_benchmark_wrapper(op_instance):
     def benchmark_func(state):
         dev_id = state.get_device()
         is_verified = False
         
-        # 1. 验证 (Verification)
+        # 1. Verification
         try:
             passed, diff_val = op_instance.run_verification(dev_id)
             state.add_summary("Acc_Pass", "Yes" if passed else "No")
             state.add_summary("Cos_Dist", f"{diff_val:.2e}") 
-            print(f"\n[ACC Verify] {op_instance.name} -> {'PASS' if passed else 'FAIL'} (1-CosSim: {diff_val:.2e})")
+            print(f"\n[VERIFY] {op_instance.name} -> {'PASS' if passed else 'FAIL'} (1-CosSim: {diff_val:.2e})")
             is_verified = passed
         except Exception as e:
             is_verified = False
-            print(f"\n[ACC Verify] Error: {e}")
+            print(f"\n[VERIFY] Error: {e}")
             state.add_summary("Acc_Pass", "Error")
 
         if not is_verified:
@@ -242,16 +258,16 @@ def create_benchmark_wrapper(op_instance):
             import os
             os._exit(0)
 
-        # 2. 手动物理预热 (Manual Warmup)
-        print(f"  >> [Warmup] Running 10 iterations to heat up GPU...", end="", flush=True)
+        # 2. Manual Warmup
+        print(f"  >> [WARMUP] Running 10 iterations...", end="", flush=True)
         try:
             for _ in range(10):
                 op_instance.run_verification(dev_id)
             print(" Done.")
         except Exception as e:
-            print(f" (Warmup failed: {e})", end="")
+            print(f" (Failed: {e})", end="")
 
-        # 3. 采样数配置
+        # 3. Sample Configuration
         raw_samples = op_instance.config.get("samples", 100)
         target_samples = max(1, raw_samples - 16) 
         state.set_min_samples(target_samples)
@@ -263,17 +279,15 @@ def create_benchmark_wrapper(op_instance):
         )
         launcher = op_instance.prepare_and_get_launcher(dev_id, tc_s)
         
-        # 4. 执行测量 (Sync 模式修复)
+        # 4. Execution (Sync Fix)
         force_sync = getattr(op_instance, '_force_sync', False)
         
         if force_sync:
             try:
-                # 使用关键字参数开启同步
                 state.exec(launcher, sync=True)
             except TypeError as e:
-                # 兼容性降级
-                print(f"\n[Warning] 'state.exec(..., sync=True)' failed: {e}")
-                print("          Falling back to default async mode.")
+                print(f"\n[WARN] 'state.exec(..., sync=True)' failed: {e}")
+                print("       Falling back to default async mode.")
                 state.exec(launcher)
         else:
             state.exec(launcher)
@@ -282,7 +296,7 @@ def create_benchmark_wrapper(op_instance):
 
 
 # =============================================================================
-#  CSV 处理工具 (集成智能时间读取)
+#  CSV Utils
 # =============================================================================
 def load_csv_data(filepath):
     if not filepath or not os.path.exists(filepath): return [], []
@@ -325,11 +339,9 @@ def parse_time_val(val_str):
 
 def format_duration(seconds):
     if seconds is None: return "N/A"
-    # 强制统一转换为 us (微秒)
     return f"{seconds * 1e6:.3f} us"
 
 def get_row_key(row_dict, header):
-    # 排除了常见数值列，dtype 不在其中，因此会自动成为 key 的一部分
     exclude = ["Samples", "CPU Time", "GPU Time", "Noise", "Elem/s", "GlobalMem", "BWUtil", "Acc_Pass", "Max_Diff", "Cos_Dist","Batch GPU"]
     key_cols = [h for h in header if not any(x in h for x in exclude) and h != "Skipped"]
     return tuple(row_dict.get(k, "") for k in key_cols)
@@ -338,11 +350,6 @@ def get_op_display_name(row):
     return row.get("op_name", row.get("Op", row.get("Benchmark", "?")))
 
 def get_effective_gpu_time(row):
-    """
-    [新增] 智能获取 GPU 时间：
-    1. 优先尝试 'Batch GPU (sec)' (Hot/Async 模式)
-    2. 如果没有，回退到 'GPU Time (sec)' (Cold/Sync 模式)
-    """
     t_batch = parse_time_val(row.get("Batch GPU (sec)", ""))
     if t_batch is not None: return t_batch
     
@@ -366,10 +373,10 @@ def _write_csv(path, header, rows):
             writer.writeheader()
             writer.writerows(rows)
     except Exception as e:
-        print(f"写入CSV失败: {e}")
+        print(f"[ERROR] Failed to write CSV: {e}")
 
 # =============================================================================
-#  Update / Generate / Compare 逻辑 (已应用智能时间读取)
+#  Update / Generate / Compare Logic
 # =============================================================================
 def perform_smart_update(temp_csv_path, target_csv_path):
     print("\n" + "="*80 +f"\n{' Smart Update Mode (>5% Gain) ':^80}\n" + "="*80)
@@ -380,7 +387,6 @@ def perform_smart_update(temp_csv_path, target_csv_path):
     old_raw_h, old_raw_r = load_csv_data(target_csv_path)
     old_h, old_r = preprocess_data(old_raw_h, old_raw_r)
 
-    # 1. 构建全量表头
     combined_header = list(old_h)
     for col in new_h:
         if col not in combined_header: combined_header.append(col)
@@ -389,7 +395,6 @@ def perform_smart_update(temp_csv_path, target_csv_path):
         combined_header.remove("op_name")
         combined_header.insert(0, "op_name")
 
-    # 使用 combined_header 生成索引，包含 dtype
     history_map = {get_row_key(r, combined_header): idx for idx, r in enumerate(old_r)}
     
     updated_cnt = 0
@@ -403,16 +408,13 @@ def perform_smart_update(temp_csv_path, target_csv_path):
         key = get_row_key(new_row, combined_header)
         match_idx = history_map.get(key, -1)
         
-        # 使用智能获取
         new_time = get_effective_gpu_time(new_row)
-        
         d_type = new_row.get("dtype", "")
         op_str = get_op_display_name(new_row)
         if d_type: op_str += f" [{d_type}]"
 
         if match_idx >= 0:
             old_row = final_rows[match_idx]
-            # 使用智能获取
             old_time = get_effective_gpu_time(old_row)
             
             if new_time is not None and old_time is not None and old_time > 0:
@@ -420,19 +422,19 @@ def perform_smart_update(temp_csv_path, target_csv_path):
                 if ratio > 0.05:
                     final_rows[match_idx].update(new_row)
                     updated_cnt += 1
-                    print(f"[UPDATE] {op_str:<35} | 提升: {ratio*100:>6.2f}%")
+                    print(f"[UPDATE] {op_str:<35} | Gain: {ratio*100:>6.2f}%")
                 else:
                     kept_cnt += 1
                     if ratio >= 0:
-                        print(f"[KEEP]   {op_str:<35} | 提升: {ratio*100:>6.2f}%")
+                        print(f"[KEEP]   {op_str:<35} | Gain: {ratio*100:>6.2f}%")
                     else:
-                        print(f"[KEEP]   {op_str:<35} | 下降: {ratio*100:>6.2f}%")
+                        print(f"[KEEP]   {op_str:<35} | Loss: {ratio*100:>6.2f}%")
             else:
                 kept_cnt += 1
-                print(f"[KEEP]   {op_str:<35} | N/A (时间数据无效)")
+                print(f"[KEEP]   {op_str:<35} | N/A (Invalid Time)")
         
     _write_csv(target_csv_path, combined_header, final_rows)
-    print("-" * 80 + f"\n完成: 更新 {updated_cnt}, 保持 {kept_cnt}\n" + "=" * 80 + "\n")
+    print("-" * 80 + f"\n[SUMMARY] Updated: {updated_cnt}, Kept: {kept_cnt}\n" + "=" * 80 + "\n")
 
 def perform_generate(temp_csv_path, target_csv_path):
     print("\n" + "="*80 +f"\n{' Generate Mode (Fill Missing) ':^80}\n" + "="*80)
@@ -446,7 +448,6 @@ def perform_generate(temp_csv_path, target_csv_path):
     else:
         old_h, old_r = [], []
 
-    # 1. 构建全量表头
     combined_header = list(old_h)
     if not combined_header: combined_header = list(new_h)
     else:
@@ -457,7 +458,6 @@ def perform_generate(temp_csv_path, target_csv_path):
         combined_header.remove("op_name")
         combined_header.insert(0, "op_name")
 
-    # 使用 combined_header 生成索引
     history_map = {get_row_key(r, combined_header): idx for idx, r in enumerate(old_r)}
     
     final_rows = list(old_r)
@@ -477,7 +477,7 @@ def perform_generate(temp_csv_path, target_csv_path):
         if d_type: op_str += f" [{d_type}]"
 
         if match_idx >= 0:
-            print(f"[SKIP]   {op_str:<35} (已存在)")
+            print(f"[SKIP]   {op_str:<35} (Exists)")
             skip_cnt += 1
         else:
             rows_to_append.append(new_row)
@@ -488,8 +488,8 @@ def perform_generate(temp_csv_path, target_csv_path):
     if append_cnt > 0:
         _write_csv(target_csv_path, combined_header, final_rows)
     else:
-        print("提示: 没有新数据需要写入。")
-    print("-" * 80 + f"\n完成: 新增 {append_cnt}, 跳过 {skip_cnt}\n" + "=" * 80 + "\n")
+        print("[INFO] No new data to write.")
+    print("-" * 80 + f"\n[SUMMARY] Appended: {append_cnt}, Skipped: {skip_cnt}\n" + "=" * 80 + "\n")
 
 def perform_comparison(cur_raw, hist_raw):
     _, cur_rows = preprocess_data([], cur_raw)
@@ -498,11 +498,9 @@ def perform_comparison(cur_raw, hist_raw):
     print("\n" + "="*95 + "\n" + f"{' Performance Comparison ':^95}" + "\n" + "="*95)
     
     row_fmt = "{:<15} | {:<15} | {:<10} | {:<15} | {:<15} | {:<20}"
-    # 这是当前运行结果的表头结构
     dummy_header = list(cur_rows[0].keys())
     
     for row in cur_rows:
-        # 1. 生成当前数据的指纹
         key = get_row_key(row, dummy_header)
         
         gpu = get_effective_gpu_time(row)
@@ -510,7 +508,6 @@ def perform_comparison(cur_raw, hist_raw):
         op_name = get_op_display_name(row)
         d_type = row.get("dtype", "-")
         
-        # 识别当前展示的时间类型
         time_label = "Batch GPU"
         if parse_time_val(row.get("Batch GPU (sec)", "")) is None and \
            parse_time_val(row.get("GPU Time (sec)", "")) is not None:
@@ -529,21 +526,16 @@ def perform_comparison(cur_raw, hist_raw):
         
         matches = []
         for idx, h_row in enumerate(hist_rows):
-            # =================================================================
-            # [修复点] 强制使用 dummy_header (即当前数据的列结构) 来生成历史数据的 Key
-            # 这样会忽略 CSV 中多余的无关列，确保指纹生成逻辑完全一致
-            # =================================================================
             if get_row_key(h_row, dummy_header) == key: 
                 matches.append((idx, h_row))
         
-        perf_ratio_str = "null"
+        perf_ratio_str = "None"
 
         if matches:
             _, h_row = matches[-1] 
             h_gpu = get_effective_gpu_time(h_row)
             h_cpu = parse_time_val(h_row.get("CPU Time (sec)", ""))
             
-            # 计算比值 (Base / Current)
             if gpu and h_gpu:
                 perf_ratio_str = f"{h_gpu/gpu*100:.2f}%"
                 gr = perf_ratio_str
@@ -564,35 +556,110 @@ def perform_comparison(cur_raw, hist_raw):
 #  Main Execution Block
 # =============================================================================
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="MCOPLIB 算子性能测试框架")
-    parser.add_argument("--op", type=str, default=None, help="算子名称 (必填，除非使用 --list)")
-    parser.add_argument("--list", action="store_true", help="列出所有支持的算子并退出")
-    parser.add_argument("--csv", type=str, default=None, help="结果 CSV 路径")
+    parser = argparse.ArgumentParser(description="MCOPLIB Operator Performance Benchmark")
+    parser.add_argument("--op", type=str, default=None, help="Operator name (Required, unless --list is used)")
+    parser.add_argument("--list", action="store_true", help="List all supported operators and exit")
+    parser.add_argument("--csv", type=str, default=None, help="Path to result CSV")
     
     group = parser.add_mutually_exclusive_group()
-    group.add_argument("--update", action="store_true", help="更新模式：仅当性能提升 >5%% 时更新 CSV")
-    group.add_argument("--generate", action="store_true", help="生成模式：仅补充缺失的测试项 (已存在则跳过)")
-    group.add_argument("--compare", action="store_true", help="对比模式：仅显示对比，不写入 CSV")
+    # 修复：这里的 > 5% 必须写成 > 5%%，否则 argparse 报错 incomplete format
+    group.add_argument("--update", action="store_true", help="Update Mode: Update CSV only if performance gain > 5%%")
+    group.add_argument("--generate", action="store_true", help="Generate Mode: Only fill missing test items (Skip existing)")
+    group.add_argument("--compare", action="store_true", help="Compare Mode: Display comparison only, no CSV write")
     
     args, unknown = parser.parse_known_args()
 
-    # 1. 处理 --list
+    # 1. Handle --list
     if args.list:
         list_supported_operators()
         sys.exit(0)
 
-    # 2. 校验 --op
+    # 2. Validate Core Argument --op
     if not args.op:
-        parser.error("参数 --op 是必需的 (除非使用了 --list)")
-    op_name = args.op
-    op_instance = load_operator_runner(op_name)  
+        # Print full help first
+        parser.print_help()
+        print("\n" + "-"*80)
+        print(" [ERROR] Argument --op is required (unless --list is used)")
+        print(" [TIP]   Please use --help to view the standard usage.")
+        print("-"*80 + "\n")
+        sys.exit(1)
     
-    # 3. 注册 Benchmark
+    # 3. Load Operator
+    op_name = args.op
+    op_instance = load_operator_runner(op_name)
+    
+    # 4. Handle CSV Default Logic
+    default_csv_path = "statistics/mcoplib_ops_performance_C500.csv"
+    if args.csv is None:
+        print(f"[WARN] --csv not specified, using default path: {default_csv_path}")
+        args.csv = default_csv_path
+
+    # 5. Pre-flight Check (File/Directory Existence)
+    active_mode = args.update or args.compare or args.generate
+    
+    if active_mode:
+        abs_csv_path = os.path.abspath(args.csv)
+        csv_dir = os.path.dirname(abs_csv_path)
+
+        # Check Directory
+        if not os.path.exists(csv_dir) and csv_dir != "":
+            print(f"[ERROR] Target directory does not exist: {csv_dir}")
+            print("        Please check path or create directory.")
+            if args.compare:
+                print("Result:")
+                print("Acc verify:None")
+                print("Performance verify:None")
+                print("\n")
+            sys.exit(1)
+
+        # Check File (Required for compare/update)
+        if (args.compare or args.update) and not os.path.exists(abs_csv_path):
+            print(f"[ERROR] Target CSV file does not exist: {abs_csv_path}")
+            print(f"        Mode '--{'compare' if args.compare else 'update'}' requires this file for baseline data.")
+            if args.compare:
+                print("Result:")
+                print("Acc verify:None")
+                print("Performance verify:None")
+                print("\n")
+            sys.exit(1)
+
+        # =========================================================================
+        # Check if Operator exists in CSV (Only for compare/update)
+        # =========================================================================
+        if args.compare or args.update:
+            check_header, check_rows = load_csv_data(abs_csv_path)
+            _, check_clean_rows = preprocess_data(check_header, check_rows)
+            
+            target_name = op_instance.name
+            op_found = False
+            
+            for row in check_clean_rows:
+                if row.get("op_name") == target_name:
+                    op_found = True
+                    break
+            
+            if not op_found:
+                print("\n" + "-"*80)
+                print(f" [WARN] Operator '{target_name}' not found in baseline CSV.")
+                print(f"        CSV Path: {abs_csv_path}")
+                print(f"        Mode: --{'compare' if args.compare else 'update'}")
+                print("        >> Skipping execution due to missing baseline data.")
+                print("-"*80 + "\n")
+                
+                if args.compare:
+                    print("Result:")
+                    print("Acc verify:None")
+                    print("Performance verify:None")
+                    print("\n")
+                
+                sys.exit(0) 
+        # =========================================================================
+
+    # 6. Register Benchmark
     bench.register(create_benchmark_wrapper(op_instance)).set_name(op_instance.name)
 
-    # 4. 确定是否需要临时文件
-    active_mode = args.update or args.compare or args.generate
-    need_temp_csv = active_mode and args.csv
+    # 7. Prepare Temp File
+    need_temp_csv = active_mode
     temp_csv = None
     
     if need_temp_csv:
@@ -600,7 +667,7 @@ if __name__ == "__main__":
             fd, temp_csv = tempfile.mkstemp(suffix=".csv")
             os.close(fd)
         except Exception as e:
-            print(f"Error creating temp file: {e}"); sys.exit(1)
+            print(f"[ERROR] Error creating temp file: {e}"); sys.exit(1)
 
     try:
         run_args = [sys.argv[0]]
@@ -608,37 +675,32 @@ if __name__ == "__main__":
         has_cli_device = any(x.startswith("--device") or x == "-d" for x in unknown)
         
         if has_cli_device:
-            print(">> [Device] 来源: 命令行参数")
+            print(">> [DEVICE] Source: CLI Argument")
         else:
             config_device = op_instance.config.get("device_id")
             if config_device is not None:
                 run_args.extend(["--device", str(config_device)])
-                print(f">> [Device] 来源: 配置文件 (ID: {config_device})")
+                print(f">> [DEVICE] Source: Config File (ID: {config_device})")
             else:
                 run_args.extend(["--device", "0"])
-                print(">> [Device] 来源: 默认值 (ID: 0)")
+                print(">> [DEVICE] Source: Default (ID: 0)")
 
         if temp_csv: 
             run_args.extend(["--csv", temp_csv])
 
-        
-        # 设置最小运行时间为 1 秒，确保采集足够的样本以获得稳定平均值
         run_args.extend(["--min-time", "1.5"])
         run_args.extend(["--timeout", "600"])
         run_args.extend(["--throttle-threshold", "0"])
-        #run_args.extend(["--warmup", "100"]) #预热100次
-        # 把剩余未知参数加进去
         run_args.extend(unknown)
         
-        # 运行测试
         bench.run_all_benchmarks(run_args)
         
     except Exception as e:
         if temp_csv and os.path.exists(temp_csv): os.remove(temp_csv)
         raise e
 
-    # 5. 后处理逻辑
-    if temp_csv and os.path.exists(temp_csv) and args.csv and active_mode:
+    # 8. Post-processing
+    if temp_csv and os.path.exists(temp_csv) and active_mode:
         try:
             if args.compare:
                 _, c_d = load_csv_data(temp_csv)

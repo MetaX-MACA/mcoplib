@@ -1,8 +1,8 @@
 {
     "device_id": 0,
     "device_name": "MetaX C280",
-    "batch_size": 32,
-    "vocab_size": 32000,
+    "batch_size": 512,
+    "vocab_size": 128000,
     "dtype": "float16",
-    "samples": 1000
+    "samples": 10000
 }
