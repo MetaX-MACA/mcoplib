@@ -8,6 +8,8 @@
 #include <cub/cub.cuh>
 
 #include "utils.h"
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
 
 template <typename scalar_t, int TOPK>
 __global__ void moe_sum_kernel(
@@ -29,6 +31,8 @@ void moe_sum(
     torch::Tensor& input,   // [num_tokens, topk, hidden_size]
     torch::Tensor& output)  // [num_tokens, hidden_size]
 {
+  DEBUG_TRACE_PARAMS(input, output);
+  DEBUG_DUMP_PARAMS(input, output);
   const int hidden_size = input.size(-1);
   const auto num_tokens = output.numel() / hidden_size;
   const int topk = input.size(1);

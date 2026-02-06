@@ -5,6 +5,8 @@
 #include <torch/torch.h>
 #include <cub/cub.cuh>
 #include "../kernel/utils.h"
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
 
 template<typename T>
 static __device__ __forceinline__ float convert_to_float(T value) {
@@ -229,6 +231,8 @@ void store_kv_cache_cuda_interface(
     int q_head_num,
     int kv_head_num
 ) {
+	DEBUG_TRACE_PARAMS(packed_qkv, q_lens, accum_q_lens, cache_lens, cache_slot_ids, &k_cache, &v_cache, k_scale, v_scale, batch_size, q_head_num, kv_head_num);
+	DEBUG_DUMP_PARAMS(packed_qkv, q_lens, accum_q_lens, cache_lens, cache_slot_ids, &k_cache, &v_cache, k_scale, v_scale, batch_size, q_head_num, kv_head_num);
     CHECK_DEVICE(packed_qkv);
     CHECK_DEVICE(q_lens);
     CHECK_DEVICE(accum_q_lens);

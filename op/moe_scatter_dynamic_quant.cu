@@ -7,6 +7,8 @@
 #include "../kernel/utils.h"
 #include "../kernel/all_reduce_kernel.cuh"
 #include "../include/moe_scatter_dynamic_quant.h"
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
 
 __device__ __forceinline__ int32_t ScanWarp2(int32_t val, int32_t mask = 8) {
   int32_t lane = threadIdx.x & 31;
@@ -311,6 +313,8 @@ void moe_scatter_dynamic_quant(at::Tensor hidden_status, at::Tensor selected_exp
                                 at::Tensor scatter_tokens, at::Tensor scatter_per_token_scale, at::Tensor scatter_tokens_offset, at::Tensor experts_token_count, at::Tensor experts_token_start,
                                 const int experts_per_rank, const int shared_experts_per_rank, const int shared_tokens_per_sp)
 {
+	DEBUG_TRACE_PARAMS(hidden_status, selected_experts, moe_weights, smooth_scale, scatter_tokens, scatter_per_token_scale, scatter_tokens_offset, experts_token_count, experts_token_start, experts_per_rank, shared_experts_per_rank, shared_tokens_per_sp);
+	DEBUG_DUMP_PARAMS(hidden_status, selected_experts, moe_weights, smooth_scale, scatter_tokens, scatter_per_token_scale, scatter_tokens_offset, experts_token_count, experts_token_start, experts_per_rank, shared_experts_per_rank, shared_tokens_per_sp);
 	CHECK_DEVICE(hidden_status);
 	CHECK_DEVICE(selected_experts);
 	CHECK_DEVICE(smooth_scale);

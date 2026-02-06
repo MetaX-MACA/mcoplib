@@ -7,6 +7,8 @@
 
 #include "quantization/fp8/common.cuh"
 #include "quantization/fp8/metax/quant_utils.cuh"
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
 
 namespace vllm {
 
@@ -204,6 +206,8 @@ void concat_and_cache_mla_rope_fused(
     torch::Tensor&
         kv_cache,  // [num_blocks, block_size, (kv_lora_rank + rot_dim)]
     const std::string& kv_cache_dtype, torch::Tensor& kv_cache_quant_scale) {
+  DEBUG_TRACE_PARAMS(positions, q_pe, k_pe, kv_c, rope_cos_sin_cache, rope_is_neox, kv_cache_slot_mapping, kv_cache);
+  DEBUG_DUMP_PARAMS(positions, q_pe, k_pe, kv_c, rope_cos_sin_cache, rope_is_neox, kv_cache_slot_mapping, kv_cache);
   const int64_t num_tokens = q_pe.size(0);
 
   const int num_q_heads = q_pe.size(1);

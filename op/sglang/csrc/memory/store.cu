@@ -7,6 +7,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <type_traits>
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
 
 namespace {
 
@@ -71,6 +73,8 @@ __global__ void store_kv_cache_128x2(
 }  // namespace
 
 auto store_kv_cache(at::Tensor k_cache, at::Tensor v_cache, at::Tensor out_loc, at::Tensor k, at::Tensor v) -> void {
+  DEBUG_TRACE_PARAMS(k_cache, v_cache, out_loc, k, v);
+  DEBUG_DUMP_PARAMS(k_cache, v_cache, out_loc, k, v);
   const auto max_tokens = k_cache.size(0);
   const auto num_tokens = out_loc.size(0);
   k_cache = k_cache.view({max_tokens, -1});

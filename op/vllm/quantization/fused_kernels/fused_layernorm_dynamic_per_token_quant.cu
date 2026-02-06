@@ -6,6 +6,9 @@
 #include "layernorm_utils.cuh"
 #include "quant_conversions.cuh"
 
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
+
 namespace vllm {
 
 template <typename scalar_t, typename scalar_out_t, bool has_residual = false>
@@ -164,6 +167,8 @@ void rms_norm_dynamic_per_token_quant(
     torch::Tensor& scales,        // [num_tokens]
     double const var_epsilon,     // Variance epsilon used in norm calculation
     std::optional<at::Tensor> scale_ub, std::optional<at::Tensor> residual) {
+  DEBUG_TRACE_PARAMS(out, input, weight, scales, var_epsilon, scale_ub, residual);
+  DEBUG_DUMP_PARAMS(out, input, weight, scales, var_epsilon, scale_ub, residual);
   static c10::ScalarType kFp8Type = is_fp8_ocp()
                                         ? c10::ScalarType::Float8_e4m3fn
                                         : c10::ScalarType::Float8_e4m3fnuz;
@@ -239,6 +244,8 @@ void rms_norm_per_block_quant(torch::Tensor& out, torch::Tensor const& input,
                               std::optional<torch::Tensor> scale_ub,
                               std::optional<torch::Tensor> residual,
                               int64_t group_size, bool is_scale_transposed) {
+  DEBUG_TRACE_PARAMS(out, input, weight, scales, var_epsilon, scale_ub, residual, group_size, is_scale_transposed);
+  DEBUG_DUMP_PARAMS(out, input, weight, scales, var_epsilon, scale_ub, residual, group_size, is_scale_transposed);
   static c10::ScalarType kFp8Type = is_fp8_ocp()
                                         ? c10::ScalarType::Float8_e4m3fn
                                         : c10::ScalarType::Float8_e4m3fnuz;

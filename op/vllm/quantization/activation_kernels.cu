@@ -8,6 +8,8 @@
 #include "dispatch_utils.h"
 
 #include "quantization/fp8/common.cuh"
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
 
 namespace vllm {
 
@@ -112,6 +114,8 @@ __global__ void act_and_mul_quant_kernel(
 void silu_and_mul_quant(torch::Tensor& out,    // [..., d]
                         torch::Tensor& input,  // [..., 2 * d]
                         torch::Tensor& scale) {
+	DEBUG_TRACE_PARAMS(out, input, scale);
+	DEBUG_DUMP_PARAMS(out, input, scale);
   TORCH_CHECK(out.dtype() == torch::kFloat8_e4m3fn ||
               out.dtype() == torch::kFloat8_e4m3fnuz);
   TORCH_CHECK(input.dtype() == torch::kFloat16 ||

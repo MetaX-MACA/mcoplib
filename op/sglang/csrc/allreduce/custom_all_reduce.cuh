@@ -15,6 +15,8 @@
 #include <vector>
 
 #include "utils.h"
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
 
 namespace sglang {
 
@@ -376,6 +378,8 @@ class CustomAllreduce {
    * Register already-shared IPC pointers.
    */
   void register_buffer(void** ptrs) {
+    DEBUG_TRACE_PARAMS(ptrs);
+    DEBUG_DUMP_PARAMS(ptrs);
     check_rank_data_capacity();
     RankData data;
     for (int i = 0; i < world_size_; i++) {

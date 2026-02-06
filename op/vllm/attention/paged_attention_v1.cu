@@ -18,6 +18,8 @@
  */
 
 #include "attention_kernels.cuh"
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
 
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
@@ -175,6 +177,9 @@ void paged_attention_v1(
     const int64_t blocksparse_local_blocks,
     const int64_t blocksparse_vert_stride, const int64_t blocksparse_block_size,
     const int64_t blocksparse_head_sliding_step) {
+
+  DEBUG_TRACE_PARAMS(out, query, key_cache, value_cache, num_kv_heads, scale, block_tables, seq_lens, block_size, max_seq_len, alibi_slopes, kv_cache_dtype, k_scale, v_scale, tp_rank, blocksparse_local_blocks, blocksparse_vert_stride, blocksparse_block_size, blocksparse_head_sliding_step);
+	DEBUG_DUMP_PARAMS(out, query, key_cache, value_cache, num_kv_heads, scale, block_tables, seq_lens, block_size, max_seq_len, alibi_slopes, kv_cache_dtype, k_scale, v_scale, tp_rank, blocksparse_local_blocks, blocksparse_vert_stride, blocksparse_block_size, blocksparse_head_sliding_step);
   const bool is_block_sparse = (blocksparse_vert_stride > 1);
 
   DISPATCH_BY_KV_CACHE_DTYPE(query.dtype(), kv_cache_dtype,

@@ -3,6 +3,8 @@
 #include "../vectorization_utils.cuh"
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/Exceptions.h>
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
 
 #include <cub/cub.cuh>
 #include <tuple>
@@ -189,6 +191,8 @@ void static_scaled_fp8_quant(
     std::optional<std::tuple<int64_t, int64_t>>
         opt_group_shape)  // optional explicit (group_m, group_n)
 {
+  DEBUG_TRACE_PARAMS(out, input, scale, opt_group_shape);
+  DEBUG_DUMP_PARAMS(out, input, scale, opt_group_shape);
   TORCH_CHECK(input.stride(-1) == 1,
               "last dimension of input must be contiguous");
   TORCH_CHECK(out.stride(-1) == 1,
@@ -326,6 +330,8 @@ void dynamic_scaled_fp8_quant(torch::Tensor& out,          // [..., d]
                               torch::Tensor const& input,  // [..., d]
                               torch::Tensor& scale)        // [1]
 {
+  DEBUG_TRACE_PARAMS(out, input, scale);
+  DEBUG_DUMP_PARAMS(out, input, scale);
   TORCH_CHECK(input.stride(-1) == 1,
               "last dimension of input must be contiguous");
   TORCH_CHECK(out.stride(-1) == 1,
@@ -370,6 +376,8 @@ void dynamic_per_token_scaled_fp8_quant(
     torch::Tensor& out,          // [..., d]
     torch::Tensor const& input,  // [..., d]
     torch::Tensor& scales, std::optional<at::Tensor> const& scale_ub) {
+  DEBUG_TRACE_PARAMS(out, input, scales, scale_ub);
+  DEBUG_DUMP_PARAMS(out, input, scales, scale_ub);
   TORCH_CHECK(input.stride(-1) == 1,
               "last dimension of input must be contiguous");
   TORCH_CHECK(out.stride(-1) == 1,

@@ -5,6 +5,8 @@
 #include <torch/torch.h>
 #include <cub/cub.cuh>
 #include "../kernel/utils.h"
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
 
 __host__ __device__ __forceinline__
 int ceil_div(int x, int y) {
@@ -133,6 +135,8 @@ void launch_moe_gather_kernel(const scalar_t* scatter_tokens, const int* scatter
 }
 
 void moe_gather(at::Tensor scatter_tokens, at::Tensor scatter_tokens_offset, at::Tensor convergent_tokens){
+    DEBUG_TRACE_PARAMS(scatter_tokens, scatter_tokens_offset, convergent_tokens);
+	DEBUG_DUMP_PARAMS(scatter_tokens, scatter_tokens_offset, convergent_tokens);
     const int hidden_size = scatter_tokens.size(-1);
     const int num_tokens = scatter_tokens.numel() / hidden_size;
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();

@@ -12,6 +12,9 @@
 #include <iostream>
 #include <c10/cuda/CUDAGuard.h>
 #include "fused_mla_impl.cuh"
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
+
 
 int64_t fused_mla_absorb_rotary_emb(
     torch::Tensor& q, // [bs, num_local_heads, qk_nope_head_dim+qk_rope_head_dim], dtype=bf16
@@ -29,6 +32,8 @@ int64_t fused_mla_absorb_rotary_emb(
     int64_t qk_rope_head_dim, //64
     int64_t qk_nope_head_dim //128
 ) {
+  DEBUG_TRACE_PARAMS(q, w_kc, latent_cache, cos_sin_cache, positions, norm_weight, q_input, k_input, v_input, q_len, num_local_heads, kv_lora_rank, qk_rope_head_dim, qk_nope_head_dim);
+  DEBUG_DUMP_PARAMS(q, w_kc, latent_cache, cos_sin_cache, positions, norm_weight, q_input, k_input, v_input, q_len, num_local_heads, kv_lora_rank, qk_rope_head_dim, qk_nope_head_dim);
     //TODO:
     //check all shape
     const at::cuda::OptionalCUDAGuard device_guard(device_of(q));

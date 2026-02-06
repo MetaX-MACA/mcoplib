@@ -8,6 +8,8 @@
 
 #include <cub/cub.cuh>
 #include <cub/util_type.cuh>
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
 
 static inline __device__ int8_t float_to_int8_rn(float x) {
   // CUDA path
@@ -425,6 +427,8 @@ void static_scaled_int8_quant(torch::Tensor& out,          // [..., hidden_size]
                               torch::Tensor const& input,  // [..., hidden_size]
                               torch::Tensor const& scale,
                               std::optional<torch::Tensor> const& azp) {
+  DEBUG_TRACE_PARAMS(out, input, scale, azp);
+  DEBUG_DUMP_PARAMS(out, input, scale, azp);
   TORCH_CHECK(input.is_contiguous());
   TORCH_CHECK(out.is_contiguous());
   TORCH_CHECK(scale.numel() == 1);
@@ -456,6 +460,8 @@ void dynamic_scaled_int8_quant(
     torch::Tensor& out,          // [..., hidden_size]
     torch::Tensor const& input,  // [..., hidden_size]
     torch::Tensor& scales, std::optional<torch::Tensor> const& azp) {
+  DEBUG_TRACE_PARAMS(out, input, scales, azp);
+  DEBUG_DUMP_PARAMS(out, input, scales, azp);
   TORCH_CHECK(input.is_contiguous());
   TORCH_CHECK(out.is_contiguous());
   TORCH_CHECK(scales.is_contiguous());

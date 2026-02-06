@@ -4,6 +4,8 @@
 #include <torch/extension.h>
 #include <torch/torch.h>
 #include "../kernel/utils.h"
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
 
 
 __global__ void set_zero_kernel(uint4* output, const int total_vec){
@@ -52,6 +54,8 @@ void launch_send_to_atten_kernel(const scalar_t* moe_hidden_status, const float*
 void send_to_attention_node_pre_process(at::Tensor moe_hidden_status, at::Tensor deepep_topk_weights, at::Tensor ori_index,
                                             at::Tensor new_index, at::Tensor output, at::Tensor valid_idx_size, const int max_index_size)
 {
+	DEBUG_TRACE_PARAMS(moe_hidden_status, deepep_topk_weights, ori_index, new_index, output, valid_idx_size, max_index_size);
+	DEBUG_DUMP_PARAMS(moe_hidden_status, deepep_topk_weights, ori_index, new_index, output, valid_idx_size, max_index_size);
     const int num_tokens = moe_hidden_status.size(-2);
     const int hidden_size = moe_hidden_status.size(-1);
     const int num_local_experts = moe_hidden_status.numel() / (num_tokens * hidden_size);

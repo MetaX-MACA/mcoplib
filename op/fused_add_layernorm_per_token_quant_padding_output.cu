@@ -8,6 +8,8 @@
 #include "../kernel/utils.h"
 #include "../kernel/rms_norm_vllm.cuh"
 #include "../kernel/utils.cuh"
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
 
 namespace vllm {
 
@@ -401,6 +403,8 @@ void add_rms_norm_dynamic_per_token_quant_padding_output(at::Tensor& output,
                                                          at::Tensor const& weight, 
                                                          const int pad_size, 
                                                          const float epsilon){
+	DEBUG_TRACE_PARAMS(output, output_rms, output_quant_int8, out_scales, input, residual,weight, pad_size, epsilon);
+	DEBUG_DUMP_PARAMS(output, output_rms, output_quant_int8, out_scales, input, residual,weight, pad_size, epsilon);
     TORCH_CHECK(output.dtype() == torch::kInt8);
     TORCH_CHECK(input.dtype() == at::ScalarType::BFloat16);
     TORCH_CHECK(output.is_contiguous() && input.is_contiguous());

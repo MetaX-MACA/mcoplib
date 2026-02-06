@@ -6,6 +6,8 @@
 
 #include "attention_dtypes.h"
 #include "attention_utils.cuh"
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
 
 namespace vllm {
 
@@ -205,5 +207,7 @@ void merge_attn_states(torch::Tensor& output,
                        const torch::Tensor& prefix_lse,
                        const torch::Tensor& suffix_output,
                        const torch::Tensor& suffix_lse) {
+  DEBUG_TRACE_PARAMS(output, output_lse, prefix_output, prefix_lse, suffix_output, suffix_lse);
+	DEBUG_DUMP_PARAMS(output, output_lse, prefix_output, prefix_lse, suffix_output, suffix_lse);
   DISPATCH_BY_SCALAR_DTYPE(output.dtype(), CALL_MERGE_ATTN_STATES_LAUNCHER);
 }

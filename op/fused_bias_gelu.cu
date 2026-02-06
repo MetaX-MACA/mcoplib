@@ -4,8 +4,12 @@
 #include <torch/extension.h>
 #include <torch/torch.h>
 #include "../kernel/fused_gelu_kernel.h"
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
 
 at::Tensor fused_gelu_fwd(at::Tensor input, at::Tensor bias) {
+    DEBUG_TRACE_PARAMS(input, bias);
+	DEBUG_DUMP_PARAMS(input, bias);
     CHECK_DEVICE(input);
     at::Tensor output = at::empty_like(input);
     const int numel = input.numel();
@@ -80,6 +84,8 @@ at::Tensor fused_gelu_fwd(at::Tensor input, at::Tensor bias) {
 }
 
 at::Tensor fused_gelu_bwd(at::Tensor input, at::Tensor input1, at::Tensor bias) {
+	DEBUG_TRACE_PARAMS(input, input1, bias);
+	DEBUG_DUMP_PARAMS(input, input1, bias);
     CHECK_DEVICE(input);
     at::Tensor output = at::empty_like(input);
     const int numel = input.numel();

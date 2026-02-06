@@ -5,6 +5,8 @@
 #include <torch/torch.h>
 #include <cub/cub.cuh>
 #include "../kernel/utils.h"
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
 
 inline __device__ int get_batch_idx(const int64_t* accum_q_lens, int64_t bid, const int batch_size) {
     #pragma unroll
@@ -145,6 +147,8 @@ torch::Tensor rotary_pos_emb_forward(
     int batch_size,
     int cut_head_dim = 0
 ) {
+	DEBUG_TRACE_PARAMS(input, sin, cos, cumsum_len, batch_size, cut_head_dim);
+	DEBUG_DUMP_PARAMS(input, sin, cos, cumsum_len, batch_size, cut_head_dim);
     // 检查输入设备是否为CUDA
     TORCH_CHECK(input.device().is_cuda(), "input must be on CUDA");
     TORCH_CHECK(sin.device().is_cuda(), "sin must be on CUDA");
@@ -213,6 +217,8 @@ torch::Tensor rotary_pos_emb_backward(
     int batch_size,
     int cut_head_dim = 0
 ) {
+    DEBUG_TRACE_PARAMS(input, sin, cos, cumsum_len, batch_size, cut_head_dim);
+	DEBUG_DUMP_PARAMS(input, sin, cos, cumsum_len, batch_size, cut_head_dim);
     // 检查输入设备是否为CUDA
     TORCH_CHECK(input.device().is_cuda(), "input must be on CUDA");
     TORCH_CHECK(sin.device().is_cuda(), "sin must be on CUDA");

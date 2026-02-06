@@ -8,6 +8,8 @@
 
 #include "mctlass/array.h"
 #include "utils.h"
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
 
 constexpr uint64_t THREADS_PER_EXPERT = 512;
 
@@ -152,6 +154,8 @@ void prepare_moe_input(
     const int64_t num_experts,
     const int64_t n,
     const int64_t k) {
+  DEBUG_TRACE_PARAMS(topk_ids, expert_offsets, blockscale_offsets, problem_sizes1, problem_sizes2, input_permutation, output_permutation, num_experts, n, k);
+  DEBUG_DUMP_PARAMS(topk_ids, expert_offsets, blockscale_offsets, problem_sizes1, problem_sizes2, input_permutation, output_permutation, num_experts, n, k);
   TORCH_CHECK(topk_ids.dtype() == torch::kInt32);
   get_moe_prepare_input_caller(
       topk_ids,
@@ -252,6 +256,8 @@ void shuffle_rows_caller(
 }
 
 void shuffle_rows(const torch::Tensor& input_tensor, const torch::Tensor& dst2src_map, torch::Tensor& output_tensor) {
+  DEBUG_TRACE_PARAMS(input_tensor, dst2src_map, output_tensor);
+  DEBUG_DUMP_PARAMS(input_tensor, dst2src_map, output_tensor);
   shuffle_rows_caller(input_tensor, dst2src_map, output_tensor);
   return;
 }
@@ -389,5 +395,7 @@ void apply_shuffle_mul_sum(
     torch::Tensor& output,
     const torch::Tensor& permutation,
     const std::optional<torch::Tensor>& factors) {
+  DEBUG_TRACE_PARAMS(input, output, permutation, factors);
+  DEBUG_DUMP_PARAMS(input, output, permutation, factors);
   get_apply_shuffle_mul_sum_caller(input, output, permutation, factors);
 }

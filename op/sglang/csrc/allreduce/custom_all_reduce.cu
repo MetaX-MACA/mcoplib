@@ -6,6 +6,8 @@
 #include <torch/all.h>
 
 #include "custom_all_reduce.cuh"
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
 
 // Fake pointer type, must match fptr_t type in ops.h.
 // We use this type alias to indicate when pointers are passed in as int64_t.
@@ -14,6 +16,8 @@ static_assert(sizeof(void*) == sizeof(fptr_t));
 
 fptr_t
 init_custom_ar(const std::vector<fptr_t>& fake_ipc_ptrs, torch::Tensor& rank_data, int64_t rank, bool full_nvlink) {
+  DEBUG_TRACE_PARAMS(fake_ipc_ptrs, rank_data, rank, full_nvlink);
+  DEBUG_DUMP_PARAMS(fake_ipc_ptrs, rank_data, rank, full_nvlink);
   int world_size = fake_ipc_ptrs.size();
   if (world_size > 8) throw std::invalid_argument("world size > 8 is not supported");
   if (world_size % 2 != 0) throw std::invalid_argument("Odd num gpus is not supported for now");
@@ -56,6 +60,8 @@ bool _is_weak_contiguous(torch::Tensor& t) {
  * copied into _reg_buffer.
  */
 void all_reduce(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out, fptr_t _reg_buffer, int64_t reg_buffer_sz_bytes) {
+  DEBUG_TRACE_PARAMS(_fa, inp, out, _reg_buffer, reg_buffer_sz_bytes);
+  DEBUG_DUMP_PARAMS(_fa, inp, out, _reg_buffer, reg_buffer_sz_bytes);
   auto fa = reinterpret_cast<sglang::CustomAllreduce*>(_fa);
   const at::cuda::OptionalCUDAGuard device_guard(device_of(inp));
   auto stream = c10::cuda::getCurrentCUDAStream().stream();
@@ -99,6 +105,8 @@ void all_reduce(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out, fptr_t _reg_
 }
 
 void dispose(fptr_t _fa) {
+  DEBUG_TRACE_PARAMS(_fa);
+  DEBUG_DUMP_PARAMS(_fa);
   delete reinterpret_cast<sglang::CustomAllreduce*>(_fa);
 }
 
@@ -107,6 +115,8 @@ int64_t meta_size() {
 }
 
 void register_buffer(fptr_t _fa, const std::vector<fptr_t>& fake_ipc_ptrs) {
+  DEBUG_TRACE_PARAMS(_fa, fake_ipc_ptrs);
+  DEBUG_DUMP_PARAMS(_fa, fake_ipc_ptrs);
   auto fa = reinterpret_cast<sglang::CustomAllreduce*>(_fa);
   TORCH_CHECK(fake_ipc_ptrs.size() == fa->world_size_);
   void* ipc_ptrs[8];
@@ -127,6 +137,8 @@ std::tuple<std::vector<int64_t>, std::vector<int64_t>> get_graph_buffer_ipc_meta
 // Use vector<int64_t> to represent byte data for python binding compatibility.
 void register_graph_buffers(
     fptr_t _fa, const std::vector<std::vector<int64_t>>& handles, const std::vector<std::vector<int64_t>>& offsets) {
+  DEBUG_TRACE_PARAMS(_fa, handles, offsets);
+  DEBUG_DUMP_PARAMS(_fa, handles, offsets);
   auto fa = reinterpret_cast<sglang::CustomAllreduce*>(_fa);
   std::vector<std::string> bytes;
   bytes.reserve(handles.size());

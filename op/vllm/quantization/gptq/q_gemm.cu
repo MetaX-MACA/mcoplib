@@ -26,6 +26,8 @@ https://github.com/qwopqwop200/GPTQ-for-LLaMa
 #include "hgemv_selector.hpp"
 #include "Hgemm_nn_128x32x128_8m1n8k_gptq-4bits.hpp"
 #include "Hgemm_nn_128x32x128_8m1n8k_gptq-8bits.hpp"
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
 
 namespace vllm {
 namespace gptq {
@@ -2360,6 +2362,8 @@ torch::Tensor gptq_gemm(torch::Tensor a, torch::Tensor b_q_weight,
                         bool use_exllama, int64_t bit, int64_t group_size,
                         torch::Tensor perm_space, torch::Tensor temp_space,
                         bool dtype_bf16) {
+  DEBUG_TRACE_PARAMS(a, b_q_weight, b_gptq_qzeros, b_gptq_scales, b_g_idx, use_exllama, bit, group_size, perm_space, temp_space, dtype_bf16);
+  DEBUG_DUMP_PARAMS(a, b_q_weight, b_gptq_qzeros, b_gptq_scales, b_g_idx, use_exllama, bit, group_size, perm_space, temp_space, dtype_bf16);
   const at::cuda::OptionalCUDAGuard device_guard(device_of(a));
   auto options = torch::TensorOptions().dtype(a.dtype()).device(a.device());
   at::Tensor c = torch::zeros({a.size(0), b_q_weight.size(1)}, options);
@@ -2397,6 +2401,8 @@ torch::Tensor gptq_gemm(torch::Tensor a, torch::Tensor b_q_weight,
 }
 
 void gptq_shuffle(torch::Tensor q_weight, torch::Tensor q_perm, int64_t bit) {
+  DEBUG_TRACE_PARAMS(q_weight, q_perm, bit);
+  DEBUG_DUMP_PARAMS(q_weight, q_perm, bit);
   const at::cuda::OptionalCUDAGuard device_guard(device_of(q_weight));
   vllm::gptq::shuffle_exllama_weight(
       (uint32_t*)q_weight.data_ptr(),

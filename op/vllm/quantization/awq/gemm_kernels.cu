@@ -18,6 +18,8 @@ Shang and Dang, Xingyu and Han, Song}, journal={arXiv}, year={2023}
 
 #include "../gptq/hgemm_gptq.h"
 #include "../gptq/scalar_type.hpp"
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
 
 // #include "hgemv_nn_splitk_awq.hpp"
 // #include "hgemv_selector.hpp"
@@ -321,6 +323,8 @@ bool launch_gemm(int quant_group, int m, int n, int k, const input_tp* dA,
 }  // namespace vllm
 
 torch::Tensor awq_to_gptq_4bit(torch::Tensor qweight) {
+  DEBUG_TRACE_PARAMS(qweight);
+  DEBUG_DUMP_PARAMS(qweight);
   const at::cuda::OptionalCUDAGuard device_guard(device_of(qweight));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
@@ -359,6 +363,8 @@ torch::Tensor awq_dequantize(torch::Tensor _kernel,
                              torch::Tensor _scaling_factors,
                              torch::Tensor _zeros, int64_t split_k_iters,
                              int64_t thx, int64_t thy) {
+  DEBUG_TRACE_PARAMS(_kernel, _scaling_factors, _zeros, split_k_iters, thx, thy);
+  DEBUG_DUMP_PARAMS(_kernel, _scaling_factors, _zeros, split_k_iters, thx, thy);
   int in_c = _kernel.size(0);
   int qout_c = _kernel.size(1);
   int out_c = qout_c * 8;
@@ -411,6 +417,8 @@ torch::Tensor awq_gemm(torch::Tensor _in_feats, torch::Tensor _kernel,
                        torch::Tensor _scaling_factors, torch::Tensor _zeros,
                        int64_t split_k_iters, torch::Tensor _temp_space,
                        bool dtype_bf16) {
+  DEBUG_TRACE_PARAMS(_in_feats, _kernel, _scaling_factors, _zeros, split_k_iters, _temp_space, dtype_bf16);
+  DEBUG_DUMP_PARAMS(_in_feats, _kernel, _scaling_factors, _zeros, split_k_iters, _temp_space, dtype_bf16);
   int num_in_feats = _in_feats.size(0);
   int num_in_channels = _in_feats.size(1);
   const at::cuda::OptionalCUDAGuard device_guard(device_of(_in_feats));

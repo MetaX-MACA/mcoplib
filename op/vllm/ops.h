@@ -7,8 +7,12 @@
 #include "core/scalar_type.hpp"
 
 #include <vector>
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
 
 torch::Tensor weak_ref_tensor(torch::Tensor& tensor) {
+  DEBUG_TRACE_PARAMS(tensor);
+  DEBUG_DUMP_PARAMS(tensor);
   // Ensure tensor is on CUDA
   if (!tensor.is_cuda()) {
     throw std::runtime_error("Tensor must be on CUDA device");

@@ -9,9 +9,13 @@
 #include "mctlass/half.h"
 #include "mctlass/layout/matrix.h"
 #include "mctlass/epilogue/thread/scale_type.h"
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
 
 int64_t mctlass_moe_w4a16_gemm_kernel_mnk(int64_t num_valid_tokens, int64_t N, int64_t K, int64_t group)
 {
+    DEBUG_TRACE_PARAMS(num_valid_tokens, N, K, group);
+    DEBUG_DUMP_PARAMS(num_valid_tokens, N, K, group);
     using ElementA = maca_bfloat16;
     using ElementB = uint8_t;
     using ElementC = maca_bfloat16;
@@ -49,6 +53,8 @@ void mctlass_fused_moe_kernel_w4a16(
     torch::Tensor const& moe_weight, torch::Tensor const& token_ids, torch::Tensor const& expert_ids, 
     torch::Tensor const& num_tokens_post_padded, int64_t N, int64_t K, int64_t EM, int64_t num_valid_tokens, int64_t topk, bool mul_routed_weight)
 {
+    DEBUG_TRACE_PARAMS(a, b, c, b_scales, zp_b, moe_weight, token_ids, expert_ids, num_tokens_post_padded, N, K, EM, num_valid_tokens, topk, mul_routed_weight);
+    DEBUG_DUMP_PARAMS(a, b, c, b_scales, zp_b, moe_weight, token_ids, expert_ids, num_tokens_post_padded, N, K, EM, num_valid_tokens, topk, mul_routed_weight);
     using ElementA = maca_bfloat16;
     using ElementB = uint8_t;
     using ElementC = maca_bfloat16;

@@ -1,6 +1,10 @@
 #include "cuda_utils.h"
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
 
 int64_t get_device_attribute(int64_t attribute, int64_t device_id) {
+  DEBUG_TRACE_PARAMS(attribute, device_id);
+  DEBUG_DUMP_PARAMS(attribute, device_id);
   // Return the cached value on subsequent calls
   static int value = [=]() {
     int device = static_cast<int>(device_id);
@@ -17,6 +21,8 @@ int64_t get_device_attribute(int64_t attribute, int64_t device_id) {
 }
 
 int64_t get_max_shared_memory_per_block_device_attribute(int64_t device_id) {
+  DEBUG_TRACE_PARAMS(device_id);
+  DEBUG_DUMP_PARAMS(device_id);
   int64_t attribute;
   // https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html
   // cudaDevAttrMaxSharedMemoryPerBlockOptin = 97 if not is_hip() else 74

@@ -2,6 +2,8 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime.h>
 #include <torch/all.h>
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
 
 #include <cfloat>
 
@@ -265,6 +267,8 @@ std::vector<at::Tensor> kimi_k2_moe_fused_gate(
     bool renormalize,
     double routed_scaling_factor,
     bool apply_routed_scaling_factor_on_output) {
+  DEBUG_TRACE_PARAMS(input, bias, topk, renormalize, routed_scaling_factor, apply_routed_scaling_factor_on_output);
+  DEBUG_DUMP_PARAMS(input, bias, topk, renormalize, routed_scaling_factor, apply_routed_scaling_factor_on_output);
   int64_t num_rows = input.size(0);
   int32_t num_experts = input.size(1);
 

@@ -2,6 +2,8 @@
 #include <torch/all.h>
 #include <ATen/cuda/CUDAContext.h>
 #include "core/registration.h"
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
 
 void moe_permute(const torch::Tensor& input,
                  const torch::Tensor& topk_ids,  // [n_token, topk]
@@ -32,6 +34,8 @@ void moe_unpermute(
 void shuffle_rows(const torch::Tensor& input_tensor,
                   const torch::Tensor& dst2src_map,
                   torch::Tensor& output_tensor) {
+  DEBUG_TRACE_PARAMS(input_tensor, dst2src_map, output_tensor);
+  DEBUG_DUMP_PARAMS(input_tensor, dst2src_map, output_tensor);
   TORCH_CHECK(false, "shuffle_rows is not supported on MACA");
 }
 

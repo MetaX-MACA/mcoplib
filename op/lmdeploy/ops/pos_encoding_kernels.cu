@@ -6,6 +6,8 @@
 
 #include "cuda_compat.h"
 #include "dispatch_utils.h"
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
 
 namespace vllm {
 
@@ -165,6 +167,8 @@ void lmdeploy_rotary_embedding(
     torch::Tensor& cos,  // [max_position, 2 * embed_dim]
     torch::Tensor& sin,  // [max_position, 2 * embed_dim]
     bool is_neox) {
+  DEBUG_TRACE_PARAMS(positions, query, key, head_size, cos, sin, is_neox);
+  DEBUG_DUMP_PARAMS(positions, query, key, head_size, cos, sin, is_neox);
   int64_t num_tokens = query.numel() / query.size(-1);
   int embed_dim = cos.size(-1) / 2;
   int num_heads = query.size(-1) / head_size;

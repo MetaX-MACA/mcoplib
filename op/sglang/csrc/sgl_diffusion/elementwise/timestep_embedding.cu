@@ -25,6 +25,9 @@ limitations under the License.
 
 #include "utils.h"
 
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
+
 template <bool flip_sin_to_cos = false, typename T_IN>
 __global__ void timestep_embedding_kernel(
     T_IN* t_ptr, float* output_ptr, int dim, float neg_log_max_period, float scale, int batch_size) {
@@ -82,6 +85,8 @@ torch::Tensor timestep_embedding(
     double downscale_freq_shift,
     double scale,
     int64_t max_period) {
+  DEBUG_TRACE_PARAMS(t, output, dim, flip_sin_to_cos, downscale_freq_shift, scale, max_period);
+  DEBUG_DUMP_PARAMS(t, output, dim, flip_sin_to_cos, downscale_freq_shift, scale, max_period);
   TORCH_CHECK(t.dim() == 1 and t.stride(0) == 1, "t should be 1D");
   TORCH_CHECK(output.dim() == 2 and output.is_contiguous(), "output should be a contiguous 2D tensor.");
 

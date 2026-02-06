@@ -12,6 +12,8 @@
   #include <hipcub/util_type.hpp>
   #include <hipcub/hipcub.hpp>
 #endif
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
 
 static __forceinline__ __device__ int8_t float_to_int8_rn(float x) {
 #ifdef USE_ROCM
@@ -1362,6 +1364,8 @@ void static_scaled_int8_quant(torch::Tensor& out,          // [..., hidden_size]
                               torch::Tensor const& input,  // [..., hidden_size]
                               torch::Tensor const& scale,
                               c10::optional<torch::Tensor> const& azp) {
+  DEBUG_TRACE_PARAMS(out, input, scale, azp);
+  DEBUG_DUMP_PARAMS(out, input, scale, azp);
   TORCH_CHECK(input.is_contiguous());
   TORCH_CHECK(out.is_contiguous());
   TORCH_CHECK(scale.numel() == 1);
@@ -1393,6 +1397,8 @@ void dynamic_scaled_int8_quant(
     torch::Tensor& out,          // [..., hidden_size]
     torch::Tensor const& input,  // [..., hidden_size]
     torch::Tensor& scales, c10::optional<torch::Tensor> const& azp) {
+  DEBUG_TRACE_PARAMS(out, input, scales, azp);
+  DEBUG_DUMP_PARAMS(out, input, scales, azp);
   TORCH_CHECK(input.is_contiguous());
   TORCH_CHECK(out.is_contiguous());
   TORCH_CHECK(scales.is_contiguous());
@@ -1571,6 +1577,8 @@ void fused_silu_mul_dq_quant_interface(
     torch::Tensor& scale,   
     torch::Tensor const& input)
 {
+  DEBUG_TRACE_PARAMS(out, scale, input);
+  DEBUG_DUMP_PARAMS(out, scale, input);
   TORCH_CHECK(input.is_contiguous());
   TORCH_CHECK(scale.is_contiguous());
   TORCH_CHECK(out.is_contiguous());

@@ -4,6 +4,8 @@
 #include <torch/extension.h>
 #include <torch/torch.h>
 #include "../kernel/utils.h"
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
 
 template<typename scalar_t>
 __global__ void move_hidden_status_from_aten(const scalar_t* input, scalar_t* output, const int* ori_index, const int* new_index, 
@@ -152,6 +154,8 @@ void recv_from_attention_node_post_process(at::Tensor hidden_status, at::Tensor 
                                         at::Tensor deepep_topk_weights,  at::Tensor expert_cnt, at::Tensor valid_idx_size, const int begin_expert_id, 
                                         const int num_local_experts, const int max_index_size, const int work_count) 
 {
+	DEBUG_TRACE_PARAMS(hidden_status, topk_idx, topk_weights, ori_index, new_index, deepep_hidden_status, deepep_topk_weights, expert_cnt, valid_idx_size, begin_expert_id, num_local_experts, max_index_size, work_count);
+	DEBUG_DUMP_PARAMS(hidden_status, topk_idx, topk_weights, ori_index, new_index, deepep_hidden_status, deepep_topk_weights, expert_cnt, valid_idx_size, begin_expert_id, num_local_experts, max_index_size, work_count);
     const int topk = topk_idx.size(-1);
     const int batch_size = topk_idx.numel() / (topk * work_count);
     const int hidden_size = hidden_status.size(-1);

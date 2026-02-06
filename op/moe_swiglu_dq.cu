@@ -5,6 +5,8 @@
 #include <torch/torch.h>
 #include <cub/cub.cuh>
 #include "../kernel/utils.h"
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
 
 template<typename T>
 float __device__ __forceinline__ convert(T value) {
@@ -268,6 +270,8 @@ void launch_silu_mul_quant_no_mask(const T* input,const float* smooth_scale, int
 void moe_swiglu_dynamic_quantize(at::Tensor scatter_tokens, at::Tensor smooth_scale, at::Tensor experts_tokens_start, at::Tensor experts_tokens_count,
     at::Tensor& y, at::Tensor& per_tokens_scale, int total_experts_num)
 {
+	DEBUG_TRACE_PARAMS(scatter_tokens, smooth_scale, experts_tokens_start, experts_tokens_count, y, per_tokens_scale, total_experts_num);
+	DEBUG_DUMP_PARAMS(scatter_tokens, smooth_scale, experts_tokens_start, experts_tokens_count, y, per_tokens_scale, total_experts_num);
     CHECK_DEVICE(scatter_tokens);
     CHECK_DEVICE(smooth_scale);
     CHECK_DEVICE(experts_tokens_start);

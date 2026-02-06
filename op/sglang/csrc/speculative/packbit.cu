@@ -18,6 +18,8 @@
 #include <flashinfer/quantization.cuh>
 
 #include "pytorch_extension_utils.h"
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
 
 using namespace flashinfer;
 
@@ -29,6 +31,8 @@ void segment_packbits(
     at::Tensor y,
     int64_t batch_size,
     int64_t cuda_stream) {
+  DEBUG_TRACE_PARAMS(x, input_indptr, output_indptr, y, batch_size, cuda_stream);
+  DEBUG_DUMP_PARAMS(x, input_indptr, output_indptr, y, batch_size, cuda_stream);
   CHECK_INPUT(x);
   CHECK_INPUT(input_indptr);
   CHECK_INPUT(output_indptr);

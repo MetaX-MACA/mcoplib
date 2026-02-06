@@ -7,6 +7,8 @@
 #include "../dispatch_utils.h"
 #include "layernorm_utils.cuh"
 // #include "quant_conversions.cuh"
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
 
 
 
@@ -437,6 +439,8 @@ void rms_norm_dynamic_per_token_quant_custom(
     torch::Tensor& scales,        // [num_tokens]
     double const var_epsilon,     // Variance epsilon used in norm calculation
     std::optional<at::Tensor> scale_ub, std::optional<at::Tensor> residual) {
+  DEBUG_TRACE_PARAMS(out, out_bf16, input, weight, scales, var_epsilon, scale_ub, residual);
+  DEBUG_DUMP_PARAMS(out, out_bf16, input, weight, scales, var_epsilon, scale_ub, residual);
   static c10::ScalarType kFp8Type = is_fp8_ocp()
                                         ? c10::ScalarType::Float8_e4m3fn
                                         : c10::ScalarType::Float8_e4m3fnuz;

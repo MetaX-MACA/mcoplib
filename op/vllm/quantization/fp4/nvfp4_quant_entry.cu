@@ -15,9 +15,13 @@
  */
 
 #include <torch/all.h>
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
 
 void scaled_fp4_quant(torch::Tensor& output, torch::Tensor const& input,
                       torch::Tensor& output_sf, torch::Tensor const& input_sf) {
+  DEBUG_TRACE_PARAMS(output, input, output_sf, input_sf);
+  DEBUG_DUMP_PARAMS(output, input, output_sf, input_sf);
   TORCH_CHECK_NOT_IMPLEMENTED(false, "No compiled nvfp4 quantization kernel");
 }
 
@@ -26,6 +30,8 @@ void scaled_fp4_experts_quant(
     torch::Tensor const& input, torch::Tensor const& input_global_scale,
     torch::Tensor const& input_offset_by_experts,
     torch::Tensor const& output_scale_offset_by_experts) {
+  DEBUG_TRACE_PARAMS(output, output_scale, input, input_global_scale, input_offset_by_experts, output_scale_offset_by_experts);
+  DEBUG_DUMP_PARAMS(output, output_scale, input, input_global_scale, input_offset_by_experts, output_scale_offset_by_experts);
   TORCH_CHECK_NOT_IMPLEMENTED(false,
                               "No compiled nvfp4 experts quantization kernel");
 }

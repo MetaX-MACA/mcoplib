@@ -29,6 +29,8 @@ limitations under the License.
 #endif
 
 #include "utils.h"
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
 
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
@@ -720,6 +722,8 @@ void topk_softmax(
     const bool renormalize,
     const double moe_softcapping,
     const c10::optional<torch::Tensor>& correction_bias) {
+  DEBUG_TRACE_PARAMS(topk_weights, topk_indices, gating_output, renormalize, moe_softcapping, correction_bias);
+  DEBUG_DUMP_PARAMS(topk_weights, topk_indices, gating_output, renormalize, moe_softcapping, correction_bias);
   // Check data type
   TORCH_CHECK(
       gating_output.scalar_type() == at::ScalarType::Float || gating_output.scalar_type() == at::ScalarType::Half ||

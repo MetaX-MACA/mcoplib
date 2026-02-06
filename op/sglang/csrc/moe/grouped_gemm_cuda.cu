@@ -8,6 +8,8 @@
 /* Includes, cuda */
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
 namespace grouped_gemm {
 #define NUM_STREAM 4
 // cublasStatus_t cublasGemmGroupedBatchedEx(cublasHandle_t handle,
@@ -399,6 +401,8 @@ void GroupedGemm(torch::Tensor a,
      torch::Tensor c,
      torch::Tensor batch_sizes,
      bool trans_a, bool trans_b) {
+  DEBUG_TRACE_PARAMS(a, b, c, batch_sizes, trans_a, trans_b);
+  DEBUG_DUMP_PARAMS(a, b, c, batch_sizes, trans_a, trans_b);
   // NOTE: We only support 'trans_a' or 'trans_b', not both.
   TORCH_CHECK(!(trans_a && trans_b));
   // We expect the batch_sizes on CPU.

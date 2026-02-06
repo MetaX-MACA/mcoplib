@@ -7,6 +7,8 @@
 #ifdef USE_ROCM
 
 #include "quick_all_reduce.h"
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
 
 quickreduce::fptr_t init_custom_qr(int64_t rank, int64_t world_size, std::optional<int64_t> qr_max_size) {
   if (world_size > 8) throw std::invalid_argument("world size > 8 is not supported");
@@ -50,6 +52,8 @@ void qr_open_handles(quickreduce::fptr_t _fa, const std::vector<torch::Tensor>& 
 
 void qr_all_reduce(
     quickreduce::fptr_t _fa, torch::Tensor& inp, torch::Tensor& out, int64_t quant_level, bool cast_bf2half) {
+  DEBUG_TRACE_PARAMS(_fa, inp, out, quant_level, cast_bf2half);
+  DEBUG_DUMP_PARAMS(_fa, inp, out, quant_level, cast_bf2half);
   auto fa = reinterpret_cast<quickreduce::DeviceComms*>(_fa);
   const at::cuda::OptionalCUDAGuard device_guard(device_of(inp));
   auto stream = at::cuda::getCurrentHIPStreamMasqueradingAsCUDA();

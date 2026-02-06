@@ -4,6 +4,8 @@
 #include <torch/all.h>
 
 #include <vector>
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
 
 template <int N>
 struct InputArray {
@@ -47,6 +49,8 @@ void copy_to_gpu_no_ce_impl(const at::Tensor& input, at::Tensor& output) {
 }
 
 void copy_to_gpu_no_ce(const at::Tensor& input, at::Tensor& output) {
+  DEBUG_TRACE_PARAMS(input, output);
+  DEBUG_DUMP_PARAMS(input, output);
   int N = static_cast<int>(input.numel());
   // Can use macro if there are more N needed
   if (N == 72) {

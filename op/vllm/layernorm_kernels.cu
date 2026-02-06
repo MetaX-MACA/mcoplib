@@ -7,6 +7,8 @@
 #include <c10/cuda/CUDAGuard.h>
 
 #include <cub/cub.cuh>
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
 
 namespace vllm {
 // TODO(woosuk): Further optimize this kernel.
@@ -185,6 +187,8 @@ void rms_norm(torch::Tensor& out,     // [..., hidden_size]
               torch::Tensor& input,   // [..., hidden_size]
               torch::Tensor& weight,  // [hidden_size]
               double epsilon) {
+  DEBUG_TRACE_PARAMS(out, input, weight, epsilon);
+  DEBUG_DUMP_PARAMS(out, input, weight, epsilon);
   TORCH_CHECK(out.is_contiguous());
   if (input.stride(-1) != 1) {
     input = input.contiguous();
@@ -240,6 +244,8 @@ void fused_add_rms_norm(torch::Tensor& input,     // [..., hidden_size]
                         torch::Tensor& residual,  // [..., hidden_size]
                         torch::Tensor& weight,    // [hidden_size]
                         double epsilon) {
+  DEBUG_TRACE_PARAMS(input, residual, weight, epsilon);
+  DEBUG_DUMP_PARAMS(input, residual, weight, epsilon);
   TORCH_CHECK(weight.scalar_type() == input.scalar_type());
   TORCH_CHECK(input.scalar_type() == residual.scalar_type());
   TORCH_CHECK(residual.is_contiguous());

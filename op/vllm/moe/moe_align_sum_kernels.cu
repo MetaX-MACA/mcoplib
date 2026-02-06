@@ -9,6 +9,8 @@
 #include "../cuda_compat.h"
 #include "../dispatch_utils.h"
 #include "core/math.hpp"
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
 
 #define CEILDIV(x, y) (((x) + (y) - 1) / (y))
 
@@ -628,6 +630,8 @@ void moe_align_block_size(torch::Tensor topk_ids, int64_t num_experts,
                           torch::Tensor experts_ids,
                           torch::Tensor num_tokens_post_pad,
                           std::optional<torch::Tensor> maybe_expert_map) {
+  DEBUG_TRACE_PARAMS(topk_ids, num_experts, block_size, sorted_token_ids, experts_ids, num_tokens_post_pad, maybe_expert_map);
+  DEBUG_DUMP_PARAMS(topk_ids, num_experts, block_size, sorted_token_ids, experts_ids, num_tokens_post_pad, maybe_expert_map);
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
   int64_t padded_num_experts =
@@ -739,6 +743,8 @@ void batched_moe_align_block_size(int64_t max_tokens_per_batch,
                                   torch::Tensor sorted_ids,
                                   torch::Tensor batch_ids,
                                   torch::Tensor num_tokens_post_pad) {
+  DEBUG_TRACE_PARAMS(max_tokens_per_batch, block_size, batch_num_tokens, sorted_ids, batch_ids, num_tokens_post_pad);
+  DEBUG_DUMP_PARAMS(max_tokens_per_batch, block_size, batch_num_tokens, sorted_ids, batch_ids, num_tokens_post_pad);
   namespace batched_kernel = vllm::moe::batched_moe_align_block_size;
 
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -764,6 +770,8 @@ void batched_moe_align_block_size(int64_t max_tokens_per_batch,
 void moe_sum(torch::Tensor& input,   // [num_tokens, topk, hidden_size]
              torch::Tensor& output)  // [num_tokens, hidden_size]
 {
+  DEBUG_TRACE_PARAMS(input, output);
+  DEBUG_DUMP_PARAMS(input, output);
   const int hidden_size = input.size(-1);
   const auto num_tokens = output.numel() / hidden_size;
   const int topk = input.size(1);
@@ -812,6 +820,8 @@ void moe_lora_align_block_size(
     torch::Tensor sorted_token_ids, torch::Tensor expert_ids,
     torch::Tensor num_tokens_post_pad, torch::Tensor adapter_enabled,
     torch::Tensor lora_ids, std::optional<torch::Tensor> maybe_expert_map) {
+  DEBUG_TRACE_PARAMS(topk_ids, token_lora_mapping, num_experts, block_size, max_loras, max_num_tokens_padded, max_num_m_blocks, sorted_token_ids, expert_ids, num_tokens_post_pad, adapter_enabled, lora_ids, maybe_expert_map);
+  DEBUG_DUMP_PARAMS(topk_ids, token_lora_mapping, num_experts, block_size, max_loras, max_num_tokens_padded, max_num_m_blocks, sorted_token_ids, expert_ids, num_tokens_post_pad, adapter_enabled, lora_ids, maybe_expert_map);
   const int topk_num = topk_ids.size(1);
 
   TORCH_CHECK(block_size > 0, "block_size should be greater than 0. ");

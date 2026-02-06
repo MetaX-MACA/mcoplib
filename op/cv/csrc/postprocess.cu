@@ -1,5 +1,8 @@
 #include <cuda_fp16.h>
 #include "process_interface.h"
+
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
 // Y = 0.299*R + 0.587*G + 0.114*B
 // U = -0.169*R - 0.331*G + 0.500*B + 0.5
 // V = 0.500*R - 0.419*G - 0.081*B + 0.5
@@ -157,6 +160,8 @@ __global__ void fused_postprocess_yuv420_Kernel(const float* __restrict inputDat
 
 void fused_postprocess_nv12(const float* __restrict intputData, uint8_t* __restrict nv12Data, int width, int height, float scale, cudaStream_t stream)
 {
+    DEBUG_TRACE_PARAMS(intputData, nv12Data, width, height, scale, stream);
+    DEBUG_DUMP_PARAMS(intputData, nv12Data, width, height, scale, stream);
     constexpr int num_threads = 512;
     int u_width = width / 2;
     int u_height = height / 2;
@@ -166,6 +171,8 @@ void fused_postprocess_nv12(const float* __restrict intputData, uint8_t* __restr
 
 void fused_postprocess_yuv420(const float* __restrict inputData, uint8_t* __restrict yuv420Data, int width, int height, float scale, cudaStream_t stream)
 {
+    DEBUG_TRACE_PARAMS(inputData, yuv420Data, width, height, scale, stream);
+    DEBUG_DUMP_PARAMS(inputData, yuv420Data, width, height, scale, stream);
     constexpr int num_threads = 512;
     int u_width = width / 2;
     int u_height = height / 2;

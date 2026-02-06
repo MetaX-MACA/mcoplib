@@ -12,6 +12,8 @@
 
 #include "cutlass/array.h"
 #include "utils.h"
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
 
 template <typename T>
 using opmath_t = at::opmath_type<T>;
@@ -226,6 +228,8 @@ __global__ void moe_sum_reduce_kernel_warp_token_general(
 }
 
 void moe_sum_reduce(at::Tensor& input, at::Tensor& output, double routed_scaling_factor) {
+  DEBUG_TRACE_PARAMS(input, output, routed_scaling_factor);
+  DEBUG_DUMP_PARAMS(input, output, routed_scaling_factor);
   TORCH_CHECK(input.is_cuda(), "input must be CUDA tensor");
   TORCH_CHECK(output.is_cuda(), "output must be CUDA tensor");
   TORCH_CHECK(input.dim() == 3, "input must be a 3D tensor like [token_num, topk_num, hidden_dim]");
