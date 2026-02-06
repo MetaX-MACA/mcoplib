@@ -7,6 +7,10 @@
 
 #include <torch/all.h>
 
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
+
+
 __device__ int64_t save_blocks(int* block_offset, int64_t range_start,
                                int64_t range_end, int64_t block_size,
                                int64_t input_block_count, int64_t kv_seqlen) {
@@ -192,6 +196,8 @@ void convert_vertical_slash_indexes(
     torch::Tensor slash_indexes,     // [BATCH, N_HEADS, NNZ_S]
     int64_t context_size, int64_t block_size_M, int64_t block_size_N,
     bool causal) {
+	DEBUG_TRACE_PARAMS(block_count, block_offset, column_count, column_index, q_seqlens, kv_seqlens, vertical_indexes, slash_indexes, context_size, block_size_M, block_size_N, causal);
+	DEBUG_DUMP_PARAMS(block_count, block_offset, column_count, column_index, q_seqlens, kv_seqlens, vertical_indexes, slash_indexes, context_size, block_size_M, block_size_N, causal);
   cudaSetDevice(q_seqlens.get_device());
 
   int batch_size = slash_indexes.size(0);
@@ -382,6 +388,8 @@ void convert_vertical_slash_indexes_mergehead(
     torch::Tensor slash_indices_count,     // [N_HEADS, ]
     int64_t context_size, int64_t block_size_M, int64_t block_size_N,
     bool causal) {
+	DEBUG_TRACE_PARAMS(block_count, block_offset, column_count, column_index, q_seqlens, kv_seqlens, vertical_indexes, slash_indexes, vertical_indices_count, slash_indices_count, context_size, block_size_M, block_size_N, causal);
+	DEBUG_DUMP_PARAMS(block_count, block_offset, column_count, column_index, q_seqlens, kv_seqlens, vertical_indexes, slash_indexes, vertical_indices_count, slash_indices_count, context_size, block_size_M, block_size_N, causal);
   cudaSetDevice(q_seqlens.get_device());
 
   int batch_size = slash_indexes.size(0);

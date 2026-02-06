@@ -5,13 +5,15 @@
 #include <torch/torch.h>
 
 #include "../kernel/fused_rope_kernel.h"
-
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
 
 
 
 at::Tensor fused_rope_fwd(at::Tensor qkv, at::Tensor cos, at::Tensor sin, c10::optional<at::Tensor> indexes, bool force_bf16_attn = false){
 
-
+    DEBUG_TRACE_PARAMS(qkv, cos,sin,indexes,force_bf16_attn);
+    DEBUG_DUMP_PARAMS(qkv, cos,sin,indexes,force_bf16_attn);
     CHECK_DEVICE(qkv);
     CHECK_DEVICE(cos);
     CHECK_DEVICE(sin);
@@ -74,7 +76,8 @@ at::Tensor fused_rope_fwd(at::Tensor qkv, at::Tensor cos, at::Tensor sin, c10::o
 
 at::Tensor fused_rope_bwd(at::Tensor qkv, at::Tensor cos, at::Tensor sin, c10::optional<at::Tensor> indexes, bool force_bf16_attn = false){
 
-
+    DEBUG_TRACE_PARAMS(qkv, cos,sin,indexes,force_bf16_attn);
+    DEBUG_DUMP_PARAMS(qkv, cos,sin,indexes,force_bf16_attn);
     CHECK_DEVICE(qkv);
     CHECK_DEVICE(cos);
     CHECK_DEVICE(sin);

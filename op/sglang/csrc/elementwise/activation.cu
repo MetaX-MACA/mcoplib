@@ -22,6 +22,8 @@
 #include <flashinfer/activation.cuh>
 
 #include "utils.h"
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
 
 #else
 #include "hip/hip_act_and_mul.cuh"
@@ -82,6 +84,8 @@ __device__ __forceinline__ T gelu_tanh(const T& x) {
 }
 
 void silu_and_mul(at::Tensor& out, at::Tensor& input) {
+  DEBUG_TRACE_PARAMS(out, input);
+  DEBUG_DUMP_PARAMS(out, input);
   int d = input.size(-1) / 2;
   int64_t num_tokens = input.numel() / input.size(-1);
   dim3 grid(num_tokens);
@@ -104,6 +108,8 @@ void silu_and_mul(at::Tensor& out, at::Tensor& input) {
 }
 
 void gelu_tanh_and_mul(at::Tensor& out, at::Tensor& input) {
+  DEBUG_TRACE_PARAMS(out, input);
+  DEBUG_DUMP_PARAMS(out, input);
   int d = input.size(-1) / 2;
   int64_t num_tokens = input.numel() / input.size(-1);
   dim3 grid(num_tokens);
@@ -126,6 +132,8 @@ void gelu_tanh_and_mul(at::Tensor& out, at::Tensor& input) {
 }
 
 void gelu_and_mul(at::Tensor& out, at::Tensor& input) {
+  DEBUG_TRACE_PARAMS(out, input);
+  DEBUG_DUMP_PARAMS(out, input);
   int d = input.size(-1) / 2;
   int64_t num_tokens = input.numel() / input.size(-1);
   dim3 grid(num_tokens);

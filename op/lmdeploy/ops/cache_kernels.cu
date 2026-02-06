@@ -18,6 +18,8 @@ typedef __hip_bfloat16 __nv_bfloat16;
 #include "./attention/dtype_fp8.cuh"
 #include "./attention/dtype_float32.cuh"
 #include "./attention/dtype_bfloat16.cuh"
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
 
 void swap_blocks(torch::Tensor& src, torch::Tensor& dst,
                  const torch::Tensor& block_mapping) {
@@ -345,6 +347,8 @@ void reshape_and_cache_new(
         value_cache,  // [num_blocks, num_heads, head_size, block_size]
     torch::Tensor& slot_mapping,  // [num_tokens]
     const std::string& kv_cache_dtype, const double kv_scale, const double v_scale) {
+  DEBUG_TRACE_PARAMS(key, value, key_cache, value_cache, slot_mapping, kv_cache_dtype, kv_scale, v_scale);
+  DEBUG_DUMP_PARAMS(key, value, key_cache, value_cache, slot_mapping, kv_cache_dtype, kv_scale, v_scale);
   int num_tokens = key.size(0);
   int num_heads = key.size(1);
   int head_size = key.size(2);

@@ -19,11 +19,15 @@ limitations under the License.
 #include <flashinfer/norm.cuh>
 
 #include "utils.h"
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
 
 using namespace flashinfer;
 
 void sgl_fused_add_rmsnorm(
     torch::Tensor input, torch::Tensor residual, torch::Tensor weight, double eps, bool enable_pdl) {
+  DEBUG_TRACE_PARAMS(input, residual, weight, eps, enable_pdl);
+  DEBUG_DUMP_PARAMS(input, residual, weight, eps, enable_pdl);
   CHECK_INPUT(input);
   CHECK_INPUT(residual);
   CHECK_INPUT(weight);

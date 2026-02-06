@@ -12,6 +12,8 @@
 #include "../dispatch_utils.h"
 #include "core/math.hpp"
 
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
 namespace {
 
 __device__ __forceinline__ int32_t index(int32_t total_col, int32_t row,
@@ -131,6 +133,8 @@ void moe_lora_align_block_size(
     torch::Tensor sorted_token_ids, torch::Tensor expert_ids,
     torch::Tensor num_tokens_post_pad, torch::Tensor adapter_enabled,
     torch::Tensor lora_ids, std::optional<torch::Tensor> maybe_expert_map) {
+  DEBUG_TRACE_PARAMS(topk_ids, token_lora_mapping, num_experts, block_size, max_loras, max_num_tokens_padded, max_num_m_blocks, sorted_token_ids, expert_ids, num_tokens_post_pad, adapter_enabled, lora_ids, maybe_expert_map);
+  DEBUG_DUMP_PARAMS(topk_ids, token_lora_mapping, num_experts, block_size, max_loras, max_num_tokens_padded, max_num_m_blocks, sorted_token_ids, expert_ids, num_tokens_post_pad, adapter_enabled, lora_ids, maybe_expert_map);
   const int topk_num = topk_ids.size(1);
 
   TORCH_CHECK(block_size > 0, "block_size should be greater than 0. ");

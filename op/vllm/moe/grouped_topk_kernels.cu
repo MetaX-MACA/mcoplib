@@ -24,6 +24,8 @@
 #include <cuda/std/limits>
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
 namespace cg = cooperative_groups;
 
 // Generic template for same type
@@ -961,6 +963,8 @@ std::tuple<torch::Tensor, torch::Tensor> grouped_topk(
     torch::Tensor const& scores, int64_t n_group, int64_t topk_group,
     int64_t topk, bool renormalize, double routed_scaling_factor,
     torch::Tensor const& bias, int64_t scoring_func = 0) {
+  DEBUG_TRACE_PARAMS(scores, n_group, topk_group, topk, renormalize, routed_scaling_factor, bias, scoring_func);
+  DEBUG_DUMP_PARAMS(scores, n_group, topk_group, topk, renormalize, routed_scaling_factor, bias, scoring_func);
   auto data_type = scores.scalar_type();
   auto bias_type = bias.scalar_type();
   auto input_size = scores.sizes();

@@ -13,6 +13,9 @@
   #include <hipcub/hipcub.hpp>
 #endif
 
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
+
 struct DivModFast {
     DivModFast(int d = 1)
     {
@@ -195,6 +198,8 @@ torch::Tensor mx_awq_dequantize(torch::Tensor _kernel,
                              torch::Tensor _scaling_factors,
                              torch::Tensor _zeros, int64_t split_k_iters,
                              int64_t thx, int64_t thy) {
+  DEBUG_TRACE_PARAMS(_kernel, _scaling_factors, _zeros, split_k_iters, thx, thy);
+  DEBUG_DUMP_PARAMS(_kernel, _scaling_factors, _zeros, split_k_iters, thx, thy);
   int in_c = _kernel.size(0);
   int qout_c = _kernel.size(1);
   int out_c = qout_c * 8;

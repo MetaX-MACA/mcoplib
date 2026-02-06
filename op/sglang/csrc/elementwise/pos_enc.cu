@@ -6,6 +6,8 @@
 #include <torch/all.h>
 
 #include "utils.h"
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
 
 template <typename scalar_t, bool IS_NEOX>
 inline __device__ void apply_token_rotary_embedding(
@@ -131,6 +133,8 @@ void rotary_embedding(
     int64_t head_size,
     torch::Tensor& cos_sin_cache,  // [max_position, rot_dim]
     bool is_neox) {
+  DEBUG_TRACE_PARAMS(positions, query, key, head_size, cos_sin_cache, is_neox);
+  DEBUG_DUMP_PARAMS(positions, query, key, head_size, cos_sin_cache, is_neox);
   // num_tokens = batch_size * seq_len
   int64_t num_tokens = positions.numel();
   int positions_ndim = positions.dim();

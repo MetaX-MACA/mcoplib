@@ -14,6 +14,9 @@
 #include <cub/block/block_load.cuh>
 #include <cub/block/block_store.cuh>
 
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
+
 #define BOOL_SWITCH(COND, CONST_NAME, ...)                                           \
     [&] {                                                                            \
         if (COND) {                                                                  \
@@ -110,6 +113,8 @@ void causal_conv1d_fwd(const at::Tensor &x, const at::Tensor &weight,
                  // used to identify padding entries if cache_indices provided
                  // in case of padding, the kernel will return early
                   int64_t pad_slot_id) {
+    DEBUG_TRACE_PARAMS(&x, &weight, &bias_, &conv_states, &query_start_loc, &cache_indices, &has_initial_state, silu_activation, pad_slot_id);
+    DEBUG_DUMP_PARAMS(&x, &weight, &bias_, &conv_states, &query_start_loc, &cache_indices, &has_initial_state, silu_activation, pad_slot_id);
     auto input_type = x.scalar_type();
     auto weight_type = weight.scalar_type();
     TORCH_CHECK(input_type == at::ScalarType::Float || input_type == at::ScalarType::Half || input_type == at::ScalarType::BFloat16);
@@ -209,6 +214,8 @@ void causal_conv1d_update(const at::Tensor &x,
                      // used to identify padding entries if cache_indices provided
                      // in case of padding, the kernel will return early
                      int64_t pad_slot_id) {
+    DEBUG_TRACE_PARAMS(&x, &conv_state, &weight, &bias_, silu_activation, &cache_seqlens_, &conv_state_indices_, pad_slot_id);
+    DEBUG_DUMP_PARAMS(&x, &conv_state, &weight, &bias_, silu_activation, &cache_seqlens_, &conv_state_indices_, pad_slot_id);
     auto input_type = x.scalar_type();
     auto weight_type = weight.scalar_type();
     TORCH_CHECK(input_type == at::ScalarType::Float || input_type == at::ScalarType::Half || input_type == at::ScalarType::BFloat16);

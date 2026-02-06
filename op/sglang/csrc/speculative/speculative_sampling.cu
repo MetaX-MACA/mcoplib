@@ -15,6 +15,8 @@
  */
 #include "pytorch_extension_utils.h"
 #include "speculative_sampling.cuh"
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
 
 using namespace flashinfer;
 
@@ -42,6 +44,8 @@ void tree_speculative_sampling_target_only(
     double threshold_single,
     double threshold_acc,
     bool deterministic = true) {
+  DEBUG_TRACE_PARAMS(predicts, accept_index, accept_token_num, candidates, retrive_index, retrive_next_token, retrive_next_sibling, uniform_samples, uniform_samples_for_final_sampling, target_probs, draft_probs, threshold_single, threshold_acc, deterministic);
+  DEBUG_DUMP_PARAMS(predicts, accept_index, accept_token_num, candidates, retrive_index, retrive_next_token, retrive_next_sibling, uniform_samples, uniform_samples_for_final_sampling, target_probs, draft_probs, threshold_single, threshold_acc, deterministic);
   CHECK_INPUT(candidates);
   CHECK_INPUT(retrive_index);
   CHECK_INPUT(retrive_next_token);

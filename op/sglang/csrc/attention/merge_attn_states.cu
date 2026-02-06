@@ -6,6 +6,8 @@
 #include <optional>
 
 #include "pytorch_extension_utils.h"
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
 
 // Helper functions to convert between different data types
 // (float, half, bfloat16) for the merge attention states kernel.
@@ -182,6 +184,8 @@ void merge_attn_states_launcher(
 
 void merge_state_v2(
     at::Tensor v_a, at::Tensor s_a, at::Tensor v_b, at::Tensor s_b, at::Tensor v_merged, at::Tensor s_merged) {
+  DEBUG_TRACE_PARAMS(v_a, s_a, v_b, s_b, v_merged, s_merged);
+  DEBUG_DUMP_PARAMS(v_a, s_a, v_b, s_b, v_merged, s_merged);
   // Input tensors must be contiguous
   CHECK_INPUT(v_a);  // v_a prefix_output (seq_len, num_heads, head_dim)
   CHECK_INPUT(s_a);  // s_a prefix_lse (seq_len, num_heads)

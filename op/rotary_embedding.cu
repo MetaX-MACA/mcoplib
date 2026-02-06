@@ -5,6 +5,8 @@
 #include <torch/torch.h>
 #include <cub/cub.cuh>
 #include "../kernel/utils.h"
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
 
 template <typename scalar_t, bool IS_NEOX>
 inline __device__ void apply_token_rotary_embedding(
@@ -98,7 +100,8 @@ void rotary_embedding(at::Tensor packed_qkv, // [num_tokens, total_head_num, hea
                         at::Tensor q_len, at::Tensor accum_q_lens, at::Tensor cache_lens, at::Tensor cos,
                         at::Tensor sin,  at::Tensor output, const int q_head_num, const int kv_head_num, 
                         const int rope_offset = 0) {
-
+	DEBUG_TRACE_PARAMS(packed_qkv, q_len, accum_q_lens, cache_lens, cos, sin, output, q_head_num, kv_head_num, rope_offset);
+	DEBUG_DUMP_PARAMS(packed_qkv, q_len, accum_q_lens, cache_lens, cos, sin, output, q_head_num, kv_head_num, rope_offset);
     const int head_dim = packed_qkv.size(-1);
     const int total_head_num = packed_qkv.size(-2);
     const int num_tokens = packed_qkv.numel() / (head_dim * total_head_num);

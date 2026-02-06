@@ -19,8 +19,12 @@ limitations under the License.
 #include <ATen/Tensor.h>
 
 #include <vector>
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
 
 at::Tensor weak_ref_tensor(const at::Tensor& tensor) {
+  DEBUG_TRACE_PARAMS(tensor);
+  DEBUG_DUMP_PARAMS(tensor);
   TORCH_CHECK(tensor.is_cuda(), "weak_ref_tensor expects a CUDA tensor");
 
   void* data_ptr = tensor.data_ptr();

@@ -22,6 +22,8 @@
  * Adapted from  https://github.com/vllm-project/vllm/tree/main/csrc/quantization/gptq_marlin
  */
 #include "gptq_marlin.cuh"
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
 
 //size_m_tensor is the real size_m need calculated
 //while size_m is tensor a.shape[0]
@@ -279,6 +281,9 @@ torch::Tensor gptq_marlin_gemm(torch::Tensor& a, torch::Tensor& b_q_weight,
                                int64_t size_k, int sms, bool is_k_full, 
                                at::ScalarType dtype=torch::kBFloat16,
                                bool use_atomic_cache = true) {
+  DEBUG_TRACE_PARAMS(a, b_q_weight, b_scales, g_idx, perm, workspace, num_bits, size_m_tensor, size_m, size_n, size_k, sms, is_k_full, dtype, use_atomic_cache);
+	DEBUG_DUMP_PARAMS(a, b_q_weight, b_scales, g_idx, perm, workspace, num_bits, size_m_tensor, size_m, size_n, size_k, sms, is_k_full, dtype, use_atomic_cache);
+
   return gptq_marlin_gemm_impl(a, b_q_weight, b_scales, g_idx, perm, workspace, num_bits,
       (const int32_t*)size_m_tensor.data_ptr(), size_m, size_n, size_k, sms, is_k_full, dtype, use_atomic_cache);
 }
@@ -291,6 +296,8 @@ torch::Tensor gptq_marlin_gemm_legacy(torch::Tensor& a, torch::Tensor& b_q_weigh
                                int64_t size_k, bool is_k_full,
                                at::ScalarType dtype=torch::kBFloat16,
                                bool use_atomic_cache = true) {
+  DEBUG_TRACE_PARAMS(a, b_q_weight, b_scales, g_idx, perm, workspace, num_bits, size_m, size_n, size_k, is_k_full, dtype, use_atomic_cache);
+	DEBUG_DUMP_PARAMS(a, b_q_weight, b_scales, g_idx, perm, workspace, num_bits, size_m, size_n, size_k, is_k_full, dtype, use_atomic_cache);
   return gptq_marlin_gemm_impl(a, b_q_weight, b_scales, g_idx, perm, workspace, num_bits,
       nullptr, size_m, size_n, size_k, -1, is_k_full, dtype, use_atomic_cache);
 }

@@ -1,6 +1,10 @@
 
 #include <cuda_fp16.h>
 #include "process_interface.h"
+
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
+
 // NV12  是yyyy....uvuvuv...  yuv420p  是 yyyyy...uuu....vvv...   3plan
 //yuv2rgb+normalize+permute 
 
@@ -202,6 +206,8 @@ __global__ void fused_preprocess_yuv420_Kernel(const uint8_t* __restrict yuv420D
 
 void fused_preprocess_nv12(const uint8_t* __restrict nv12Data, float* __restrict outputData, int width, int height, float scale, cudaStream_t stream)
 {
+    DEBUG_TRACE_PARAMS(nv12Data, outputData, width, height, scale, stream);
+    DEBUG_DUMP_PARAMS(nv12Data, outputData, width, height, scale, stream);
     constexpr int num_threads = 512;
     int u_width = width / 2;
     int u_height = height / 2;
@@ -211,6 +217,8 @@ void fused_preprocess_nv12(const uint8_t* __restrict nv12Data, float* __restrict
 
 void fused_preprocess_yuv420(const uint8_t* __restrict yuv420Data, float* __restrict outputData, int width, int height, float scale, cudaStream_t stream)
 {
+    DEBUG_TRACE_PARAMS(yuv420Data, outputData, width, height, scale, stream);
+    DEBUG_DUMP_PARAMS(yuv420Data, outputData, width, height, scale, stream);
     constexpr int num_threads = 512;
     int u_width = width / 2;
     int u_height = height / 2;

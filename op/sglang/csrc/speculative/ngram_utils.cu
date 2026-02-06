@@ -8,6 +8,9 @@
 #include "pytorch_extension_utils_rocm.h"
 #endif
 
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
+
 // tree_mask: [bs * draft_token_num * draft_token_num]
 // verified_seq_len: [bs]
 // positions: [bs * draft_token_num]
@@ -90,6 +93,8 @@ void reconstruct_indices_from_tree_mask(
     at::Tensor retrive_next_sibling,
     int64_t batch_size,
     int64_t draft_token_num) {
+  DEBUG_TRACE_PARAMS(tree_mask, verified_seq_len, positions, retrive_index, retrive_next_token, retrive_next_sibling, batch_size, draft_token_num);
+  DEBUG_DUMP_PARAMS(tree_mask, verified_seq_len, positions, retrive_index, retrive_next_token, retrive_next_sibling, batch_size, draft_token_num);
   dim3 grid(batch_size);
   dim3 block(draft_token_num);
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();

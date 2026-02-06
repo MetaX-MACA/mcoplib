@@ -15,6 +15,8 @@
  */
 
 #include <torch/all.h>
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
 
 void cutlass_scaled_fp4_mm(torch::Tensor& D, torch::Tensor const& A,
                            torch::Tensor const& B, torch::Tensor const& A_sf,
@@ -27,5 +29,7 @@ void cutlass_scaled_fp4_mm(torch::Tensor& D, torch::Tensor const& A,
 }
 
 bool cutlass_scaled_mm_supports_fp4(int64_t cuda_device_capability) {
+  DEBUG_TRACE_PARAMS(cuda_device_capability);
+  DEBUG_DUMP_PARAMS(cuda_device_capability);
   return false;
 }

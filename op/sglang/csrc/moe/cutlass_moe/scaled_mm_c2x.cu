@@ -11,6 +11,8 @@
 #else
 #include "cutlass/cutlass.h"
 #endif
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
 
 
 int64_t cutlass_moe_mm_gemm_kernel_m_w8a8_sm75(int64_t num_valid_tokens, int64_t N, int64_t K, int64_t group) {
@@ -111,6 +113,8 @@ int64_t cutlass_moe_mm_gemm_kernel_m_w8a8(int64_t num_valid_tokens,
                                           int64_t K, 
                                           int64_t group) 
 {
+  DEBUG_TRACE_PARAMS(num_valid_tokens, N, K, group);
+  DEBUG_DUMP_PARAMS(num_valid_tokens, N, K, group);
   return cutlass_moe_mm_gemm_kernel_m_w8a8_sm75(num_valid_tokens, N, K, group);
 }
 
@@ -130,7 +134,8 @@ void cutlass_moe_mm_w8a8(torch::Tensor const& a,
                          int64_t topk, 
                          bool mul_routed_weight) 
 {
-
+  DEBUG_TRACE_PARAMS(a, b, c, a_scales, b_scales, moe_weight, token_ids, expert_ids, num_tokens_post_padded, N, K, EM, num_valid_tokens, topk, mul_routed_weight);
+  DEBUG_DUMP_PARAMS(a, b, c, a_scales, b_scales, moe_weight, token_ids, expert_ids, num_tokens_post_padded, N, K, EM, num_valid_tokens, topk, mul_routed_weight);
   cutlass_moe_mm_w8a8_sm75(a, b, c, a_scales, b_scales, moe_weight, token_ids, expert_ids,
                            num_tokens_post_padded, N, K, EM, num_valid_tokens, topk, mul_routed_weight);
 }

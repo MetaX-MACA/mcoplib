@@ -6,6 +6,8 @@
 
 #include "scaled_mm_c2x.cu"
 #include "cutlass_extensions/common.hpp"
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
 
 int32_t get_sm_version_num() {
   int32_t major_capability, minor_capability;
@@ -187,6 +189,8 @@ void cutlass_scaled_mm(torch::Tensor& c, torch::Tensor const& a,
                        torch::Tensor const& b, torch::Tensor const& a_scales,
                        torch::Tensor const& b_scales,
                        std::optional<torch::Tensor> const& bias) {
+  DEBUG_TRACE_PARAMS(c, a, b, a_scales, b_scales, bias);
+  DEBUG_DUMP_PARAMS(c, a, b, a_scales, b_scales, bias);
 #ifdef USE_MACA
   cutlass_scaled_mm_sm75(c, a, b, a_scales, b_scales, bias);
 #else               
@@ -365,6 +369,8 @@ void cutlass_scaled_mm_azp(torch::Tensor& c, torch::Tensor const& a,
                            torch::Tensor const& azp_adj,
                            std::optional<torch::Tensor> const& azp,
                            std::optional<torch::Tensor> const& bias) {
+  DEBUG_TRACE_PARAMS(c, a, b, a_scales, b_scales, azp_adj, azp, bias);
+  DEBUG_DUMP_PARAMS(c, a, b, a_scales, b_scales, azp_adj, azp, bias);
 
   // Checks for conformality
   TORCH_CHECK(a.dim() == 2 && b.dim() == 2 && c.dim() == 2);

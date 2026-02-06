@@ -15,6 +15,8 @@
  */
 
 #include <torch/all.h>
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
 
 #if defined ENABLE_CUTLASS_MLA && ENABLE_CUTLASS_MLA
 void cutlass_mla_decode_sm100a(torch::Tensor const& out,
@@ -30,6 +32,8 @@ void cutlass_mla_decode(torch::Tensor const& out, torch::Tensor const& q_nope,
                         torch::Tensor const& kv_c_and_k_pe_cache,
                         torch::Tensor const& seq_lens,
                         torch::Tensor const& page_table, double scale) {
+  DEBUG_TRACE_PARAMS(out, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, scale);
+  DEBUG_DUMP_PARAMS(out, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, scale);
 #if defined ENABLE_CUTLASS_MLA && ENABLE_CUTLASS_MLA
   return cutlass_mla_decode_sm100a(out, q_nope, q_pe, kv_c_and_k_pe_cache,
                                    seq_lens, page_table, scale);

@@ -5,6 +5,8 @@
 #include <torch/torch.h>
 #include <cub/cub.cuh>
 #include "../kernel/utils.h"
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
 
 __device__ float warpReduceMax(float val) {
     for (int offset = 16; offset > 0; offset /= 2) {
@@ -127,6 +129,8 @@ std::tuple<at::Tensor, at::Tensor> scale_dynamic_quant(
     const at::Tensor& smooth_scales,
     at::ScalarType dst_dtype = at::ScalarType::Char
 ) {
+	DEBUG_TRACE_PARAMS(hidden_states, smooth_scales, dst_dtype);
+	DEBUG_DUMP_PARAMS(hidden_states, smooth_scales, dst_dtype);
     CHECK_DEVICE(hidden_states);
     CHECK_DEVICE(smooth_scales);
 

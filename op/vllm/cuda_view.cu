@@ -1,10 +1,14 @@
 #include <torch/all.h>
 #include <torch/cuda.h>
 #include <cuda_runtime.h>
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
 
 // This function assumes that `cpu_tensor` is a CPU tensor allocated with pinned
 // memory, and that UVA (Unified Virtual Addressing) is enabled.
 torch::Tensor get_cuda_view_from_cpu_tensor(torch::Tensor& cpu_tensor) {
+  DEBUG_TRACE_PARAMS(cpu_tensor);
+	DEBUG_DUMP_PARAMS(cpu_tensor);
   TORCH_CHECK(cpu_tensor.device().is_cpu(), "Input tensor must be on CPU");
 
   // Get raw host pointer from CPU tensor

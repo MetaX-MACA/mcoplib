@@ -4,6 +4,8 @@
 #include <torch/all.h>
 
 #include "cutlass_extensions/common.hpp"
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
 
 void cutlass_scaled_mm_sm75(torch::Tensor& c, torch::Tensor const& a,
                             torch::Tensor const& b,
@@ -20,14 +22,20 @@ void cutlass_scaled_mm_azp_sm75(torch::Tensor& c, torch::Tensor const& a,
                                 std::optional<torch::Tensor> const& bias);
 
 bool cutlass_scaled_mm_supports_fp8(int64_t cuda_device_capability) {
+  DEBUG_TRACE_PARAMS(cuda_device_capability);
+  DEBUG_DUMP_PARAMS(cuda_device_capability);
   return false;
 }
 
 bool cutlass_scaled_mm_supports_block_fp8(int64_t cuda_device_capability) {
+  DEBUG_TRACE_PARAMS(cuda_device_capability);
+  DEBUG_DUMP_PARAMS(cuda_device_capability);
   return false;
 }
 
 bool cutlass_group_gemm_supported(int64_t cuda_device_capability) {
+  DEBUG_TRACE_PARAMS(cuda_device_capability);
+  DEBUG_DUMP_PARAMS(cuda_device_capability);
   return false;
 }
 
@@ -35,6 +43,8 @@ void cutlass_scaled_mm(torch::Tensor& c, torch::Tensor const& a,
                        torch::Tensor const& b, torch::Tensor const& a_scales,
                        torch::Tensor const& b_scales,
                        std::optional<torch::Tensor> const& bias) {
+  DEBUG_TRACE_PARAMS(c, a, b, a_scales, b_scales, bias);
+  DEBUG_DUMP_PARAMS(c, a, b, a_scales, b_scales, bias);
   cutlass_scaled_mm_sm75(c, a, b, a_scales, b_scales, bias);
 }
 
@@ -88,6 +98,8 @@ void cutlass_scaled_mm_azp(torch::Tensor& c, torch::Tensor const& a,
                            torch::Tensor const& azp_adj,
                            std::optional<torch::Tensor> const& azp,
                            std::optional<torch::Tensor> const& bias) {
+  DEBUG_TRACE_PARAMS(c, a, b, a_scales, b_scales, azp_adj, azp, bias);
+  DEBUG_DUMP_PARAMS(c, a, b, a_scales, b_scales, azp_adj, azp, bias);
   // Checks for conformality
   TORCH_CHECK(a.dim() == 2 && b.dim() == 2 && c.dim() == 2);
   TORCH_CHECK(c.size(0) == a.size(0) && a.size(1) == b.size(0) &&

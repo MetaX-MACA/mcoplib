@@ -1,7 +1,8 @@
 #pragma once
 
 #include <ATen/ATen.h>
-#include <torch/extension.h>
+// #include <torch/extension.h>
+#include <torch/csrc/api/include/torch/types.h>
 #include <string>
 #include <sstream>
 #include <fstream>
@@ -726,10 +727,11 @@ inline void dump_params_simple(const char* function_name, const Args&... args) {
 #define PP_ARG_N( \
           _1, _2, _3, _4, _5, _6, _7, _8, _9, _10, \
          _11, _12, _13, _14, _15, _16, _17, _18, _19, _20, \
+         _21, _22, _23, _24, _25, _26, _27, _28, \
          N, ...) N
 
 #define PP_RSEQ_N() \
-         20, 19, 18, 17, 16, 15, 14, 13, 12, 11, \
+         28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11, \
          10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0
 
 // 宏重载选择器
@@ -915,6 +917,78 @@ inline void dump_params_simple(const char* function_name, const Args&... args) {
             constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10, #x11, #x12, #x13, #x14, #x15, #x16, #x17, #x18, #x19, #x20}; \
             std::vector<const char*> _names_vec(_names, _names + 20); \
             ::mcop::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20); \
+        } \
+    } while(0)
+
+#define DEBUG_DUMP_PARAMS_IMPL_21(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21) \
+    do { \
+        if (::mcop::debug::is_debug_enabled()) { \
+            constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10, #x11, #x12, #x13, #x14, #x15, #x16, #x17, #x18, #x19, #x20, #x21}; \
+            std::vector<const char*> _names_vec(_names, _names + 21); \
+            ::mcop::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21); \
+        } \
+    } while(0)
+
+#define DEBUG_DUMP_PARAMS_IMPL_22(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22) \
+    do { \
+        if (::mcop::debug::is_debug_enabled()) { \
+            constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10, #x11, #x12, #x13, #x14, #x15, #x16, #x17, #x18, #x19, #x20, #x21, #x22}; \
+            std::vector<const char*> _names_vec(_names, _names + 22); \
+            ::mcop::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22); \
+        } \
+    } while(0)
+
+#define DEBUG_DUMP_PARAMS_IMPL_23(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23) \
+    do { \
+        if (::mcop::debug::is_debug_enabled()) { \
+            constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10, #x11, #x12, #x13, #x14, #x15, #x16, #x17, #x18, #x19, #x20, #x21, #x22, #x23}; \
+            std::vector<const char*> _names_vec(_names, _names + 23); \
+            ::mcop::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23); \
+        } \
+    } while(0)
+
+#define DEBUG_DUMP_PARAMS_IMPL_24(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24) \
+    do { \
+        if (::mcop::debug::is_debug_enabled()) { \
+            constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10, #x11, #x12, #x13, #x14, #x15, #x16, #x17, #x18, #x19, #x20, #x21, #x22, #x23, #x24}; \
+            std::vector<const char*> _names_vec(_names, _names + 24); \
+            ::mcop::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24); \
+        } \
+    } while(0)
+
+#define DEBUG_DUMP_PARAMS_IMPL_25(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25) \
+    do { \
+        if (::mcop::debug::is_debug_enabled()) { \
+            constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10, #x11, #x12, #x13, #x14, #x15, #x16, #x17, #x18, #x19, #x20, #x21, #x22, #x23, #x24, #x25}; \
+            std::vector<const char*> _names_vec(_names, _names + 25); \
+            ::mcop::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25); \
+        } \
+    } while(0)
+
+#define DEBUG_DUMP_PARAMS_IMPL_26(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26) \
+    do { \
+        if (::mcop::debug::is_debug_enabled()) { \
+            constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10, #x11, #x12, #x13, #x14, #x15, #x16, #x17, #x18, #x19, #x20, #x21, #x22, #x23, #x24, #x25, #x26}; \
+            std::vector<const char*> _names_vec(_names, _names + 26); \
+            ::mcop::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26); \
+        } \
+    } while(0)
+
+#define DEBUG_DUMP_PARAMS_IMPL_27(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27) \
+    do { \
+        if (::mcop::debug::is_debug_enabled()) { \
+            constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10, #x11, #x12, #x13, #x14, #x15, #x16, #x17, #x18, #x19, #x20, #x21, #x22, #x23, #x24, #x25, #x26, #x27}; \
+            std::vector<const char*> _names_vec(_names, _names + 27); \
+            ::mcop::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27); \
+        } \
+    } while(0)
+
+#define DEBUG_DUMP_PARAMS_IMPL_28(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28) \
+    do { \
+        if (::mcop::debug::is_debug_enabled()) { \
+            constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10, #x11, #x12, #x13, #x14, #x15, #x16, #x17, #x18, #x19, #x20, #x21, #x22, #x23, #x24, #x25, #x26, #x27, #x28}; \
+            std::vector<const char*> _names_vec(_names, _names + 28); \
+            ::mcop::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28); \
         } \
     } while(0)
 

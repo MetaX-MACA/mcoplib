@@ -6,6 +6,8 @@
 #include <c10/cuda/CUDAStream.h>
 #include <cuda.h>
 #include <torch/all.h>
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
 
 // Save the start index of each block in the given range into block_offset.
 // Returns the updated block count.
@@ -210,6 +212,8 @@ void convert_vertical_slash_indexes(
     int64_t block_size_M,
     int64_t block_size_N,
     bool causal) {
+  DEBUG_TRACE_PARAMS(block_count, block_offset, column_count, column_index, q_seqlens, kv_seqlens, vertical_indexes, slash_indexes, context_size, block_size_M, block_size_N, causal);
+  DEBUG_DUMP_PARAMS(block_count, block_offset, column_count, column_index, q_seqlens, kv_seqlens, vertical_indexes, slash_indexes, context_size, block_size_M, block_size_N, causal);
   cudaSetDevice(q_seqlens.get_device());
 
   int64_t batch_size = slash_indexes.size(0);
@@ -432,6 +436,8 @@ void convert_vertical_slash_indexes_mergehead(
     int64_t block_size_M,
     int64_t block_size_N,
     bool causal) {
+  DEBUG_TRACE_PARAMS(block_count, block_offset, column_count, column_index, q_seqlens, kv_seqlens, vertical_indexes, slash_indexes, vertical_indices_count, slash_indices_count, context_size, block_size_M, block_size_N, causal);
+  DEBUG_DUMP_PARAMS(block_count, block_offset, column_count, column_index, q_seqlens, kv_seqlens, vertical_indexes, slash_indexes, vertical_indices_count, slash_indices_count, context_size, block_size_M, block_size_N, causal);
   cudaSetDevice(q_seqlens.get_device());
 
   int batch_size = slash_indexes.size(0);

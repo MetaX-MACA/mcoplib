@@ -6,10 +6,28 @@
 #include <cstdlib>
 #include <optional>
 #include <ATen/ATen.h> // 确保包含 ATen
+#include <utility>
+#include <iostream>
+
+#ifdef scalar_type
+#undef scalar_type
+#endif
 
 // ==========================================
 // Part 1: 辅助工具函数 (保持不变)
 // ==========================================
+namespace std {
+    // 为 tuple 提供流支持
+    template<class... Args>
+    std::ostream& operator<<(std::ostream& os, const std::tuple<Args...>& t) {
+        os << "(";
+        std::apply([&os](auto&&... args) {
+            size_t n = 0;
+            ((os << (n++ == 0 ? "" : ", ") << args), ...);
+        }, t);
+        return os << ")";
+    }
+}
 namespace debug_utils {
     inline bool is_trace_enabled() {
         static const char* env_p = std::getenv("MCOP_DEBUG_TRACE");
@@ -62,8 +80,8 @@ namespace debug_utils {
 // ==========================================
 
 // 1. 计数器宏：支持自动推导 0~20 个参数
-#define GET_ARG_COUNT(...) GET_ARG_COUNT_INNER(__VA_ARGS__, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1)
-#define GET_ARG_COUNT_INNER(_1, _2, _3, _4, _5, _6, _7, _8, _9, _10, _11, _12, _13, _14, _15, _16, _17, _18, _19, _20, N, ...) N
+#define GET_ARG_COUNT(...) GET_ARG_COUNT_INNER(__VA_ARGS__, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1)
+#define GET_ARG_COUNT_INNER(_1, _2, _3, _4, _5, _6, _7, _8, _9, _10, _11, _12, _13, _14, _15, _16, _17, _18, _19, _20, _21, _22, _23, _24, _25, _26, _27, _28, N, ...) N
 
 // 2. 拼接宏
 #define CONCAT(A, B) CONCAT_INNER(A, B)
@@ -93,6 +111,14 @@ namespace debug_utils {
 #define FOR_EACH_18(x, ...) debug_utils::log_argument(#x, x, false); FOR_EACH_17(__VA_ARGS__)
 #define FOR_EACH_19(x, ...) debug_utils::log_argument(#x, x, false); FOR_EACH_18(__VA_ARGS__)
 #define FOR_EACH_20(x, ...) debug_utils::log_argument(#x, x, false); FOR_EACH_19(__VA_ARGS__)
+#define FOR_EACH_21(x, ...) debug_utils::log_argument(#x, x, false); FOR_EACH_20(__VA_ARGS__)
+#define FOR_EACH_22(x, ...) debug_utils::log_argument(#x, x, false); FOR_EACH_21(__VA_ARGS__)
+#define FOR_EACH_23(x, ...) debug_utils::log_argument(#x, x, false); FOR_EACH_22(__VA_ARGS__)
+#define FOR_EACH_24(x, ...) debug_utils::log_argument(#x, x, false); FOR_EACH_23(__VA_ARGS__)
+#define FOR_EACH_25(x, ...) debug_utils::log_argument(#x, x, false); FOR_EACH_24(__VA_ARGS__)
+#define FOR_EACH_26(x, ...) debug_utils::log_argument(#x, x, false); FOR_EACH_25(__VA_ARGS__)
+#define FOR_EACH_27(x, ...) debug_utils::log_argument(#x, x, false); FOR_EACH_26(__VA_ARGS__)
+#define FOR_EACH_28(x, ...) debug_utils::log_argument(#x, x, false); FOR_EACH_27(__VA_ARGS__)
 
 // 4. 最终分发宏
 #define FOR_EACH_(N, ...) CONCAT(FOR_EACH_, N)(__VA_ARGS__)

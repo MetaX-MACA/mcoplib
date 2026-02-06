@@ -4,6 +4,8 @@
 
 #include "cuda_compat.h"
 #include "dispatch_utils.h"
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
 
 namespace vllm {
 
@@ -145,6 +147,8 @@ void rotary_embedding(
     int64_t head_size,
     torch::Tensor& cos_sin_cache,  // [max_position, rot_dim]
     bool is_neox) {
+  DEBUG_TRACE_PARAMS(positions, query, key, head_size, cos_sin_cache, is_neox);
+  DEBUG_DUMP_PARAMS(positions, query, key, head_size, cos_sin_cache, is_neox);
   // num_tokens = batch_size * seq_len
   int64_t num_tokens = positions.numel();
   int positions_ndim = positions.dim();
@@ -233,6 +237,8 @@ void batched_rotary_embedding(
     bool is_neox, int64_t rot_dim,
     torch::Tensor& cos_sin_cache_offsets  // [num_tokens] or [batch_size]
 ) {
+  DEBUG_TRACE_PARAMS(positions, query, key, head_size, cos_sin_cache, is_neox, rot_dim, cos_sin_cache_offsets);
+  DEBUG_DUMP_PARAMS(positions, query, key, head_size, cos_sin_cache, is_neox, rot_dim, cos_sin_cache_offsets);
   // num_tokens = batch_size * seq_len
   int64_t num_tokens = cos_sin_cache_offsets.size(0);
   TORCH_CHECK(

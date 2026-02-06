@@ -15,6 +15,8 @@
 
 #include "selective_scan.h"
 #include "static_switch.h"
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
 
 template<int kNThreads_, int kNItems_, int kNRows_, bool kIsEvenLen_,
          bool kIsVariableB_, bool kIsVariableC_,
@@ -505,6 +507,8 @@ void selective_scan_fwd(const torch::Tensor &u, const torch::Tensor &delta,
                   // used to identify padding entries if cache_indices provided
                   // in case of padding, the kernel will return early
                   int64_t pad_slot_id) {
+  DEBUG_TRACE_PARAMS(&u, &delta, &A, &B, &C, &D_, &z_, &delta_bias_, delta_softplus, &query_start_loc, &cache_indices, &has_initial_state, &ssm_states, pad_slot_id);
+  DEBUG_DUMP_PARAMS(&u, &delta, &A, &B, &C, &D_, &z_, &delta_bias_, delta_softplus, &query_start_loc, &cache_indices, &has_initial_state, &ssm_states, pad_slot_id);
     auto input_type = u.scalar_type();
     auto weight_type = A.scalar_type();
     TORCH_CHECK(input_type == at::ScalarType::Float || input_type == at::ScalarType::Half || input_type == at::ScalarType::BFloat16);

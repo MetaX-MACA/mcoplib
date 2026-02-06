@@ -24,6 +24,8 @@
 #include "cuda_compat.h"
 #include "dispatch_utils.h"
 #include "type_convert.cuh"
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
 
 #define CHECK_TYPE(x, st)                                              \
   TORCH_CHECK(x.scalar_type() == st, #x " dtype is ", x.scalar_type(), \
@@ -376,6 +378,8 @@ void fused_qk_norm_rope(
     bool is_neox,                  // Whether RoPE is applied in Neox style
     torch::Tensor& position_ids    // Position IDs for RoPE [num_tokens]
 ) {
+  DEBUG_TRACE_PARAMS(qkv, num_heads_q, num_heads_k, num_heads_v, head_dim, eps, q_weight, k_weight, cos_sin_cache, is_neox, position_ids);
+  DEBUG_DUMP_PARAMS(qkv, num_heads_q, num_heads_k, num_heads_v, head_dim, eps, q_weight, k_weight, cos_sin_cache, is_neox, position_ids);
   // Input validation
   CHECK_INPUT(qkv);
   CHECK_INPUT(position_ids);

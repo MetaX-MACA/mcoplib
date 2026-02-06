@@ -18,6 +18,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
+
 
 namespace {
 
@@ -437,6 +440,8 @@ void fast_topk_transform_interface(
     const at::Tensor& src_page_table,
     const at::Tensor& cu_seqlens_q,
     std::optional<at::Tensor> row_starts_opt) {
+  DEBUG_TRACE_PARAMS(score, lengths, dst_page_table, src_page_table, cu_seqlens_q, row_starts_opt);
+  DEBUG_DUMP_PARAMS(score, lengths, dst_page_table, src_page_table, cu_seqlens_q, row_starts_opt);
   CHECK_CUDA(score);
   CHECK_CUDA(lengths);
   CHECK_CUDA(dst_page_table);
@@ -492,6 +497,8 @@ void fast_topk_transform_ragged_interface(
     at::Tensor& topk_indices_ragged,
     const at::Tensor& topk_indices_offset,
     std::optional<at::Tensor> row_starts_opt) {
+  DEBUG_TRACE_PARAMS(score, lengths, topk_indices_ragged, topk_indices_offset, row_starts_opt);
+  DEBUG_DUMP_PARAMS(score, lengths, topk_indices_ragged, topk_indices_offset, row_starts_opt);
   CHECK_CUDA(score);
   CHECK_CUDA(lengths);
   CHECK_CUDA(topk_indices_ragged);
