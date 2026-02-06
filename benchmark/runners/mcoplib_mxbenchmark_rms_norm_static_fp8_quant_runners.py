@@ -12,8 +12,6 @@ class Rms_norm_static_fp8_quant_runner(OpBenchmarkBase):
         self.batch_size = config.get("batch_size", 16384)
         self.hidden_size = config.get("hidden_size", 4096)
         self.epsilon = config.get("epsilon", 1e-6)
-        
-        # 检测环境是否支持 float8_e4m3fn，如果不支持则使用 uint8 占位以进行性能测试
         if hasattr(torch, 'float8_e4m3fn'):
             self.out_dtype = torch.float8_e4m3fn
         else:
@@ -23,19 +21,12 @@ class Rms_norm_static_fp8_quant_runner(OpBenchmarkBase):
         state.add_summary("Op", self.name)
         state.add_summary("dtype", self.config.get("dtype", str(self.dtype)))
         state.add_summary("Shape", f"({self.batch_size} {self.hidden_size})")
-        
         total_elements = self.batch_size * self.hidden_size
         state.add_element_count(total_elements)
-        
-        # Bytes calculation
-        in_bytes = 2 if self.dtype == torch.float16 else 4 # FP16/BF16
-        out_bytes = 1 # FP8 (1 byte)
-        
-        # Reads: Input (N*H*2) + Weight (H*2) + Scale (4 bytes)
-        # Writes: Output (N*H*1)
+        in_bytes = 2 if self.dtype == torch.float16 else 4
+        out_bytes = 1
         read_vol = (total_elements * in_bytes) + (self.hidden_size * in_bytes) + 4
         write_vol = total_elements * out_bytes
-        
         state.add_global_memory_reads(read_vol)
         state.add_global_memory_writes(write_vol)
 
@@ -43,56 +34,29 @@ class Rms_norm_static_fp8_quant_runner(OpBenchmarkBase):
         with torch.cuda.stream(tc_s):
             dev = f'cuda:{dev_id}'
             shape = (self.batch_size, self.hidden_size)
-            
             inp = torch.randn(shape, dtype=self.dtype, device=dev)
             weight = torch.ones(self.hidden_size, dtype=self.dtype, device=dev)
             scale = torch.tensor([1.0], dtype=torch.float32, device=dev)
-            
-            # Output tensor (FP8)
             out = torch.empty(shape, dtype=self.out_dtype, device=dev)
-            
         return self.make_launcher(dev_id, torch.ops._C.rms_norm_static_fp8_quant, 
                                   out, inp, weight, scale, self.epsilon)
 
     def run_verification(self, dev_id):
-        # 验证需要 PyTorch 环境支持 FP8 类型
         if not hasattr(torch, 'float8_e4m3fn'):
-            print(f"\n[Verify] Warning: torch.float8_e4m3fn not found. Skipping accuracy check.")
-            # 返回 True 跳过检查，cos_dist 返回 0
             return True, 0.0
-
         dev = f'cuda:{dev_id}'
         shape = (self.batch_size, self.hidden_size)
-        
         inp = torch.randn(shape, dtype=self.dtype, device=dev)
         weight = torch.randn(self.hidden_size, dtype=self.dtype, device=dev)
-        # 使用随机 scale
         scale_val = 0.5
         scale = torch.tensor([scale_val], dtype=torch.float32, device=dev)
-        
         out_op = torch.empty(shape, dtype=torch.float8_e4m3fn, device=dev)
-        
-        # Run Op
         torch.ops._C.rms_norm_static_fp8_quant(out_op, inp, weight, scale, self.epsilon)
-        
-        # Ref Logic
         inp_f = inp.float()
         w_f = weight.float()
-        
-        # 1. RMS Norm
         rms = torch.sqrt(inp_f.pow(2).mean(dim=-1, keepdim=True) + self.epsilon)
         normed = (inp_f / rms) * w_f
-        
-        # 2. Quantization
-        # 文档公式暗示: result = scaled_fp8_conversion(y, scale^-1)
-        # 常见实现为 y / scale (其中 scale 为最大值统计量等)
-        # 这里模拟: (normed / scale_val).to(fp8)
         out_ref_fp8 = (normed / scale_val).to(torch.float8_e4m3fn)
-        
-        # 转换回 Float 进行对比
         out_op_f = out_op.float()
         out_ref_f = out_ref_fp8.float()
-        
-        # 由于 FP8 量化引入较大噪声，且不同的 rounding 策略可能导致差异，
-        # 这里设置一个相对宽松的阈值 (0.95)
         return self.check_diff(out_op_f, out_ref_f, threshold=0.95)

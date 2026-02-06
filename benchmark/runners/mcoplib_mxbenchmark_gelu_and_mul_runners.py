@@ -19,18 +19,11 @@ class Gelu_and_mul_runner(OpBenchmarkBase):
         state.add_summary("Op", self.name)
         state.add_summary("dtype", str(self.dtype))
         state.add_summary("Shape", f"(B{self.batch_size}_S{self.seq_len}_H{self.hidden_dim})")
-        
-        # Output elements: B * S * H
         total_elements = self.batch_size * self.seq_len * self.hidden_dim
         state.add_element_count(total_elements)
-        
         element_size = 2 if self.dtype == torch.float16 else 4
-        
-        # Reads: Input is (B, S, 2*H)
         input_size = (self.batch_size * self.seq_len * 2 * self.hidden_dim) * element_size
-        # Writes: Output is (B, S, H)
         output_size = total_elements * element_size
-        
         state.add_global_memory_reads(input_size)
         state.add_global_memory_writes(output_size)
 
@@ -38,10 +31,8 @@ class Gelu_and_mul_runner(OpBenchmarkBase):
         with torch.cuda.stream(tc_s):
             dev = f'cuda:{dev_id}'
             input_dim = 2 * self.hidden_dim
-            
             input_tensor = torch.randn(self.batch_size, self.seq_len, input_dim, dtype=self.dtype, device=dev)
             output_tensor = torch.empty(self.batch_size, self.seq_len, self.hidden_dim, dtype=self.dtype, device=dev)
-            
         return self.make_launcher(
             dev_id, 
             torch.ops._C.gelu_and_mul, 
@@ -52,16 +43,10 @@ class Gelu_and_mul_runner(OpBenchmarkBase):
     def run_verification(self, dev_id):
         dev = f'cuda:{dev_id}'
         input_dim = 2 * self.hidden_dim
-        
         input_tensor = torch.randn(self.batch_size, self.seq_len, input_dim, dtype=self.dtype, device=dev)
         output_tensor = torch.empty(self.batch_size, self.seq_len, self.hidden_dim, dtype=self.dtype, device=dev)
-        
         torch.ops._C.gelu_and_mul(output_tensor, input_tensor)
-        
-        # Reference Logic: split last dim -> gelu(x) * y
         x, y = input_tensor.chunk(2, dim=-1)
         expected = F.gelu(x.float(), approximate='none') * y.float()
-        
         out_ref = expected.to(self.dtype)
-        
         return self.check_diff(output_tensor, out_ref)

@@ -1,0 +1,9 @@
+{
+    "device_id": 0,
+    "device_name": "MetaX C500",
+    "rank": 0,
+    "world_size": 2,
+    "full_nvlink": true,
+    "rank_data_size": 8388608,
+    "samples": 100
+}

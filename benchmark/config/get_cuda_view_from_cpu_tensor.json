@@ -1,7 +1,7 @@
 {
     "device_id": 0,
     "device_name": "MetaX C280",
-    "size": 1048576,
+    "size": 67108864,
     "dtype": "float32",
-    "samples": 100000
+    "samples": 50000
 }

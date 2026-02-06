@@ -1,0 +1,12 @@
+{
+    "device_id": 0,
+    "device_name": "MetaX C280",
+    "dtype": "bfloat16",
+    "num_tokens": 4096,
+    "num_experts": 8,
+    "topk": 2,
+    "K": 4096,
+    "N": 11008,
+    "group_size": 64,
+    "samples": 1000
+}

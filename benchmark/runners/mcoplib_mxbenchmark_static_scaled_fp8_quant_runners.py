@@ -14,15 +14,10 @@ class Static_scaled_fp8_quant_runner(OpBenchmarkBase):
         state.add_summary("Op", self.name)
         state.add_summary("dtype", "fp16->fp8")
         state.add_summary("Shape", f"({self.rows} {self.cols})")
-        
         total_elements = self.rows * self.cols
         state.add_element_count(total_elements)
-        
-        # Read: Input (2 bytes) + Scale (4 bytes scalar, negligible)
-        # Write: Output (1 byte)
         read_bytes = total_elements * 2
         write_bytes = total_elements * 1
-        
         state.add_global_memory_reads(read_bytes)
         state.add_global_memory_writes(write_bytes)
 
@@ -30,34 +25,23 @@ class Static_scaled_fp8_quant_runner(OpBenchmarkBase):
         with torch.cuda.stream(tc_s):
             dev = f'cuda:{dev_id}'
             shape = (self.rows, self.cols)
-            
             input_tensor = torch.randn(shape, dtype=self.input_dtype, device=dev)
             scale = torch.tensor([1.0], dtype=torch.float32, device=dev)
             output_tensor = torch.empty(shape, dtype=self.output_dtype, device=dev)
-            
         return self.make_launcher(
-            dev_id, 
-            torch.ops._C.static_scaled_fp8_quant, 
-            output_tensor, 
-            input_tensor, 
+            dev_id,
+            torch.ops._C.static_scaled_fp8_quant,
+            output_tensor,
+            input_tensor,
             scale
         )
 
     def run_verification(self, dev_id):
         dev = f'cuda:{dev_id}'
         shape = (self.rows, self.cols)
-        
         input_tensor = torch.randn(shape, dtype=self.input_dtype, device=dev)
-        # 使用非1.0的scale以更好地验证逻辑
         scale = torch.tensor([2.0], dtype=torch.float32, device=dev)
         output_tensor = torch.empty(shape, dtype=self.output_dtype, device=dev)
-        
-        # 运行算子
         torch.ops._C.static_scaled_fp8_quant(output_tensor, input_tensor, scale)
-        
-        # 计算参考结果 (Ref Logic: Input / Scale -> Cast to FP8)
-        # PyTorch 的 to() 方法处理了 saturation
         ref_tensor = (input_tensor.float() / scale).to(self.output_dtype)
-        
-        # 比较时转回 float
         return self.check_diff(output_tensor.float(), ref_tensor.float())

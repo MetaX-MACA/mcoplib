@@ -17,21 +17,12 @@ class Moe_align_block_size_runner(OpBenchmarkBase):
         self.dtype = torch.int32 
 
     def define_metrics(self, state):
-        # --- 1. 通用列定义 (与其他算子对齐) ---
         state.add_summary("Op", self.name)
-        state.add_summary("dtype", "int32") # 显式添加 dtype
-        
-        # 将维度合并为标准的 Shape 字符串格式: (Tokens, Experts, BlockSize)
+        state.add_summary("dtype", "int32")
         shape_str = f"({self.num_tokens} {self.num_experts} {self.block_size})"
         state.add_summary("Shape", shape_str)
-        
-        # --- 2. 吞吐量计算指标 ---
         total_ids = self.num_tokens * self.top_k
         state.add_element_count(total_ids)
-        
-        # --- 3. 显存访问估算 ---
-        # Read: topk_ids
-        # Write: sorted_ids, expert_ids, num_tokens_post_pad
         max_padded = total_ids + (self.num_experts * self.block_size)
         bytes_read = total_ids * 4
         bytes_write = (max_padded * 4) + (max_padded // self.block_size * 4) + 4
@@ -41,20 +32,13 @@ class Moe_align_block_size_runner(OpBenchmarkBase):
     def prepare_and_get_launcher(self, dev_id, tc_s):
         with torch.cuda.stream(tc_s):
             dev = f'cuda:{dev_id}'
-            # 1. 准备输入：topk_ids 保持 2D 形状 [N, K]
             topk_ids = torch.randint(0, self.num_experts, (self.num_tokens, self.top_k), 
                                      dtype=self.dtype, device=dev)
-            
-            # 2. 准备输出张量空间
             total_elements = topk_ids.numel()
             max_num_tokens_padded = total_elements + self.num_experts * self.block_size
-            
-            # 初始化为 total_elements (numel) 以匹配 Reference 和 Padding 行为
             sorted_token_ids = torch.full((max_num_tokens_padded,), total_elements, dtype=torch.int32, device=dev)
             experts_ids = torch.full((max_num_tokens_padded // self.block_size,), -1, dtype=torch.int32, device=dev)
             num_tokens_post_pad = torch.zeros(1, dtype=torch.int32, device=dev)
-
-        # 调用算子：严格传递 7 个参数，最后一个传 None
         return self.make_launcher(dev_id, torch.ops._moe_C.moe_align_block_size, 
                                  topk_ids, self.num_experts, self.block_size, 
                                  sorted_token_ids, experts_ids, num_tokens_post_pad, 
@@ -62,52 +46,35 @@ class Moe_align_block_size_runner(OpBenchmarkBase):
 
     def run_verification(self, dev_id):
         dev = f'cuda:{dev_id}'
-        # 初始化输入
         topk_ids = torch.randint(0, self.num_experts, (self.num_tokens, self.top_k), 
                                  dtype=self.dtype, device=dev)
-        
         total_elements = topk_ids.numel()
         max_num_tokens_padded = total_elements + self.num_experts * self.block_size
-        
-        # 初始化输出
         sorted_token_ids = torch.full((max_num_tokens_padded,), total_elements, dtype=torch.int32, device=dev)
         experts_ids = torch.full((max_num_tokens_padded // self.block_size,), -1, dtype=torch.int32, device=dev)
         num_tokens_post_pad = torch.zeros(1, dtype=torch.int32, device=dev)
-
-        # 执行算子
         torch.ops._moe_C.moe_align_block_size(topk_ids, self.num_experts, self.block_size, 
                                 sorted_token_ids, experts_ids, num_tokens_post_pad, 
                                 None)
-        
-        # --- CPU 参考实现 ---
         topk_cpu = topk_ids.cpu().flatten()
         num_el = topk_cpu.numel()
-        
         expert_counts = torch.bincount(topk_cpu, minlength=self.num_experts)
         padded_counts = ((expert_counts + self.block_size - 1) // self.block_size) * self.block_size
         total_padded = padded_counts.sum().item()
-        
         ref_sorted_token_ids = torch.full((max_num_tokens_padded,), num_el, dtype=torch.int32)
         ref_experts_ids = torch.full((max_num_tokens_padded // self.block_size,), -1, dtype=torch.int32)
-        
         current_offset = 0
         for e_id in range(self.num_experts):
             indices = (topk_cpu == e_id).nonzero(as_tuple=True)[0]
             count = len(indices)
-            
             if count > 0:
                 ref_sorted_token_ids[current_offset : current_offset + count] = indices
-            
             num_blocks = padded_counts[e_id].item() // self.block_size
             block_start = current_offset // self.block_size
             if num_blocks > 0:
                 ref_experts_ids[block_start : block_start + num_blocks] = e_id
-            
             current_offset += padded_counts[e_id].item()
-        
         ref_num_tokens_post_pad = torch.tensor([total_padded], dtype=torch.int32)
-
-        # --- 对 GPU 结果进行分段排序 ---
         gpu_sorted_ids_cpu = sorted_token_ids.cpu()
         current_offset = 0
         for e_id in range(self.num_experts):
@@ -117,18 +84,14 @@ class Moe_align_block_size_runner(OpBenchmarkBase):
                 sorted_segment, _ = torch.sort(segment)
                 gpu_sorted_ids_cpu[current_offset : current_offset + length] = sorted_segment
             current_offset += length
-
-        # --- 最终对比 ---
         actual_res = torch.cat([
             gpu_sorted_ids_cpu.float(),
             experts_ids.cpu().float(),
             num_tokens_post_pad.cpu().float()
         ])
-        
         expected_res = torch.cat([
             ref_sorted_token_ids.float(),
             ref_experts_ids.cpu().float(),
             ref_num_tokens_post_pad.float()
         ])
-
         return self.check_diff(actual_res, expected_res)

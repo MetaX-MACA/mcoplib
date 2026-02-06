@@ -30,11 +30,9 @@ class Convert_vertical_slash_indexes_mergehead_runner(OpBenchmarkBase):
         state.add_element_count(total_out)
         
         element_size = 4
-        # Inputs: seqlens(2*B) + indexes(B*H*(V+S)) + counts(2*H)
         size_in = (self.batch_size * 2) + \
                   (self.batch_size * self.num_heads * (self.nnz_v + self.nnz_s)) + \
                   (self.num_heads * 2)
-        # Outputs: block/col counts + block/col offsets
         size_out = (self.batch_size * self.num_heads * self.num_rows) * (2 + self.nnz_s + self.nnz_v)
         
         state.add_global_memory_reads(size_in * element_size)
@@ -81,17 +79,13 @@ class Convert_vertical_slash_indexes_mergehead_runner(OpBenchmarkBase):
         block_count = args[0]
         column_count = args[2]
         
-        # 验证逻辑：检查输出是否在有效范围内
-        # 1. 检查是否有数据写入 (非全0)
         has_data = (block_count.sum() + column_count.sum()) > 0
-        # 2. 检查数值是否越界 (count 不应超过 nnz 大小)
         valid_block = (block_count <= self.nnz_s).all()
         valid_col = (column_count <= self.nnz_v).all()
         
         if has_data and valid_block and valid_col:
             return True, block_count.float().mean().item()
         else:
-            # 构造差异以报错
             ref = block_count.clone()
             if not valid_block: ref += 999
             return self.check_diff(block_count, ref)

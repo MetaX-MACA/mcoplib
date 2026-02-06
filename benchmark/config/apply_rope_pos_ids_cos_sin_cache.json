@@ -1,0 +1,14 @@
+{
+    "device_id": 0,
+    "device_name": "MetaX C500",
+    "dtype": "bfloat16",
+    "nnz": 81920,
+    "num_q_heads": 32,
+    "num_kv_heads": 32,
+    "head_dim": 128,
+    "rotary_dim": 128,
+    "max_seq_len": 32768,
+    "interleave": false,
+    "enable_pdl": false,
+    "samples": 8000
+}

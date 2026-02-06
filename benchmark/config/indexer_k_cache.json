@@ -1,5 +1,6 @@
 {
     "device_id": 0,
+    "device_name": "MetaX C500",
     "num_tokens": 131072,
     "block_size": 16,
     "head_dim": 128,
