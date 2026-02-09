@@ -135,8 +135,6 @@ void launch_all_reduce_sum_kernel(T* input, T* output, int num_tokens, int hidde
 void all_reduce_max(at::Tensor input,
                 at::Tensor output)               // [num_tokens, hidden_size]
 {
-	DEBUG_TRACE_PARAMS(input, output);
-	DEBUG_DUMP_PARAMS(input, output);
     DEBUG_TRACE_PARAMS(input, output);
     DEBUG_DUMP_PARAMS(input, output);
     const int hidden_size = input.size(-1);
@@ -153,8 +151,6 @@ void all_reduce_max(at::Tensor input,
 void all_reduce_sum(at::Tensor input,
                 at::Tensor output)               // [num_tokens, hidden_size]
 {
-	DEBUG_TRACE_PARAMS(input, output);
-	DEBUG_DUMP_PARAMS(input, output);
     DEBUG_TRACE_PARAMS(input, output);
     DEBUG_DUMP_PARAMS(input, output);
     const int hidden_size = input.size(-1);
