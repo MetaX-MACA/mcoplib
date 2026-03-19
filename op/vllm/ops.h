@@ -112,6 +112,10 @@ void top_k_per_row_decode(const torch::Tensor& logits, int64_t next_n,
                           int64_t numRows, int64_t stride0, int64_t stride1,
                           int64_t topK);
 
+void large_context_topk(const torch::Tensor& score, torch::Tensor& indices,
+                        const torch::Tensor& lengths,
+                        std::optional<torch::Tensor> row_starts_opt);
+
 void rms_norm_static_fp8_quant(torch::Tensor& out, torch::Tensor& input,
                                torch::Tensor& weight, torch::Tensor& scale,
                                double epsilon);
@@ -247,7 +251,7 @@ int64_t ggml_moe_get_block_size(int64_t type);
         const int64_t num_experts, const int64_t n, const int64_t k,
         const std::optional<torch::Tensor>& blockscale_offsets);
 
-    void get_cutlass_pplx_moe_mm_data(torch::Tensor& expert_offsets,
+    void get_cutlass_batched_moe_mm_data(torch::Tensor& expert_offsets,
                                     torch::Tensor& problem_sizes1,
                                     torch::Tensor& problem_sizes2,
                                     const torch::Tensor& expert_num_tokens,
@@ -323,3 +327,6 @@ void selective_scan_fwd(const torch::Tensor& u, const torch::Tensor& delta,
                         const std::optional<torch::Tensor>& cache_indices,
                         const std::optional<torch::Tensor>& has_initial_state,
                         const torch::Tensor& ssm_states, int64_t pad_slot_id);
+
+void dsv3_fused_a_gemm(torch::Tensor& output, torch::Tensor const& mat_a,
+                       torch::Tensor const& mat_b);

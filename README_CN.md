@@ -42,6 +42,16 @@ export WCUDA_DEBUG=1
 ```
 note: 通过pip install -e . --no-build-isolation -v或者-vv, -vvv命令编译时， 并不会打印出setup.py中的print信息，因为pip 对该子进程使用管道（pipe）捕获 stdout/stderr，以便在失败时回显或在 verbose 模式下合并显示， 也即只有在编译失败时或者编译成功完成后才会打印出setup.py中的print信息
 
+CUTLASS OP API接口编译控制
+```shell
+#默认开启CUTLASS OP API的编译
+#也可以通过环境变量来控制CUTLASS OP 的编译
+#开启
+export ENABLE_BUILD_CUTLASS_OP=1
+#关闭
+export ENABLE_BUILD_CUTLASS_OP=0
+```
+
 项目打包命令：
 
 ```shell
@@ -396,11 +406,11 @@ Traceback (most recent call last):
 ## Release
 ### Release 0.4.0
 - add cv op kernel
-- support sglang 0.5.7 && 0.5.8 op 
+- support sglang  0.5.8 && 0.5.9 op 
 - optimize mcoplib project build 
 - support mxbench for auto test op kernel `s perfromance
 - support profiler tools check op kernel `s perfromance
-- support for vllm 0.15.0  op kernels
+- support for vllm 0.17.0  op kernels
 - support Project-customized op kernels
 - support k-transformer op kernels
 - support verl op kernels

@@ -421,7 +421,7 @@ void add_rms_norm_dynamic_per_token_quant_padding_output(at::Tensor& output,
                                                          at::Tensor const& weight, 
                                                          const int pad_size, 
                                                          const float epsilon){
-    TORCH_CHECK(output.dtype() == torch::kInt8);
+    // TORCH_CHECK(output.dtype() == torch::kInt8);
     TORCH_CHECK(input.dtype() == at::ScalarType::BFloat16);
     TORCH_CHECK(output.is_contiguous() && input.is_contiguous());
     MOE_DISPATCH_FLOATING_TYPES(

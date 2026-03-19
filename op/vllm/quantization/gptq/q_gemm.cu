@@ -1942,17 +1942,41 @@ bool launch_gemm(int m, int n, int k, int quant_group, const input_tp* dA,
   const input_tp* dA_actual = (g_idx != nullptr ? perm_space : dA);
   bool ret = true;
 
-  if(m >= 128 && (total_m_blocks % 8)==0) {
-        int chunks = total_m_blocks / 8;
-        if(chunks > 0) {
-            int real_m = m > chunks * 8 * SLICE_M ? chunks * 8 * SLICE_M : m;
-            if (is_gptq) {
-                ret = launch_gemm_gptq<input_tp, w_type_id, output_tp, quant_packed_tp>(real_m, n, k, quant_group, dA_actual, lda, dB, ldb, dC,
-                 dC_temp, ldc, d_zeros, d_scales, stream, chunks, 8);
-            }    
-        }
-        return ret;
-  }
+  // if(m >= 128 && m != 19 && m != 760) {
+  //   int chunks = total_m_blocks / 8;
+  //   int rest_blocks_m = total_m_blocks % 8;
+
+  //   if (chunks > 0) {
+  //       int real_m = m > chunks * 8 * SLICE_M ? chunks * 8 * SLICE_M : m;
+  //       if (is_gptq) {
+  //           ret = launch_gemm_gptq<input_tp, w_type_id, output_tp, quant_packed_tp>(real_m, n, k, quant_group, dA_actual, lda, dB, ldb, dC, dC_temp, ldc, d_zeros,
+  //           d_scales, stream, chunks, 8);
+  //       }
+  //   }
+  //   if (rest_blocks_m > 0) {
+  //       int m_offset = chunks * 8 * SLICE_M;
+  //       if (is_gptq) {
+  //           int chunks1 = rest_blocks_m / MAX_BLOCKS_M;
+  //           int rest_blocks_m1 = rest_blocks_m % MAX_BLOCKS_M;
+
+  //           if (chunks1 > 0) {
+  //               int real_m = rest_blocks_m > chunks1 * MAX_BLOCKS_M * SLICE_M ? chunks1 * MAX_BLOCKS_M * SLICE_M : rest_blocks_m;
+  //               if (is_gptq) {
+  //                   ret = ret && launch_gemm_gptq<input_tp, w_type_id, output_tp, quant_packed_tp>(real_m, n, k, quant_group, dA_actual + lda * m_offset, lda, dB, ldb, dC + ldc * m_offset, 
+  //                       dC_temp + ldc * m_offset, ldc, d_zeros, d_scales, stream, chunks1, MAX_BLOCKS_M);
+  //               }
+  //           }
+  //           if (rest_blocks_m1 > 0) {
+  //               m_offset += chunks1 * MAX_BLOCKS_M * SLICE_M;
+  //               if (is_gptq) {
+  //                   ret = ret && launch_gemm_gptq<input_tp, w_type_id, output_tp, quant_packed_tp>(m - m_offset, n, k, quant_group, dA_actual + lda * m_offset, lda, dB, ldb, dC + ldc * m_offset, 
+  //                       dC_temp + ldc * m_offset, ldc, d_zeros, d_scales, stream, 1, MAX_BLOCKS_M);
+  //               }
+  //           }
+  //       }
+  //   }
+  //   return ret;
+  // }
 
   if (chunks > 0) {
     int real_m = m > chunks * MAX_BLOCKS_M * SLICE_M

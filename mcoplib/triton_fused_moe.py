@@ -1319,6 +1319,7 @@ def fused_moe_triton_kernel_gptq_awq(
     stride_bze,
     stride_bzk,
     stride_bzn,
+    block_k_diviable: tl.constexpr,
     group_size: tl.constexpr,
     **kwargs,
 ):
@@ -1355,6 +1356,7 @@ def fused_moe_triton_kernel_gptq_awq(
         stride_bze,
         stride_bzk,
         stride_bzn,
+        block_k_diviable,
         group_size,
         **kwargs,
     )

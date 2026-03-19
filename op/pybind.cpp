@@ -60,6 +60,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("recv_from_attention_node_post_process", &recv_from_attention_node_post_process);
     m.def("send_to_attention_node_pre_process", &send_to_attention_node_pre_process);
     m.def("fused_silu_mul_dq_mask_quant", &fused_silu_mul_dq_mask_quant_pack);
+    m.def("fused_silu_mul_dq_mask_fp8_quant", &fused_silu_mul_dq_mask_quant_fp8_pack);
     m.def("fused_silu_mul_dq_reorder_quant", &fused_silu_mul_dq_quant_reordered_topk_interface);
 
     py::object torch_bfloat16 = py::module::import("torch").attr("bfloat16");

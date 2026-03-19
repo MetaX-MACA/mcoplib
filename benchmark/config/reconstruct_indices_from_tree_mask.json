@@ -1,0 +1,8 @@
+{
+    "device_id": 0,
+    "device_name": "MetaX C500",
+    "batch_size": 8192,
+    "draft_token_num": 16,
+    "dtype": "bool",
+    "samples": 10000
+}

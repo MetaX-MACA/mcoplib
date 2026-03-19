@@ -66,7 +66,7 @@ void get_cutlass_moe_mm_data(
       version_num, ". Required capability: 90");
 }
 
-void get_cutlass_pplx_moe_mm_data(torch::Tensor& expert_offsets,
+void get_cutlass_batched_moe_mm_data(torch::Tensor& expert_offsets,
                                   torch::Tensor& problem_sizes1,
                                   torch::Tensor& problem_sizes2,
                                   const torch::Tensor& expert_num_tokens,
@@ -76,7 +76,7 @@ void get_cutlass_pplx_moe_mm_data(torch::Tensor& expert_offsets,
   int32_t version_num = get_sm_version_num();
   TORCH_CHECK_NOT_IMPLEMENTED(
       false,
-      "No compiled get_cutlass_pplx_moe_mm_data: no cutlass_scaled_mm kernel "
+      "No compiled get_cutlass_batched_moe_mm_data: no cutlass_scaled_mm kernel "
       "for CUDA device capability: ",
       version_num, ". Required capability: 90");
 }

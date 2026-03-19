@@ -8,12 +8,10 @@ void moe_permute(const torch::Tensor& input,
                  const torch::Tensor& token_expert_indices,
                  const std::optional<torch::Tensor>& expert_map,
                  int64_t n_expert, int64_t n_local_expert, int64_t topk,
-                 const std::optional<int64_t>& align_block_size,
                  torch::Tensor& permuted_input,
                  torch::Tensor& expert_first_token_offset,
                  torch::Tensor& inv_permuted_idx,  // [n_token, topk]
-                 torch::Tensor& permuted_idx,      // [permute_size]
-                 torch::Tensor& m_indices) {
+                 torch::Tensor& permuted_idx) {      // [permute_size]
   TORCH_CHECK(false, "moe_unpermute is not supported on MACA");
 }
 

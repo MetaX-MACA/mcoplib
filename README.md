@@ -13,6 +13,7 @@ pip3 install setuptools-scm==8.0
 # Install pybind11
 pip3 install pybind11
 pip3 install build
+pip3 install setuptools-scm==8.0
 ```
 Environment variable setup:
 
@@ -40,7 +41,15 @@ python setup.py build_ext --inplace
 export WCUDA_DEBUG=1
 ```
 note: When compiling using the pip install -e . --no-build-isolation -v (or -vv, -vvv) command, print messages within setup.py will not be printed immediately. This is because pip uses a pipe to capture stdout/stderr from the subprocess in order to echo it upon failure or merge the display in verbose mode. Therefore, print messages from setup.py will only be displayed after compilation fails or completes successfully.
-
+CUTLASS OP API接口编译控制
+```shell
+#The compilation of CUTLASS OP API is enabled by default
+#The compilation of CUTLASS OP can also be controlled through environment variables
+#Enable
+export ENABLE_BUILD_CUTLASS_OP=1
+#Disable
+export ENABLE_BUILD_CUTLASS_OP=0
+```
 Project Packaging Command:
 
 ```shell
@@ -394,11 +403,11 @@ def fused_mla_normal_rotary_emb(
 ## Release
 ### Release 0.4.0
 - add cv op kernel
-- support sglang 0.5.7 && 0.5.8 op 
+- support sglang  0.5.8 && 0.5.9 op 
 - optimize mcoplib project build 
 - support mxbench for auto test op kernel `s perfromance
 - support profiler tools check op kernel `s perfromance
-- support for vllm 0.15.0  op kernels
+- support for vllm 0.17.0  op kernels
 - support Project-customized op kernels
 - support k-transformer op kernels
 - support verl op kernels

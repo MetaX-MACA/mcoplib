@@ -197,6 +197,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "int numRows, int stride0, int stride1, int topK) -> ()");
   ops.impl("top_k_per_row_decode", torch::kCUDA, &top_k_per_row_decode);
 
+  ops.def(
+      "large_context_topk(Tensor score, Tensor indices, Tensor lengths, "
+      "Tensor? "
+      "row_starts_opt) -> ()");
+  ops.impl("large_context_topk", torch::kCUDA, &large_context_topk);
+
   // ┌------------------------  Not supported for Metax
   // ------------------------┐ Layernorm-quant Apply Root Mean Square (RMS)
   // -------------------------┐ Layernorm-quant Apply Root Mean Square (RMS)
@@ -253,6 +259,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("batched_rotary_embedding", torch::kCUDA, &batched_rotary_embedding);
 
   // Quantization ops
+  // DeepSeek V3 fused A GEMM (SM 9.0+, bf16 only, 1-16 tokens).
+  ops.def(
+      "dsv3_fused_a_gemm(Tensor! output, Tensor mat_a, Tensor mat_b) -> ()");
+  // conditionally compiled so impl registration is in source file
+
   // Quantized GEMM for AWQ.
   ops.def(
       "awq_gemm(Tensor _in_feats, Tensor _kernel, Tensor _scaling_factors, "

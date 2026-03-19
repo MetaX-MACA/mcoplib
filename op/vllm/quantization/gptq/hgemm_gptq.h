@@ -268,6 +268,55 @@ struct TileManager {
   }
 };
 
+template<int BLOCKS_M, int BLOCKS_N, int BLOCKS_K>
+struct TIleK_TileManager {
+    int tile_start_row;
+    int tile_start_col;
+    int tiles_k;
+    int my_iters = 0;
+    bool global_pred = true;
+
+    __device__ __forceinline__ void init(int m, int n, int k, int bidx, int iters) {
+        //Calculate tile start row and cols so we can calculate the offset address of a b and c
+        int tile_idx = iters * bidx;
+        tiles_k = div_ceil(k, TILE_K);
+        tile_start_col = blockIdx.z;
+        tile_start_row = tile_idx;
+        my_iters = iters;
+    }
+
+    __device__ __forceinline__ void next_tile() {
+        tile_start_row =  tile_start_row + 1;
+        --my_iters;
+        global_pred = my_iters > 0;
+    }
+
+    __device__ __host__ __forceinline__ bool need_save_data() {
+        if (global_pred && my_iters == 1) return true;
+        if (global_pred && tile_start_row + 1 == tiles_k) return true;
+        return false;
+    }
+
+    //support for preloading next tile in current tile calculation
+    //The point is when all quanted values are dequanted and all a are stored to bsm already
+    //Then the registers for scales, zeros, and a_caches are free to use, bsm for scales are already
+    //free to use.
+    //The main problem we will face is that no more registers can be used to cache tile information
+    //when we want to preload next tile data
+    bool flag_save_data = false;
+    int tile_start_col_cache; //Kept for saving result n calculation
+
+    __device__ __forceinline__ void next_tile_pre() {
+        flag_save_data = need_save_data();
+        tile_start_col_cache = tile_start_col;
+        next_tile();
+    }
+
+    __device__ __forceinline__ bool need_save_data_pre() {
+        return flag_save_data;
+    }
+};
+
 struct ThreadView {
   int tid;
   int wave_idx;
@@ -1095,7 +1144,7 @@ struct LoadingManager {
       }
       barrier_bsm;  // sync threads for sts_a
       lds_a(0);     // load first 16 batches into registers
-      dequant(0);   // dequant b0
+      dequant(0, 1);   // dequant b0
     }
   }
 
@@ -2162,7 +2211,7 @@ __global__ void hgemm_gptq(
 }
 }  // end of namespace __hgemm_even_blocks_k
 
-namespace __hgemm_singular_ad_blocks_k {
+namespace __hgemm_singular_opt1_blocks_k {
 template<typename scalar_t, const vllm::ScalarTypeId w_type_id, int THREADS, int BLOCKS_M, int BLOCKS_N, int BLOCKS_K, bool HAS_ACT, bool HAS_ZP, bool HAS_M_PRED, bool HAS_NK_PRED>
 struct LoadingManager {
     constexpr static int FragACount = 2;
@@ -2217,7 +2266,7 @@ struct LoadingManager {
     float output[BLOCKS_M][N_ITERS][4];
     FragA temp_a[LOADING_A_LOOP];
 
-    TileManager<BLOCKS_M, BLOCKS_N, BLOCKS_K> tile_manager;
+    TIleK_TileManager<BLOCKS_M, BLOCKS_N, BLOCKS_K> tile_manager;
     ThreadView tv;
 
     __device__ __forceinline__ void set_address(const PackTypeInt4* a,
@@ -2339,7 +2388,7 @@ struct LoadingManager {
         if constexpr(HAS_NK_PRED) {
             pred = pred && tv.tid < (n - tile_manager.tile_start_col * TILE_N) / (sizeof(FragScaleLoading) / sizeof(scalar_t));
         }
-        //FragScaleLoading *scale_bsm = (FragScaleLoading*)(smem_base + 0x2800) + tv.tid;
+        //FragScaleLoading *scale_bsm = (FragScaleLoading*)(smem_base + 0x2000) + tv.tid;
         FragScaleLoading *gvm_addr = (FragScaleLoading*)scales_loading + tv.tid;
         //ldg_b32_bsm_async(scale_bsm, gvm_addr, pred, false);
         ldg_b32_reg_noasync(*((PackType*)&temp_scales), gvm_addr, pred, true);
@@ -2357,7 +2406,7 @@ struct LoadingManager {
     }
 
     __device__ __forceinline__ void sts_scales() {
-        FragScaleLoading *scale_bsm = (FragScaleLoading*)(smem_base + 0x2800) + tv.tid;
+        FragScaleLoading *scale_bsm = (FragScaleLoading*)(smem_base + 0x2000) + tv.tid;
         *scale_bsm = temp_scales;
     }
 
@@ -2367,7 +2416,7 @@ struct LoadingManager {
             if (pred) {
                 float temp[PACK_RATIO_4BITS];
                 decompress_zero_4bits(temp_zeros, temp);
-                float *scale_bsm = (float*)(smem_base + 0x3800) + tv.tid * PACK_RATIO_4BITS;
+                float *scale_bsm = (float*)(smem_base + 0x3000) + tv.tid * PACK_RATIO_4BITS;
                 for (int i = 0; i < PACK_RATIO_4BITS; i++) {
                     *(scale_bsm + i) = temp[i];
                 }
@@ -2495,26 +2544,18 @@ struct LoadingManager {
 
     __device__ __forceinline__ void init_bsm_addr() {
         bsm_a_ptr = (PackTypeInt4*)smem_base;           //use 8k bytes, will load at most 32x128*sizeof(half), either m32k128 or m128k32
-        remaining_bsm_ptr = (float*)(smem_base + 0x2800 + 0x1000); //3k bytes
+        remaining_bsm_ptr = (float*)(smem_base + 0x2000 + 0x1000); //3k bytes
         bsm_a_ptr += tv.slot_tid * (PAD_SLICE_K / (sizeof(PackTypeInt4) / sizeof(scalar_t))) + tv.slot_idx;
-        bsm_scales_ptr = (scalar_t*)(smem_base + 0x2800);      //use 128xsizeof(float)*2 = 1k
+        bsm_scales_ptr = (scalar_t*)(smem_base + 0x2000);      //use 128xsizeof(float)*2 = 1k
         bsm_scales_ptr += (tv.wave_idx * SLOT + tv.slot_tid) * N_ITERS;
         if constexpr(w_type_id == vllm::kU4.id()) {
-            bsm_zeros_ptr = (float*)(smem_base + 0x3800);
+            bsm_zeros_ptr = (float*)(smem_base + 0x3000);
             bsm_zeros_ptr += (tv.wave_idx * SLOT + tv.slot_tid) * N_ITERS;
         }
     }
 
     __device__ __forceinline__ void write_c(int offset, const float& v) {
-        if constexpr(std::is_same_v<scalar_t, __maca_bfloat16>) {
-            #ifdef BF16_HIGH_PRECISION
-            atomicAdd(C_temp + offset, v);
-            #else
-            atomicAdd(C+offset, (atomic_type)v);
-            #endif
-        } else {
-            atomicAdd(C + offset, (scalar_t)v);
-        }
+        C[offset] = (scalar_t)v;
     }
 
     //atomic write to c
@@ -2575,7 +2616,7 @@ struct LoadingManager {
             }
             barrier_bsm; //sync threads for sts_a
             lds_a(0); //load first 16 batches into registers
-            dequant(0); //dequant b0
+            dequant(0, 1); //dequant b0
         }
     }
 
@@ -2749,16 +2790,12 @@ __global__ void hgemm_gptq(
     __shared__ uint8_t smem_base[0x4000]; //4x16x256 = 16Kbytes
     using LoadingManagerType = LoadingManager<scalar_t, w_type_id, THREADS, BLOCKS_M, BLOCKS_N, BLOCKS_K, HAS_ACT_ORDER, HAS_ZP, HAS_M_PRED, HAS_NK_PRED>;
     LoadingManagerType loading_manager;
-    A += blockIdx.y * (8 * SLICE_M) * prob_k / (sizeof(PackTypeInt4) / sizeof(scalar_t));
-    C += blockIdx.y * (8 * SLICE_M) * prob_n / (sizeof(PackTypeInt4) / sizeof(scalar_t));
-    #ifdef BF16_HIGH_PRECISION
-    if constexpr(std::is_same_v<scalar_t, __maca_bfloat16>) {
-        C_tmp += blockIdx.y * (8 * SLICE_M) * prob_n / (sizeof(PackTypeInt4) / sizeof(float));
-    }
-    #endif
+    A += blockIdx.y * (MAX_BLOCKS_M * SLICE_M) * prob_k / (sizeof(PackTypeInt4) / sizeof(scalar_t));
+    C += blockIdx.y * (MAX_BLOCKS_M * SLICE_M) * prob_n / (sizeof(PackTypeInt4) / sizeof(scalar_t));
+  
     loading_manager.set_address(A, B, C, C_tmp, scales_ptr, zp_ptr);
     //loading_manager.init_address(prob_m, prob_n, prob_k, bidx, max_iters, smem_base);
-    loading_manager.init_address_pre(std::min<int>(8*SLICE_M, prob_m - blockIdx.y * (8 * SLICE_M)), prob_n, prob_k, quant_group_power2, bidx, max_iters, smem_base);
+    loading_manager.init_address_pre(std::min<int>(MAX_BLOCKS_M*SLICE_M, prob_m - blockIdx.y * (MAX_BLOCKS_M * SLICE_M)), prob_n, prob_k, quant_group_power2, bidx, max_iters, smem_base);
     loading_manager.clear_c();
 
     while (max_iters > 0) {
@@ -2806,16 +2843,751 @@ __global__ void hgemm_gptq(
         loading_manager.matmul(m_idx); //do matmul
         max_iters--;
 
-        if (loading_manager.tile_manager.need_save_data_pre()) {
-            loading_manager.write_c_pre(); // reduce and write back
-            loading_manager.clear_c();
-        }
+        // if (loading_manager.tile_manager.need_save_data_pre()) {
+        //     loading_manager.write_c_pre(); // reduce and write back
+        // }
 
         barrier_bsm;
     }
+    loading_manager.write_c_pre(); // reduce and write back
 }
 
-} //end of namespace __hgemm_singular_ad_blocks_k
+} //end of namespace __hgemm_singular_opt1_blocks_k
+
+namespace __hgemm_even_opt1_blocks_k {
+template<typename scalar_t, const vllm::ScalarTypeId w_type_id, int THREADS, int BLOCKS_M, int BLOCKS_N, int BLOCKS_K, bool HAS_ACT, bool HAS_ZP, bool HAS_M_PRED, bool HAS_NK_PRED>
+struct LoadingManager {
+    constexpr static int FragACount = 4;
+    using FragA = PackTypeInt2;
+    constexpr static int FragBCount = 1;
+    using FragB = PackType;
+    constexpr static int FragCCount = 4;
+    using FragC = scalar_t;
+    const FragA* A;
+    const FragA* A_loading;
+    const FragB* B;
+    const FragB* B_loading;
+    FragC* C;
+    float* C_temp;
+    using FragScaleLoading = half2;
+    using FragZeroLoading = uint32_t;
+    const FragScaleLoading* scales;
+    const FragScaleLoading* scales_loading;
+    const FragZeroLoading* zeros;
+    const FragZeroLoading* zeros_loading;
+
+    constexpr static int DOUBLE_SLICE_K = SLICE_K * 2;
+    constexpr static int DOUBLE_PAD_SLICE_K = SLICE_K * 2 + sizeof(PackTypeInt4) / sizeof(scalar_t);
+
+    int m;
+    int n;
+    int k;
+    int quant_group_power2;
+    uint8_t* smem_base;
+    int bidx;
+
+    PackTypeInt4* bsm_a_ptr;
+    scalar_t* bsm_scales_ptr;
+    float* bsm_zeros_ptr;
+    //float* remaining_bsm_ptr;
+
+    PackTypeInt2 local_a[BLOCKS_M][2];
+    PackType local_b[N_ITERS];
+    PackType local_b_cache[N_ITERS];
+    scalar_t local_dequanted_b[N_ITERS][PACK_RATIO_4BITS];
+    scalar_t local_dequanted_b_8bits[N_ITERS][2][PACK_RATIO_8BITS];
+    v2f local_scales[N_ITERS];
+    v2f local_zeros[N_ITERS];
+    FragScaleLoading temp_scales;
+    PackType temp_zeros;
+    float output[BLOCKS_M][N_ITERS][4];
+    FragA temp_a[LOADING_A_LOOP];
+
+    TIleK_TileManager<BLOCKS_M, BLOCKS_N, BLOCKS_K> tile_manager;
+    ThreadView tv;
+
+    __device__ __forceinline__ void set_address(const PackTypeInt4* a,
+        const PackTypeInt4* b,
+        PackTypeInt4* c,
+        PackTypeInt4* c_temp,
+        const PackTypeInt4* scale_ptr,
+        const PackTypeInt4* zp_ptr = nullptr) {
+            A = (const FragA*)a;
+            B = (const FragB*)b;
+            C = (FragC*)c;
+            C_temp = (float*)c_temp;
+            scales = (const FragScaleLoading*)scale_ptr;
+            if constexpr(w_type_id == vllm::kU4.id()) {
+                zeros = (const FragZeroLoading*)zp_ptr;
+            }
+    }
+
+    __device__ __forceinline__ bool debug() {
+        #ifdef DEBUG
+        bool do_print = tv.wave_idx == 1 && tv.slot_idx == 0 && tv.slot_tid == 0;
+        return do_print;
+        #else
+        return false;
+        #endif
+    }
+
+    __device__ __forceinline__ void next_k0() {
+        //reset bsm a to base
+        bsm_a_ptr = (PackTypeInt4*)smem_base;
+        bsm_a_ptr += tv.slot_tid * (DOUBLE_PAD_SLICE_K / (sizeof(PackTypeInt4) / sizeof(scalar_t))) + tv.slot_idx;
+    }
+
+    __device__ __forceinline__ void next_k1() {
+        //Update only bsm_a_ptr
+        bsm_a_ptr = (PackTypeInt4*)smem_base;
+        bsm_a_ptr += tv.slot_tid * (DOUBLE_PAD_SLICE_K / (sizeof(PackTypeInt4) / sizeof(scalar_t))) + tv.slot_idx + WAVE_SLOTS;
+        //load k32~k63
+        //bsm_a_ptr += 4;
+    }
+
+    __device__ __forceinline__ void next_k0_pre() {
+        //A_loading += SLICE_K / FragACount;
+        //B_loading += SLICE_K / PACK_RATIO_4BITS * n;
+        if constexpr(w_type_id == vllm::kU4.id() || w_type_id == vllm::kU4B8.id()) {
+            B_loading += SLICE_K / PACK_RATIO_4BITS * n;
+        } else if constexpr(w_type_id == vllm::kU8.id() || w_type_id == vllm::kU8B128.id()) {
+            B_loading += SLICE_K / PACK_RATIO_8BITS * n;
+        }
+    }
+
+    __device__ __forceinline__ void next_k1_pre() {
+        A_loading += DOUBLE_SLICE_K / FragACount;
+        if constexpr(w_type_id == vllm::kU4.id() || w_type_id == vllm::kU4B8.id()) {
+            B_loading += SLICE_K / PACK_RATIO_4BITS * n;
+        } else if constexpr(w_type_id == vllm::kU8.id() || w_type_id == vllm::kU8B128.id()) {
+            B_loading += SLICE_K / PACK_RATIO_8BITS * n;
+        }
+    }
+
+    __device__ __forceinline__ void ldg_a(int k_idx) {
+        //32x64/2/256 = 16 / 4 = 4
+        int t = tv.tid;
+        int k_broad = tile_manager.tile_start_row * TILE_K + k_idx * SLICE_K;
+        #pragma unroll LOADING_A_LOOP
+        for (int i = 0; i < LOADING_A_LOOP; i++)  {
+            int reading_m = t / (DOUBLE_SLICE_K / FragACount);
+            int reading_k = t % (DOUBLE_SLICE_K / FragACount);
+            int gvm_offset = reading_m * k / FragACount + reading_k;
+            FragA* gvm_addr = (FragA*)A_loading + gvm_offset;
+            //FIXME: we cannot do slice k pad as ldg_b32_bsm_async seems does not support padding
+            if constexpr(HAS_M_PRED && HAS_NK_PRED) {
+                bool pred = reading_m < m;
+                bool pred_k = k_broad + reading_k * FragACount < k;
+                pred = pred && pred_k && tile_manager.global_pred;
+                ldg_b64_reg_noasync(temp_a[i], gvm_addr, pred, true);
+            } else if constexpr(HAS_M_PRED) {
+                bool pred = reading_m < m && tile_manager.global_pred;
+                ldg_b64_reg_noasync(temp_a[i], gvm_addr, pred, true);
+            } else if constexpr(HAS_NK_PRED) {
+                bool pred_k = k_broad + reading_k * FragACount < k && tile_manager.global_pred;
+                ldg_b64_reg_noasync(temp_a[i], gvm_addr, pred_k, true);
+            } else {
+                ldg_b64_reg_noasync(temp_a[i], gvm_addr, tile_manager.global_pred, true);
+            }
+            t += THREADS;
+        }
+    }
+
+    __device__ __forceinline__ void sts_a() {
+        FragA* to_bsm_a_ptr = (FragA*)smem_base;
+        int t = tv.tid;
+        #pragma unroll LOADING_A_LOOP
+        for (int i = 0; i < LOADING_A_LOOP; i++)  {
+            int reading_m = t / (DOUBLE_SLICE_K / FragACount);
+            int reading_k = t % (DOUBLE_SLICE_K / FragACount);
+            int bsm_offset = reading_m * (DOUBLE_PAD_SLICE_K / FragACount) + reading_k;
+            *(to_bsm_a_ptr + bsm_offset) = temp_a[i];
+            t += THREADS;
+        }
+    }
+
+    __device__ __forceinline__ void lds_a(int midx) {
+        *((PackTypeInt4*)local_a[midx]) = *bsm_a_ptr;
+        bsm_a_ptr += SLOT * (DOUBLE_PAD_SLICE_K / (sizeof(PackTypeInt4) / sizeof(scalar_t)));
+    }
+
+    //TODO: implement when N_ITERS==1 or N_ITERS==3
+    //korder used gptq_8bits, ldg_b will load two times in one SLICE_K
+    //For example, t0 loads packed_k0, packed_k1, and packed_k0 represents a packed 4 ks in first line of B,
+    //and packed_k1 represents a packed 4 ks in second line of B
+    __device__ __forceinline__ void ldg_b(int k_idx, int korder = 0) {
+        if constexpr(HAS_NK_PRED) {
+            bool pred_k = tile_manager.tile_start_row * TILE_K + k_idx * SLICE_K + tv.slot_idx * PACK_RATIO_4BITS + korder < k;
+            bool pred_n = tile_manager.tile_start_col * TILE_N + (tv.wave_idx * SLOT + tv.slot_tid)*N_ITERS < n;
+            bool pred = pred_n && pred_k && tile_manager.global_pred;
+            FragB* addr =  (FragB*)B_loading + korder * n;
+            if constexpr(N_ITERS == 1) {
+                ldg_b32_reg_noasync(*((PackType*)local_b_cache), ((PackType*)addr), pred, true);
+            } else if constexpr(N_ITERS == 2) {
+                ldg_b64_reg_noasync(*((PackTypeInt2*)local_b_cache), ((PackTypeInt2*)addr), pred, true);
+            } else if constexpr(N_ITERS == 4) {
+                ldg_b128_reg_noasync(*((PackTypeInt4*)local_b_cache), ((PackTypeInt4*)addr), pred, true);
+            }
+        } else {
+            FragB* addr =  (FragB*)B_loading + korder * n;
+            if constexpr(N_ITERS == 1) {
+                ldg_b32_reg_noasync(*((PackType*)local_b_cache), ((PackType*)addr), tile_manager.global_pred, true);
+            } else if constexpr(N_ITERS == 2) {
+                ldg_b64_reg_noasync(*((PackTypeInt2*)local_b_cache), ((PackTypeInt2*)addr), tile_manager.global_pred, true);
+            } else if constexpr(N_ITERS == 4) {
+                ldg_b128_reg_noasync(*((PackTypeInt4*)local_b_cache), ((PackTypeInt4*)addr), tile_manager.global_pred, true);
+            }
+        }
+    }
+
+    __device__ __forceinline__ void swap_b_cache(int i) {
+        local_b[i] = local_b_cache[i];
+    }
+
+    __device__ __forceinline__ void ldg_scales() {
+        bool pred = tv.tid < TILE_N / (sizeof(FragScaleLoading) / sizeof(scalar_t)) && tile_manager.global_pred;
+        if constexpr(HAS_NK_PRED) {
+            pred = pred && tv.tid < (n - tile_manager.tile_start_col * TILE_N) / (sizeof(FragScaleLoading) / sizeof(scalar_t));
+        }
+        //FragScaleLoading *scale_bsm = (FragScaleLoading*)(smem_base + 0x2000) + tv.tid;
+        FragScaleLoading *gvm_addr = (FragScaleLoading*)scales_loading + tv.tid;
+        //ldg_b32_bsm_async(scale_bsm, gvm_addr, pred, false);
+        ldg_b32_reg_noasync(*((PackType*)&temp_scales), gvm_addr, pred, true);
+    }
+
+    __device__ __forceinline__ void ldg_zp() {
+        if constexpr(w_type_id == vllm::kU4.id()) {
+            bool pred = (tv.tid < TILE_N / PACK_RATIO_4BITS) && tile_manager.global_pred;
+            if constexpr(HAS_NK_PRED) {
+                pred = pred && tv.tid < ((n - tile_manager.tile_start_col * TILE_N) / PACK_RATIO_4BITS);
+            }
+            FragZeroLoading *gvm_addr = (FragZeroLoading*)zeros_loading + tv.tid;
+            ldg_b32_reg_noasync(*((PackType*)&temp_zeros), gvm_addr, pred, true);
+        }
+    }
+
+    __device__ __forceinline__ void sts_scales() {
+        FragScaleLoading *scale_bsm = (FragScaleLoading*)(smem_base + 0x3000) + tv.tid;
+        *scale_bsm = temp_scales;
+    }
+
+    __device__ __forceinline__ void sts_zeros() {
+        if constexpr(w_type_id == vllm::kU4.id()) {
+            bool pred = (tv.tid < TILE_N / PACK_RATIO_4BITS) && tile_manager.global_pred;
+            if (pred) {
+                float temp[PACK_RATIO_4BITS];
+                decompress_zero_4bits(temp_zeros, temp);
+                float *zeros_bsm = (float*)(smem_base + 0x3400) + tv.tid * PACK_RATIO_4BITS;
+                for (int i = 0; i < PACK_RATIO_4BITS; i++) {
+                    *(zeros_bsm + i) = temp[i];
+                }
+            }
+        }
+    }
+
+    //TODO: implement when N_ITERS==1 or N_ITERS==3
+    __device__ __forceinline__ void lds_scales() {
+        if constexpr(N_ITERS == 1) {
+            *(half*)local_dequanted_b[0] = *(half*)bsm_scales_ptr;
+        } else if constexpr(N_ITERS==2) {
+            *((half2*)local_dequanted_b[0]) = *((half2*)bsm_scales_ptr);
+        } else if constexpr(N_ITERS==4) {
+            *((PackTypeInt2*)local_dequanted_b[0]) = *((PackTypeInt2*)bsm_scales_ptr);
+        }
+    }
+
+    __device__ __forceinline__ void pack_scales() {
+        if constexpr(w_type_id == vllm::kU4B8.id()) {
+            #pragma unroll
+            for (int i = 0; i < N_ITERS; i++) {
+                float s = local_dequanted_b[0][i];
+                float z = -8 * s;
+                local_scales[i] = {s, s};
+                local_zeros[i] = {z, z};
+            }
+        } else if constexpr(w_type_id == vllm::kU4.id()) {
+            #pragma unroll
+            for (int i = 0; i < N_ITERS; i++) {
+                float s;
+                if constexpr(std::is_same_v<scalar_t, __maca_bfloat16>) {
+                    s = __bfloat162float(local_dequanted_b[0][i]);
+                } else {
+                    s = local_dequanted_b[0][i];
+                }
+                float z = *(bsm_zeros_ptr + i);
+                z = z * s;
+                local_scales[i] = {s, s};
+                local_zeros[i] = {z, z};
+            }
+        } else if constexpr(w_type_id == vllm::kU8B128.id()) {
+            #pragma unroll
+            for (int i = 0; i < N_ITERS; i++) {
+                float s = local_dequanted_b[0][i];
+                float z = -128 * s;
+                local_scales[i] = {s, s};
+                local_zeros[i] = {z, z};
+            }
+        } else if constexpr(w_type_id == vllm::kU8.id()) {
+            // should apply zeros
+        }
+    }
+
+    __device__ __forceinline__ void dequant(int kdx, int korder = 0) {
+        if constexpr(w_type_id == vllm::kU4.id() || w_type_id == vllm::kU4B8.id()) {
+            dequant_gptq_4bits<scalar_t>(local_b[kdx], local_dequanted_b[kdx], local_scales[kdx], local_zeros[kdx]);
+        } else if constexpr(w_type_id == vllm::kU8.id() || w_type_id == vllm::kU8B128.id()) {
+            dequant_gptq_8bits<scalar_t>(local_b[kdx], local_dequanted_b_8bits[kdx][korder], local_scales[kdx], local_zeros[kdx]);
+        }
+    }
+
+    __device__ __forceinline__ void matmul(int mdx) {
+        if constexpr(w_type_id == vllm::kU4.id() || w_type_id == vllm::kU4B8.id()) {
+            #pragma unroll
+            for (int i = 0; i < N_ITERS; i++) {
+                mma_16x16x16<scalar_t>(local_a[mdx][0], *((PackTypeInt2*)local_dequanted_b[i]), *((PackTypeInt4*)output[mdx][i]));
+                mma_16x16x16<scalar_t>(local_a[mdx][1], *((PackTypeInt2*)local_dequanted_b[i] + 1), *((PackTypeInt4*)output[mdx][i]));
+            }
+        } else if constexpr(w_type_id == vllm::kU8.id() || w_type_id == vllm::kU8B128.id()) {
+            #pragma unroll
+            for (int i = 0; i < N_ITERS; i++) {
+                mma_16x16x16<scalar_t>(local_a[mdx][0], *((PackTypeInt2*)local_dequanted_b_8bits[i][0]), *((PackTypeInt4*)output[mdx][i]));
+                mma_16x16x16<scalar_t>(local_a[mdx][1], *((PackTypeInt2*)local_dequanted_b_8bits[i][1]), *((PackTypeInt4*)output[mdx][i]));
+            }
+        }
+    }
+
+    __device__ __forceinline__ void clear_c() {
+        #pragma unroll
+        for (int miter = 0; miter < BLOCKS_M; miter++) {
+            #pragma unroll
+            for (int niter = 0; niter < N_ITERS; niter++) {
+                #pragma unroll
+                for (int miter2 = 0; miter2 < 4; miter2++) {
+                    output[miter][niter][miter2] = 0;
+                }
+            }
+        }
+    }
+
+    //functions for preloading next tile data
+    __device__ __forceinline__ void init_address_pre(int _m, int _n, int _k, int _quant_group_power2, int _bidx, int _iters, uint8_t *_smem_base) {
+        tv.init();
+        m = _m;
+        n = _n;
+        k = _k;
+        quant_group_power2 = _quant_group_power2;
+        bidx = _bidx;
+        smem_base = _smem_base;
+        tile_manager.init(m, n, k, bidx, _iters);
+        init_tile_pre(tile_manager.tile_start_col, tile_manager.tile_start_row);
+    }
+
+     __device__ __forceinline__ void init_tile_pre(int col, int row) {
+        //Initialize start slice address and set them to A_loading and B_loading
+        int offset_n = col * TILE_N;
+        int offset_k = row * TILE_K;
+        //A_loading address will always be valid
+        A_loading = A + offset_k / (FragACount);
+        if constexpr(w_type_id == vllm::kU4.id() || w_type_id == vllm::kU4B8.id()) {
+            B_loading = B + (offset_k / PACK_RATIO_4BITS * n + offset_n) / (FragBCount) + tv.slot_idx * n + (tv.wave_idx * SLOT + tv.slot_tid)*N_ITERS;
+        } else if constexpr(w_type_id == vllm::kU8.id() || w_type_id == vllm::kU8B128.id()) {
+            B_loading = B + (offset_k / PACK_RATIO_8BITS * n + offset_n) / (FragBCount) + tv.slot_idx * n * 2 + (tv.wave_idx * SLOT + tv.slot_tid)*N_ITERS;
+        }
+        scales_loading = scales + ((offset_k >> quant_group_power2) * n + offset_n) / (sizeof(FragScaleLoading)/sizeof(scalar_t));
+        if constexpr(w_type_id == vllm::kU4.id()) {
+            zeros_loading = zeros + ((offset_k >> quant_group_power2) * n + offset_n) / PACK_RATIO_4BITS;
+        }
+    }
+
+    __device__ __forceinline__ void next_tile_pre() {
+        tile_manager.next_tile_pre();
+        init_tile_pre(tile_manager.tile_start_col, tile_manager.tile_start_row);
+    }
+
+    __device__ __forceinline__ void init_bsm_addr() {
+        bsm_a_ptr = (PackTypeInt4*)smem_base;           //use 8k bytes, will load at most 32x128*sizeof(half), either m32k128 or m128k32
+        //remaining_bsm_ptr = (float*)(smem_base + 0x2000 + 0x1000); //3k bytes
+        bsm_a_ptr += tv.slot_tid * (DOUBLE_PAD_SLICE_K / (sizeof(PackTypeInt4) / sizeof(scalar_t))) + tv.slot_idx;
+        bsm_scales_ptr = (scalar_t*)(smem_base + 0x3000);      //use 128xsizeof(float)*2 = 1k
+        bsm_scales_ptr += (tv.wave_idx * SLOT + tv.slot_tid) * N_ITERS;
+        if constexpr(w_type_id == vllm::kU4.id()) {
+            bsm_zeros_ptr = (float*)(smem_base + 0x3400);      //use 128xsizeof(float)*2 = 1k
+            bsm_zeros_ptr += (tv.wave_idx * SLOT + tv.slot_tid) * N_ITERS;
+        }
+    }
+
+    __device__ __forceinline__ void write_c(int offset, const float& v) {
+        C[offset] = (scalar_t)v;
+    }
+
+    //atomic write to c
+    __device__ __forceinline__ void write_c_pre() {
+        int k_broad = tv.slot_idx * 4;
+        int n_broad = (tv.wave_idx * SLOT + tv.slot_tid) * N_ITERS + tile_manager.tile_start_col_cache * TILE_N;
+        #pragma unroll
+        for (int miter = 0; miter < BLOCKS_M; miter++) {
+            #pragma unroll
+            for (int niter = 0; niter < N_ITERS; niter++) {
+                int store_n = n_broad + niter;
+                #pragma unroll
+                for (int miter2 = 0; miter2 < 4; miter2++) {
+                    int store_m = k_broad + miter * SLICE_M + miter2;
+                    if constexpr(HAS_M_PRED && HAS_NK_PRED) {
+                        if (store_m < m && store_n < n) {
+			                write_c(store_m * n + store_n, output[miter][niter][miter2]);
+                        }
+                    } else if constexpr(HAS_M_PRED) {
+                        if (store_m < m) {
+			                write_c(store_m * n + store_n, output[miter][niter][miter2]);
+                        }
+                    } else if constexpr(HAS_NK_PRED) {
+                        if (store_n < n) {
+			                write_c(store_m * n + store_n, output[miter][niter][miter2]);
+                        }
+                    } else {
+			            write_c(store_m * n + store_n, output[miter][niter][miter2]);
+                    }
+                }
+            }
+        }
+    }
+
+    template<int K, bool KTAIL>
+    __device__ __forceinline__ void on_sts_a() {
+        if constexpr(K == 0) {
+            sts_a(); // reorder data_a from reg(gvm resouce) to bsm
+        }
+    }
+
+    template<int K, bool KTAIL>
+    __device__ __forceinline__ void on_preload(int k_idx) {
+        if constexpr(!KTAIL) {
+            if constexpr(K == 0) {
+                next_k0_pre(); // preload gvm a/b
+            } else {
+                next_k1_pre(); // preload gvm a/b
+            }
+            ldg_b(k_idx + K + 1); //preload b for next k
+            if constexpr(K == 1) {
+                ldg_a(k_idx + K + 1); //preload a for next k
+            }
+        } else {
+            next_tile_pre();
+            ldg_scales();
+            ldg_zp();
+            ldg_b(0);
+            ldg_a(0);
+        }
+    }
+
+    template<int K, bool KTAIL>
+    __device__ __forceinline__ void on_dequant_niters1(int k_idx) {
+        if constexpr(w_type_id == vllm::kU4.id() || w_type_id == vllm::kU4B8.id()) {
+            swap_b_cache(0);
+            on_sts_a<K,KTAIL>(); // reorder data_a from reg(gvm resouce) to bsm
+            on_preload<K,KTAIL>(k_idx);
+            barrier_bsm; //sync threads for sts_a
+            lds_a(0); //load first 16 batches into registers
+            dequant(0); //dequant b0
+        } else if constexpr(w_type_id == vllm::kU8.id() || w_type_id == vllm::kU8B128.id()) {
+            swap_b_cache(0);
+            ldg_b(0, 1);
+            dequant(0, 0);
+            on_sts_a<K,KTAIL>(); // reorder data_a from reg(gvm resouce) to bsm
+            swap_b_cache(0);
+            on_preload<K,KTAIL>(k_idx);
+            barrier_bsm; //sync threads for sts_a
+            lds_a(0); //load first 16 batches into registers
+            dequant(0, 1); //dequant b0
+        }
+    }
+
+    template<int K, bool KTAIL>
+    __device__ __forceinline__ void on_dequant_niters2(int k_idx) {
+        if constexpr(w_type_id == vllm::kU4.id() || w_type_id == vllm::kU4B8.id()) {
+            swap_b_cache(0);
+            dequant(0); //dequant b0
+            on_sts_a<K,KTAIL>();
+            swap_b_cache(1);
+            on_preload<K,KTAIL>(k_idx);
+            barrier_bsm; //sync threads for sts_a
+            lds_a(0); //load first 16 batches into registers
+            dequant(1);   //dequant b64
+        } else if constexpr(w_type_id == vllm::kU8.id() || w_type_id == vllm::kU8B128.id()) {
+            swap_b_cache(0);
+            swap_b_cache(1);
+            ldg_b(0, 1);
+            dequant(0); //dequant b0
+            on_sts_a<K,KTAIL>();
+            dequant(1);
+            swap_b_cache(0);
+            swap_b_cache(1);
+            on_preload<K,KTAIL>(k_idx);
+            barrier_bsm; //sync threads for sts_a
+            lds_a(0); //load first 16 batches into registers
+            dequant(0, 1);   //dequant b64
+            dequant(1, 1);   //dequant b64
+        }
+    }
+
+    template<int K, bool KTAIL>
+    __device__ __forceinline__ void on_dequant_niters3(int k_idx) {
+        if constexpr(w_type_id == vllm::kU4.id() || w_type_id == vllm::kU4B8.id()) {
+            swap_b_cache(0);
+            dequant(0); //dequant b0
+            on_sts_a<K,KTAIL>();
+            swap_b_cache(1);
+            dequant(1);
+            swap_b_cache(2);
+            on_preload<K,KTAIL>(k_idx);
+            barrier_bsm; //sync threads for sts_a
+            lds_a(0); //load first 16 batches into registers
+            dequant(2); //dequant b0
+        } else if constexpr(w_type_id == vllm::kU8.id() || w_type_id == vllm::kU8B128.id()) {
+            swap_b_cache(0);
+            swap_b_cache(1);
+            swap_b_cache(2);
+            ldg_b(0, 1);
+            dequant(0); //dequant b0
+            on_sts_a<K,KTAIL>();
+            swap_b_cache(1);
+            dequant(1);
+            dequant(2);
+            swap_b_cache(0);
+            swap_b_cache(1);
+            swap_b_cache(2);
+            on_preload<K,KTAIL>(k_idx);
+            barrier_bsm; //sync threads for sts_a
+            lds_a(0); //load first 16 batches into registers
+            dequant(0, 1); //dequant b0
+            dequant(1, 1); //dequant b0
+            dequant(2, 1); //dequant b0
+        }
+    }
+
+    template<int K, bool KTAIL>
+    __device__ __forceinline__ void on_dequant_niters4(int k_idx) {
+        if constexpr(w_type_id == vllm::kU4.id() || w_type_id == vllm::kU4B8.id()) {
+            swap_b_cache(0);
+            dequant(0); //dequant b0
+            on_sts_a<K,KTAIL>();
+            swap_b_cache(1);
+            dequant(1); //dequant b1
+            swap_b_cache(2);
+            swap_b_cache(3);
+            dequant(2); //dequant b2
+            on_preload<K,KTAIL>(k_idx);
+            barrier_bsm; //sync threads for sts_a
+            lds_a(0); //load first 16 batches into registers
+            dequant(3); //dequant b3
+        } else if constexpr(w_type_id == vllm::kU8.id() || w_type_id == vllm::kU8B128.id()) {
+            swap_b_cache(0);
+            swap_b_cache(1);
+            swap_b_cache(2);
+            swap_b_cache(3);
+            ldg_b(0, 1);
+            dequant(0); //dequant b0
+            on_sts_a<K,KTAIL>();
+            dequant(1); //dequant b1
+            dequant(2); //dequant b2
+            dequant(3); //dequant b2
+            swap_b_cache(0);
+            swap_b_cache(1);
+            swap_b_cache(2);
+            swap_b_cache(3);
+            on_preload<K,KTAIL>(k_idx);
+            barrier_bsm; //sync threads for sts_a
+            lds_a(0); //load first 16 batches into registers
+            dequant(0, 1); //dequant b0
+            dequant(1, 1); //dequant b1
+            dequant(2, 1); //dequant b2
+            dequant(3, 1); //dequant b3
+        }
+    }
+
+    template<int K, bool KTAIL>
+    __device__ __forceinline__ void on_dequant(int kdx) {
+        if constexpr(N_ITERS == 1) on_dequant_niters1<K,KTAIL>(kdx);
+        else if constexpr(N_ITERS == 2) on_dequant_niters2<K,KTAIL>(kdx);
+        else if constexpr(N_ITERS == 3) on_dequant_niters3<K,KTAIL>(kdx);
+        else if constexpr(N_ITERS == 4) on_dequant_niters4<K,KTAIL>(kdx);
+    }
+};
+
+template<typename scalar_t,
+    const vllm::ScalarTypeId w_type_id,
+    const int THREADS,          // number of threads in a threadblock
+    const int BLOCKS_M,         // number of 16x16 blocks in the m
+                                // dimension (batchsize) of the
+                                // threadblock
+    const int BLOCKS_N,         // same for n dimension (output)
+    const int BLOCKS_K,         // same for k dimension (reduction)
+    const bool HAS_ACT_ORDER,   // whether act_order is enabled
+    const bool HAS_ZP,          // whether zero-points are enabled
+    const bool HAS_M_PRED = true,  //If we should use predictors to load m from gvm
+    const bool HAS_NK_PRED = true  //If we should use predictors to load nk from gvm
+    >
+__global__ void hgemm_gptq(
+    const PackTypeInt4* __restrict__ A,  // fp16 input matrix of shape mxk
+    const PackTypeInt4* __restrict__ B,  // 4bit quantized weight matrix of shape kxn
+    PackTypeInt4* __restrict__ C,        // fp16 output buffer of shape mxn
+    PackTypeInt4* __restrict__ C_tmp,    // fp32 tmp output buffer (for reduce)
+    const PackTypeInt4* __restrict__ scales_ptr,  // fp16 quantization scales of shape
+                                          // (k/groupsize)xn
+    const PackTypeInt4* __restrict__ zp_ptr,      // 4bit packed zero-points of shape
+                                          // (k/groupsize)x(n/pack_factor)
+    const int* __restrict__ g_idx,        // int32 group indices of shape k
+    int prob_m,           // batch dimension m
+    int prob_n,           // output dimension n
+    int prob_k,           // reduction dimension k
+    int quant_group_power2,
+    int max_iters,        // max tile iterations for one block
+    int* locks,           // extra global storage for barrier synchronization
+    bool use_fp32_reduce  // whether to use fp32 global reduce
+) {
+    int bidx = blockIdx.x;
+    __shared__ uint8_t smem_base[0x4000]; //4x16x256 = 16Kbytes
+    using LoadingManagerType = LoadingManager<scalar_t, w_type_id, THREADS, BLOCKS_M, BLOCKS_N, BLOCKS_K, HAS_ACT_ORDER, HAS_ZP, HAS_M_PRED, HAS_NK_PRED>;
+    LoadingManagerType loading_manager;
+    A += blockIdx.y * (MAX_BLOCKS_M * SLICE_M) * prob_k / (sizeof(PackTypeInt4) / sizeof(scalar_t));
+    C += (blockIdx.y * (MAX_BLOCKS_M * SLICE_M) * prob_n) / (sizeof(PackTypeInt4) / sizeof(scalar_t));
+
+    loading_manager.set_address(A, B, C, C_tmp, scales_ptr, zp_ptr);
+    //loading_manager.init_address(prob_m, prob_n, prob_k, bidx, max_iters, smem_base);
+    loading_manager.init_address_pre(std::min<int>(MAX_BLOCKS_M*SLICE_M, prob_m - blockIdx.y * (MAX_BLOCKS_M * SLICE_M)), prob_n, prob_k, quant_group_power2, bidx, max_iters, smem_base);
+
+    loading_manager.ldg_scales(); //Load all scales to bsm
+    loading_manager.ldg_zp();
+    loading_manager.ldg_b(0);    //load b in k0~31
+    loading_manager.ldg_a(0);    //Load first k0~63 and all m
+    loading_manager.clear_c();
+
+    while (max_iters > 0) {
+        loading_manager.init_bsm_addr(); //reset all bsm address for current tile
+        loading_manager.sts_scales();
+        loading_manager.sts_zeros();
+        barrier_bsm;
+        loading_manager.lds_scales(); //load scale0 and scale64
+        loading_manager.pack_scales(); //pack scales into two v2f structure
+
+        int k_idx = 0;
+        if constexpr(BLOCKS_K / 2 - 1 > 0) {
+            #pragma unroll BLOCKS_K / 2 - 1
+            for (int kloop = 0; kloop < BLOCKS_K / 2 - 1; kloop++) {
+                int m_idx = 0;
+                loading_manager.template on_dequant<0, false>(k_idx);
+                if constexpr(BLOCKS_M > 1) {
+                    #pragma unroll BLOCKS_M - 1
+                    for (; m_idx < BLOCKS_M - 1; m_idx++) {
+                        loading_manager.lds_a(m_idx+1); //pre load next 16 batches
+                        loading_manager.matmul(m_idx); //do matmul
+                    }
+                }
+                barrier_bsm; //wait for the last 16 batches ready, becasue of k_idx will be change
+                loading_manager.next_k1(); //modify gvm/bsm address of a and b
+                loading_manager.matmul(m_idx); //do matmul
+                m_idx = 0;
+                loading_manager.template on_dequant<1, false>(k_idx);
+                if constexpr(BLOCKS_M > 1) {
+                    #pragma unroll BLOCKS_M - 1
+                    for (; m_idx < BLOCKS_M - 1; m_idx++) {
+                        loading_manager.lds_a(m_idx+1); //pre load next 16 batches
+                        loading_manager.matmul(m_idx); //do matmul
+                    }
+                }
+                barrier_bsm; //wait for the last 16 batches ready, becasue of k_idx will be change
+                loading_manager.next_k0(); //modify gvm/bsm address of a and b
+                loading_manager.matmul(m_idx); //do matmul
+                k_idx += 2;
+            }
+        }
+
+        int m_idx = 0;
+        loading_manager.template on_dequant<0, false>(k_idx);
+        if constexpr(BLOCKS_M > 1) {
+            #pragma unroll BLOCKS_M - 1
+            for (; m_idx < BLOCKS_M - 1; m_idx++) {
+                loading_manager.lds_a(m_idx+1); //pre load next 16 batches
+                loading_manager.matmul(m_idx); //do matmul
+            }
+        }
+        barrier_bsm; //wait for the last 16 batches ready, becasue of k_idx will be change
+        loading_manager.next_k1(); //modify gvm/bsm address of a and b
+        loading_manager.matmul(m_idx); //do matmul
+        m_idx = 0;
+        loading_manager.template on_dequant<1, true>(k_idx);
+        if constexpr(BLOCKS_M > 1) {
+            #pragma unroll BLOCKS_M - 1
+            for (; m_idx < BLOCKS_M - 1; m_idx++) {
+                loading_manager.lds_a(m_idx+1); //pre load next 16 batches
+                loading_manager.matmul(m_idx); //do matmul
+            }
+        }
+        barrier_bsm; //wait for the last 16 batches ready, becasue of k_idx will be change
+        //loading_manager.next_tile_pre(); should move into on_dequant ?
+        loading_manager.matmul(m_idx); //do matmul
+
+        max_iters--;
+
+        // if (loading_manager.tile_manager.need_save_data_pre()) {
+        //     loading_manager.write_c_pre(); // reduce and write back
+        // }
+
+        barrier_bsm;
+    }
+
+    loading_manager.write_c_pre(); // reduce and write back
+}
+} //end of namespace __hgemm_even_opt1_blocks_k
+
+template<typename scalar_t,
+    const vllm::ScalarTypeId w_type_id,
+    int THREADS,
+    int BLOCKS_M,
+    int BLOCKS_N,
+    int BLOCKS_K,
+    bool HAS_ACT_ORDER,
+    bool HAS_ZP,
+    bool HAS_M_PRED,
+    bool HAS_NK_PRED>
+bool launch_gemm_gptq_no_atomic_kernel(const PackTypeInt4* A,
+    const PackTypeInt4* B,
+    PackTypeInt4* C,
+    PackTypeInt4* C_temp,
+    const PackTypeInt4* scales,
+    const PackTypeInt4* zeros,
+    int* g_idx, int m, int n, int k, int quant_group, int chunks, cudaStream_t stream = nullptr) {
+    int tiles_m = div_ceil(m, TILE_M);
+    int tiles_n = div_ceil(n, TILE_N);
+    int tiles_k = div_ceil(k, TILE_K);
+    if (TILE_K > quant_group && TILE_K % quant_group != 0) {
+        printf("Invalid TILE_K %d that can not be dived by QUANT_GROUP %d\n", TILE_K, quant_group);
+        return false;
+    }
+
+    // printf("Launching hgemm_gptq_4bits THREADS=%d, BLOCKS_M=%d, BLOCKS_N=%d, BLOCKS_K=%d, HAS_M_PRED=%d, HAS_NK_PRED=%d, tiles_n=%d, tiles_k = %d, total_tiles = %d, iters = %d, blocks = %d, chunks = %d, TILE=m%dn%dk%d\n",
+    // THREADS, BLOCKS_M, BLOCKS_N, BLOCKS_K, HAS_M_PRED, HAS_NK_PRED, tiles_n, tiles_k, total_tiles, iters, blocks, chunks, BLOCKS_M*SLICE_M, BLOCKS_N*SLICE_N, BLOCKS_K*SLICE_K
+    // );
+
+    //It is better to do perm before launch kernel
+    if constexpr(BLOCKS_K % 2 == 1) {
+        __hgemm_singular_opt1_blocks_k::hgemm_gptq<scalar_t,
+            w_type_id,
+            THREADS,
+            BLOCKS_M, BLOCKS_N, BLOCKS_K,
+            HAS_ACT_ORDER, HAS_ZP, HAS_M_PRED, HAS_NK_PRED
+            ><<<dim3(1, std::max(chunks,1), tiles_n), THREADS, 0, stream>>>(A, B, C, C_temp, scales, zeros, g_idx, m, n, k, get_power2(quant_group), tiles_k, nullptr, false);
+    } else {
+        __hgemm_even_opt1_blocks_k::hgemm_gptq<scalar_t,
+            w_type_id,
+            THREADS,
+            BLOCKS_M, BLOCKS_N, BLOCKS_K,
+            HAS_ACT_ORDER, HAS_ZP, HAS_M_PRED, HAS_NK_PRED
+            ><<<dim3(1, std::max(chunks,1), tiles_n), THREADS, 0, stream>>>(A, B, C, C_temp, scales, zeros, g_idx, m, n, k, get_power2(quant_group), tiles_k, nullptr, false);
+    }
+
+    return true;
+}
 
 template <typename scalar_t, const vllm::ScalarTypeId w_type_id, int THREADS,
           int BLOCKS_M, int BLOCKS_N, int BLOCKS_K, bool HAS_ACT_ORDER,
@@ -2835,6 +3607,9 @@ bool launch_gemm_gptq_kernel(const PackTypeInt4* A, const PackTypeInt4* B,
     return false;
   }
 
+  if(tiles_n * std::max(chunks,1) >= PEUS) return launch_gemm_gptq_no_atomic_kernel<scalar_t, w_type_id, THREADS, BLOCKS_M, BLOCKS_N, BLOCKS_K, HAS_ACT_ORDER,
+    HAS_ZP, HAS_M_PRED, HAS_NK_PRED>(A, B, C,C_temp, scales, zeros, g_idx, m, n, k, quant_group, chunks, stream);
+  
   int total_tiles = tiles_n * tiles_k;
   int blocks = PEUS;
   int iters = div_ceil(total_tiles, PEUS);
@@ -2881,14 +3656,7 @@ bool launch_gemm_gptq_kernel(const PackTypeInt4* A, const PackTypeInt4* B,
   }
 
   // It is better to do perm before launch kernel
-  if constexpr(BLOCKS_M == 8) {
-    __hgemm_singular_ad_blocks_k::hgemm_gptq<scalar_t,
-            w_type_id,
-            THREADS,
-            BLOCKS_M, BLOCKS_N, BLOCKS_K,
-            HAS_ACT_ORDER, HAS_ZP, HAS_M_PRED, HAS_NK_PRED
-            ><<<dim3(std::max(blocks,1), std::max(chunks,1), 1), THREADS, 0, stream>>>(A, B, C, C_temp, scales, zeros, g_idx, m, n, k, get_power2(quant_group), iters, nullptr, false);
-  } else if constexpr (BLOCKS_K % 2 == 1) {
+  if constexpr (BLOCKS_K % 2 == 1) {
     __hgemm_singular_blocks_k::hgemm_gptq<
         scalar_t, w_type_id, THREADS, BLOCKS_M, BLOCKS_N, BLOCKS_K,
         HAS_ACT_ORDER, HAS_ZP, HAS_M_PRED, HAS_NK_PRED>

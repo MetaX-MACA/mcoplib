@@ -1,0 +1,14 @@
+{
+    "device_id": 0,
+    "device_name": "MetaX C500",
+    "batch_size": 256, 
+    "num_spec_step": 8,
+    "num_draft_tokens": 16,
+    "tot_num_draft_tokens": 4096, 
+    "vocab_size": 32000,
+    "threshold_single": 0.5,
+    "threshold_acc": 0.8,
+    "deterministic": true,
+    "dtype": "float32",
+    "samples": 5000 
+}

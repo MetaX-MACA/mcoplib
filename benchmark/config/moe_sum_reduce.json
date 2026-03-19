@@ -1,0 +1,10 @@
+{
+    "device_id": 0,
+    "device_name": "MetaX C500",
+    "token_num": 16384,
+    "topk_num": 2,
+    "hidden_dim": 8192,
+    "routed_scaling_factor": 1.0,
+    "dtype": "bfloat16",
+    "samples": 10000
+}

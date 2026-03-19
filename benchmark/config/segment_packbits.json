@@ -1,0 +1,8 @@
+{
+    "device_id": 0,
+    "device_name": "MetaX C500",
+    "batch_size": 65536,
+    "bits_per_segment": 2048,
+    "dtype": "bool",
+    "samples": 10000
+}

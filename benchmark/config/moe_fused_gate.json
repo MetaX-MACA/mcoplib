@@ -1,0 +1,14 @@
+{
+    "device_id": 0,
+    "device_name": "MetaX C500",
+    "num_tokens": 65535,
+    "num_experts": 256,
+    "num_expert_group": 8,
+    "topk_group": 2,
+    "topk": 6,
+    "num_fused_shared_experts": 0,
+    "routed_scaling_factor": 1.0,
+    "apply_routed_scaling_factor_on_output": false,
+    "dtype": "float32",
+    "samples": 10000
+}

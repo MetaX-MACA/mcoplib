@@ -1,0 +1,11 @@
+{
+    "device_id": 0,
+    "device_name": "MetaX C500",
+    "total_pool_blocks": 65536,
+    "num_blocks_to_copy": 16384,
+    "elements_per_block": 4096,
+    "block_quota": 256,
+    "num_warps_per_block": 4,
+    "dtype": "float16",
+    "samples": 10000
+}

@@ -54,3 +54,7 @@ std::tuple<torch::Tensor, torch::Tensor> grouped_topk(
     torch::Tensor const& scores, int64_t n_group, int64_t topk_group,
     int64_t topk, bool renormalize, double routed_scaling_factor,
     torch::Tensor const& bias, int64_t scoring_func);
+
+// cuBLAS bf16 x bf16 -> fp32 router GEMM (fallback for non-SM90 / batch > 16)
+torch::Tensor router_gemm_bf16_fp32(torch::Tensor const& input,
+                                    torch::Tensor const& weight);

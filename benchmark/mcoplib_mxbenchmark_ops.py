@@ -84,14 +84,32 @@ SUPPORTED_OPERATORS = [
     "static_scaled_int8_quant",      
     "swap_blocks",              
     "swigluoai_and_mul",
-    "top_k_per_row_decode",
-    "top_k_per_row",
-    "topk_softmax",
     "transfer_kv_all_layer_direct_lf_pf",  
     "transfer_kv_direct",              
-    "transfer_kv_per_layer_direct_pf_lf"  
+    "transfer_kv_per_layer_direct_pf_lf",
+    "moe_sum_reduce",
+    "moe_fused_gate",
+    "prepare_moe_input",
+    "apply_shuffle_mul_sum",
+    "fused_moe_gate_opt",
+    "fused_silu_mul_dq_quant_interface",
+    "mx_awq_dequantize",
+    "tree_speculative_sampling_target_only",
+    "verify_tree_greedy",
+    "reconstruct_indices_from_tree_mask",
+    "build_tree_kernel_efficient",
+    "segment_packbits",
+    "transfer_kv_per_layer",
+    "transfer_kv_per_layer_pf_lf",
+    "transfer_kv_per_layer_ph_lf",
+    "transfer_kv_all_layer",
+    "transfer_kv_all_layer_lf_pf",
+    "transfer_kv_all_layer_lf_ph",
+    "transfer_kv_per_layer_mla",
+    "transfer_kv_per_layer_mla_pf_lf",
+    "transfer_kv_all_layer_mla",
+    "transfer_kv_all_layer_mla_lf_pf"
 ]
-
 
 # =============================================================================
 #  Loader Logic

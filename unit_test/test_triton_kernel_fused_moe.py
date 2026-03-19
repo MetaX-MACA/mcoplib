@@ -93,9 +93,6 @@ def reference_moe_with_padding(A: torch.Tensor, B: torch.Tensor,
     # Sum across TOP_K dimension like vLLM does
     return torch.sum(C, dim=1)  # Shape: (M, N)
 
-
-# NOTE(zyongye): we can remove all the wna16 kernel
-# once we drop off sm75 support
 def invoke_fused_moe_wna16_triton_kernel(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -134,6 +131,7 @@ def invoke_fused_moe_wna16_triton_kernel(
     )
 
     fused_moe_triton_kernel_gptq_awq(
+        grid,
         A,
         B,
         C,
@@ -401,6 +399,8 @@ def test_invoke_fused_moe_kernel_only():
         # Warmup runs
         for _ in range(WARMUP):
             
+            print(f"invoke_fused_moe_wna16_triton_kernel C tensor:{C.shape}")
+
             invoke_fused_moe_triton_kernel(
                 A, B, C,
                 A_scale, B_scale,

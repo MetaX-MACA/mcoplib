@@ -1224,7 +1224,7 @@ void launch_silu_mul_quant_pack(T* input, T* output, T1* mask, int64_t num_token
     cudaGetDevice(&dev);
     int sm_count = 0;
     cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, dev);
-    int gridsize = sm_count;
+    int gridsize = sm_count*4;
     int64_t inner_hidden_size = hidden_size / 2;
     int blocksize = 512;
     int N = sizeof(float4) / sizeof(T);
@@ -1474,7 +1474,7 @@ void dynamic_scaled_int8_mask_quant(
             cudaGetDevice(&dev);
             int sm_count = 0;
             cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, dev);
-            int gridsize = sm_count;
+            int gridsize = sm_count * 4;
             if(hidden_size <= 4096 && ((hidden_size & (n - 1)) == 0) && n == 8) {
               int blocksize = 512;
               vllm::dynamic_scaled_int8_quant_mask_kernel_sreg_opt<scalar_t, float, float4, float2><<<gridsize, blocksize, 0, stream>>>(input.data_ptr<scalar_t>(),out.data_ptr<int8_t>(),scales.data_ptr<float>(),hidden_size,blocksize,num_tokens_batch,mask_size,gridsize,mask.data_ptr<int>());

@@ -4,6 +4,11 @@ void fused_silu_mul_dq_mask_quant_pack(
     at::Tensor const& input, 
     at::Tensor const &mask);
 
+void fused_silu_mul_dq_mask_quant_fp8_pack(
+    torch::Tensor& out,          
+    torch::Tensor const& input, 
+    torch::Tensor const &mask);
+
 void fused_silu_mul_dq_quant_reordered_topk_interface(
     at::Tensor& out,
     at::Tensor& scale,   

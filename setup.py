@@ -43,7 +43,7 @@ CMAKE_EXECUTABLE = 'cmake' if not USE_MACA else 'cmake_maca'
 #Python 当前解释器的扩展后缀
 ext_suffix = sysconfig.get_config_var('EXT_SUFFIX') or '.so'
 name="mcoplib"
-mcoplib_version="0.4.1"
+mcoplib_version="0.4.2"
 
 
 
@@ -612,8 +612,8 @@ def write_git_info_file(target_path):
                 f'Build_Maca_Version = {maca_version!r}\n'
                 f'GIT_BRANCH = {branch!r}\n'
                 f'GIT_COMMIT = {commit!r}\n'
-                f'Vllm Op Version = 0.15.0\n'
-                f'SGlang Op Version  = 0.5.7 && 0.5.8\n'
+                f'Vllm Op Version = 0.17.0\n'
+                f'SGlang Op Version  = 0.5.8 && 0.5.9\n'
             )
     os.makedirs(os.path.dirname(target_path), exist_ok=True)
     with open(target_path, "w", encoding="utf-8") as f:

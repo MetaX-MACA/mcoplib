@@ -225,6 +225,8 @@ if (BUILD_VLLM_SUBMODULE)
     "${VLLM_SRC_DIR}/layernorm_quant_kernels.cu"
     "${VLLM_SRC_DIR}/fused_qknorm_rope_kernel.cu"
     "${VLLM_SRC_DIR}/sampler.cu"
+    "${VLLM_SRC_DIR}/topk.cu"
+    "${VLLM_SRC_DIR}/dsv3_fused_a_gemm.cu"
     "${VLLM_SRC_DIR}/cuda_view.cu"
     "${VLLM_SRC_DIR}/quantization/gptq/q_gemm.cu"
     "${VLLM_SRC_DIR}/quantization/compressed_tensors/int8_quant_kernels.cu"

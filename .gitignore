@@ -64,7 +64,6 @@ build/bin
 build/
 mxbench/install/
 mxbench/python/build/
-mxbench/python/_deps/
 mxbench/python/dist/
 mxbench/python/build/_deps/fmt-src
 mxbench/python/pynvbench.egg-info
@@ -87,5 +86,3 @@ compile_commands.json
 *.cap
 *.pcapng
 *.txt
-CLAUDE.md
-.claude/

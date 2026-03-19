@@ -48,6 +48,11 @@ if(BUILD_LIBRARY)
     target_compile_options(mcoplib_cv PRIVATE
         ${CUDA_COMPILE_OPTIONS}
     )
+    if(BUILD_MACA_PLATFORM STREQUAL "C600")
+      target_compile_options(mcoplib_cv PRIVATE
+          $<$<COMPILE_LANGUAGE:CUDA>:--offload-arch=xcore1500>
+        )
+    endif()
     
     # 安装规则
     #install(TARGETS mcoplib_cv

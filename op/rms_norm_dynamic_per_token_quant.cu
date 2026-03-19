@@ -268,7 +268,6 @@ void rms_norm_dynamic_per_token_quant_custom(
     at::Tensor& scales,        // [num_tokens]
     double const var_epsilon,     // Variance epsilon used in norm calculation
     c10::optional<at::Tensor> scale_ub, c10::optional<at::Tensor> residual) {
-  TORCH_CHECK(out.dtype() == torch::kInt8);
   TORCH_CHECK(out.is_contiguous() && input.is_contiguous());
 
   TORCH_CHECK(scales.dtype() == torch::kFloat32);
