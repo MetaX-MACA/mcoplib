@@ -10,7 +10,8 @@ from typing import Callable, NamedTuple, Optional
 current_dir = os.path.dirname(os.path.abspath(__file__))
 project_dir = os.path.dirname(current_dir)
 sys.path.append(project_dir)
-from mcoplib import op as ops
+#from mcoplib import op as ops
+import mcoplib.sgl_kernel
 from measure_cuda import measure_cuda
 
 def cosine_similarity(a, b):
@@ -144,7 +145,7 @@ def moe_gate_func(q_len, num_experts, topk, num_expert_group, top_k_group, renor
     golden_routing_weights, golden_selected_experts = biased_grouped_topk(gating_output, gating_output, correction_bias, topk, renormalize, num_expert_group, top_k_group, num_shared_experts, scale_factor)
 
     def kernel():
-        ops.fused_moe_gate_opt(gating_output, correction_bias, out_routing_weights, out_selected_experts, topk, renormalize, num_expert_group, top_k_group, num_shared_experts, scale_factor)
+        torch.ops.sgl_kernel.fused_moe_gate_opt(gating_output, correction_bias, out_routing_weights, out_selected_experts, topk, renormalize, num_expert_group, top_k_group, num_shared_experts, scale_factor)
         #torch.ops.sgl_kernel.fused_moe_gate_opt(gating_output, correction_bias, out_routing_weights, out_selected_experts, topk, renormalize, num_expert_group, top_k_group, num_shared_experts, scale_factor)
     stats = measure_cuda(kernel, iters=200, warmup=20, device=device)
     print("PyTorch matmul stats (microseconds):")
@@ -168,8 +169,8 @@ class TestMoeGate(unittest.TestCase):
     def test_moe_gate_160_experts_bfloat16_f_1(self):
         moe_gate_func(q_len=16, num_experts=160, topk=9, num_expert_group=1, top_k_group=1, renormalize=True, num_shared_experts=1, test_dtype=torch.float32, scale_factor=1.0, test_name="test_moe_gate_160_experts_bfloat16_f_1")
 
-    # def test_moe_gate_256_experts_bfloat16_t_1(self):
-    #     moe_gate_func(q_len=16, num_experts=256, topk=9, num_expert_group=8, top_k_group=4, renormalize=True, num_shared_experts=1, test_dtype=torch.bfloat16, scale_factor=1.0)
+    def test_moe_gate_256_experts_float32_t_1(self):
+        moe_gate_func(q_len=16, num_experts=256, topk=8, num_expert_group=1, top_k_group=1, renormalize=True, num_shared_experts=0, test_dtype=torch.float32, scale_factor=1.0)
 
     # def test_moe_gate_256_experts_bfloat16_f_1(self):
     #     moe_gate_func(q_len=16, num_experts=256, topk=9, num_expert_group=8, top_k_group=4, renormalize=True, num_shared_experts=1, test_dtype=torch.bfloat16, scale_factor=1.0)

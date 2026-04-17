@@ -1,4 +1,3 @@
-// 2025 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 // #include "fused_rotary_emb.h"
 
 #include <cuda_bf16.h>
@@ -29,6 +28,7 @@ int64_t fused_mla_absorb_rotary_emb(
     int64_t qk_rope_head_dim, //64
     int64_t qk_nope_head_dim //128
 ) {
+    
     //TODO:
     //check all shape
     const at::cuda::OptionalCUDAGuard device_guard(device_of(q));
@@ -52,6 +52,7 @@ int64_t fused_mla_absorb_rotary_emb(
         "Invalid shape of latent cache, get (", latent_cache.size(0), ", ", latent_cache.size(1), ") but expected (",
         q_len, ", ", kv_lora_rank + qk_rope_head_dim, ")"
     );
+    
     TORCH_CHECK(q_input.size(0) == q_len && q_input.size(1) == num_local_heads && q_input.size(2) == kv_lora_rank + qk_rope_head_dim,
         "Invalid shape of q_input, get (", q_input.size(0), ", ", q_input.size(1), ", ", q_input.size(2), ") but expeced (",
         q_len, ", ", qk_nope_head_dim, ", ", kv_lora_rank+qk_rope_head_dim, ")"
@@ -69,7 +70,7 @@ int64_t fused_mla_absorb_rotary_emb(
         "), but expected (MAX_POSITION_EMBEDDINGS, ", qk_rope_head_dim, ")");
     TORCH_CHECK(positions.size(0) == q_len, "Invalid positions shape, get (", positions.size(0), ") but expected (", q_len, ")");
     TORCH_CHECK(norm_weight.size(0) == kv_lora_rank, "Invalid norm_weight shape, get (", norm_weight.size(0), ") but expected (", kv_lora_rank, ")");
-
+    
     #define LAUNCH_FUSED_ABSORB_MLA(NUM_LOCAL_HEADS, KV_LORA_RANK, QK_NOPE_HEAD_DIM, QK_ROPE_HEAD_DIM) \
         else if (q_len > 0 && num_local_heads == NUM_LOCAL_HEADS && kv_lora_rank == KV_LORA_RANK && qk_nope_head_dim == QK_NOPE_HEAD_DIM && qk_rope_head_dim == QK_ROPE_HEAD_DIM) { \
             fused_mla::fused_absorb_mla<scalar_t, NUM_LOCAL_HEADS, KV_LORA_RANK, QK_NOPE_HEAD_DIM, QK_ROPE_HEAD_DIM><<<grid, block, 0, at::cuda::getCurrentCUDAStream(dev)>>>(      \
@@ -90,7 +91,7 @@ int64_t fused_mla_absorb_rotary_emb(
 
 
     // dim3 grid = dim3((q_len/4 +4)*(num_local_heads+1)-1, 1, 1);
-    dim3 grid = dim3((q_len + 15)/16 * kv_lora_rank/128 * num_local_heads + (q_len+3)/4 * num_local_heads + (q_len+3)/4, 1, 1);
+    dim3 grid = dim3((q_len + 15)/16 * kv_lora_rank/256 * num_local_heads + (q_len+3)/4 * num_local_heads + (q_len+3)/4, 1, 1);
     dim3 block = dim3(256, 1, 1);
     const int latent_cache_stride = latent_cache.stride(0);
     // printf("latent_cache_stride: %d\n", latent_cache_stride);

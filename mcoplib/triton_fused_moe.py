@@ -569,7 +569,6 @@ def sgl_fused_moe_kernel(
     c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
     tl.store(c_ptrs, accumulator, mask=c_mask)
 
-
 @triton.jit
 def fused_moe_kernel_gptq_awq(
     # Pointers to matrices
@@ -668,7 +667,8 @@ def fused_moe_kernel_gptq_awq(
     if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
         return
     offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
-    offs_token = tl.load(sorted_token_ids_ptr + offs_token_id)
+    # Cast to int64 to prevent overflow in stride*offset products
+    offs_token = tl.load(sorted_token_ids_ptr + offs_token_id).to(tl.int64)
     token_mask = offs_token < num_valid_tokens
 
     off_experts = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
@@ -1048,7 +1048,9 @@ def fused_moe_kernel(
     # `accumulator` will be converted back to fp16 after the loop.
 
     # ┌------------------------  Metax Modification -------------------------┐
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    accumulator = tl.zeros(
+        (BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.int32 if use_int8_w8a8 else tl.float32
+    )
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K * SPLIT_K)):
         # Load the next block of A and B, generate a mask by checking the
         # K dimension.
@@ -1241,6 +1243,7 @@ def fused_moe_triton_kernel(
             - num_warps: warp数量
             - num_stages: 流水线阶段数
     """
+    #print(f"fused_moe_triton_kernel func Python Wrapper 拦截到了 kwargs: {kwargs}")
     fused_moe_kernel[grid](
         a_ptr,
         b_ptr,
@@ -1324,6 +1327,7 @@ def fused_moe_triton_kernel_gptq_awq(
     **kwargs,
 ):
 
+    #print(f"fused_moe_triton_kernel_gptq_awq func Python Wrapper 拦截到了 kwargs: {kwargs}")
     fused_moe_kernel_gptq_awq[grid](
         a_ptr,
         b_ptr,

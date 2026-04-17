@@ -228,6 +228,26 @@ __forceinline__ __device__ void st32_cs(int* addr, int val) {
 #endif
 }
 
+// 128-bit cache-streaming (.cs) load / store.
+// Falls back to ld128/st128 on ROCm (no .cs hint).
+__forceinline__ __device__ int4 ld128_cs(const int4* addr) {
+  int4 val;
+// #ifndef USE_ROCM
+//   asm volatile("ld.global.cs.v4.u32 {%0,%1,%2,%3}, [%4];"
+//                : "=r"(val.x), "=r"(val.y), "=r"(val.z), "=r"(val.w)
+//                : "l"(addr));
+// #else
+  ld128(val, addr);
+//#endif
+  return val;
+}
+
+__forceinline__ __device__ void st128_cs(int4* addr, int4 val) {
+
+  st128(val, addr);
+
+}
+
 // Predicated 256-bit / 128-bit cache-global (.cg) loads.
 // Returns zero if pred is false.  SM100+ only.
 __device__ __forceinline__ void ld256_cg_or_zero(u32x8_t& val, const void* ptr,

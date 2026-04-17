@@ -1,8 +1,8 @@
-// 2025 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <torch/all.h>
 #include "fused_moe_gate.cuh"
+
 
 int64_t fused_moe_gate_opt(
     torch::Tensor& gating_outputs, //[bs, num_experts], dtype=bf16
@@ -42,6 +42,15 @@ int64_t fused_moe_gate_opt(
     }
     c10::ScalarType type = gating_outputs.scalar_type();
     c10::ScalarType type_bias =  correction_bias.scalar_type();
+
+    // 2. 严格的类型安全校验 (Fail Fast)
+    TORCH_CHECK(type_bias == type, 
+        "Type mismatch: correction_bias (", type_bias, 
+        ") must match gating_outputs (", type, ")");
+        
+    TORCH_CHECK(out_routing_weights.scalar_type() == torch::kFloat32, 
+        "Type mismatch: out_routing_weights MUST be float32 for softmax stability.");
+
 #define LAUNCH_MOE_GATE(NUM_SHARED_EXPERTS, NUM_EXPERTS, NUM_EXPERT_GROUP, TOPK_GROUP, TOPK) \
     else if (num_shared_experts == NUM_SHARED_EXPERTS && num_expert_group == NUM_EXPERT_GROUP && topk_group == TOPK_GROUP && num_experts == NUM_EXPERTS) { \
         int block = ((NUM_EXPERTS + 63) / 64) * 64;                                                                                                           \
@@ -62,6 +71,7 @@ int64_t fused_moe_gate_opt(
     // TopK=8, 无共享专家配置 (按专家数排序)
     LAUNCH_MOE_GATE(0, 160, 1, 1, 8)
     LAUNCH_MOE_GATE(0, 256, 8, 4, 8)
+    LAUNCH_MOE_GATE(0, 256, 1, 1, 8)
     LAUNCH_MOE_GATE(0, 320, 1, 1, 8)
     LAUNCH_MOE_GATE(0, 384, 1, 1, 8)
     LAUNCH_MOE_GATE(0, 448, 1, 1, 8)

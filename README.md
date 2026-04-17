@@ -9,7 +9,6 @@ Install build dependencies:
 ```shell
 # Install cmake. Note: If compiling inside a container and the code is stored on a network shared drive, you must first switch to the root user and install cmake as root.
 pip3 install cmake==3.26.3
-pip3 install setuptools-scm==8.0
 # Install pybind11
 pip3 install pybind11
 pip3 install build
@@ -407,7 +406,7 @@ def fused_mla_normal_rotary_emb(
 - optimize mcoplib project build 
 - support mxbench for auto test op kernel `s perfromance
 - support profiler tools check op kernel `s perfromance
-- support for vllm 0.17.0  op kernels
+- support for vllm 0.18.0  op kernels
 - support Project-customized op kernels
 - support k-transformer op kernels
 - support verl op kernels

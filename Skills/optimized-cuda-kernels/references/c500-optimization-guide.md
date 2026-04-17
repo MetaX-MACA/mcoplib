@@ -23,7 +23,7 @@ C500 has less atomic hd instruction, so Try to avoid using atomic on Metax C500.
 | Memory Bandwidth | 1.55 TB/s | HBM2e |
 | Max Threads/SM | 2048 | 64 warps |
 | Max Threads/Block | 1024 | 32 warps |
-| Warp Size | 64 | Unchanged |
+| Warp Size | 32 | Unchanged |
 
 ### Key C500 Features
 
