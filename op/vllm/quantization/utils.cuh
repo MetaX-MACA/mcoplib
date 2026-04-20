@@ -29,6 +29,13 @@ struct quant_type_max<c10::Float8_e4m3fnuz> {
   }
 };
 
+template <>
+struct quant_type_max<c10::Float8_e4m3fn> {
+  static constexpr c10::Float8_e4m3fn val() {
+    return c10::Float8_e4m3fn(0x7E, c10::Float8_e4m3fn::from_bits());
+  }
+};
+
 template <typename T>
 MAYBE_HOST_DEVICE static constexpr T quant_type_max_v =
     quant_type_max<T>::val();

@@ -42,6 +42,28 @@ def fused_add_rms_norm_dynamic_per_token_quant_padding_output(input: torch.tenso
                                                   weight, pad_size, epsilon)
     return output, residual, output_rms, output_quant_int8, scales
 
+def fused_fp8_add_rms_norm_dynamic_per_token_quant_padding_output(input: torch.tensor, 
+                                                              residual: torch.tensor,
+                                                              weight: torch.tensor,
+                                                              pad_size: int,
+                                                              epsilon: float
+                                                              ) -> tuple[torch.tensor, torch.tensor]:
+    assert input.is_contiguous()
+    shape = list(input.shape)
+    shape[-1] = pad_size
+    output = torch.empty(shape, dtype=torch.bfloat16, device=input.device)
+    assert weight.is_contiguous()
+    C_output = output.view(dtype=torch.float8_e4m3fn)
+
+    output_rms = torch.empty_like(input)
+    output_quant_fp8 = torch.empty_like(input, dtype=torch.float8_e4m3fn)
+    scales = torch.empty((input.numel() // input.shape[-1], 1),
+                         device=input.device,
+                         dtype=torch.float32)
+    ops.fused_add_rms_norm_dynamic_per_token_quant_padding_output(C_output, output_rms, output_quant_fp8, scales, input, residual,
+                                                  weight, pad_size, epsilon)
+    return output, residual, output_rms, output_quant_fp8, scales
+
 def rms_norm_dynamic_per_token_quant(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -55,10 +77,6 @@ def rms_norm_dynamic_per_token_quant(
                          device=input.device,
                          dtype=torch.float32)
 
-    ops.rms_norm_dynamic_per_token_quant_custom(output, input, weight,
-                                                  scales, epsilon, scale_ub,
-                                                  residual)
-    return output, scales
     ops.rms_norm_dynamic_per_token_quant_custom(output, input, weight,
                                                   scales, epsilon, scale_ub,
                                                   residual)

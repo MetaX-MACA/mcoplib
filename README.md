@@ -9,7 +9,6 @@ Install build dependencies:
 ```shell
 # Install cmake. Note: If compiling inside a container and the code is stored on a network shared drive, you must first switch to the root user and install cmake as root.
 pip3 install cmake==3.26.3
-pip3 install setuptools-scm==8.0
 # Install pybind11
 pip3 install pybind11
 pip3 install build
@@ -401,13 +400,13 @@ def fused_mla_normal_rotary_emb(
     Answer: Please execute the environment variable script env.sh before compiling: cd /code/dir/mcoplib/ && source env.sh
 
 ## Release
-### Release 0.4.0
+### Release 0.4.4
 - add cv op kernel
-- support sglang  0.5.8 && 0.5.9 op 
+- support sglang  0.5.10 op
 - optimize mcoplib project build 
 - support mxbench for auto test op kernel `s perfromance
 - support profiler tools check op kernel `s perfromance
-- support for vllm 0.17.0  op kernels
+- support for vllm 0.19.0  op kernels
 - support Project-customized op kernels
 - support k-transformer op kernels
 - support verl op kernels

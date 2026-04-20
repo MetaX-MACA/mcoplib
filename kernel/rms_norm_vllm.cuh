@@ -177,7 +177,7 @@ struct ScaledQuant<
 template <typename fp8_type>
 static __device__ __forceinline__ fp8_type float_to_fp8(float const x) {
   float const r =
-      fmax(-128, fmin(x, 127));
+      fmax(-448, fmin(x, 448));
   return static_cast<fp8_type>(r);
 }
 

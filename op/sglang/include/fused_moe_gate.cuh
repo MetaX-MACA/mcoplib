@@ -308,12 +308,17 @@ template<class scalar_t>
         if (wave_idx == 0 && wave_lane >= topks_in_block) {
             if constexpr (std::is_same_v<scalar_t, float>) {
                 max_cache[wave_lane][0] = -INFINITY;
-                *((uint32_t*)&max_cache[wave_lane][1]) = tid;
+                *((uint32_t*)&max_cache[wave_lane][1]) = wave_lane;
             }
-            else
-                ((float*)(max_cache))[wave_lane] = *(float*)idx_and_weight;
+            else {
+                // 对于 bf16/half -INFINITY 
+                // 低16位: weight = -INFINITY
+                // 高16位: index
+                scalar_t neg_inf = float2scalar<scalar_t>(-INFINITY);
+                int32_t packed = (*(int32_t*)&neg_inf) | (wave_lane << 16);
+                ((int32_t*)(max_cache))[wave_lane] = packed;
+            }
         }
-   
         __syncthreads();
 
         //We get NUM_EXPERTS/WAVE_SIZE*TOPK experts&weights

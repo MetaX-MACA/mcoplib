@@ -1,4 +1,3 @@
-// 2025 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <cutlass/arch/arch.h>
@@ -505,6 +504,9 @@ void sm90_fp8_blockwise_group_mm_dispatch_shape(
   torch::Tensor scales_a_t = scales_a.t();
   torch::Tensor scales_b_t = scales_b.transpose(1, 2);
 
+  const std::string H20_device_type_str("NVIDIA H20");
+  bool is_h20_device = std::string(at::cuda::getCurrentDeviceProperties()->name) == H20_device_type_str;
+
   if (a.size(0) <= 2048) {
     run_get_group_gemm_starts<MmaConfigSmallM::LayoutSFA, MmaConfigSmallM::LayoutSFB, MmaConfigSmallM::ScaleConfig>(
         expert_offsets,
@@ -538,6 +540,78 @@ void sm90_fp8_blockwise_group_mm_dispatch_shape(
         expert_offsets,
         workspace);
     output = output_t.t();
+  } else {
+    if (is_h20_device && a.size(1) > 128) {
+      // For H20 with K > 128, use Pingpong Schedule
+      run_get_group_gemm_starts<
+          MmaConfigH20LargeK::LayoutSFA,
+          MmaConfigH20LargeK::LayoutSFB,
+          MmaConfigH20LargeK::ScaleConfig>(
+          expert_offsets,
+          a_ptrs,
+          b_ptrs,
+          out_ptrs,
+          a_scales_ptrs,
+          b_scales_ptrs,
+          a,
+          b,
+          output,
+          scales_a,
+          scales_b,
+          layout_sfa,
+          layout_sfb,
+          problem_sizes,
+          problem_sizes_transpose);
+      launch_sm90_fp8_blockwise_scaled_group_mm<OutType, MmaConfigH20LargeK, cutlass::layout::RowMajor>(
+          out_ptrs,
+          a_ptrs,
+          b_ptrs,
+          a_scales_ptrs,
+          b_scales_ptrs,
+          stride_a,
+          stride_b,
+          stride_c,
+          layout_sfa,
+          layout_sfb,
+          problem_sizes,
+          expert_offsets,
+          workspace);
+    } else {
+      // For H20 with K <= 128, and H100 & H200 & H800, use Cooperative Schedule
+      run_get_group_gemm_starts<
+          MmaConfigHx00AndH20SmallK::LayoutSFA,
+          MmaConfigHx00AndH20SmallK::LayoutSFB,
+          MmaConfigHx00AndH20SmallK::ScaleConfig>(
+          expert_offsets,
+          a_ptrs,
+          b_ptrs,
+          out_ptrs,
+          a_scales_ptrs,
+          b_scales_ptrs,
+          a,
+          b,
+          output,
+          scales_a,
+          scales_b,
+          layout_sfa,
+          layout_sfb,
+          problem_sizes,
+          problem_sizes_transpose);
+      launch_sm90_fp8_blockwise_scaled_group_mm<OutType, MmaConfigHx00AndH20SmallK, cutlass::layout::RowMajor>(
+          out_ptrs,
+          a_ptrs,
+          b_ptrs,
+          a_scales_ptrs,
+          b_scales_ptrs,
+          stride_a,
+          stride_b,
+          stride_c,
+          layout_sfa,
+          layout_sfb,
+          problem_sizes,
+          expert_offsets,
+          workspace);
+    }
   }
 }
 

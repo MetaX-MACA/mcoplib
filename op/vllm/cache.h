@@ -95,3 +95,9 @@ void cp_gather_indexer_k_quant_cache(
     torch::Tensor& dst_scale,  // [num_tokens, head_dim / quant_block_size * 4]
     const torch::Tensor& block_table,   // [batch_size, num_blocks]
     const torch::Tensor& cu_seq_lens);  // [batch_size + 1]
+
+// Concatenate query nope and rope for MLA/DSA attention
+void concat_mla_q(
+    torch::Tensor& ql_nope,  // [num_tokens, num_heads, nope_dim]
+    torch::Tensor& q_pe,     // [num_tokens, num_heads, rope_dim]
+    torch::Tensor& q_out);   // [num_tokens, num_heads, nope_dim + rope_dim]

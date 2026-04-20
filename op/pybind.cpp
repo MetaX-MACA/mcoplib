@@ -1,4 +1,3 @@
-// Copyright (c) 2025 MetaX Integrated Circuits (Shanghai) Co., Ltd. All rights reserved.
 #include <pybind11/pybind11.h>
 #include <torch/extension.h>
 #include <torch/serialize/tensor.h>
@@ -62,6 +61,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("fused_silu_mul_dq_mask_quant", &fused_silu_mul_dq_mask_quant_pack);
     m.def("fused_silu_mul_dq_mask_fp8_quant", &fused_silu_mul_dq_mask_quant_fp8_pack);
     m.def("fused_silu_mul_dq_reorder_quant", &fused_silu_mul_dq_quant_reordered_topk_interface);
+    m.def("fused_silu_mul_dq_quant", &fused_silu_mul_dq_quant_interface);
 
     py::object torch_bfloat16 = py::module::import("torch").attr("bfloat16");
     m.def("gptq_marlin_gemm_legacy", &gptq_marlin_gemm_legacy,

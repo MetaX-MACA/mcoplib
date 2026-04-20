@@ -1,4 +1,3 @@
-// 2025 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 #include "rms_norm.cuh"
 #include "rotary_emb.cuh"
 #include "bmm.cuh"
@@ -85,11 +84,11 @@ __global__ void fused_absorb_mla(
     uint32_t bidx = blockIdx.x;
     uint32_t tid = threadIdx.x;
 
-    if (bidx < (Q_LEN + 15)/16*4*NUM_LOCAL_HEADS) {
+    if (bidx < (Q_LEN + 15)/16*2*NUM_LOCAL_HEADS) {
         do_bmm<scalar_t, 1, 8, 4, NUM_LOCAL_HEADS, KV_LORA_RANK, QK_NOPE_HEAD_DIM, QK_ROPE_HEAD_DIM>(Q_LEN, q, w_kc, q_input, tid, bidx);
-    } else if (bidx < ((Q_LEN+3)/4 + (Q_LEN + 15)/16*4) * NUM_LOCAL_HEADS) {
+    } else if (bidx < ((Q_LEN+3)/4 + (Q_LEN + 15)/16*2) * NUM_LOCAL_HEADS) {
         //do t1/t2
-        bidx -= (Q_LEN + 15)/16*4*NUM_LOCAL_HEADS;
+        bidx -= (Q_LEN + 15)/16*2*NUM_LOCAL_HEADS;
         bidx = 4*bidx;
 
         //#pragma unroll
@@ -113,7 +112,7 @@ __global__ void fused_absorb_mla(
             );
         }
     } else {
-        bidx -= ((Q_LEN+3)/4 + (Q_LEN + 15)/16*4) * NUM_LOCAL_HEADS;
+        bidx -= ((Q_LEN+3)/4 + (Q_LEN + 15)/16*2) * NUM_LOCAL_HEADS;
         bidx *= 4;
 
         uint32_t m = bidx + tid/QK_ROPE_HEAD_DIM;
@@ -195,7 +194,7 @@ __global__ void gemm_test(const scalar_t* q, const scalar_t* w_kc, scalar_t* q_i
         >(Q_LEN, q, w_kc, wave_idx, wave_group_idx, wave_group_lane, 0, 0,0, q_input);
 }
 
- 
+
 template<typename scalar_t, int NUM_LOCAL_HEADS=128, int KV_LORA_RANK=512, int QK_NOPE_HEAD_DIM=128, int QK_ROPE_HEAD_DIM=64>
 __global__ void fused_mla_RMS_rotary_emb(
     const int Q_LEN,
@@ -314,4 +313,5 @@ __global__ void fused_mla_normal_kv_element_wise(
         *((float4*)v + v_offset) = val;
     }
 }
+
 }

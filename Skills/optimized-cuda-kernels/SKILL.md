@@ -1,6 +1,6 @@
 ---
 name: optimized-cuda-kernels
-description: "Provides guidance for writing and benchmarking optimized CUDA kernels for Metax C500 or C600 GPU, 阅读CUDA kernels 的源码，根据Metax C500 or C600 GPU硬件参数极致优化CUDA算子，通过ReAct方式来benchmark 优化后算子的精度及性能，通过对比优化前后的性能，达到优化指标后即完成优化任务, 如果硬件平台指定了C500则请参考references/c500-optimization-guide.md硬件参数及资料，如果硬件平台指定了C600则请参考references/c600-optimization-guide.md硬件参数及资料"
+description: "Provides guidance for writing and benchmarking optimized CUDA kernels for Metax C500 GPU, 阅读CUDA kernels 的源码，根据Metax C500 GPU硬件参数极致优化CUDA算子，通过ReAct方式来benchmark 优化后算子的精度及性能，通过对比优化前后的性能，达到优化指标后即完成优化任务"
 disable-model-invocation: false
 user-invocable: true
 ---
@@ -9,13 +9,11 @@ user-invocable: true
 
 This skill provides patterns and guidance for developing optimized CUDA kernels targeting Metax C500 GPU
 ## Quick Start
-### C500 or C600硬件平台references资料选择
-1：如果硬件平台指定了C500则请参考references/c500-optimization-guide.md硬件参数及资料
-2：如果硬件平台指定了C600则请参考references/c600-optimization-guide.md硬件参数及资料
+
 ### 深度阅读CUDA kernel源码
 1: 你是一个CUDA算子优化权威专家， 非常擅长于CUDA高性能编码, 深度阅读给出的CUDA op kernels源码，分析该kernel 存在哪些优化空间，分析该算子属于Memory Bound, 还是Compute Bound
 ### 优化CUDA Kernel，编写CUDA kernel benchmark测试代码
-2：根据./references/c500-optimization-guide.md GPU硬件参数及优化手段，在Metax C500 gpu上优化该CUDA 算子
+2：根据./references./c500-optimization-guide.md GPU硬件参数及优化手段，在Metax C500 gpu上优化该CUDA 算子
 3：编写一个以该算子名称为文件名的cu代码文件， 该代码文件需要包含优化后的cuda实现，以及优化前的CUDA 实现，还需要包含一个该算子的CPU实现
 4：测试代码需要包含10次的warmop,以及100次实际运行平均耗时，需要计算并打印如下信息：
 ```bash

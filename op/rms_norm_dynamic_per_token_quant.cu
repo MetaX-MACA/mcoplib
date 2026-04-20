@@ -1,4 +1,3 @@
-// Copyright (c) 2025 MetaX Integrated Circuits (Shanghai) Co., Ltd. All rights reserved.
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <torch/all.h>
@@ -212,7 +211,7 @@ void  rms_norm_dynamic_per_token_quant_dispatch_(
 
   if (residual.has_value()) {
     if (hidden_size == 7168) {
-      MOE_DISPATCH_QUANT_TYPES(
+      MOE_DISPATCH_MORE_QUANT_TYPES(
         out.scalar_type(), "rms_norm_dynamic_per_token_quant_opt_kernel_", [&] {
           vllm::rms_norm_dynamic_per_token_quant_opt_kernel_<scalar_in_t, scalar_t, VPT, 7168 / VPT, block_size, true>
               <<<grid, block, 0, stream>>>(
@@ -223,7 +222,7 @@ void  rms_norm_dynamic_per_token_quant_dispatch_(
                   residual->data_ptr<scalar_in_t>());
         });
     } else {
-      MOE_DISPATCH_QUANT_TYPES(
+      MOE_DISPATCH_MORE_QUANT_TYPES(
         out.scalar_type(), "rms_norm_dynamic_per_token_quant_kernel", [&] {
           vllm::rms_norm_dynamic_per_token_quant_kernel<scalar_in_t, scalar_t,
                                                         true>
@@ -237,7 +236,7 @@ void  rms_norm_dynamic_per_token_quant_dispatch_(
     }
   } else {
     if (hidden_size == 7168) {
-      MOE_DISPATCH_QUANT_TYPES(
+      MOE_DISPATCH_MORE_QUANT_TYPES(
         out.scalar_type(), "rms_norm_dynamic_per_token_quant_opt_kernel_", [&] {
           vllm::rms_norm_dynamic_per_token_quant_opt_kernel_<scalar_in_t, scalar_t, VPT, 7168 / VPT, block_size, false>
               <<<grid, block, 0, stream>>>(
@@ -247,7 +246,7 @@ void  rms_norm_dynamic_per_token_quant_dispatch_(
                   var_epsilon, min_scaling_factor, hidden_size, nullptr);
         });
     } else {
-      MOE_DISPATCH_QUANT_TYPES(
+      MOE_DISPATCH_MORE_QUANT_TYPES(
         out.scalar_type(), "rms_norm_dynamic_per_token_quant_kernel", [&] {
           vllm::rms_norm_dynamic_per_token_quant_kernel<scalar_in_t, scalar_t,
                                                         false>
@@ -268,6 +267,7 @@ void rms_norm_dynamic_per_token_quant_custom(
     at::Tensor& scales,        // [num_tokens]
     double const var_epsilon,     // Variance epsilon used in norm calculation
     c10::optional<at::Tensor> scale_ub, c10::optional<at::Tensor> residual) {
+  TORCH_CHECK(out.dtype() == torch::kInt8 || out.dtype() == torch::kFloat8_e4m3fn);
   TORCH_CHECK(out.is_contiguous() && input.is_contiguous());
 
   TORCH_CHECK(scales.dtype() == torch::kFloat32);

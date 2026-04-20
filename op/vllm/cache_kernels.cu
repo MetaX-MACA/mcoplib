@@ -10,7 +10,7 @@
 #include "quantization/vectorization_utils.cuh"
 
 #include "quantization/fp8/metax/quant_utils.cuh"
-
+#include "concat_mla_q.cuh"
 #include <algorithm>
 #include <cassert>
 #include <map>
@@ -979,8 +979,8 @@ __global__ void gather_and_maybe_dequant_cache(
 // SCALAR_T is the data type of the destination tensor.
 // CACHE_T is the stored data type of kv-cache.
 // KV_DTYPE is the real data type of kv-cache.
-#define CALL_GATHER_CACHE(SCALAR_T, CACHE_T, KV_DTYPE)                        \
-  vllm::gather_and_maybe_dequant_cache<SCALAR_T, CACHE_T, KV_DTYPE, 576,      \
+#define CALL_GATHER_CACHE(SCALAR_T, CACHE_T, KV_DTYPE, ENTRY_SZ)              \
+  vllm::gather_and_maybe_dequant_cache<SCALAR_T, CACHE_T, KV_DTYPE, ENTRY_SZ, \
                                        thread_block_size>                     \
       <<<grid, block, 0, stream>>>(                                           \
           reinterpret_cast<CACHE_T*>(src_cache.data_ptr()),                   \
@@ -990,6 +990,12 @@ __global__ void gather_and_maybe_dequant_cache(
           block_table_stride, cache_block_stride, cache_entry_stride,         \
           dst_entry_stride, reinterpret_cast<const float*>(scale.data_ptr()), \
           seq_starts_ptr);
+
+#define CALL_GATHER_CACHE_576(SCALAR_T, CACHE_T, KV_DTYPE) \
+  CALL_GATHER_CACHE(SCALAR_T, CACHE_T, KV_DTYPE, 576)
+
+#define CALL_GATHER_CACHE_320(SCALAR_T, CACHE_T, KV_DTYPE) \
+  CALL_GATHER_CACHE(SCALAR_T, CACHE_T, KV_DTYPE, 320)
 
 // Gather sequences from the cache into the destination tensor.
 //  - cu_seq_lens contains the cumulative sequence lengths for each batch
@@ -1020,9 +1026,10 @@ void gather_and_maybe_dequant_cache(
     TORCH_CHECK(seq_starts.value().dtype() == torch::kInt32,
                 "seq_starts must be int32");
   }
-  TORCH_CHECK(head_dim == 576,
-              "gather_and_maybe_dequant_cache only support the head_dim to 576 "
-              "for better performance")
+  TORCH_CHECK(
+      head_dim == 320 || head_dim == 576,
+      "gather_and_maybe_dequant_cache only support the head_dim to 320 or 576 "
+      "for better performance")
 
   TORCH_CHECK(src_cache.device() == dst.device(),
               "src_cache and dst must be on the same device");
@@ -1047,7 +1054,13 @@ void gather_and_maybe_dequant_cache(
   const int32_t* seq_starts_ptr =
       seq_starts.has_value() ? seq_starts.value().data_ptr<int32_t>() : nullptr;
 
-  DISPATCH_BY_KV_CACHE_DTYPE(dst.dtype(), kv_cache_dtype, CALL_GATHER_CACHE);
+  if (head_dim == 576) {
+    DISPATCH_BY_KV_CACHE_DTYPE(dst.dtype(), kv_cache_dtype,
+                               CALL_GATHER_CACHE_576);
+  } else {
+    DISPATCH_BY_KV_CACHE_DTYPE(dst.dtype(), kv_cache_dtype,
+                               CALL_GATHER_CACHE_320);
+  }
 }
 
 namespace vllm {
@@ -1515,5 +1528,80 @@ void cp_gather_indexer_k_quant_cache(
     CALL_CP_GATHER_INDEXER_K_QUANT_CACHE(16);
   } else {
     CALL_CP_GATHER_INDEXER_K_QUANT_CACHE(32);
+  }
+}
+
+// Concatenate ql_nope and q_pe into a contiguous q_out tensor for MLA/DSA.
+// Replaces torch.cat((ql_nope, q_pe), dim=-1).
+// Supports non-contiguous input tensors by using stride-aware kernel.
+void concat_mla_q(torch::Tensor& ql_nope,  // [num_tokens, num_heads, nope_dim]
+                  torch::Tensor& q_pe,     // [num_tokens, num_heads, rope_dim]
+                  torch::Tensor& q_out     // [num_tokens, num_heads, nope_dim +
+                                           // rope_dim]
+) {
+  const int num_tokens = ql_nope.size(0);
+  const int num_heads = ql_nope.size(1);
+  const int nope_dim = ql_nope.size(2);
+  const int rope_dim = q_pe.size(2);
+
+  TORCH_CHECK(nope_dim % 512 == 0, "nope_dim must be a multiple of 512, got ",
+              nope_dim);
+  TORCH_CHECK(rope_dim == 64, "rope_dim must be 64, got ", rope_dim);
+  TORCH_CHECK(q_out.size(2) == nope_dim + rope_dim);
+
+  // Innermost dimension must have stride 1 for vectorized memory access
+  TORCH_CHECK(ql_nope.stride(2) == 1, "ql_nope must have stride 1 in dim 2");
+  TORCH_CHECK(q_pe.stride(2) == 1, "q_pe must have stride 1 in dim 2");
+  TORCH_CHECK(q_out.stride(2) == 1, "q_out must have stride 1 in dim 2");
+
+  if (num_tokens == 0) return;
+
+  // Get strides for proper memory addressing (supports non-contiguous tensors)
+  const int64_t nope_stride_0 = ql_nope.stride(0);
+  const int64_t nope_stride_1 = ql_nope.stride(1);
+  const int64_t pe_stride_0 = q_pe.stride(0);
+  const int64_t pe_stride_1 = q_pe.stride(1);
+  const int64_t out_stride_0 = q_out.stride(0);
+  const int64_t out_stride_1 = q_out.stride(1);
+
+  constexpr int warps_per_block = 8;
+  const int total_warps = num_tokens * num_heads;
+  const int grid_size = (total_warps + warps_per_block - 1) / warps_per_block;
+  const int block_size = warps_per_block * 32;
+
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(ql_nope));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  auto data_type = ql_nope.scalar_type();
+  switch (data_type) {
+      case torch::kFloat16:
+          // Handle Float16
+          vllm::ConcatMLAQKernel<half, 512><<<grid_size, block_size, 0, stream>>>(
+              reinterpret_cast<half*>(q_out.mutable_data_ptr()),
+              reinterpret_cast<const half*>(ql_nope.data_ptr()),
+              reinterpret_cast<const half*>(q_pe.data_ptr()),
+              num_tokens, num_heads,
+              out_stride_0, out_stride_1,
+              nope_stride_0, nope_stride_1,
+              pe_stride_0, pe_stride_1);
+          break;
+
+      case torch::kBFloat16:
+          // Handle BFloat16
+          vllm::ConcatMLAQKernel<__nv_bfloat16, 512><<<grid_size, block_size, 0, stream>>>(
+              reinterpret_cast<__nv_bfloat16*>(q_out.mutable_data_ptr()),
+              reinterpret_cast<const __nv_bfloat16*>(ql_nope.data_ptr()),
+              reinterpret_cast<const __nv_bfloat16*>(q_pe.data_ptr()),
+              num_tokens, num_heads,
+              out_stride_0, out_stride_1,
+              nope_stride_0, nope_stride_1,
+              pe_stride_0, pe_stride_1);
+          break;
+
+      default:
+          // Handle other data types
+          throw std::invalid_argument(
+              "Invalid dtype, only supports float16 and bfloat16");
+          break;
   }
 }

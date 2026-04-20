@@ -992,15 +992,108 @@ __global__ void silu_and_mul_mask_quant_pack_1mask(T* input, T* output,T1* mask,
             }
         }
 
-        using BlockReduce = cub::BlockReduce<float, NUM_THREADS>;
-        __shared__ typename BlockReduce::TempStorage reduceStorage;
-        float const block_absmax_val_maybe =
-           BlockReduce(reduceStorage).Reduce(absmax_val, cub::Max{}, NUM_THREADS);
-        __shared__ float block_absmax_val;
+        // using BlockReduce = cub::BlockReduce<float, NUM_THREADS>;
+        // __shared__ typename BlockReduce::TempStorage reduceStorage;
+        // float const block_absmax_val_maybe =
+        //    BlockReduce(reduceStorage).Reduce(absmax_val, cub::Max{}, NUM_THREADS);
+        // __shared__ float block_absmax_val;
+        constexpr int sm_size = NUM_THREADS >> 4;
+        constexpr int sm_size2 = sm_size / 2;
+
+        __shared__ float sm_max[sm_size];
+        float block_absmax_val;
+        if constexpr (sm_size == 32) {
+            for(int i = 8; i > 0; i >>= 1) {
+            absmax_val = max(__shfl_down_sync_16(0xffffffffffffffff, absmax_val, i), absmax_val);
+            }
+            int lane_id = threadIdx.x & 15;
+            int group_id = threadIdx.x >> 4;
+            if(lane_id == 0) {
+            sm_max[group_id] = absmax_val;
+            }
+            __syncthreads();
+            __shared__ float sm_max2[sm_size>>4];
+            if(threadIdx.x < sm_size) {
+            float data = sm_max[threadIdx.x];
+            for(int i = 8; i >= 1; i >>= 1) {
+                data = max(__shfl_down_sync_16(0xffffffffffffffff, data, i), data);
+            }
+            int local_group_id = threadIdx.x >> 4;
+            int local_lane_id = threadIdx.x & 15;
+            if(local_lane_id == 0) {
+                sm_max2[local_group_id] = data;
+            }
+            }
+            __syncthreads();
+            block_absmax_val = max(sm_max2[0], sm_max2[1]);
+        } else if constexpr(sm_size == 16) {
+            for(int i = 8; i > 0; i >>=1 ) {
+            absmax_val = max(__shfl_down_sync_16(0xffffffffffffffff, absmax_val, i),absmax_val);
+            }
+            int lane_id = threadIdx.x & 15;
+            int group_id = threadIdx.x >> 4;
+            if(lane_id == 0) {
+            sm_max[group_id] = absmax_val;
+            }
+            __syncthreads();
+            if(threadIdx.x < sm_size) {
+            float data = sm_max[threadIdx.x];
+            for(int i = 8; i >= 1; i >>= 1) {
+                data = max(__shfl_down_sync_16(0xffffffffffffffff, data, i), data);
+            }
+            if(threadIdx.x == 0) {
+                sm_max[0] = data;
+            }
+            }
+            __syncthreads();
+            block_absmax_val = sm_max[0];
+        } else if constexpr(sm_size == 8) {
+            for(int i = 8; i > 0; i >>=1 ) {
+            absmax_val = max(__shfl_down_sync_16(0xffffffffffffffff, absmax_val, i) , absmax_val);
+            }
+            int lane_id = threadIdx.x & 15;
+            int group_id = threadIdx.x >> 4;
+            if(lane_id == 0) {
+            sm_max[group_id] = absmax_val;
+            }
+            __syncthreads();
+            if(threadIdx.x < sm_size) {
+            float data = sm_max[threadIdx.x];
+            for(int i = 4; i >= 1; i >>= 1) {
+                data = max(__shfl_down_sync_16(0xffffffffffffffff, data, i), data);
+            }
+            if(threadIdx.x == 0) {
+                sm_max[0] = data;
+            }
+            }
+            __syncthreads();
+            block_absmax_val = sm_max[0];
+        } else if constexpr(sm_size == 4) {
+            for(int i = 8; i > 0; i >>=1 ) {
+            absmax_val = max(__shfl_down_sync_16(0xffffffffffffffff, absmax_val, i), absmax_val);
+            }
+            int lane_id = threadIdx.x & 15;
+            int group_id = threadIdx.x >> 4;
+            if(lane_id == 0) {
+            sm_max[group_id] = absmax_val;
+            }
+            __syncthreads();
+            if(threadIdx.x < sm_size) {
+            float data = sm_max[threadIdx.x];
+            for(int i = 2; i >= 1; i >>= 1) {
+                data = max(__shfl_down_sync_16(0xffffffffffffffff, data, i), data);
+            }
+            if(threadIdx.x == 0) {
+                sm_max[0] = data;
+            }
+            }
+            __syncthreads();
+            block_absmax_val = sm_max[0];
+        }
         int8_t* ptr_output = (int8_t*)(output + token_idx * out_stirde);
         float* ptr_scale = (float*)(ptr_output + hidden_size);
         if (tid == 0) {
-            block_absmax_val = block_absmax_val_maybe;
+            // block_absmax_val = block_absmax_val_maybe;
             ptr_scale[0] = block_absmax_val * 0.0078740157;
         }
         __syncthreads();
@@ -1055,15 +1148,108 @@ __global__ void silu_and_mul_mask_quant_pack_2mask(T* input, T* output,T1* mask,
             }
         }
 
-        using BlockReduce = cub::BlockReduce<float, NUM_THREADS>;
-        __shared__ typename BlockReduce::TempStorage reduceStorage;
-        float const block_absmax_val_maybe =
-           BlockReduce(reduceStorage).Reduce(absmax_val, cub::Max{}, NUM_THREADS);
-        __shared__ float block_absmax_val;
+        // using BlockReduce = cub::BlockReduce<float, NUM_THREADS>;
+        // __shared__ typename BlockReduce::TempStorage reduceStorage;
+        // float const block_absmax_val_maybe =
+        //    BlockReduce(reduceStorage).Reduce(absmax_val, cub::Max{}, NUM_THREADS);
+        // __shared__ float block_absmax_val;
+        constexpr int sm_size = NUM_THREADS >> 4;
+        constexpr int sm_size2 = sm_size / 2;
+
+        __shared__ float sm_max[sm_size];
+        float block_absmax_val;
+        if constexpr (sm_size == 32) {
+            for(int i = 8; i > 0; i >>= 1) {
+            absmax_val = max(__shfl_down_sync_16(0xffffffffffffffff, absmax_val, i), absmax_val);
+            }
+            int lane_id = threadIdx.x & 15;
+            int group_id = threadIdx.x >> 4;
+            if(lane_id == 0) {
+            sm_max[group_id] = absmax_val;
+            }
+            __syncthreads();
+            __shared__ float sm_max2[sm_size>>4];
+            if(threadIdx.x < sm_size) {
+            float data = sm_max[threadIdx.x];
+            for(int i = 8; i >= 1; i >>= 1) {
+                data = max(__shfl_down_sync_16(0xffffffffffffffff, data, i), data);
+            }
+            int local_group_id = threadIdx.x >> 4;
+            int local_lane_id = threadIdx.x & 15;
+            if(local_lane_id == 0) {
+                sm_max2[local_group_id] = data;
+            }
+            }
+            __syncthreads();
+            block_absmax_val = max(sm_max2[0], sm_max2[1]);
+        } else if constexpr(sm_size == 16) {
+            for(int i = 8; i > 0; i >>=1 ) {
+            absmax_val = max(__shfl_down_sync_16(0xffffffffffffffff, absmax_val, i),absmax_val);
+            }
+            int lane_id = threadIdx.x & 15;
+            int group_id = threadIdx.x >> 4;
+            if(lane_id == 0) {
+            sm_max[group_id] = absmax_val;
+            }
+            __syncthreads();
+            if(threadIdx.x < sm_size) {
+            float data = sm_max[threadIdx.x];
+            for(int i = 8; i >= 1; i >>= 1) {
+                data = max(__shfl_down_sync_16(0xffffffffffffffff, data, i), data);
+            }
+            if(threadIdx.x == 0) {
+                sm_max[0] = data;
+            }
+            }
+            __syncthreads();
+            block_absmax_val = sm_max[0];
+        } else if constexpr(sm_size == 8) {
+            for(int i = 8; i > 0; i >>=1 ) {
+            absmax_val = max(__shfl_down_sync_16(0xffffffffffffffff, absmax_val, i) , absmax_val);
+            }
+            int lane_id = threadIdx.x & 15;
+            int group_id = threadIdx.x >> 4;
+            if(lane_id == 0) {
+            sm_max[group_id] = absmax_val;
+            }
+            __syncthreads();
+            if(threadIdx.x < sm_size) {
+            float data = sm_max[threadIdx.x];
+            for(int i = 4; i >= 1; i >>= 1) {
+                data = max(__shfl_down_sync_16(0xffffffffffffffff, data, i), data);
+            }
+            if(threadIdx.x == 0) {
+                sm_max[0] = data;
+            }
+            }
+            __syncthreads();
+            block_absmax_val = sm_max[0];
+        } else if constexpr(sm_size == 4) {
+            for(int i = 8; i > 0; i >>=1 ) {
+            absmax_val = max(__shfl_down_sync_16(0xffffffffffffffff, absmax_val, i), absmax_val);
+            }
+            int lane_id = threadIdx.x & 15;
+            int group_id = threadIdx.x >> 4;
+            if(lane_id == 0) {
+            sm_max[group_id] = absmax_val;
+            }
+            __syncthreads();
+            if(threadIdx.x < sm_size) {
+            float data = sm_max[threadIdx.x];
+            for(int i = 2; i >= 1; i >>= 1) {
+                data = max(__shfl_down_sync_16(0xffffffffffffffff, data, i), data);
+            }
+            if(threadIdx.x == 0) {
+                sm_max[0] = data;
+            }
+            }
+            __syncthreads();
+            block_absmax_val = sm_max[0];
+        }
         int8_t* ptr_output = (int8_t*)(output + token_idx * out_stirde);
         float* ptr_scale = (float*)(ptr_output + hidden_size);
         if (tid == 0) {
-            block_absmax_val = block_absmax_val_maybe;
+            // block_absmax_val = block_absmax_val_maybe;
             ptr_scale[0] = block_absmax_val * 0.0078740157;
         }
         __syncthreads();
@@ -1109,14 +1295,40 @@ __global__ void silu_and_mul_quant(T* input, int8_t* output, float* scale, int64
         }
     }
 
-    using BlockReduce = cub::BlockReduce<float, 512>;
-    __shared__ typename BlockReduce::TempStorage reduceStorage;
-    float const block_absmax_val_maybe =
-       BlockReduce(reduceStorage).Reduce(absmax_val, cub::Max(), blockDim_x);
-    __shared__ float block_absmax_val;
+    // using BlockReduce = cub::BlockReduce<float, 512>;
+    // __shared__ typename BlockReduce::TempStorage reduceStorage;
+    // float const block_absmax_val_maybe =
+    //    BlockReduce(reduceStorage).Reduce(absmax_val, cub::Max(), blockDim_x);
+    // __shared__ float block_absmax_val;
+    constexpr int sm_size = 512 >> 4;
+    __shared__ float sm_max[sm_size];
+    float block_absmax_val;
+    for(int i = 8; i > 0; i >>= 1) {
+    absmax_val = max(__shfl_down_sync_16(0xffffffffffffffff, absmax_val, i), absmax_val);
+    }
+    int lane_id = threadIdx.x & 15;
+    int group_id = threadIdx.x >> 4;
+    if(lane_id == 0) {
+    sm_max[group_id] = absmax_val;
+    }
+    __syncthreads();
+    __shared__ float sm_max2[sm_size>>4];
+    if(threadIdx.x < sm_size) {
+    float data = sm_max[threadIdx.x];
+    for(int i = 8; i >= 1; i >>= 1) {
+        data = max(__shfl_down_sync_16(0xffffffffffffffff, data, i), data);
+    }
+    int local_group_id = threadIdx.x >> 4;
+    int local_lane_id = threadIdx.x & 15;
+    if(local_lane_id == 0) {
+        sm_max2[local_group_id] = data;
+    }
+    }
+    __syncthreads();
+    block_absmax_val = max(sm_max2[0], sm_max2[1]);
     int8_t* ptr_output = (int8_t*)(output + token_idx * hidden_size);
     if (tid == 0) {
-        block_absmax_val = block_absmax_val_maybe;
+        // block_absmax_val = block_absmax_val_maybe;
         scale[token_idx] = block_absmax_val * 0.0078740157;
     }
     __syncthreads();
@@ -1183,17 +1395,43 @@ __global__ void silu_and_mul_sm_quant(T* input, int8_t* output, float* scale, in
         }
     }
 
-    using BlockReduce = cub::BlockReduce<float, 512>;
-    __shared__ typename BlockReduce::TempStorage reduceStorage;
-    float const block_absmax_val_maybe =
-       BlockReduce(reduceStorage).Reduce(absmax_val, cub::Max(), blockDim_x);
-    __shared__ float block_absmax_val;
-    int8_t* ptr_output = (int8_t*)(output + token_idx * hidden_size);
-    if (tid == 0) {
-        block_absmax_val = block_absmax_val_maybe;
-        scale[token_idx] = block_absmax_val * 0.0078740157;
+    // using BlockReduce = cub::BlockReduce<float, 512>;
+    // __shared__ typename BlockReduce::TempStorage reduceStorage;
+    // float const block_absmax_val_maybe =
+    //    BlockReduce(reduceStorage).Reduce(absmax_val, cub::Max(), blockDim_x);
+    // __shared__ float block_absmax_val;
+    constexpr int sm_size = 512 >> 4;
+    __shared__ float sm_max[sm_size];
+    float block_absmax_val;
+    for(int i = 8; i > 0; i >>= 1) {
+    absmax_val = max(__shfl_down_sync_16(0xffffffffffffffff, absmax_val, i), absmax_val);
+    }
+    int lane_id = threadIdx.x & 15;
+    int group_id = threadIdx.x >> 4;
+    if(lane_id == 0) {
+    sm_max[group_id] = absmax_val;
     }
     __syncthreads();
+    __shared__ float sm_max2[sm_size>>4];
+    if(threadIdx.x < sm_size) {
+    float data = sm_max[threadIdx.x];
+    for(int i = 8; i >= 1; i >>= 1) {
+        data = max(__shfl_down_sync_16(0xffffffffffffffff, data, i), data);
+    }
+    int local_group_id = threadIdx.x >> 4;
+    int local_lane_id = threadIdx.x & 15;
+    if(local_lane_id == 0) {
+        sm_max2[local_group_id] = data;
+    }
+    }
+    __syncthreads();
+    block_absmax_val = max(sm_max2[0], sm_max2[1]);
+    int8_t* ptr_output = (int8_t*)(output + token_idx * hidden_size);
+    if (tid == 0) {
+        // block_absmax_val = block_absmax_val_maybe;
+        scale[token_idx] = block_absmax_val * 0.0078740157;
+    }
+    // __syncthreads();
     float const tmp_scale = 127.0f * __builtin_mxc_rcpf(block_absmax_val);
     for (int i = tid*N, k = 0; i < hidden_size1; i += stride, k++) {
         VT1 vdst;
@@ -1298,7 +1536,19 @@ void launch_silu_mul_quant_pack(T* input, T* output, T1* mask, int64_t num_token
         
     } else if(N == 8&&(inner_hidden_size & (N - 1)) == 0 && (out_stride & (N -1)) == 0) {
         int base = blocksize * N;
-        if(inner_hidden_size <= base) {
+        if(inner_hidden_size <= 64 * N) {
+            constexpr int NUM_THREADS = 64;
+            gridsize = gridsize * 8;
+            silu_and_mul_mask_quant_pack<T, T1, float4, float2, 1><<<gridsize, NUM_THREADS,0,stream>>>(input, output, mask, mask_size, gridsize, num_tokens, inner_hidden_size, out_stride, NUM_THREADS);
+        } else if(inner_hidden_size <= 128 * N) {
+            constexpr int NUM_THREADS = 128;
+            gridsize = gridsize * 4;
+            silu_and_mul_mask_quant_pack<T, T1, float4, float2, 1><<<gridsize, NUM_THREADS,0,stream>>>(input, output, mask, mask_size, gridsize, num_tokens, inner_hidden_size, out_stride, NUM_THREADS);
+        } else if(inner_hidden_size <= 256 * N) {
+            constexpr int NUM_THREADS = 256;
+            gridsize = gridsize * 2;
+            silu_and_mul_mask_quant_pack<T, T1, float4, float2, 1><<<gridsize, NUM_THREADS,0,stream>>>(input, output, mask, mask_size, gridsize, num_tokens, inner_hidden_size, out_stride, NUM_THREADS);
+        } else if(inner_hidden_size <= base) {
             silu_and_mul_mask_quant_pack<T, T1, float4, float2, 1><<<gridsize, blocksize,0,stream>>>(input, output, mask, mask_size, gridsize, num_tokens, inner_hidden_size, out_stride, blocksize);
         } else if(inner_hidden_size <= base*2) {
             silu_and_mul_mask_quant_pack<T, T1, float4, float2, 2><<<gridsize, blocksize,0,stream>>>(input, output, mask, mask_size, gridsize, num_tokens, inner_hidden_size, out_stride, blocksize);

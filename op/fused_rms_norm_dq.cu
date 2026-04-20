@@ -1,4 +1,3 @@
-// Copyright (c) 2025 MetaX Integrated Circuits (Shanghai) Co., Ltd. All rights reserved.
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <torch/extension.h>
@@ -61,6 +60,18 @@ struct ScaledQuant<
       return float_to_int8_rn(x / scale);
     }
   }
+};
+
+template<bool is_scale_inverted>
+struct ScaledQuant<c10::Float8_e4m3fn, is_scale_inverted, void> {
+    static __device__ __forceinline__ c10::Float8_e4m3fn quant_fn(float const x,
+                                                          float const scale) {
+    if constexpr (is_scale_inverted) {
+      return float_to_fp8<c10::Float8_e4m3fn>(x * scale);
+    } else {
+      return float_to_fp8<c10::Float8_e4m3fn>(x / scale);
+    }  
+}
 };
 
 // has_residual must be true, if residual is not a nullptr

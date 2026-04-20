@@ -17,3 +17,8 @@ void fused_silu_mul_dq_quant_reordered_topk_interface(
     at::Tensor const& w2_scale,
     int64_t start_expert_id,
     int64_t end_expert_id);
+
+void fused_silu_mul_dq_quant_interface(
+    torch::Tensor& out,
+    torch::Tensor& scale,   
+    torch::Tensor const& input);

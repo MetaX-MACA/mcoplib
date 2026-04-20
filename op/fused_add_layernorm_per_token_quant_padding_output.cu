@@ -285,6 +285,9 @@ __global__ void add_rms_norm_quant_padding_output_opt_kernel(
 template<typename scalar_t, typename scalar_out_t>
 __global__ void add_rms_norm_dynamic_per_token_quant_padding_output_kernel(
     scalar_out_t* __restrict__ out,
+    scalar_t* __restrict__ out_rms,
+    scalar_out_t* __restrict__ output_quant_int8,
+    float* __restrict__ out_scales,
     scalar_t* const __restrict__ input,
     scalar_t* __restrict__ residual,
     scalar_t const* __restrict__ weight,
@@ -325,6 +328,7 @@ __global__ void add_rms_norm_dynamic_per_token_quant_padding_output_kernel(
         scale = max(scale / qmax, min_scaling_factor);
         s_token_scale = scale;
         *out_scale_ptr = scale;
+        out_scales[block_idx] = scale;
         }
         __syncthreads();
 
@@ -332,7 +336,11 @@ __global__ void add_rms_norm_dynamic_per_token_quant_padding_output_kernel(
             float x = static_cast<float>(residual[token_offset + i]);
             scalar_t const w = weight[i];
             float token_scale_ = 1.0f / s_token_scale;
-            out[block_idx * pad_size * 2 + i] = ScaledQuant<scalar_out_t, true>::quant_fn(static_cast<scalar_t>(x * s_rms) * w, token_scale_);
+            float tmp = x * s_rms;
+            out_rms[block_idx * hidden_size + i] = static_cast<scalar_t>(tmp);
+            scalar_out_t dst = ScaledQuant<scalar_out_t, true>::quant_fn(static_cast<scalar_t>(tmp) * w, token_scale_);
+            out[block_idx * pad_size * 2 + i] = dst;
+            output_quant_int8[block_idx * hidden_size + i] = dst;
         }
     }
 }
@@ -351,7 +359,6 @@ void add_rms_norm_dynamic_per_token_quant_padding_output_with_dispatch(torch::Te
                                                                         double const var_epsilon){
     int32_t hidden_size = input.size(-1);
     int32_t num_tokens = input.numel() / hidden_size;
-
     int dev = 0;
     cudaGetDevice(&dev);
     int sm_count = 0;
@@ -368,9 +375,9 @@ void add_rms_norm_dynamic_per_token_quant_padding_output_with_dispatch(torch::Te
       output.dtype() == torch::kInt8
           ? std::numeric_limits<float>::epsilon()
           : 1.0f / (std::numeric_limits<c10::Float8_e4m3fn>::max() * 448.f);
-
+    
     if (hidden_size == 7168) {
-        MOE_DISPATCH_QUANT_TYPES(output.scalar_type(), "add_rms_norm_quant_padding_output_opt_kernel", [&] {
+        MOE_DISPATCH_MORE_QUANT_TYPES(output.scalar_type(), "add_rms_norm_quant_padding_output_opt_kernel", [&] {
             vllm::add_rms_norm_quant_padding_output_opt_kernel<scalar_in_t, scalar_t, VPT, 7168 / VPT, block_d>
                 <<<num_tokens, block_d, 0, stream>>>(
                     output.data_ptr<scalar_t>(), out_rms.data_ptr<scalar_in_t>(), output_quant_int8.data_ptr<scalar_t>(), 
@@ -380,7 +387,7 @@ void add_rms_norm_dynamic_per_token_quant_padding_output_with_dispatch(torch::Te
                 );
         });
     }  else if (hidden_size == 5120) {
-        MOE_DISPATCH_QUANT_TYPES(output.scalar_type(), "add_rms_norm_quant_padding_output_opt_kernel", [&] {
+        MOE_DISPATCH_MORE_QUANT_TYPES(output.scalar_type(), "add_rms_norm_quant_padding_output_opt_kernel", [&] {
             vllm::add_rms_norm_quant_padding_output_opt_kernel<scalar_in_t, scalar_t, VPT, 5120 / VPT, block_d>
                 <<<num_tokens, block_d, 0, stream>>>(
                     output.data_ptr<scalar_t>(), out_rms.data_ptr<scalar_in_t>(), output_quant_int8.data_ptr<scalar_t>(), 
@@ -390,7 +397,7 @@ void add_rms_norm_dynamic_per_token_quant_padding_output_with_dispatch(torch::Te
                 );
         });
     } else if (hidden_size == 6144){
-        MOE_DISPATCH_QUANT_TYPES(output.scalar_type(), "add_rms_norm_quant_padding_output_opt_kernel", [&] {
+        MOE_DISPATCH_MORE_QUANT_TYPES(output.scalar_type(), "add_rms_norm_quant_padding_output_opt_kernel", [&] {
             vllm::add_rms_norm_quant_padding_output_opt_kernel<scalar_in_t, scalar_t, VPT, 6144 / VPT, block_d>
                 <<<num_tokens, block_d, 0, stream>>>(
                     output.data_ptr<scalar_t>(), out_rms.data_ptr<scalar_in_t>(), output_quant_int8.data_ptr<scalar_t>(), 
@@ -399,11 +406,22 @@ void add_rms_norm_dynamic_per_token_quant_padding_output_with_dispatch(torch::Te
                     var_epsilon, min_scaling_factor, hidden_size, pad_size, num_tokens
                 );
         });
+    } else if(hidden_size == 3072) {
+          MOE_DISPATCH_MORE_QUANT_TYPES(output.scalar_type(), "add_rms_norm_quant_padding_output_opt_kernel", [&] {
+            vllm::add_rms_norm_quant_padding_output_opt_kernel<scalar_in_t, scalar_t, VPT, 3072 / VPT, block_d>
+                <<<num_tokens, block_d, 0, stream>>>(
+                    output.data_ptr<scalar_t>(), out_rms.data_ptr<scalar_in_t>(), output_quant_int8.data_ptr<scalar_t>(), 
+                    out_scales.data_ptr<float>(), input.data_ptr<scalar_in_t>(), 
+                    residual.data_ptr<scalar_in_t>(), weight.data_ptr<scalar_in_t>(),
+                    var_epsilon, min_scaling_factor, hidden_size, pad_size, num_tokens
+                );
+        });
     } else {
-        MOE_DISPATCH_QUANT_TYPES(output.scalar_type(), "add_rms_norm_dynamic_per_token_quant_padding_output_kernel", [&] {
+        MOE_DISPATCH_MORE_QUANT_TYPES(output.scalar_type(), "add_rms_norm_dynamic_per_token_quant_padding_output_kernel", [&] {
             vllm::add_rms_norm_dynamic_per_token_quant_padding_output_kernel<scalar_in_t, scalar_t>
                 <<<grid, block, 0, stream>>>(
-                    output.data_ptr<scalar_t>(), input.data_ptr<scalar_in_t>(), 
+                    output.data_ptr<scalar_t>(), out_rms.data_ptr<scalar_in_t>(), output_quant_int8.data_ptr<scalar_t>(), 
+                    out_scales.data_ptr<float>(), input.data_ptr<scalar_in_t>(), 
                     residual.data_ptr<scalar_in_t>(), weight.data_ptr<scalar_in_t>(),
                     var_epsilon, min_scaling_factor, hidden_size, pad_size, num_tokens
                 );
@@ -421,7 +439,7 @@ void add_rms_norm_dynamic_per_token_quant_padding_output(at::Tensor& output,
                                                          at::Tensor const& weight, 
                                                          const int pad_size, 
                                                          const float epsilon){
-    // TORCH_CHECK(output.dtype() == torch::kInt8);
+    TORCH_CHECK(output.dtype() == torch::kInt8 || output.dtype() == torch::kFloat8_e4m3fn);
     TORCH_CHECK(input.dtype() == at::ScalarType::BFloat16);
     TORCH_CHECK(output.is_contiguous() && input.is_contiguous());
     MOE_DISPATCH_FLOATING_TYPES(

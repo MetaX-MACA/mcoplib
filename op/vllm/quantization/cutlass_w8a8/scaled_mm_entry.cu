@@ -57,7 +57,8 @@ void get_cutlass_moe_mm_data(
     torch::Tensor& problem_sizes1, torch::Tensor& problem_sizes2,
     torch::Tensor& input_permutation, torch::Tensor& output_permutation,
     const int64_t num_experts, const int64_t n, const int64_t k,
-    const std::optional<torch::Tensor>& blockscale_offsets) {
+    const std::optional<torch::Tensor>& blockscale_offsets,
+    const bool is_gated) {
   int32_t version_num = get_sm_version_num();
   TORCH_CHECK_NOT_IMPLEMENTED(
       false,
