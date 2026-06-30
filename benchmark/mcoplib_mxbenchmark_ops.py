@@ -6,14 +6,15 @@ import re
 import importlib
 import argparse
 import tempfile
+import platform
+from datetime import datetime, timezone
 import torch
 import difflib  # Used for similarity matching
 
 try:
     import cuda.bench._nvbench as bench
 except ImportError:
-    print("[ERROR] Runtime environment missing 'nvbench'. Please check configuration.")
-    sys.exit(1)
+    bench = None
 
 # Import base class for type checking
 from mcoplib_mxbenchmark_op_wrapper import OpBenchmarkBase
@@ -114,6 +115,65 @@ SUPPORTED_OPERATORS = [
 # =============================================================================
 def get_base_dir():
     return os.path.dirname(os.path.abspath(__file__))
+
+def _read_maca_version():
+    maca_path = os.environ.get("MACA_PATH")
+    if not maca_path:
+        return None
+    version_file = os.path.join(maca_path, "Version.txt")
+    if not os.path.isfile(version_file):
+        return None
+    try:
+        with open(version_file, "r", encoding="utf-8") as f:
+            return f.readline().strip().split(":")[-1].strip()
+    except Exception:
+        return None
+
+def collect_benchmark_env():
+    runtime = {
+        "cuda_available": bool(torch.cuda.is_available()),
+        "device_count": torch.cuda.device_count() if torch.cuda.is_available() else 0,
+        "torch_version": getattr(torch, "__version__", None),
+        "torch_cuda": getattr(torch.version, "cuda", None),
+        "torch_hip": getattr(torch.version, "hip", None),
+    }
+    if torch.cuda.is_available():
+        runtime["devices"] = [
+            {
+                "id": idx,
+                "name": torch.cuda.get_device_name(idx),
+                "capability": torch.cuda.get_device_capability(idx),
+            }
+            for idx in range(torch.cuda.device_count())
+        ]
+
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "benchmark_dir": get_base_dir(),
+        "platform": {
+            "system": platform.system(),
+            "release": platform.release(),
+            "machine": platform.machine(),
+            "python": sys.version,
+        },
+        "environment": {
+            "MACA_PATH": os.environ.get("MACA_PATH"),
+            "CUDA_HOME": os.environ.get("CUDA_HOME"),
+            "LD_LIBRARY_PATH": os.environ.get("LD_LIBRARY_PATH"),
+        },
+        "maca_version": _read_maca_version(),
+        "runtime": runtime,
+        "supported_operator_count": len(SUPPORTED_OPERATORS),
+    }
+
+def write_benchmark_env(path):
+    target = os.path.abspath(path)
+    target_dir = os.path.dirname(target)
+    if target_dir:
+        os.makedirs(target_dir, exist_ok=True)
+    with open(target, "w", encoding="utf-8") as f:
+        json.dump(collect_benchmark_env(), f, indent=2, sort_keys=True)
+        f.write("\n")
 
 def list_supported_operators():
     print("\n" + "="*40 + f"\n{' Supported Operators ':=^40}\n" + "="*40)
@@ -577,6 +637,7 @@ if __name__ == "__main__":
     parser.add_argument("--op", type=str, default=None, help="Operator name (Required, unless --list is used)")
     parser.add_argument("--list", action="store_true", help="List all supported operators and exit")
     parser.add_argument("--csv", type=str, default=None, help="Path to result CSV")
+    parser.add_argument("--env-json", type=str, default=None, help="Write benchmark environment metadata to JSON")
     
     group = parser.add_mutually_exclusive_group()
     # 修复：这里的 > 5% 必须写成 > 5%%，否则 argparse 报错 incomplete format
@@ -591,6 +652,12 @@ if __name__ == "__main__":
         list_supported_operators()
         sys.exit(0)
 
+    if args.env_json:
+        write_benchmark_env(args.env_json)
+        print(f"[ENV] Benchmark environment metadata written to: {os.path.abspath(args.env_json)}")
+        if not args.op:
+            sys.exit(0)
+
     # 2. Validate Core Argument --op
     if not args.op:
         # Print full help first
@@ -601,6 +668,10 @@ if __name__ == "__main__":
         print("-"*80 + "\n")
         sys.exit(1)
     
+    if bench is None:
+        print("[ERROR] Runtime environment missing 'nvbench'. Please check configuration.")
+        sys.exit(1)
+
     # 3. Load Operator
     op_name = args.op
     op_instance = load_operator_runner(op_name)
