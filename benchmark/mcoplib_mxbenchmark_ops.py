@@ -12,8 +12,7 @@ import difflib  # Used for similarity matching
 try:
     import cuda.bench._nvbench as bench
 except ImportError:
-    print("[ERROR] Runtime environment missing 'nvbench'. Please check configuration.")
-    sys.exit(1)
+    bench = None
 
 # Import base class for type checking
 from mcoplib_mxbenchmark_op_wrapper import OpBenchmarkBase
@@ -124,6 +123,10 @@ def list_supported_operators():
             print(f"  * {op}")
     print("="*40 + "\n")
 
+def find_literal_matches(query, candidates):
+    pattern = re.compile(re.escape(query), re.IGNORECASE)
+    return [item for item in candidates if pattern.search(item)]
+
 def load_operator_runner(op_name):
     current_dir = get_base_dir()
     if current_dir not in sys.path:
@@ -144,9 +147,8 @@ def load_operator_runner(op_name):
     else:
         print(f"[INFO] Exact config match not found for '{op_name}', trying fuzzy search...")
         try:
-            pattern = re.compile(op_name, re.IGNORECASE)
             json_files = [f for f in os.listdir(config_dir) if f.endswith(".json")]
-            matched_jsons = [f for f in json_files if pattern.search(f)]
+            matched_jsons = find_literal_matches(op_name, json_files)
 
             if len(matched_jsons) == 0:
                 print(f"[ERROR] Config file not found, and fuzzy search for '{op_name}' yielded no results.")
@@ -195,14 +197,12 @@ def load_operator_runner(op_name):
             
             # Strategy A: Config Name
             if canonical_name:
-                pattern_canon = re.compile(canonical_name, re.IGNORECASE)
-                matched_runners = [f for f in py_files if pattern_canon.search(f)]
+                matched_runners = find_literal_matches(canonical_name, py_files)
 
             # Strategy B: Input Name Fallback
             if not matched_runners and op_name and op_name != canonical_name:
                 print(f"[INFO] Canonical name match failed, falling back to input name '{op_name}'...")
-                pattern_op = re.compile(op_name, re.IGNORECASE)
-                matched_runners = [f for f in py_files if pattern_op.search(f)]
+                matched_runners = find_literal_matches(op_name, py_files)
                 
         except re.error as e:
             print(f"[ERROR] Regex error: {e}")
@@ -601,6 +601,10 @@ if __name__ == "__main__":
         print("-"*80 + "\n")
         sys.exit(1)
     
+    if bench is None:
+        print("[ERROR] Runtime environment missing 'nvbench'. Please check configuration.")
+        sys.exit(1)
+
     # 3. Load Operator
     op_name = args.op
     op_instance = load_operator_runner(op_name)
