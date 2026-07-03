@@ -4,12 +4,13 @@ import subprocess
 import time
 
 # ================= 配置路径与规则 =================
-CONFIG_DIR = "config"
-RUNNERS_DIR = "runners" 
-TARGET_SCRIPT = "mcoplib_mxbenchmark_ops.py"
-OUTPUT_FILE = "teslalloutput.txt"
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_DIR = os.path.join(SCRIPT_DIR, "config")
+RUNNERS_DIR = os.path.join(SCRIPT_DIR, "runners")
+TARGET_SCRIPT = os.path.join(SCRIPT_DIR, "mcoplib_mxbenchmark_ops.py")
+OUTPUT_FILE = os.path.join(SCRIPT_DIR, "testalloutput.txt")
 
-STATISTICS_DIR = "statistics"
+STATISTICS_DIR = os.path.join(SCRIPT_DIR, "statistics")
 CSV_FILENAME = "mcoplib_ops_performance_C500.csv"
 CSV_SAVE_PATH = os.path.join(STATISTICS_DIR, CSV_FILENAME)
 
