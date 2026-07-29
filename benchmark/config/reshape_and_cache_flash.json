@@ -8,5 +8,5 @@
     "num_blocks": 16384,
     "dtype": "bfloat16",
     "kv_cache_dtype": "auto",
-    "samples": 1000
+    "samples": 10000
 }

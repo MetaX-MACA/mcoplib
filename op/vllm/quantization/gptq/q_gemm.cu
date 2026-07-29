@@ -1001,9 +1001,8 @@ void gemm_half_q_half_cuda_part(const half* a, const uint32_t* b_q_weight,
         mcFreeAsync(dB_perm, stream);
       }
     } else {
-      TORCH_CHECK(false, "gptq_gemv_half_q_half: unsupported parameter combination: bit=", bit,
-                  ", m_sign=", m_sign, ", v_sign=", v_sign,
-                  " (this branch requires (bit==4||bit==8) && m_sign && !v_sign)");
+      printf("Parameters not supported!\n");
+      return;
     }
   } else if ((bit == 4 || bit == 8) && v_sign) {
     constexpr int m_per_thread = 4;
@@ -1795,18 +1794,19 @@ bool launch_gemm_gptq(int m, int n, int k, int quant_group, const input_tp* dA,
                       const cudaStream_t stream, int chunks = 1, int max_blocks_m=4) {
   using namespace hgemm_marlin_gptq;
   if (n % 16 != 0) {
-    TORCH_CHECK(false, "launch_gemm_gptq: size_n must be divisible by 16, got n=", n);
+    printf("n %% 16 != 0, n = %d\n", n);
+    return false;
   }
   if (k % 32 != 0) {
-    TORCH_CHECK(false, "launch_gemm_gptq: size_k must be divisible by 32, got k=", k);
+    printf("k %% 32 != 0, k = %d\n", k);
+    return false;
   }
   // const vllm::ScalarTypeId w_type_id = vllm::kU4B8.id();
   const int THREADS = 256;
   int BLOCKS_M = div_ceil(m, SLICE_M);
   if (BLOCKS_M >= max_blocks_m && BLOCKS_M % max_blocks_m != 0) {
-    TORCH_CHECK(false, "launch_gemm_gptq: input m is invalid, m=", m,
-                ", blocks_m=", BLOCKS_M, " (must be divisible by max_blocks_m=", max_blocks_m,
-                " when blocks_m >= max_blocks_m)");
+    printf("Error: input m is error, m = %d, blocks_m = %d\n", m, BLOCKS_M);
+    return false;
   }
   if (BLOCKS_M > max_blocks_m) BLOCKS_M = max_blocks_m;
   int BLOCKS_N = 8;
@@ -1875,11 +1875,13 @@ bool launch_gemm_gptq(int m, int n, int k, int quant_group, const input_tp* dA,
   LAUNCH_GPTQ_PRED(false, true)
   LAUNCH_GPTQ_PRED(false, false)
   else {
-    TORCH_CHECK(false, "launch_gemm_gptq: unsupported GPTQ kernel configuration: "
-                "BLOCKS_M=", BLOCKS_M, ", BLOCKS_N=", BLOCKS_N, ", BLOCKS_K=", BLOCKS_K,
-                ", THREADS=", THREADS, ", HAS_ACT_ORDER=", HAS_ACT_ORDER,
-                ", HAS_ZP=", HAS_ZP, ", quant_group=", quant_group,
-                ", HAS_M_PRED=", HAS_M_PRED, ", HAS_NK_PRED=", HAS_NK_PRED);
+    printf(
+        "BLOCKS_M=%d, BLOCKS_N=%d, BLOCKS_k=%d, THREADS=%d, HAS_ACT_ORDER=%d, "
+        "HAS_ZP=%d, quant_group=%d, HAS_M_PRED=%d, HAS_NK_PRED=%d is not "
+        "supported\n",
+        BLOCKS_M, BLOCKS_N, BLOCKS_K, THREADS, HAS_ACT_ORDER, HAS_ZP,
+        quant_group, HAS_M_PRED, HAS_NK_PRED);
+    return false;
   }
 
   return true;

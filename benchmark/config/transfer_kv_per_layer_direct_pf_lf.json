@@ -8,5 +8,5 @@
     "total_pages": 8192,
     "copy_pages": 1024,  
     "dtype": "float16",
-    "samples": 10
+    "samples": 100      
 }

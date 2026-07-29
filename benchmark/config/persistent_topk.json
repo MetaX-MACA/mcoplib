@@ -1,9 +1,0 @@
-{
-    "device_id": 0,
-    "device_name": "MetaX C500",
-    "num_rows": 1024,
-    "maxlen": 65536,
-    "topk": 1024,
-    "dtype": "float32",
-    "samples": 1000
-}

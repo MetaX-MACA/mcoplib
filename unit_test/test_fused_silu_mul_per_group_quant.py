@@ -56,7 +56,6 @@ def make_input(shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
 def reference(
     input_tensor: torch.Tensor,
     quant_dtype: torch.dtype,
-    swiglu_limit: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     input_hidden = input_tensor.size(-1)
     hidden = input_hidden // 2
@@ -68,12 +67,6 @@ def reference(
     up = x[:, hidden:]
 
     y = torch.nn.functional.silu(gate) * up
-    # Match the kernel: when swiglu_limit is provided, the SiLU(gate)*up output
-    # is symmetrically clamped to [-swiglu_limit, +swiglu_limit] BEFORE the
-    # per-group absmax reduction and quantization.
-    if swiglu_limit is not None:
-        y = torch.clamp(y, -swiglu_limit, swiglu_limit)
-
     grouped = y.view(tokens, groups, GROUP_SIZE)
     amax = grouped.abs().amax(dim=-1)
 
@@ -122,21 +115,12 @@ def call_op(
     out: torch.Tensor,
     scales: torch.Tensor,
     input_tensor: torch.Tensor,
-    swiglu_limit: float | None = None,
 ) -> None:
-    if swiglu_limit is None:
-        torch.ops.sgl_kernel.fused_silu_mul_per_group_quant(
-            out,
-            scales,
-            input_tensor,
-        )
-    else:
-        torch.ops.sgl_kernel.fused_silu_mul_per_group_quant(
-            out,
-            scales,
-            input_tensor,
-            float(swiglu_limit),
-        )
+    torch.ops.sgl_kernel.fused_silu_mul_per_group_quant(
+        out,
+        scales,
+        input_tensor,
+    )
 
 
 def check_functional_case(
@@ -145,7 +129,6 @@ def check_functional_case(
     input_dtype: torch.dtype,
     quant_dtype: torch.dtype,
     cos_threshold: float,
-    swiglu_limit: float | None = None,
 ) -> None:
     input_shape = (*shape_prefix, hidden * 2)
     tokens = 1
@@ -157,11 +140,9 @@ def check_functional_case(
     out = torch.empty((*shape_prefix, hidden), device="cuda", dtype=quant_dtype)
     scales = torch.empty((tokens, groups), device="cuda", dtype=torch.float32)
 
-    out_ref, scales_ref, y_ref = reference(
-        input_tensor, quant_dtype, swiglu_limit=swiglu_limit
-    )
+    out_ref, scales_ref, y_ref = reference(input_tensor, quant_dtype)
 
-    call_op(out, scales, input_tensor, swiglu_limit=swiglu_limit)
+    call_op(out, scales, input_tensor)
     torch.cuda.synchronize()
 
     torch.testing.assert_close(
@@ -223,7 +204,7 @@ def valid_tensors(
 
 def run_shape_checks() -> None:
     out, scales, input_tensor = valid_tensors()
-    call_op(out, scales, input_tensor, swiglu_limit=None)
+    call_op(out, scales, input_tensor)
     torch.cuda.synchronize()
     print("PASS shape_check valid")
 
@@ -402,13 +383,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cos-threshold", type=float, default=0.999)
     parser.add_argument("--include-prod-shapes", action="store_true")
     parser.add_argument("--rank3", action="store_true")
-    parser.add_argument(
-        "--swiglu_limit",
-        type=float,
-        default=100.0,
-        help="SwiGLU clamp limit applied to SiLU(gate)*up before per-group "
-        "quantization. Default 100 for tests (kernel C++ default is 10.0).",
-    )
     return parser.parse_args()
 
 
@@ -449,7 +423,6 @@ def main() -> None:
                         input_dtype,
                         quant_dtype,
                         args.cos_threshold,
-                        swiglu_limit=args.swiglu_limit,
                     )
 
 

@@ -5,5 +5,5 @@
     "out_c": 28672,
     "group_size": 128,
     "dtype": "bfloat16",
-    "samples": 1000
+    "samples": 10000
 }

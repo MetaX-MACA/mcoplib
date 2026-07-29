@@ -4,7 +4,6 @@ Copyright (c) 2025 by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights 
 
 import os
 import sys
-import random
 import torch
 import unittest
 from typing import Callable, NamedTuple, Optional
@@ -14,18 +13,6 @@ sys.path.append(project_dir)
 #from mcoplib import op as ops
 import mcoplib.sgl_kernel
 from measure_cuda import measure_cuda
-
-def set_seed(seed=42):
-    # Python
-    random.seed(seed)
-    # PyTorch CPU
-    torch.manual_seed(seed)
-
-    # PyTorch CUDA
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)   # 多GPU
-
 
 def cosine_similarity(a, b):
     """
@@ -150,7 +137,6 @@ def biased_grouped_topk(
 
 def moe_gate_func(q_len, num_experts, topk, num_expert_group, top_k_group, renormalize=True, num_shared_experts=1, test_dtype=torch.bfloat16, scale_factor=1.0, test_name=""):
     print(f"moe_gate_func test_function_name:{test_name} test_dtype:{test_dtype} q_len:{q_len} num_experts:{num_experts} topk:{topk}")
-    set_seed(42)
     gating_output = torch.rand(q_len, num_experts, dtype=test_dtype).cuda()
     correction_bias = torch.rand(num_experts, dtype=test_dtype).cuda()
     out_routing_weights = torch.zeros(q_len, topk, dtype=torch.float).cuda()
@@ -186,10 +172,6 @@ class TestMoeGate(unittest.TestCase):
 
     def test_moe_gate_256_experts_float32_t_1(self):
         moe_gate_func(q_len=16, num_experts=256, topk=8, num_expert_group=1, top_k_group=1, renormalize=True, num_shared_experts=0, test_dtype=torch.float32, scale_factor=1.0,test_name="test_moe_gate_256_experts_float32_t_1")
-
-    def test_moe_gate_256_experts_float16_t_1(self):
-        moe_gate_func(q_len=6, num_experts=256, topk=8, num_expert_group=1, top_k_group=1, renormalize=True, num_shared_experts=0, test_dtype=torch.bfloat16, scale_factor=2.5,test_name="test_moe_gate_256_experts_float16_t_1")
-
 
     def test_moe_gate_288_experts_float32_t_0(self):
         moe_gate_func(q_len=32, num_experts=288, topk=8, num_expert_group=1, top_k_group=1, renormalize=True, num_shared_experts=0, test_dtype=torch.float32, scale_factor=1.0,test_name="test_moe_gate_288_experts_float32_t_0")

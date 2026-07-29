@@ -40,13 +40,12 @@ class Merge_attn_states_runner(OpBenchmarkBase):
     def prepare_and_get_launcher(self, dev_id, tc_s):
         with torch.cuda.stream(tc_s):
             tensors = self._prepare_tensors(dev_id)
-            return self.make_launcher(dev_id, torch.ops._C.merge_attn_states,
-                                      *tensors, None, None)
+            return self.make_launcher(dev_id, torch.ops._C.merge_attn_states, *tensors)
 
     def run_verification(self, dev_id):
         output, output_lse, prefix_output, prefix_lse, suffix_output, suffix_lse = self._prepare_tensors(dev_id)
         torch.ops._C.merge_attn_states(
-            output, output_lse, prefix_output, prefix_lse, suffix_output, suffix_lse, None, None
+            output, output_lse, prefix_output, prefix_lse, suffix_output, suffix_lse
         )
         p_lse_t = prefix_lse.transpose(0, 1).unsqueeze(-1)
         s_lse_t = suffix_lse.transpose(0, 1).unsqueeze(-1)

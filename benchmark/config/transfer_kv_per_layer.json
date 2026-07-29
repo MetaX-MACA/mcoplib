@@ -7,5 +7,5 @@
     "block_quota": 256,
     "num_warps_per_block": 4,
     "dtype": "float16",
-    "samples": 1000
+    "samples": 10000
 }

@@ -391,8 +391,7 @@ void GroupedGemmVariableK(torch::Tensor a,
   } else if (a.scalar_type() == torch::kFloat) {
     CublasGroupedGemmVariableKMultiStream<float, CUDA_R_32F>(a, b, c, batch_sizes);
   } else {
-    TORCH_CHECK(false, "GroupedGemmVariableK: unsupported input dtype, expected bfloat16/half/float, got ",
-                a.scalar_type());
+    assert(0);
   }
 }
 void GroupedGemm(torch::Tensor a,
@@ -448,8 +447,7 @@ void GroupedGemm(torch::Tensor a,
   } else if (a.scalar_type() == torch::kFloat) {
     CublasGroupedGemmMultiStream<float, CUDA_R_32F>(a, b, c, batch_sizes, trans_a, trans_b);
   } else {
-    TORCH_CHECK(false, "GroupedGemm: unsupported input dtype, expected bfloat16/half/float, got ",
-                a.scalar_type());
+    assert(0);
   }
   return;
 }

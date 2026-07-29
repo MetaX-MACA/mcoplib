@@ -24,50 +24,37 @@ import mcoplib_mxbenchmark_op_wrapper
 # =============================================================================
 SUPPORTED_OPERATORS = [
     "apply_repetition_penalties",
-    "apply_rope_pos_ids_cos_sin_cache",
-    "apply_shuffle_mul_sum",
     "awq_dequantize",
     "awq_gemm",
     "awq_to_gptq_4bit",
-    "batched_moe_align_block_size",
+    "batched_moe_align_block_size",  
     "batched_rotary_embedding",
-    "build_tree_kernel_efficient",
     "concat_and_cache_mla",
-    "concat_mla_absorb_q",
-    "concat_mla_k",
-    "concat_mla_q",
+    "concat_mla_absorb_q",           
+    "concat_mla_k",                  
     "convert_fp8",
     "convert_vertical_slash_indexes",
-    "convert_vertical_slash_indexes_mergehead",
-    "copy_to_gpu_no_ce",
+    "copy_to_gpu_no_ce",             
     "cp_gather_cache",
-    "cp_gather_indexer_k_cache",
-    "cp_gather_indexer_k_quant_cache",
+    "cp_gather_indexer_k_quant_cache", 
     "cutlass_group_gemm_supported",
-    "cutlass_scaled_mm",
     "cutlass_scaled_mm_azp",
     "cutlass_scaled_mm_supports_block_fp8",
     "cutlass_scaled_mm_supports_fp4",
     "cutlass_scaled_mm_supports_fp8",
-    "dsv4_fused_q_indexer_rope_hadamard_quant",
-    "dsv4_fused_q_norm_rope",
+    "cutlass_scaled_mm",
     "dynamic_per_token_scaled_fp8_quant",
     "dynamic_scaled_int8_quant",
-    "fast_topk",
-    "fast_topk_transform_fused",
-    "fast_topk_transform_ragged_fused",
+    "fast_topk_transform_fused",        
+    "fast_topk_transform_ragged_fused", 
+    "fast_topk",                        
     "fatrelu_and_mul",
-    "fp32_router_gemm",
-    "fused_add_rms_norm",
     "fused_add_rms_norm_static_fp8_quant",
-    "fused_add_rmsnorm",
+    "fused_add_rms_norm",
+    "fused_add_rmsnorm",            
     "fused_bias_dropout",
-    "fused_mla_absorb_rotary_emb",
-    "fused_moe_gate_deepseek",
-    "fused_moe_gate_opt",
+    "fused_mla_absorb_rotary_emb",   
     "fused_rope_fwd",
-    "fused_silu_mul_dq_quant_interface",
-    "fused_unpack",
     "gather_and_maybe_dequant_cache",
     "gelu_and_mul",
     "gelu_fast",
@@ -76,78 +63,50 @@ SUPPORTED_OPERATORS = [
     "gelu_tanh_and_mul",
     "get_cuda_view_from_cpu_tensor",
     "gptq_gemm",
-    "gptq_marlin_gemm",
-    "gptq_shuffle",
-    "grouped_topk",
-    "indexer_k_cache",
-    "init_custom_ar",
-    "mctlass_moe_w4a16_gemm_kernel_mnk",
-    "merge_attn_states",
-    "merge_state",
-    "merge_state_v2",
-    "meta_size",
-    "moe_align_block_size",
-    "moe_fused_gate",
-    "moe_lora_align_block_size",
+    "mctlass_moe_w4a16_gemm_kernel_mnk",   
+    "merge_attn_states",        
+    "merge_state_v2",             
+    "merge_state",               
+    "moe_align_block_size",          
+    "moe_lora_align_block_size",     
     "moe_sum",
-    "moe_sum_reduce",
     "mul_and_silu",
-    "paged_attention_v1",
-    "paged_attention_v2",
-    "per_token_cast_to_fp8",
-    "per_token_group_fp8_quant",
-    "persistent_topk",
-    "prepare_moe_input",
-    "reshape_and_cache",
     "reshape_and_cache_flash",
-    "rms_norm",
-    "rms_norm_dynamic_per_group_quant",
-    "rms_norm_dynamic_per_token_quant",
+    "reshape_and_cache",
     "rms_norm_static_fp8_quant",
-    "rms_norm_dynamic_per_group_quant_int8",
-    "rms_norm_dynamic_per_group_quant_fp8",
-    "rotary_embedding",
-    "segment_packbits",
-    "selective_scan_fwd",
-    "sgl_rotary_embedding",
-    "silu_and_mul",
+    "rms_norm",
+    "selective_scan_fwd",            
     "silu_and_mul_quant",
+    "silu_and_mul",
     "static_scaled_fp8_quant",
-    "static_scaled_int8_quant",
-    "swap_blocks",
+    "static_scaled_int8_quant",      
+    "swap_blocks",              
     "swigluoai_and_mul",
-    "top_k_per_row_decode",
-    "topk_sigmoid",
-    "sgl_topk_softmax",
-    "vllm_topk_softmax",
-    "transfer_kv_all_layer",
-    "transfer_kv_all_layer_direct_lf_pf",
-    "transfer_kv_all_layer_lf_pf",
-    "transfer_kv_all_layer_lf_ph",
-    "transfer_kv_all_layer_mla",
-    "transfer_kv_all_layer_mla_lf_pf",
-    "transfer_kv_direct",
-    "transfer_kv_per_layer",
+    "transfer_kv_all_layer_direct_lf_pf",  
+    "transfer_kv_direct",              
     "transfer_kv_per_layer_direct_pf_lf",
-    "transfer_kv_per_layer_mla",
-    "transfer_kv_per_layer_mla_pf_lf",
-    "transfer_kv_per_layer_pf_lf",
-    "transfer_kv_per_layer_ph_lf",
+    "moe_sum_reduce",
+    "moe_fused_gate",
+    "prepare_moe_input",
+    "apply_shuffle_mul_sum",
+    "fused_moe_gate_opt",
+    "fused_silu_mul_dq_quant_interface",
+    "mx_awq_dequantize",
     "tree_speculative_sampling_target_only",
     "verify_tree_greedy",
     "reconstruct_indices_from_tree_mask",
-    "vllm_rotary_embedding",
-    "mx_awq_dequantize"
-]
-
-# =============================================================================
-#  Global Config: Ignored Operators
-# =============================================================================
-# Operators in this list are skipped entirely (no nvbench run, no CSV write).
-# The script prints the ignored op name and exits with code 0.
-# Use exact op names (must match SUPPORTED_OPERATORS entries or the --op arg).
-IGNORED_OPERATORS = [
-    # "gptq_shuffle",   # example: uncomment to skip a slow/flaky op
+    "build_tree_kernel_efficient",
+    "segment_packbits",
+    "transfer_kv_per_layer",
+    "transfer_kv_per_layer_pf_lf",
+    "transfer_kv_per_layer_ph_lf",
+    "transfer_kv_all_layer",
+    "transfer_kv_all_layer_lf_pf",
+    "transfer_kv_all_layer_lf_ph",
+    "transfer_kv_per_layer_mla",
+    "transfer_kv_per_layer_mla_pf_lf",
+    "transfer_kv_all_layer_mla",
+    "transfer_kv_all_layer_mla_lf_pf"
 ]
 
 # =============================================================================
@@ -433,26 +392,6 @@ def _write_csv(path, header, rows):
     except Exception as e:
         print(f"[ERROR] Failed to write CSV: {e}")
 
-def _append_compare_row(csv_path, op_name, cur_gpu_str, base_gpu_str,
-                        acc_status, perf_ratio_str):
-    """Append one compare-result row to csv_path.
-
-    Creates the file with a fixed header if it does not exist; otherwise
-    appends only the data row. Parent directories are created as needed.
-    """
-    header = ["Op_Name", "Current Batch GPU", "Base Batch GPU",
-              "ACC verify", "Performance verify"]
-    target_dir = os.path.dirname(csv_path)
-    if target_dir and not os.path.exists(target_dir):
-        os.makedirs(target_dir, exist_ok=True)
-    file_exists = os.path.exists(csv_path)
-    with open(csv_path, "a", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        if not file_exists:
-            writer.writerow(header)
-        writer.writerow([op_name, cur_gpu_str, base_gpu_str,
-                         acc_status, perf_ratio_str])
-
 # =============================================================================
 #  Update / Generate / Compare Logic
 # =============================================================================
@@ -569,23 +508,23 @@ def perform_generate(temp_csv_path, target_csv_path):
         print("[INFO] No new data to write.")
     print("-" * 80 + f"\n[SUMMARY] Appended: {append_cnt}, Skipped: {skip_cnt}\n" + "=" * 80 + "\n")
 
-def perform_comparison(cur_raw, hist_raw, output_csv=None):
+def perform_comparison(cur_raw, hist_raw):
     _, cur_rows = preprocess_data([], cur_raw)
     _, hist_rows = preprocess_data([], hist_raw)
     if not cur_rows: return
     print("\n" + "="*95 + "\n" + f"{' Performance Comparison ':^95}" + "\n" + "="*95)
-
+    
     row_fmt = "{:<15} | {:<15} | {:<10} | {:<15} | {:<15} | {:<20}"
     dummy_header = list(cur_rows[0].keys())
-
+    
     for row in cur_rows:
         key = get_row_key(row, dummy_header)
-
+        
         gpu = get_effective_gpu_time(row)
         cpu = parse_time_val(row.get("CPU Time (sec)", ""))
         op_name = get_op_display_name(row)
         d_type = row.get("dtype", "-")
-
+        
         time_label = "Batch GPU"
         if parse_time_val(row.get("Batch GPU (sec)", "")) is None and \
            parse_time_val(row.get("GPU Time (sec)", "")) is not None:
@@ -601,20 +540,19 @@ def perform_comparison(cur_raw, hist_raw, output_csv=None):
         print(row_fmt.format("Type", time_label, "Ratio", "CPU Time", "Ratio", ""))
         print("-" * 95)
         print(row_fmt.format("Current", format_duration(gpu), "-", format_duration(cpu), "-", ""))
-
+        
         matches = []
         for idx, h_row in enumerate(hist_rows):
-            if get_row_key(h_row, dummy_header) == key:
+            if get_row_key(h_row, dummy_header) == key: 
                 matches.append((idx, h_row))
-
+        
         perf_ratio_str = "None"
-        h_gpu = None
 
         if matches:
-            _, h_row = matches[-1]
+            _, h_row = matches[-1] 
             h_gpu = get_effective_gpu_time(h_row)
             h_cpu = parse_time_val(h_row.get("CPU Time (sec)", ""))
-
+            
             if gpu and h_gpu:
                 perf_ratio_str = f"{h_gpu/gpu*100:.2f}%"
                 gr = perf_ratio_str
@@ -625,21 +563,11 @@ def perform_comparison(cur_raw, hist_raw, output_csv=None):
             print(row_fmt.format("Base", format_duration(h_gpu), gr, format_duration(h_cpu), cr, ""))
         else:
             print(f"{'Base':<15} | {'N/A':<15} | {'N/A':<10} | {'N/A':<15} | {'N/A':<15} |")
-
+        
         print("Result:")
         print(f"Acc verify:{acc_status}")
         print(f"Performance verify:{perf_ratio_str}")
         print("\n")
-
-        if output_csv:
-            base_gpu_str = format_duration(h_gpu) if matches else "N/A"
-            try:
-                _append_compare_row(output_csv, op_name,
-                                    format_duration(gpu), base_gpu_str,
-                                    acc_status, perf_ratio_str)
-                print(f"[OUTPUT] Appended compare result for '{op_name}' -> {output_csv}")
-            except Exception as e:
-                print(f"[WARN] Failed to append compare result to '{output_csv}': {e}")
 
 # =============================================================================
 #  Main Execution Block
@@ -649,12 +577,6 @@ if __name__ == "__main__":
     parser.add_argument("--op", type=str, default=None, help="Operator name (Required, unless --list is used)")
     parser.add_argument("--list", action="store_true", help="List all supported operators and exit")
     parser.add_argument("--csv", type=str, default=None, help="Path to result CSV")
-    parser.add_argument("--output", type=str, default=None,
-                        help="CSV file to append --compare results (Op_Name, "
-                             "Current Batch GPU, Base Batch GPU, ACC verify, "
-                             "Performance verify). File is created with header "
-                             "if absent; rows are appended otherwise. "
-                             "Only effective in --compare mode.")
     
     group = parser.add_mutually_exclusive_group()
     # 修复：这里的 > 5% 必须写成 > 5%%，否则 argparse 报错 incomplete format
@@ -678,16 +600,9 @@ if __name__ == "__main__":
         print(" [TIP]   Please use --help to view the standard usage.")
         print("-"*80 + "\n")
         sys.exit(1)
-
-    # 2.5. Ignored Operator Check
-    # Operators in IGNORED_OPERATORS are skipped entirely: no nvbench run,
-    # no CSV write. Print a clear marker and exit with code 0.
-    op_name = args.op
-    if op_name in IGNORED_OPERATORS:
-        print(f"[IGNORED] {op_name} is in the ignored list, skipping nvbench run.")
-        sys.exit(0)
-
+    
     # 3. Load Operator
+    op_name = args.op
     op_instance = load_operator_runner(op_name)
     
     # 4. Handle CSV Default Logic
@@ -698,12 +613,7 @@ if __name__ == "__main__":
 
     # 5. Pre-flight Check (File/Directory Existence)
     active_mode = args.update or args.compare or args.generate
-
-    # --output only takes effect in --compare mode.
-    if args.output and not args.compare:
-        print(f"[WARN] --output '{args.output}' is only effective in --compare mode; "
-              f"it will be ignored in --{'generate' if args.generate else 'update'} mode.")
-
+    
     if active_mode:
         abs_csv_path = os.path.abspath(args.csv)
         csv_dir = os.path.dirname(abs_csv_path)
@@ -812,8 +722,7 @@ if __name__ == "__main__":
             if args.compare:
                 _, c_d = load_csv_data(temp_csv)
                 _, h_d = load_csv_data(args.csv)
-                output_path = os.path.abspath(args.output) if args.output else None
-                perform_comparison(c_d, h_d, output_csv=output_path)
+                perform_comparison(c_d, h_d)
             elif args.update:
                 perform_smart_update(temp_csv, args.csv)
             elif args.generate:

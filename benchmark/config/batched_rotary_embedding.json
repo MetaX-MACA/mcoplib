@@ -1,6 +1,6 @@
 {
     "device_id": 0,
-    "device_name": "MetaX C500",
+    "device_name": "MetaX C280",
     "batch_size": 4,
     "seq_len": 1024,
     "num_heads": 32,
@@ -10,5 +10,5 @@
     "max_position": 4096,
     "is_neox": true,
     "dtype": "bfloat16",
-    "samples": 1000
+    "samples": 10000
 }

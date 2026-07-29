@@ -157,16 +157,11 @@ class OpsBenchmark:
             try:
                 if op_name == "add_rms_norm":
                     result = self.test_add_rms_norm(shape)
-                    results.append(result)
-
-                    result = self.test_add_rms_norm_without_weight(shape)
-                    results.append(result)
-
-                    continue
-
                 else:
                     print(f"Unknown op: {op_name}")
                     continue
+                
+                results.append(result)
                 
             except Exception as e:
                 print(f"Failed to test {op_name} with shape {shape}: {e}")
@@ -205,37 +200,6 @@ class OpsBenchmark:
             return kwargs["hidden_states"]  # 返回hidden_states用于对比
         
         return self.compare_ops("add_rms_norm", test_mcoplib, input_data, str(shape))
-
-    def test_add_rms_norm_without_weight(self, shape: Tuple[int, ...]) -> Dict[str, Any]:
-        """测试add_rms_norm算子(weight=None)"""
-
-        # 生成测试数据
-        hidden_states = self.generate_test_data(shape)
-        residual = self.generate_test_data(shape)
-        epsilon = 1e-6
-
-        input_data = {
-            "hidden_states": hidden_states,
-            "residual": residual,
-            "epsilon": epsilon
-        }
-
-        def test_mcoplib(**kwargs):
-            torch.ops._C.fused_add_rms_norm(
-                kwargs["hidden_states"],
-                kwargs["residual"],
-                None,
-                kwargs["epsilon"]
-            )
-
-            return kwargs["hidden_states"]
-
-        return self.compare_ops(
-            "add_rms_norm_without_weight",
-            test_mcoplib,
-            input_data,
-            str(shape)
-        )
     
     def test_silu_and_mul(self, shape: Tuple[int, ...]) -> Dict[str, Any]:
         """测试silu_and_mul算子"""

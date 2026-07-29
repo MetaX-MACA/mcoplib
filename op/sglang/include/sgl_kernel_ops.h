@@ -946,8 +946,7 @@ void fused_silu_mul_dq_quant_interface(torch::Tensor& out, torch::Tensor& scale,
 void fused_silu_mul_per_group_quant(
     torch::Tensor& out,
     torch::Tensor& scales,
-    const torch::Tensor& input,
-    c10::optional<double> _swiglu_limit = c10::nullopt);
+    const torch::Tensor& input);
 
 void static_scaled_int8_quant(torch::Tensor& out, torch::Tensor const& input,
                               torch::Tensor const& scale,

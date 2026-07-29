@@ -113,13 +113,6 @@ private:
     this->sync_stream();
 
     this->check_skip_time(m_cuda_timer.get_duration());
-    const auto time_estimate = m_cuda_timer.get_duration() * 0.95;
-    auto batch_size          = static_cast<nvbench::int64_t>(m_min_time / time_estimate);
-    //加大warmup的次数
-    for (nvbench::int64_t i = 0; i < batch_size; ++i)
-    {
-      this->launch_kernel();
-    } 
   }
 
   void run_trials()

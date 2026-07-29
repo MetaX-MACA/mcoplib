@@ -27,9 +27,7 @@
 #include "../include/rms_norm_dynamic_per_token_quant.h"
 #include "../include/fused_moe_gate_deepseek.h"
 #include "../include/glm_attention_prepare.h"
-#ifdef ENABLE_BUILD_GPTQ_MARLIN_OP
-    #include "gptq_marlin.h"
-#endif
+#include "gptq_marlin.h"
 #include "fused_moe_gate_opt.h"
 #include "../include/fused_deepseekv4_qkv_rms_norm_rope.h"
 #include "../include/fused_split_gemma_rmsnorm_rope.h"
@@ -82,8 +80,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("fused_silu_mul_dq_mask_quant_fp8_nopack", &fused_silu_mul_dq_mask_quant_fp8_nopack);
 
     py::object torch_bfloat16 = py::module::import("torch").attr("bfloat16");
-
-#ifdef ENABLE_BUILD_GPTQ_MARLIN_OP
     m.def("gptq_marlin_gemm_legacy", &gptq_marlin_gemm_legacy,
           "Function to perform GEMM using Marlin quantization.", py::arg("a"),
           py::arg("b_q_weight"), py::arg("b_scales"), py::arg("g_idx"),
@@ -97,7 +93,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("size_m"), py::arg("size_n"), py::arg("size_k"),
         py::arg("sms"), py::arg("is_k_full"), py::arg("dtype") = torch_bfloat16,
         py::arg("use_atomic_cache") = true);
-#endif 
+
     m.def("fused_moe_gate_deepseek", &fused_moe_gate_deepseek, "Fused moe gate topk selection",
         py::arg("gating_outputs"),
         py::arg("correction_bias"),

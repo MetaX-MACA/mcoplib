@@ -4,5 +4,5 @@
     "batch_size": 32,
     "vocab_size": 64000,
     "dtype": "float32",
-    "samples": 1000
+    "samples": 10000
 }

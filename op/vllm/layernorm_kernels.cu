@@ -249,40 +249,35 @@ inline bool rms_rows_are_vector_aligned(int num_dims, int vec_size,
    Additional optimizations we can make in this case are
    packed and vectorized operations, which help with the
    memory latency bottleneck. */
-template <typename scalar_t, int width, bool HasWeight>
+template <typename scalar_t, int width>
 __global__ std::enable_if_t<(width > 0) && _typeConvert<scalar_t>::exists>
-fused_add_rms_norm_kernel(
-    scalar_t* __restrict__ input,        // [..., hidden_size]
-    const int64_t input_stride,
-    scalar_t* __restrict__ residual,     // [..., hidden_size]
-    const scalar_t* __restrict__ weight, // [hidden_size], nullptr if !HasWeight
-    const float epsilon,
-    const int num_tokens,
-    const int hidden_size) {
+fused_add_rms_norm_kernel(scalar_t *__restrict__ input, // [..., hidden_size]
+                          const int64_t input_stride,
+                          scalar_t *__restrict__ residual, // [..., hidden_size]
+                          const scalar_t *__restrict__ weight, // [hidden_size]
+                          const float epsilon, const int num_tokens,
+                          const int hidden_size) {
   // Sanity checks on our vector struct and type-punned pointer arithmetic
   static_assert(std::is_pod_v<_f16Vec<scalar_t, width>>);
   static_assert(sizeof(_f16Vec<scalar_t, width>) == sizeof(scalar_t) * width);
 
   const int vec_hidden_size = hidden_size / width;
   const int64_t vec_input_stride = input_stride / width;
-
   __shared__ float s_variance;
   float variance = 0.0f;
-
   /* These and the argument pointers are all declared `restrict` as they are
      not aliased in practice. Argument pointers should not be dereferenced
      in this kernel as that would be undefined behavior */
-  auto* __restrict__ input_v =
-      reinterpret_cast<_f16Vec<scalar_t, width>*>(input);
-  auto* __restrict__ residual_v =
-      reinterpret_cast<_f16Vec<scalar_t, width>*>(residual);
-  auto* __restrict__ weight_v =
-      reinterpret_cast<const _f16Vec<scalar_t, width>*>(weight);
+  auto *__restrict__ input_v =
+      reinterpret_cast<_f16Vec<scalar_t, width> *>(input);
+  auto *__restrict__ residual_v =
+      reinterpret_cast<_f16Vec<scalar_t, width> *>(residual);
+  auto *__restrict__ weight_v =
+      reinterpret_cast<const _f16Vec<scalar_t, width> *>(weight);
 
   for (int idx = threadIdx.x; idx < vec_hidden_size; idx += blockDim.x) {
     int id = blockIdx.x * vec_hidden_size + idx;
     int64_t strided_id = blockIdx.x * vec_input_stride + idx;
-
     _f16Vec<scalar_t, width> temp = input_v[strided_id];
     temp += residual_v[id];
     variance += temp.sum_squares();
@@ -301,29 +296,16 @@ fused_add_rms_norm_kernel(
   for (int idx = threadIdx.x; idx < vec_hidden_size; idx += blockDim.x) {
     int id = blockIdx.x * vec_hidden_size + idx;
     int64_t strided_id = blockIdx.x * vec_input_stride + idx;
-
     _f16Vec<scalar_t, width> res = residual_v[id];
+    _f16Vec<scalar_t, width> w = weight_v[idx];
     _f16Vec<scalar_t, width> out;
-
     using Converter = _typeConvert<scalar_t>;
-
-    if constexpr (HasWeight) {
-      _f16Vec<scalar_t, width> w = weight_v[idx];
-
 #pragma unroll
-      for (int j = 0; j < width; ++j) {
-        float x = Converter::convert(res.data[j]);
-        float wf = Converter::convert(w.data[j]);
-        out.data[j] = Converter::convert(x * s_variance * wf);
-      }
-    } else {
-#pragma unroll
-      for (int j = 0; j < width; ++j) {
-        float x = Converter::convert(res.data[j]);
-        out.data[j] = Converter::convert(x * s_variance);
-      }
+    for (int j = 0; j < width; ++j) {
+      float x = Converter::convert(res.data[j]);
+      float wf = Converter::convert(w.data[j]);
+      out.data[j] = Converter::convert(x * s_variance * wf);
     }
-
     input_v[strided_id] = out;
   }
 }
@@ -331,16 +313,14 @@ fused_add_rms_norm_kernel(
 /* Generic fused_add_rms_norm_kernel
    The width field is not used here but necessary for other specializations.
  */
-template <typename scalar_t, int width, bool HasWeight>
+template <typename scalar_t, int width>
 __global__ std::enable_if_t<(width == 0) || !_typeConvert<scalar_t>::exists>
-fused_add_rms_norm_kernel(
-    scalar_t* __restrict__ input,        // [..., hidden_size]
-    const int64_t input_stride,
-    scalar_t* __restrict__ residual,     // [..., hidden_size]
-    const scalar_t* __restrict__ weight, // [hidden_size], nullptr if !HasWeight
-    const float epsilon,
-    const int num_tokens,
-    const int hidden_size) {
+fused_add_rms_norm_kernel(scalar_t *__restrict__ input, // [..., hidden_size]
+                          const int64_t input_stride,
+                          scalar_t *__restrict__ residual, // [..., hidden_size]
+                          const scalar_t *__restrict__ weight, // [hidden_size]
+                          const float epsilon, const int num_tokens,
+                          const int hidden_size) {
   __shared__ float s_variance;
   float variance = 0.0f;
 
@@ -363,15 +343,8 @@ fused_add_rms_norm_kernel(
 
   for (int idx = threadIdx.x; idx < hidden_size; idx += blockDim.x) {
     float x = (float)residual[blockIdx.x * hidden_size + idx];
-
-    if constexpr (HasWeight) {
-      float w = (float)weight[idx];
-      input[blockIdx.x * input_stride + idx] =
-          (scalar_t)(x * s_variance * w);
-    } else {
-      input[blockIdx.x * input_stride + idx] =
-          (scalar_t)(x * s_variance);
-    }
+    float w = (float)weight[idx];
+    input[blockIdx.x * input_stride + idx] = (scalar_t)(x * s_variance * w);
   }
 }
 
@@ -482,25 +455,15 @@ void rms_norm(torch::Tensor &out, torch::Tensor &input,
   });
 }
 
-#define LAUNCH_FUSED_ADD_RMS_NORM(width, has_weight)                     \
-  VLLM_DISPATCH_FLOATING_TYPES(                                          \
-      input.scalar_type(), "fused_add_rms_norm_kernel", [&] {            \
-        if (has_weight) {                                                \
-          vllm::fused_add_rms_norm_kernel<scalar_t, width, true>         \
-              <<<grid, block, 0, stream>>>(                              \
-                  input.data_ptr<scalar_t>(), input_stride,              \
-                  residual.data_ptr<scalar_t>(),                         \
-                  weight->data_ptr<scalar_t>(),                          \
-                  epsilon, num_tokens, hidden_size);                     \
-        } else {                                                         \
-          vllm::fused_add_rms_norm_kernel<scalar_t, width, false>        \
-              <<<grid, block, 0, stream>>>(                              \
-                  input.data_ptr<scalar_t>(), input_stride,              \
-                  residual.data_ptr<scalar_t>(),                         \
-                  nullptr,                                               \
-                  epsilon, num_tokens, hidden_size);                     \
-        }                                                                \
-      })
+#define LAUNCH_FUSED_ADD_RMS_NORM(width)                                       \
+  VLLM_DISPATCH_FLOATING_TYPES(                                                \
+      input.scalar_type(), "fused_add_rms_norm_kernel", [&] {                  \
+        vllm::fused_add_rms_norm_kernel<scalar_t, width>                       \
+            <<<grid, block, 0, stream>>>(                                      \
+                input.data_ptr<scalar_t>(), input_stride,                      \
+                residual.data_ptr<scalar_t>(), weight.data_ptr<scalar_t>(),    \
+                epsilon, num_tokens, hidden_size);                             \
+      });
 
 template <typename T>
 static __device__ __forceinline__ T float_to_dstT(float value) {
@@ -555,470 +518,271 @@ template <> __device__ __forceinline__ void copy<1>(void *src, void *dst) {
   *ptr_dst = *ptr_src;
 }
 
-template <uint32_t VEC_SIZE,
-          uint32_t NUM_REG,
-          typename T,
-          int NUM_THREADS,
-          bool HasWeight>
+template <uint32_t VEC_SIZE, uint32_t NUM_REG, typename T, int NUM_THREADS>
 __global__ void FusedAddRMSNormKernelOpt(
-    T *__restrict__ input,
-    T *__restrict__ residual,
-    T *__restrict__ weight,
-    const uint32_t d,
-    const uint32_t stride_input,
-    const uint32_t stride_residual,
-    float weight_bias,
-    float eps)
-{
-    float rms = 0;
+    T *__restrict__ input, T *__restrict__ residual, T *__restrict__ weight,
+    const uint32_t d, const uint32_t stride_input,
+    const uint32_t stride_residual, float weight_bias, float eps) {
+  float rms = 0;
+  T *ptr_input = input + blockIdx.x * stride_input;
+  T *ptr_residual = residual + blockIdx.x * stride_residual;
 
-    T *ptr_input = input + blockIdx.x * stride_input;
-    T *ptr_residual = residual + blockIdx.x * stride_residual;
-
-    float reg_input[NUM_REG][VEC_SIZE];
-
-    // sum of squares
-    float ss = 0.0f;
-
-    uint32_t tid = threadIdx.x * VEC_SIZE;
-    uint32_t block_stride = NUM_THREADS * VEC_SIZE;
-    uint32_t k = 0;
-
-    for (uint32_t i = tid; i < d; i += block_stride) {
-        T local[VEC_SIZE];
-        copy<sizeof(T) * VEC_SIZE>((void *)(ptr_input + i), (void *)local);
-
-        T reg_residual[VEC_SIZE];
-        copy<sizeof(T) * VEC_SIZE>(
-            (void *)(ptr_residual + i),
-            (void *)reg_residual);
+  float reg_input[NUM_REG][VEC_SIZE];
+  // sum of squares
+  float ss = 0.0f;
+  uint32_t tid = threadIdx.x * VEC_SIZE;
+  uint32_t block_stride = NUM_THREADS * VEC_SIZE;
+  uint32_t k = 0;
+  for (uint32_t i = tid; i < d; i += block_stride) {
+    T local[VEC_SIZE];
+    copy<sizeof(T) * VEC_SIZE>((void *)(ptr_input + i), (void *)local);
+    T reg_residual[VEC_SIZE];
+    copy<sizeof(T) * VEC_SIZE>((void *)(ptr_residual + i),
+                               (void *)reg_residual);
 
 #pragma unroll VEC_SIZE
-        for (uint32_t j = 0; j < VEC_SIZE; j++) {
-            float x = static_cast<float>(local[j]);
-            x += static_cast<float>(reg_residual[j]);
-            reg_residual[j] = float_to_dstT<T>(x);
-            ss += x * x;
-            reg_input[k][j] = x;
-        }
-
-        copy<sizeof(T) * VEC_SIZE>(
-            (void *)reg_residual,
-            (void *)(ptr_residual + i));
-
-        k++;
+    for (uint32_t j = 0; j < VEC_SIZE; j++) {
+      float x = static_cast<float>(local[j]);
+      x += static_cast<float>(reg_residual[j]);
+      reg_residual[j] = float_to_dstT<T>(x);
+      ss += x * x;
+      reg_input[k][j] = x;
     }
-
-    constexpr int sm_size = NUM_THREADS >> 4;
-    constexpr int sm_size2 = sm_size / 2;
-
-    __shared__ float sm_sum[sm_size];
-
-    if constexpr (sm_size == 32) {
-
-        for (int i = 8; i > 0; i >>= 1) {
-            ss += __shfl_down_sync_16(0xffffffffffffffff, ss, i);
-        }
-
-        int lane_id = threadIdx.x & 15;
-        int group_id = threadIdx.x >> 4;
-
-        if (lane_id == 0) {
-            sm_sum[group_id] = ss;
-        }
-
-        __syncthreads();
-
-        __shared__ float sm_sum2[sm_size >> 4];
-
-        if (threadIdx.x < sm_size) {
-
-            float data = sm_sum[threadIdx.x];
-
-            for (int i = 8; i >= 1; i >>= 1) {
-                data += __shfl_down_sync_16(0xffffffffffffffff, data, i);
-            }
-
-            if (lane_id == 0) {
-                sm_sum2[group_id] = data;
-            }
-        }
-
-        __syncthreads();
-
-        ss = sm_sum2[0] + sm_sum2[1];
-
-    } else if constexpr (sm_size == 16) {
-
-        for (int i = 8; i > 0; i >>= 1) {
-            ss += __shfl_down_sync_16(0xffffffffffffffff, ss, i);
-        }
-
-        int lane_id = threadIdx.x & 15;
-        int group_id = threadIdx.x >> 4;
-
-        if (lane_id == 0) {
-            sm_sum[group_id] = ss;
-        }
-
-        __syncthreads();
-
-        if (threadIdx.x < sm_size) {
-
-            float data = sm_sum[threadIdx.x];
-
-            for (int i = 8; i >= 1; i >>= 1) {
-                data += __shfl_down_sync_16(0xffffffffffffffff, data, i);
-            }
-
-            if (threadIdx.x == 0) {
-                sm_sum[0] = data;
-            }
-        }
-
-        __syncthreads();
-
-        ss = sm_sum[0];
-
-    } else if constexpr (sm_size == 8) {
-
-        for (int i = 8; i > 0; i >>= 1) {
-            ss += __shfl_down_sync_16(0xffffffffffffffff, ss, i);
-        }
-
-        int lane_id = threadIdx.x & 15;
-        int group_id = threadIdx.x >> 4;
-
-        if (lane_id == 0) {
-            sm_sum[group_id] = ss;
-        }
-
-        __syncthreads();
-
-        if (threadIdx.x < sm_size) {
-
-            float data = sm_sum[threadIdx.x];
-
-            for (int i = 4; i >= 1; i >>= 1) {
-                data += __shfl_down_sync_16(0xffffffffffffffff, data, i);
-            }
-
-            if (threadIdx.x == 0) {
-                sm_sum[0] = data;
-            }
-        }
-
-        __syncthreads();
-
-        ss = sm_sum[0];
-
-    } else if constexpr (sm_size == 4) {
-
-        for (int i = 8; i > 0; i >>= 1) {
-            ss += __shfl_down_sync_16(0xffffffffffffffff, ss, i);
-        }
-
-        int lane_id = threadIdx.x & 15;
-        int group_id = threadIdx.x >> 4;
-
-        if (lane_id == 0) {
-            sm_sum[group_id] = ss;
-        }
-
-        __syncthreads();
-
-        if (threadIdx.x < sm_size) {
-
-            float data = sm_sum[threadIdx.x];
-
-            for (int i = 2; i >= 1; i >>= 1) {
-                data += __shfl_down_sync_16(0xffffffffffffffff, data, i);
-            }
-
-            if (threadIdx.x == 0) {
-                sm_sum[0] = data;
-            }
-        }
-
-        __syncthreads();
-
-        ss = sm_sum[0];
+    copy<sizeof(T) * VEC_SIZE>((void *)reg_residual,
+                               (void *)(ptr_residual + i));
+    k++;
+  }
+  // using BlockReduce = cub::BlockReduce<float, NUM_THREADS>;
+  // __shared__ typename BlockReduce::TempStorage reduceStore;
+  // ss = BlockReduce(reduceStore).Reduce(ss, cub::Sum{}, NUM_THREADS);
+  constexpr int sm_size = NUM_THREADS >> 4;
+  constexpr int sm_size2 = sm_size / 2;
+  __shared__ float sm_sum[sm_size];
+  if constexpr (sm_size == 32) {
+    for (int i = 8; i > 0; i >>= 1) {
+      ss += __shfl_down_sync_16(0xffffffffffffffff, ss, i);
     }
-
-    __shared__ float s_rms;
-
-    if (threadIdx.x == 0) {
-        s_rms = rsqrtf(ss / (float)d + eps);
+    int lane_id = threadIdx.x & 15;
+    int group_id = threadIdx.x >> 4;
+    if (lane_id == 0) {
+      sm_sum[group_id] = ss;
     }
-
     __syncthreads();
+    __shared__ float sm_sum2[sm_size >> 4];
+    if (threadIdx.x < sm_size) {
+      float data = sm_sum[threadIdx.x];
+      for (int i = 8; i >= 1; i >>= 1) {
+        data += __shfl_down_sync_16(0xffffffffffffffff, data, i);
+      }
 
-    rms = s_rms;
-
-    T const *ptr_weight = weight;
-
-    k = 0;
-
-    for (uint32_t i = tid; i < d; i += block_stride) {
-
-        T reg_dst[VEC_SIZE];
-
-        if constexpr (HasWeight) {
-
-            T local_weight[VEC_SIZE];
-
-            copy<sizeof(T) * VEC_SIZE>(
-                (void *)(ptr_weight + i),
-                (void *)local_weight);
-
-#pragma unroll VEC_SIZE
-            for (uint32_t j = 0; j < VEC_SIZE; j++) {
-                reg_dst[j] = float_to_dstT<T>(
-                    reg_input[k][j] * rms * float(local_weight[j]));
-            }
-
-        } else {
-
-#pragma unroll VEC_SIZE
-            for (uint32_t j = 0; j < VEC_SIZE; j++) {
-                reg_dst[j] =
-                    float_to_dstT<T>(reg_input[k][j] * rms);
-            }
-        }
-
-        k++;
-
-        copy<VEC_SIZE * sizeof(T)>(
-            (void *)reg_dst,
-            (void *)(ptr_input + i));
+      if (lane_id == 0) {
+        sm_sum2[group_id] = data;
+      }
     }
+    __syncthreads();
+    ss = sm_sum2[0] + sm_sum2[1];
+  } else if constexpr (sm_size == 16) {
+    for (int i = 8; i > 0; i >>= 1) {
+      ss += __shfl_down_sync_16(0xffffffffffffffff, ss, i);
+    }
+    int lane_id = threadIdx.x & 15;
+    int group_id = threadIdx.x >> 4;
+    if (lane_id == 0) {
+      sm_sum[group_id] = ss;
+    }
+    __syncthreads();
+    if (threadIdx.x < sm_size) {
+      float data = sm_sum[threadIdx.x];
+      for (int i = 8; i >= 1; i >>= 1) {
+        data += __shfl_down_sync_16(0xffffffffffffffff, data, i);
+      }
+      if (threadIdx.x == 0) {
+        sm_sum[0] = data;
+      }
+    }
+    __syncthreads();
+    ss = sm_sum[0];
+  } else if constexpr (sm_size == 8) {
+    for (int i = 8; i > 0; i >>= 1) {
+      ss += __shfl_down_sync_16(0xffffffffffffffff, ss, i);
+    }
+    int lane_id = threadIdx.x & 15;
+    int group_id = threadIdx.x >> 4;
+    if (lane_id == 0) {
+      sm_sum[group_id] = ss;
+    }
+    __syncthreads();
+    if (threadIdx.x < sm_size) {
+      float data = sm_sum[threadIdx.x];
+      for (int i = 4; i >= 1; i >>= 1) {
+        data += __shfl_down_sync_16(0xffffffffffffffff, data, i);
+      }
+      if (threadIdx.x == 0) {
+        sm_sum[0] = data;
+      }
+    }
+    __syncthreads();
+    ss = sm_sum[0];
+  } else if constexpr (sm_size == 4) {
+    for (int i = 8; i > 0; i >>= 1) {
+      ss += __shfl_down_sync_16(0xffffffffffffffff, ss, i);
+    }
+    int lane_id = threadIdx.x & 15;
+    int group_id = threadIdx.x >> 4;
+    if (lane_id == 0) {
+      sm_sum[group_id] = ss;
+    }
+    __syncthreads();
+    if (threadIdx.x < sm_size) {
+      float data = sm_sum[threadIdx.x];
+      for (int i = 2; i >= 1; i >>= 1) {
+        data += __shfl_down_sync_16(0xffffffffffffffff, data, i);
+      }
+      if (threadIdx.x == 0) {
+        sm_sum[0] = data;
+      }
+    }
+    __syncthreads();
+    ss = sm_sum[0];
+  }
+  __shared__ float s_rms;
+  if (threadIdx.x == 0) {
+    s_rms = rsqrtf(ss / (float)d + eps);
+  }
+  __syncthreads();
+  rms = s_rms;
+  T const *ptr_weight = weight;
+  k = 0;
+  for (uint32_t i = tid; i < d; i += block_stride) {
+    T local_weight[VEC_SIZE];
+    copy<sizeof(T) * VEC_SIZE>((void *)(ptr_weight + i), (void *)local_weight);
+    T reg_dst[VEC_SIZE];
+#pragma unroll VEC_SIZE
+    for (uint32_t j = 0; j < VEC_SIZE; j++) {
+      reg_dst[j] =
+          float_to_dstT<T>(reg_input[k][j] * rms * float(local_weight[j]));
+    }
+    k++;
+    copy<VEC_SIZE * sizeof(T)>((void *)reg_dst, (void *)(ptr_input + i));
+  }
 }
 
-template<typename T, bool HasWeight>
-int launch_fused_add_rms_norm(
-    T* input,
-    T* residual,
-    T* weight,
-    uint32_t batch_size,
-    uint32_t d,
-    uint32_t stride_input,
-    uint32_t stride_residual,
-    float eps = 1e-5,
-    cudaStream_t stream = 0)
-{
-    dim3 nblks(batch_size);
-
-    constexpr int N = 16 / sizeof(T);
-
-    if ((d & (N - 1)) == 0) {
-        int blocksize = 64;
-        float weight_bias = 0.0f;
-
-        if (d <= blocksize * N) {
-            constexpr int NUM_THREADS = 64;
-            FusedAddRMSNormKernelOpt<N, 1, T, NUM_THREADS, HasWeight>
-                <<<nblks, NUM_THREADS, 0, stream>>>(
-                    input,
-                    residual,
-                    weight,
-                    d,
-                    stride_input,
-                    stride_residual,
-                    weight_bias,
-                    eps);
-            return 0;
-        } else if (d <= blocksize * 2 * N) {
-            constexpr int NUM_THREADS = 128;
-            FusedAddRMSNormKernelOpt<N, 1, T, NUM_THREADS, HasWeight>
-                <<<nblks, NUM_THREADS, 0, stream>>>(
-                    input,
-                    residual,
-                    weight,
-                    d,
-                    stride_input,
-                    stride_residual,
-                    weight_bias,
-                    eps);
-            return 0;
-        } else if (d <= blocksize * 4 * N) {
-            constexpr int NUM_THREADS = 256;
-            FusedAddRMSNormKernelOpt<N, 1, T, NUM_THREADS, HasWeight>
-                <<<nblks, NUM_THREADS, 0, stream>>>(
-                    input,
-                    residual,
-                    weight,
-                    d,
-                    stride_input,
-                    stride_residual,
-                    weight_bias,
-                    eps);
-            return 0;
-        } else if (d < blocksize * 8 * N) {
-            constexpr int NUM_THREADS = 512;
-            FusedAddRMSNormKernelOpt<N, 1, T, NUM_THREADS, HasWeight>
-                <<<nblks, NUM_THREADS, 0, stream>>>(
-                    input,
-                    residual,
-                    weight,
-                    d,
-                    stride_input,
-                    stride_residual,
-                    weight_bias,
-                    eps);
-            return 0;
-        } else if (d < blocksize * 16 * N) {
-            constexpr int NUM_THREADS = 512;
-            FusedAddRMSNormKernelOpt<N, 2, T, NUM_THREADS, HasWeight>
-                <<<nblks, NUM_THREADS, 0, stream>>>(
-                    input,
-                    residual,
-                    weight,
-                    d,
-                    stride_input,
-                    stride_residual,
-                    weight_bias,
-                    eps);
-            return 0;
-        }
+template <typename T>
+int launch_fused_add_rmsnorm(T *input, T *residual, T *weight,
+                             uint32_t batch_size, uint32_t d,
+                             uint32_t stride_input, uint32_t stride_residual,
+                             float eps = 1e-5, cudaStream_t stream = 0) {
+  dim3 nblks(batch_size);
+  constexpr int N = 16 / sizeof(T);
+  if ((d & (N - 1)) == 0) {
+    int blocksize = 64;
+    float weight_bias = 0.0f;
+    if (d <= blocksize * N) {
+      constexpr int NUM_THREADS = 64;
+      FusedAddRMSNormKernelOpt<N, 1, T, NUM_THREADS>
+          <<<nblks, NUM_THREADS, 0, stream>>>(input, residual, weight, d,
+                                              stride_input, stride_residual,
+                                              weight_bias, eps);
+      return 0;
+    } else if (d <= blocksize * 2 * N) {
+      constexpr int NUM_THREADS = 128;
+      FusedAddRMSNormKernelOpt<N, 1, T, NUM_THREADS>
+          <<<nblks, NUM_THREADS, 0, stream>>>(input, residual, weight, d,
+                                              stride_input, stride_residual,
+                                              weight_bias, eps);
+      return 0;
+    } else if (d <= blocksize * 4 * N) {
+      constexpr int NUM_THREADS = 256;
+      FusedAddRMSNormKernelOpt<N, 1, T, NUM_THREADS>
+          <<<nblks, NUM_THREADS, 0, stream>>>(input, residual, weight, d,
+                                              stride_input, stride_residual,
+                                              weight_bias, eps);
+      return 0;
+    } else if (d < blocksize * 8 * N) {
+      constexpr int NUM_THREADS = 512;
+      FusedAddRMSNormKernelOpt<N, 1, T, NUM_THREADS>
+          <<<nblks, NUM_THREADS, 0, stream>>>(input, residual, weight, d,
+                                              stride_input, stride_residual,
+                                              weight_bias, eps);
+      return 0;
+    } else if (d < blocksize * 16 * N) {
+      constexpr int NUM_THREADS = 512;
+      FusedAddRMSNormKernelOpt<N, 2, T, NUM_THREADS>
+          <<<nblks, NUM_THREADS, 0, stream>>>(input, residual, weight, d,
+                                              stride_input, stride_residual,
+                                              weight_bias, eps);
+      return 0;
     }
+  }
 
-    return -1;
+  return -1;
 }
 
-void fused_add_rms_norm(
-    torch::Tensor& input,
-    torch::Tensor& residual,
-    std::optional<torch::Tensor> weight,
-    double epsilon)
-{
-    TORCH_CHECK(input.scalar_type() == residual.scalar_type());
-    TORCH_CHECK(residual.is_contiguous());
+void fused_add_rms_norm(torch::Tensor &input,    // [..., hidden_size]
+                        torch::Tensor &residual, // [..., hidden_size]
+                        torch::Tensor &weight,   // [hidden_size]
+                        double epsilon) {
+  TORCH_CHECK(weight.scalar_type() == input.scalar_type());
+  TORCH_CHECK(input.scalar_type() == residual.scalar_type());
+  TORCH_CHECK(residual.is_contiguous());
+  TORCH_CHECK(weight.is_contiguous());
+  int hidden_size = input.size(-1);
+  int64_t input_stride = input.stride(-2);
+  int num_tokens = input.numel() / hidden_size;
 
-    if (weight.has_value()) {
-        TORCH_CHECK(weight->scalar_type() == input.scalar_type());
-        TORCH_CHECK(weight->is_contiguous());
+  dim3 grid(num_tokens);
+  /* This kernel is memory-latency bound in many scenarios.
+     When num_tokens is large, a smaller block size allows
+     for increased block occupancy on CUs and better latency
+     hiding on global mem ops. */
+  const int max_block_size = (num_tokens < 256) ? 1024 : 256;
+  dim3 block(std::min(hidden_size, max_block_size));
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  /*If the tensor types are FP16/BF16, try to use the optimized kernel
+    with packed + vectorized ops.
+    Max optimization is achieved with a width-8 vector of FP16/BF16s
+    since we can load at most 128 bits at once in a global memory op.
+    However, this requires each tensor's data to be aligned to 16
+    bytes.
+   */
+  auto inp_ptr = reinterpret_cast<std::uintptr_t>(input.data_ptr());
+  auto res_ptr = reinterpret_cast<std::uintptr_t>(residual.data_ptr());
+  auto wt_ptr = reinterpret_cast<std::uintptr_t>(weight.data_ptr());
+
+  int status = -1;
+  if ((hidden_size & 7) == 0 && (input_stride & 7) == 0) {
+    if (input.dtype() == at::ScalarType::BFloat16) {
+      status = launch_fused_add_rmsnorm<maca_bfloat16>(
+          static_cast<maca_bfloat16 *>(input.data_ptr()),
+          static_cast<maca_bfloat16 *>(residual.data_ptr()),
+          static_cast<maca_bfloat16 *>(weight.data_ptr()), num_tokens,
+          hidden_size, input_stride, hidden_size, epsilon, stream);
+    } else if (input.dtype() == at::ScalarType::Half) {
+      status = launch_fused_add_rmsnorm<half>(
+          static_cast<half *>(input.data_ptr()),
+          static_cast<half *>(residual.data_ptr()),
+          static_cast<half *>(weight.data_ptr()), num_tokens, hidden_size,
+          input_stride, hidden_size, epsilon, stream);
     }
+  }
+  if (status == 0)
+    return;
 
-    int hidden_size = input.size(-1);
-    int64_t input_stride = input.stride(-2);
-    int num_tokens = input.numel() / hidden_size;
-
-    dim3 grid(num_tokens);
-
-    const int max_block_size = (num_tokens < 256) ? 1024 : 256;
-    dim3 block(std::min(hidden_size, max_block_size));
-
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-
-    auto inp_ptr = reinterpret_cast<std::uintptr_t>(input.data_ptr());
-    auto res_ptr = reinterpret_cast<std::uintptr_t>(residual.data_ptr());
-
-    int status = -1;
-
-    if (weight.has_value()) {
-
-        if ((hidden_size % 8 == 0 && (input_stride & 7) == 0) &&
-            (input.dtype() == at::ScalarType::BFloat16)) {
-
-            status = launch_fused_add_rms_norm<maca_bfloat16, true>(
-                static_cast<maca_bfloat16*>(input.data_ptr()),
-                static_cast<maca_bfloat16*>(residual.data_ptr()),
-                static_cast<maca_bfloat16*>(weight->data_ptr()),
-                num_tokens,
-                hidden_size,
-                input_stride,
-                hidden_size,
-                epsilon,
-                stream);
-
-        } else if (input.dtype() == at::ScalarType::Half) {
-
-            status = launch_fused_add_rms_norm<half, true>(
-                static_cast<half*>(input.data_ptr()),
-                static_cast<half*>(residual.data_ptr()),
-                static_cast<half*>(weight->data_ptr()),
-                num_tokens,
-                hidden_size,
-                input_stride,
-                hidden_size,
-                epsilon,
-                stream);
-        }
-
-    } else {
-
-        if ((hidden_size % 8 == 0 && (input_stride & 7) == 0) &&
-            (input.dtype() == at::ScalarType::BFloat16)) {
-
-            status = launch_fused_add_rms_norm<maca_bfloat16, false>(
-                static_cast<maca_bfloat16*>(input.data_ptr()),
-                static_cast<maca_bfloat16*>(residual.data_ptr()),
-                nullptr,
-                num_tokens,
-                hidden_size,
-                input_stride,
-                hidden_size,
-                epsilon,
-                stream);
-
-        } else if (input.dtype() == at::ScalarType::Half) {
-
-            status = launch_fused_add_rms_norm<half, false>(
-                static_cast<half*>(input.data_ptr()),
-                static_cast<half*>(residual.data_ptr()),
-                nullptr,
-                num_tokens,
-                hidden_size,
-                input_stride,
-                hidden_size,
-                epsilon,
-                stream);
-        }
-    }
-
-    if (status == 0) {
-        return;
-    }
-
-    constexpr int vector_width = 8;
-    constexpr int req_alignment_bytes = vector_width * 2;
-
-    bool offsets_are_multiple_of_vector_width =
-        hidden_size % vector_width == 0 &&
-        input_stride % vector_width == 0;
-
-    bool batch_invariant_launch = vllm::vllm_is_batch_invariant();
-
-    if (weight.has_value()) {
-
-        auto wt_ptr = reinterpret_cast<std::uintptr_t>(weight->data_ptr());
-
-        bool ptrs_are_aligned =
-            inp_ptr % req_alignment_bytes == 0 &&
-            res_ptr % req_alignment_bytes == 0 &&
-            wt_ptr % req_alignment_bytes == 0;
-
-        if (ptrs_are_aligned &&
-            offsets_are_multiple_of_vector_width &&
-            !batch_invariant_launch) {
-            LAUNCH_FUSED_ADD_RMS_NORM(8, true);
-        } else {
-            LAUNCH_FUSED_ADD_RMS_NORM(0, true);
-        }
-
-    } else {
-
-        bool ptrs_are_aligned =
-            inp_ptr % req_alignment_bytes == 0 &&
-            res_ptr % req_alignment_bytes == 0;
-
-        if (ptrs_are_aligned &&
-            offsets_are_multiple_of_vector_width &&
-            !batch_invariant_launch) {
-            LAUNCH_FUSED_ADD_RMS_NORM(8, false);
-        } else {
-            LAUNCH_FUSED_ADD_RMS_NORM(0, false);
-        }
-    }
+  constexpr int vector_width = 8;
+  constexpr int req_alignment_bytes =
+      vector_width * 2; // vector_width * sizeof(bfloat16 or float16) (float32
+                        // falls back to non-vectorized version anyway)
+  bool ptrs_are_aligned = inp_ptr % req_alignment_bytes == 0 &&
+                          res_ptr % req_alignment_bytes == 0 &&
+                          wt_ptr % req_alignment_bytes == 0;
+  bool offsets_are_multiple_of_vector_width =
+      hidden_size % vector_width == 0 && input_stride % vector_width == 0;
+  bool batch_invariant_launch = vllm::vllm_is_batch_invariant();
+  if (ptrs_are_aligned && offsets_are_multiple_of_vector_width &&
+      !batch_invariant_launch) {
+    LAUNCH_FUSED_ADD_RMS_NORM(8);
+  } else {
+    LAUNCH_FUSED_ADD_RMS_NORM(0);
+  }
 }

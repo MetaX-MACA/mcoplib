@@ -1,9 +1,0 @@
-{
-    "device_id": 0,
-    "device_name": "MetaX C500",
-    "m": 32,
-    "n": 1024,
-    "group_size": 128,
-    "dtype": "bfloat16",
-    "samples": 1000
-}

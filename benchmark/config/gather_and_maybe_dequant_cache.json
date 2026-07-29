@@ -8,5 +8,5 @@
     "seq_len": 1024,
     "dtype": "float16",
     "kv_cache_dtype": "auto",
-    "samples": 1000
+    "samples": 10000
 }

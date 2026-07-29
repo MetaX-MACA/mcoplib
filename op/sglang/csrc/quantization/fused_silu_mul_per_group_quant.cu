@@ -129,25 +129,18 @@ static inline bool is_aligned(const void* ptr, uintptr_t alignment) {
   return (reinterpret_cast<uintptr_t>(ptr) & (alignment - 1)) == 0;
 }
 
-template <typename T, bool kHasLimit>
+template <typename T>
 __device__ __forceinline__ float silu_mul_value(
     const T* __restrict__ gate,
     const T* __restrict__ up,
-    int64_t idx,
-    float swiglu_limit) {
+    int64_t idx) {
   const float gate_v = static_cast<float>(gate[idx]);
   const float up_v = static_cast<float>(up[idx]);
 
   const float silu =
       gate_v * __builtin_mxc_rcpf(1.0f + __builtin_expf(-gate_v));
 
-  float v = silu * up_v;
-
-  if constexpr (kHasLimit) {
-    v = fmaxf(-swiglu_limit, fminf(v, swiglu_limit));
-  }
-
-  return v;
+  return silu * up_v;
 }
 
 template <typename quant_t>
@@ -178,13 +171,12 @@ __device__ __forceinline__ quant_t do_quant(float x, float inv_scale) {
 // 1 block = 1 token + 1 group
 // blockDim = 128
 // ============================================================
-template <typename input_t, typename quant_t, bool kHasLimit>
+template <typename input_t, typename quant_t>
 __global__ void fused_silu_mul_per_group_quant_default_kernel(
     quant_t* __restrict__ out,
     float* __restrict__ scales,
     const input_t* __restrict__ input,
-    int64_t hidden,
-    float swiglu_limit) {
+    int64_t hidden) {
   constexpr int GROUP = kSiluMulGroupSize;
 
   const int group_id = blockIdx.x;
@@ -205,7 +197,7 @@ __global__ void fused_silu_mul_per_group_quant_default_kernel(
   float abs_val = 0.0f;
 
   if (col < hidden) {
-    val = silu_mul_value<input_t, kHasLimit>(gate, up, col, swiglu_limit);
+    val = silu_mul_value<input_t>(gate, up, col);
     abs_val = fabsf(val);
   }
 
@@ -257,14 +249,13 @@ __global__ void fused_silu_mul_per_group_quant_default_kernel(
 //   gate_vec = *(AlignedArray<input_t, VEC>*)
 //   up_vec   = *(AlignedArray<input_t, VEC>*)
 // ============================================================
-template <typename input_t, typename quant_t, int VEC, bool kHasLimit>
+template <typename input_t, typename quant_t, int VEC>
 __global__ void fused_silu_mul_per_group_quant_vec_kernel(
     quant_t* __restrict__ out,
     float* __restrict__ scales,
     const input_t* __restrict__ input,
     int64_t hidden,
-    int64_t groups,
-    float swiglu_limit) {
+    int64_t groups) {
   static_assert(VEC == 2 || VEC == 4 || VEC == 8);
 
   constexpr int GROUP = kSiluMulGroupSize;
@@ -322,11 +313,7 @@ __global__ void fused_silu_mul_per_group_quant_vec_kernel(
     const float silu =
         gate_v * __builtin_mxc_rcpf(1.0f + __builtin_expf(-gate_v));
 
-    float v = silu * up_v;
-
-    if constexpr (kHasLimit) {
-      v = fmaxf(-swiglu_limit, fminf(v, swiglu_limit));
-    }
+    const float v = silu * up_v;
 
     vals[i] = v;
     local_absmax = fmaxf(local_absmax, fabsf(v));
@@ -362,14 +349,13 @@ __global__ void fused_silu_mul_per_group_quant_vec_kernel(
 // ============================================================
 // launchers
 // ============================================================
-template <typename input_t, typename quant_t, bool kHasLimit>
+template <typename input_t, typename quant_t>
 void launch_fused_silu_mul_per_group_quant_default(
     quant_t* out,
     float* scales,
     const input_t* input,
     int64_t tokens,
     int64_t hidden,
-    float swiglu_limit,
     cudaStream_t stream) {
   constexpr int GROUP = kSiluMulGroupSize;
 
@@ -378,19 +364,17 @@ void launch_fused_silu_mul_per_group_quant_default(
   dim3 grid(groups, tokens);
   dim3 block(GROUP);
 
-  fused_silu_mul_per_group_quant_default_kernel<input_t, quant_t, kHasLimit>
-      <<<grid, block, 0, stream>>>(out, scales, input, hidden, swiglu_limit);
+  fused_silu_mul_per_group_quant_default_kernel<input_t, quant_t>
+      <<<grid, block, 0, stream>>>(out, scales, input, hidden);
 }
 
-template <typename input_t, typename quant_t, int VEC, int BLOCK_THREADS,
-          bool kHasLimit>
+template <typename input_t, typename quant_t, int VEC, int BLOCK_THREADS>
 void launch_fused_silu_mul_per_group_quant_vec(
     quant_t* out,
     float* scales,
     const input_t* input,
     int64_t tokens,
     int64_t hidden,
-    float swiglu_limit,
     cudaStream_t stream) {
   static_assert(VEC == 2 || VEC == 4 || VEC == 8);
   static_assert(BLOCK_THREADS == 64 ||
@@ -411,15 +395,14 @@ void launch_fused_silu_mul_per_group_quant_vec(
   dim3 grid(grid_x, tokens);
   dim3 block(BLOCK_THREADS);
 
-  fused_silu_mul_per_group_quant_vec_kernel<input_t, quant_t, VEC, kHasLimit>
-      <<<grid, block, 0, stream>>>(out, scales, input, hidden, groups,
-                                    swiglu_limit);
+  fused_silu_mul_per_group_quant_vec_kernel<input_t, quant_t, VEC>
+      <<<grid, block, 0, stream>>>(out, scales, input, hidden, groups);
 }
 
 // ============================================================
 // dispatch
 // ============================================================
-template <typename input_t, typename quant_t, bool kHasLimit>
+template <typename input_t, typename quant_t>
 void dispatch_fused_silu_mul_per_group_quant(
     quant_t* out,
     float* scales,
@@ -429,87 +412,78 @@ void dispatch_fused_silu_mul_per_group_quant(
     bool can_vec8,
     bool can_vec4,
     bool can_vec2,
-    float swiglu_limit,
     cudaStream_t stream) {
   if (can_vec8) {
     if (hidden == 128) {
-      launch_fused_silu_mul_per_group_quant_default<input_t, quant_t, kHasLimit>(
-          out, scales, input, tokens, hidden, swiglu_limit, stream);
+      launch_fused_silu_mul_per_group_quant_default<input_t, quant_t>(
+          out, scales, input, tokens, hidden, stream);
     } else if (hidden <= 512) {
-      launch_fused_silu_mul_per_group_quant_vec<input_t, quant_t, 8, 64, kHasLimit>(
-          out, scales, input, tokens, hidden, swiglu_limit, stream);
+      launch_fused_silu_mul_per_group_quant_vec<input_t, quant_t, 8, 64>(
+          out, scales, input, tokens, hidden, stream);
     } else if (hidden <= 1024) {
-      launch_fused_silu_mul_per_group_quant_vec<input_t, quant_t, 8, 128, kHasLimit>(
-          out, scales, input, tokens, hidden, swiglu_limit, stream);
+      launch_fused_silu_mul_per_group_quant_vec<input_t, quant_t, 8, 128>(
+          out, scales, input, tokens, hidden, stream);
     } else if (hidden <= 2048) {
-      launch_fused_silu_mul_per_group_quant_vec<input_t, quant_t, 8, 256, kHasLimit>(
-          out, scales, input, tokens, hidden, swiglu_limit, stream);
+      launch_fused_silu_mul_per_group_quant_vec<input_t, quant_t, 8, 256>(
+          out, scales, input, tokens, hidden, stream);
     } else {
-      launch_fused_silu_mul_per_group_quant_vec<input_t, quant_t, 8, 512, kHasLimit>(
-          out, scales, input, tokens, hidden, swiglu_limit, stream);
+      launch_fused_silu_mul_per_group_quant_vec<input_t, quant_t, 8, 512>(
+          out, scales, input, tokens, hidden, stream);
     }
     return;
   }
 
   if (can_vec4) {
     if (hidden == 128) {
-      launch_fused_silu_mul_per_group_quant_default<input_t, quant_t, kHasLimit>(
-          out, scales, input, tokens, hidden, swiglu_limit, stream);
+      launch_fused_silu_mul_per_group_quant_default<input_t, quant_t>(
+          out, scales, input, tokens, hidden, stream);
     } else if (hidden <= 512) {
-      launch_fused_silu_mul_per_group_quant_vec<input_t, quant_t, 4, 64, kHasLimit>(
-          out, scales, input, tokens, hidden, swiglu_limit, stream);
+      launch_fused_silu_mul_per_group_quant_vec<input_t, quant_t, 4, 64>(
+          out, scales, input, tokens, hidden, stream);
     } else if (hidden <= 1024) {
-      launch_fused_silu_mul_per_group_quant_vec<input_t, quant_t, 4, 128, kHasLimit>(
-          out, scales, input, tokens, hidden, swiglu_limit, stream);
+      launch_fused_silu_mul_per_group_quant_vec<input_t, quant_t, 4, 128>(
+          out, scales, input, tokens, hidden, stream);
     } else if (hidden <= 2048) {
-      launch_fused_silu_mul_per_group_quant_vec<input_t, quant_t, 4, 256, kHasLimit>(
-          out, scales, input, tokens, hidden, swiglu_limit, stream);
+      launch_fused_silu_mul_per_group_quant_vec<input_t, quant_t, 4, 256>(
+          out, scales, input, tokens, hidden, stream);
     } else {
-      launch_fused_silu_mul_per_group_quant_vec<input_t, quant_t, 4, 512, kHasLimit>(
-          out, scales, input, tokens, hidden, swiglu_limit, stream);
+      launch_fused_silu_mul_per_group_quant_vec<input_t, quant_t, 4, 512>(
+          out, scales, input, tokens, hidden, stream);
     }
     return;
   }
 
   if (can_vec2) {
     if (hidden == 128) {
-      launch_fused_silu_mul_per_group_quant_default<input_t, quant_t, kHasLimit>(
-          out, scales, input, tokens, hidden, swiglu_limit, stream);
+      launch_fused_silu_mul_per_group_quant_default<input_t, quant_t>(
+          out, scales, input, tokens, hidden, stream);
     } else if (hidden <= 512) {
-      launch_fused_silu_mul_per_group_quant_vec<input_t, quant_t, 2, 64, kHasLimit>(
-          out, scales, input, tokens, hidden, swiglu_limit, stream);
+      launch_fused_silu_mul_per_group_quant_vec<input_t, quant_t, 2, 64>(
+          out, scales, input, tokens, hidden, stream);
     } else if (hidden <= 1024) {
-      launch_fused_silu_mul_per_group_quant_vec<input_t, quant_t, 2, 128, kHasLimit>(
-          out, scales, input, tokens, hidden, swiglu_limit, stream);
+      launch_fused_silu_mul_per_group_quant_vec<input_t, quant_t, 2, 128>(
+          out, scales, input, tokens, hidden, stream);
     } else if (hidden <= 2048) {
-      launch_fused_silu_mul_per_group_quant_vec<input_t, quant_t, 2, 256, kHasLimit>(
-          out, scales, input, tokens, hidden, swiglu_limit, stream);
+      launch_fused_silu_mul_per_group_quant_vec<input_t, quant_t, 2, 256>(
+          out, scales, input, tokens, hidden, stream);
     } else {
-      launch_fused_silu_mul_per_group_quant_vec<input_t, quant_t, 2, 512, kHasLimit>(
-          out, scales, input, tokens, hidden, swiglu_limit, stream);
+      launch_fused_silu_mul_per_group_quant_vec<input_t, quant_t, 2, 512>(
+          out, scales, input, tokens, hidden, stream);
     }
     return;
   }
 
-  launch_fused_silu_mul_per_group_quant_default<input_t, quant_t, kHasLimit>(
-      out, scales, input, tokens, hidden, swiglu_limit, stream);
+  launch_fused_silu_mul_per_group_quant_default<input_t, quant_t>(
+      out, scales, input, tokens, hidden, stream);
 }
 
 } // namespace vllm
 
 // Note: only support group size 128
-//
-// Optional swiglu_limit: when provided, the SiLU(gate) * up output is
-// symmetrically clamped to [-swiglu_limit, +swiglu_limit] BEFORE the per-group
-// absmax reduction and quantization. This bounds the dynamic range fed into the
-// quantizer so that outliers in the activation do not blow up the per-group
-// scale and destroy resolution for the rest of the group. When omitted, the
-// kernel skips the clamp entirely (equivalent to an infinite limit).
 void fused_silu_mul_per_group_quant(
     torch::Tensor& out,
     torch::Tensor& scales,
-    const torch::Tensor& input,
-    c10::optional<double> _swiglu_limit) {
+    const torch::Tensor& input) {
   TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
   TORCH_CHECK(out.is_cuda(), "out must be a CUDA tensor");
   TORCH_CHECK(scales.is_cuda(), "scales must be a CUDA tensor");
@@ -614,27 +588,6 @@ void fused_silu_mul_per_group_quant(
               "out dtype must be int8 or float8_e4m3fn, got ",
               out.dtype());
 
-  // Safety CHECK on swiglu_limit per the explicit requirement.
-  // When provided, it must be a strictly positive, finite scalar. A non-positive
-  // or non-finite value would either collapse all activations to 0 (clamp to a
-  // degenerate range) or poison the FP pipeline (NaN/Inf), making the output
-  // meaningless. Default of 10.0 is applied when the caller omits the arg.
-  constexpr double kDefaultSwigluLimit = 10.0;
-  float swiglu_limit = 0.0f;
-  bool use_limit = false;
-  if (_swiglu_limit.has_value()) {
-    const double v = *_swiglu_limit;
-    TORCH_CHECK(std::isfinite(v),
-                "swiglu_limit must be finite (got ", v, ")");
-    TORCH_CHECK(v > 0.0,
-                "swiglu_limit must be strictly positive (got ", v, ")");
-    swiglu_limit = static_cast<float>(v);
-    use_limit = true;
-  } else {
-    swiglu_limit = static_cast<float>(kDefaultSwigluLimit);
-    use_limit = true;
-  }
-
   const size_t input_elem_size = input.element_size();
   const size_t out_elem_size = out.element_size();
 
@@ -662,66 +615,32 @@ void fused_silu_mul_per_group_quant(
   if (is_fp8_out) {
     VLLM_DISPATCH_FLOATING_TYPES(
         input.scalar_type(), "fused_silu_mul_per_group_quant", [&] {
-          if (use_limit) {
-            vllm::dispatch_fused_silu_mul_per_group_quant<
-                scalar_t,
-                c10::Float8_e4m3fn,
-                true>(
-                reinterpret_cast<c10::Float8_e4m3fn*>(out.data_ptr()),
-                scales.data_ptr<float>(),
-                input.data_ptr<scalar_t>(),
-                tokens,
-                hidden,
-                can_vec8,
-                can_vec4,
-                can_vec2,
-                swiglu_limit,
-                stream);
-          } else {
-            vllm::dispatch_fused_silu_mul_per_group_quant<
-                scalar_t,
-                c10::Float8_e4m3fn,
-                false>(
-                reinterpret_cast<c10::Float8_e4m3fn*>(out.data_ptr()),
-                scales.data_ptr<float>(),
-                input.data_ptr<scalar_t>(),
-                tokens,
-                hidden,
-                can_vec8,
-                can_vec4,
-                can_vec2,
-                swiglu_limit,
-                stream);
-          }
+          vllm::dispatch_fused_silu_mul_per_group_quant<
+              scalar_t,
+              c10::Float8_e4m3fn>(
+              reinterpret_cast<c10::Float8_e4m3fn*>(out.data_ptr()),
+              scales.data_ptr<float>(),
+              input.data_ptr<scalar_t>(),
+              tokens,
+              hidden,
+              can_vec8,
+              can_vec4,
+              can_vec2,
+              stream);
         });
   } else {
     VLLM_DISPATCH_FLOATING_TYPES(
         input.scalar_type(), "fused_silu_mul_per_group_quant", [&] {
-          if (use_limit) {
-            vllm::dispatch_fused_silu_mul_per_group_quant<scalar_t, int8_t, true>(
-                out.data_ptr<int8_t>(),
-                scales.data_ptr<float>(),
-                input.data_ptr<scalar_t>(),
-                tokens,
-                hidden,
-                can_vec8,
-                can_vec4,
-                can_vec2,
-                swiglu_limit,
-                stream);
-          } else {
-            vllm::dispatch_fused_silu_mul_per_group_quant<scalar_t, int8_t, false>(
-                out.data_ptr<int8_t>(),
-                scales.data_ptr<float>(),
-                input.data_ptr<scalar_t>(),
-                tokens,
-                hidden,
-                can_vec8,
-                can_vec4,
-                can_vec2,
-                swiglu_limit,
-                stream);
-          }
+          vllm::dispatch_fused_silu_mul_per_group_quant<scalar_t, int8_t>(
+              out.data_ptr<int8_t>(),
+              scales.data_ptr<float>(),
+              input.data_ptr<scalar_t>(),
+              tokens,
+              hidden,
+              can_vec8,
+              can_vec4,
+              can_vec2,
+              stream);
         });
   }
 }

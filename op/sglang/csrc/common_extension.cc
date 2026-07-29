@@ -388,8 +388,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "fused_silu_mul_per_group_quant("
       "Tensor(a!) out, "
       "Tensor(b!) scales, "
-      "Tensor input, "
-      "float? _swiglu_limit = 10.0"
+      "Tensor input"
       ") -> ()"
       );
   m.impl(

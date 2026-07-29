@@ -192,18 +192,19 @@ bool launch_gemm_gptq(int m, int n, int k, int quant_group, const input_tp* dA,
                       const cudaStream_t stream, int chunks = 1) {
   using namespace hgemm_marlin_gptq;
   if (n % 16 != 0) {
-    TORCH_CHECK(false, "launch_gemm_awq: size_n must be divisible by 16, got n=", n);
+    printf("n %% 16 != 0, n = %d\n", n);
+    return false;
   }
   if (k % 32 != 0) {
-    TORCH_CHECK(false, "launch_gemm_awq: size_k must be divisible by 32, got k=", k);
+    printf("k %% 32 != 0, k = %d\n", k);
+    return false;
   }
   // const vllm::ScalarTypeId w_type_id = vllm::kU4B8.id();
   const int THREADS = 256;
   int BLOCKS_M = div_ceil(m, SLICE_M);
   if (BLOCKS_M >= MAX_BLOCKS_M && BLOCKS_M % MAX_BLOCKS_M != 0) {
-    TORCH_CHECK(false, "launch_gemm_awq: input m is invalid, m=", m,
-                ", blocks_m=", BLOCKS_M, " (must be divisible by MAX_BLOCKS_M=", MAX_BLOCKS_M,
-                " when blocks_m >= MAX_BLOCKS_M)");
+    printf("Error: input m is error, m = %d, blocks_m = %d\n", m, BLOCKS_M);
+    return false;
   }
   if (BLOCKS_M > MAX_BLOCKS_M) BLOCKS_M = MAX_BLOCKS_M;
   int BLOCKS_N = 8;
@@ -267,11 +268,13 @@ bool launch_gemm_gptq(int m, int n, int k, int quant_group, const input_tp* dA,
   LAUNCH_AWQ_PRED(false, true)
   LAUNCH_AWQ_PRED(false, false)
   else {
-    TORCH_CHECK(false, "launch_gemm_awq: unsupported AWQ kernel configuration: "
-                "BLOCKS_M=", BLOCKS_M, ", BLOCKS_N=", BLOCKS_N, ", BLOCKS_K=", BLOCKS_K,
-                ", THREADS=", THREADS, ", HAS_ACT_ORDER=", HAS_ACT_ORDER,
-                ", HAS_ZP=", HAS_ZP, ", quant_group=", quant_group,
-                ", HAS_M_PRED=", HAS_M_PRED, ", HAS_NK_PRED=", HAS_NK_PRED);
+    printf(
+        "BLOCKS_M=%d, BLOCKS_N=%d, BLOCKS_k=%d, THREADS=%d, HAS_ACT_ORDER=%d, "
+        "HAS_ZP=%d, quant_group=%d, HAS_M_PRED=%d, HAS_NK_PRED=%d is not "
+        "supported\n",
+        BLOCKS_M, BLOCKS_N, BLOCKS_K, THREADS, HAS_ACT_ORDER, HAS_ZP,
+        quant_group, HAS_M_PRED, HAS_NK_PRED);
+    return false;
   }
 
   return true;
@@ -392,8 +395,8 @@ torch::Tensor awq_dequantize(torch::Tensor _kernel,
             kernel, scaling_factors, zeros, de_kernel, G, qout_c, blocksize,
             num_elems, vllm::awq::DivModFast(qout_c));
   } else {
-    TORCH_CHECK(false, "awq_dequantize: unsupported scaling_factors dtype, expected Half or BFloat16, got ",
-                _scaling_factors.dtype());
+    printf("not support this type\n");
+    assert(0);
   }
   return _de_kernel;
 }

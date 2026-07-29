@@ -191,22 +191,6 @@ if (GLOBAL_ENABLE_BUILD_CUTLASS_OP)
   add_definitions(-DENABLE_CUTALASS_OP)
 endif()
 
-##################gptq marlin build switch#######################
-option(GLOBAL_ENABLE_BUILD_GPTQ_MARLIN "Default not build the gptq marlin op kernels " OFF)
-# 如果存在环境变量，则覆盖默认设置
-if(DEFINED ENV{ENABLE_BUILD_GPTQ_MARLIN_OP})
-    message(STATUS "mcoplib build option ENV ENABLE_BUILD_GPTQ_MARLIN_OP:$ENV{ENABLE_BUILD_GPTQ_MARLIN_OP}")
-    string(TOLOWER "$ENV{ENABLE_BUILD_GPTQ_MARLIN_OP}" _val)
-    if (_val STREQUAL "1" OR _val STREQUAL "on" OR _val STREQUAL "true")
-        set(GLOBAL_ENABLE_BUILD_GPTQ_MARLIN ON)
-    else()
-        set(GLOBAL_ENABLE_BUILD_GPTQ_MARLIN OFF)
-    endif()
-endif()
-
-if (GLOBAL_ENABLE_BUILD_GPTQ_MARLIN)
-  add_definitions(-DENABLE_BUILD_GPTQ_MARLIN_OP)
-endif()
 #
 # Use FetchContent for C++ dependencies that are compiled as part of vLLM's build process.
 # setup.py will override FETCHCONTENT_BASE_DIR to play nicely with sccache.
@@ -241,7 +225,6 @@ if (BUILD_VLLM_SUBMODULE)
     "${VLLM_SRC_DIR}/minimax_reduce_rms_kernel.cu"
     "${VLLM_SRC_DIR}/fused_deepseek_v4_qnorm_rope_kv_insert_kernel.cu"
     "${VLLM_SRC_DIR}/fused_deepseek_v4_qnorm_rope_kv_insert_kernel_bf16.cu"
-    "${VLLM_SRC_DIR}/fused_minimax_m3_qknorm_rope_kv_insert_kernel.cu"
     "${VLLM_SRC_DIR}/sampler.cu"
     "${VLLM_SRC_DIR}/topk.cu"
     "${VLLM_SRC_DIR}/dsv3_fused_a_gemm.cu"
@@ -531,16 +514,12 @@ if (BUILD_DEFAULT_OP_SUBMODULE)
       "${MCOPLIB_SRCS_DIR}/fused_add_gemma_rmsnorm_per_token_quant_padding_output.cu"
       "${MCOPLIB_SRCS_DIR}/rms_norm_dynamic_per_token_quant.cu"
       "${MCOPLIB_SRCS_DIR}/fused_moe_gate_deepseek.cu"
+      "${MCOPLIB_SRCS_DIR}/gptq_marlin.cu"
       "${MCOPLIB_SRCS_DIR}/moe_fused_gate_opt.cu"
       "${MCOPLIB_SRCS_DIR}/glm_attention_prepare.cu"
       "${MCOPLIB_SRCS_DIR}/fused_deepseekv4_qkv_rms_norm_rope.cu"
       "${MCOPLIB_SRCS_DIR}/fused_split_qkv_gemma_rmsnorm_rope.cu"
       "${MCOPLIB_SRCS_DIR}/fused_split_qkv_gemma_rmsnorm_rope_no_pack.cu")
-
-  if (GLOBAL_ENABLE_BUILD_GPTQ_MARLIN)
-      list(APPEND MCOPLIB_EXT_SRC
-        "${MCOPLIB_SRCS_DIR}/gptq_marlin.cu")
-  endif()
 
   set_gencode_flags_for_srcs(
     SRCS "${MCOPLIB_EXT_SRC}"

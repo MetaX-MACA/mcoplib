@@ -7,5 +7,5 @@
     "head_size": 128,
     "seq_len": 256,
     "dtype": "float16",
-    "samples": 1000
+    "samples": 10000
 }

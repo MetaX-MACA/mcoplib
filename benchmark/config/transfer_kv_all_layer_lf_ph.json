@@ -9,5 +9,5 @@
     "block_quota": 256,
     "num_warps_per_block": 4,
     "dtype": "bfloat16",
-    "samples": 100
+    "samples": 1000
 }

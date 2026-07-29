@@ -1,0 +1,237 @@
+=== testall.py | mode=update | csv=./statistics/mcoplib_ops_performance_C500.csv ===
+=== 116 operators ===
+
+[apply_repetition_penalties] -> SUCCESS | updated(csv) | rc=0 | 34.54s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[apply_rope_pos_ids_cos_sin_cache] -> SUCCESS | updated | rc=0 | 25.29s
+  verify_pass=True acc=None perf=None action=UPDATE fatal=False
+[apply_shuffle_mul_sum] -> SUCCESS | updated(csv) | rc=0 | 25.76s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[awq_dequantize] -> SUCCESS | updated(csv) | rc=0 | 26.86s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[awq_gemm] -> SUCCESS | updated(csv) | rc=0 | 135.86s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[awq_to_gptq_4bit] -> SUCCESS | updated(csv) | rc=0 | 61.92s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[batched_moe_align_block_size] -> SUCCESS | updated(csv) | rc=0 | 32.89s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[batched_rotary_embedding] -> SUCCESS | updated(csv) | rc=0 | 24.80s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[build_tree_kernel_efficient] -> SUCCESS | updated(csv) | rc=0 | 29.42s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[concat_and_cache_mla] -> SUCCESS | updated(csv) | rc=0 | 23.84s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[concat_mla_absorb_q] -> SUCCESS | updated(csv) | rc=0 | 28.17s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[concat_mla_k] -> SUCCESS | updated(csv) | rc=0 | 24.18s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[concat_mla_q] -> SUCCESS | updated(csv) | rc=0 | 23.78s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[convert_fp8] -> SUCCESS | updated(csv) | rc=0 | 27.13s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[convert_vertical_slash_indexes] -> SUCCESS | updated(csv) | rc=0 | 24.05s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[convert_vertical_slash_indexes_mergehead] -> SUCCESS | updated(csv) | rc=0 | 29.10s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[copy_to_gpu_no_ce] -> SUCCESS | updated(csv) | rc=0 | 34.09s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[cp_gather_cache] -> SUCCESS | updated(csv) | rc=0 | 33.27s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[cp_gather_indexer_k_cache] -> SUCCESS | updated(csv) | rc=0 | 31.18s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[cp_gather_indexer_k_quant_cache] -> SUCCESS | updated(csv) | rc=0 | 31.76s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[dsv4_fused_q_indexer_rope_hadamard_quant] -> SUCCESS | updated(csv) | rc=0 | 32.58s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[dsv4_fused_q_norm_rope] -> SUCCESS | updated(csv) | rc=0 | 34.08s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[dynamic_per_token_scaled_fp8_quant] -> SUCCESS | updated(csv) | rc=0 | 24.45s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[dynamic_scaled_int8_quant] -> SUCCESS | updated(csv) | rc=0 | 26.33s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[fast_topk] -> SUCCESS | updated(csv) | rc=0 | 79.59s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[fast_topk_transform_fused] -> SUCCESS | updated(csv) | rc=0 | 25.74s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[fast_topk_transform_ragged_fused] -> SUCCESS | updated(csv) | rc=0 | 26.13s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[fatrelu_and_mul] -> SUCCESS | updated(csv) | rc=0 | 24.48s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[fp32_router_gemm] -> SUCCESS | updated(csv) | rc=0 | 26.44s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[fused_add_rms_norm] -> SUCCESS | updated(csv) | rc=0 | 24.57s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[fused_add_rms_norm_static_fp8_quant] -> SUCCESS | updated(csv) | rc=0 | 24.60s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[fused_add_rmsnorm] -> SUCCESS | updated(csv) | rc=0 | 25.00s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[fused_bias_dropout] -> SUCCESS | updated(csv) | rc=0 | 25.12s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert] -> SUCCESS | updated | rc=0 | 25.69s
+  verify_pass=True acc=None perf=None action=UPDATE fatal=False
+[fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert] -> SUCCESS | updated | rc=0 | 24.69s
+  verify_pass=True acc=None perf=None action=UPDATE fatal=False
+[fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert] -> SUCCESS | updated | rc=0 | 24.35s
+  verify_pass=True acc=None perf=None action=UPDATE fatal=False
+[fused_minimax_m3_qknorm_rope_kv_insert] -> SUCCESS | updated(csv) | rc=0 | 29.36s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[fused_mla_absorb_rotary_emb] -> SUCCESS | updated(csv) | rc=0 | 25.64s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[fused_moe_gate_deepseek] -> SUCCESS | updated(csv) | rc=0 | 24.73s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[fused_moe_gate_opt] -> SUCCESS | updated(csv) | rc=0 | 26.79s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[fused_rope_fwd] -> SUCCESS | updated(csv) | rc=0 | 25.21s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[fused_silu_mul_dq_quant_interface] -> SUCCESS | updated(csv) | rc=0 | 25.09s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[fused_silu_mul_per_group_quant_fp8] -> SUCCESS | updated(csv) | rc=0 | 25.65s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[fused_silu_mul_per_group_quant_int8] -> SUCCESS | updated(csv) | rc=0 | 26.45s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[fused_unpack] -> SUCCESS | updated(csv) | rc=0 | 28.29s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[gather_and_maybe_dequant_cache] -> SUCCESS | updated(csv) | rc=0 | 32.01s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[gelu_and_mul] -> SUCCESS | updated(csv) | rc=0 | 24.38s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[gelu_fast] -> SUCCESS | updated(csv) | rc=0 | 24.26s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[gelu_new] -> SUCCESS | updated(csv) | rc=0 | 32.43s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[gelu_quick] -> SUCCESS | updated(csv) | rc=0 | 24.55s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[gelu_tanh_and_mul] -> SUCCESS | updated(csv) | rc=0 | 26.73s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[get_cuda_view_from_cpu_tensor] -> SUCCESS | updated(csv) | rc=0 | 40.89s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[gptq_gemm] -> SUCCESS | updated(csv) | rc=0 | 28.94s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[gptq_marlin_gemm] -> SUCCESS | updated(csv) | rc=0 | 11.01s
+  verify_pass=None acc=None perf=None action=None fatal=False
+[gptq_shuffle] -> SUCCESS | updated(csv) | rc=0 | 25.72s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[grouped_topk] -> SUCCESS | updated(csv) | rc=0 | 28.20s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[indexer_k_cache] -> SUCCESS | updated(csv) | rc=0 | 23.98s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[init_custom_ar] -> SUCCESS | updated(csv) | rc=0 | 36.75s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[mctlass_moe_w4a16_gemm_kernel_mnk] -> SUCCESS | updated(csv) | rc=0 | 36.81s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[merge_attn_states] -> SUCCESS | updated(csv) | rc=0 | 32.60s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[merge_state] -> SUCCESS | updated(csv) | rc=0 | 24.11s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[merge_state_v2] -> SUCCESS | updated(csv) | rc=0 | 24.22s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[meta_size] -> SUCCESS | updated(csv) | rc=0 | 37.08s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[moe_align_block_size] -> SUCCESS | updated(csv) | rc=0 | 162.14s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[moe_fused_gate] -> SUCCESS | updated(csv) | rc=0 | 25.11s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[moe_lora_align_block_size] -> SUCCESS | updated(csv) | rc=0 | 59.39s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[moe_sum] -> SUCCESS | updated(csv) | rc=0 | 24.28s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[moe_sum_reduce] -> SUCCESS | updated(csv) | rc=0 | 144.60s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[mul_and_silu] -> SUCCESS | updated(csv) | rc=0 | 29.08s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[mx_awq_dequantize] -> SUCCESS | updated(csv) | rc=0 | 27.19s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[paged_attention_v1] -> SUCCESS | updated(csv) | rc=0 | 28.12s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[paged_attention_v2] -> SUCCESS | updated(csv) | rc=0 | 27.80s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[per_token_cast_to_fp8] -> SUCCESS | updated(csv) | rc=0 | 24.89s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[per_token_group_fp8_quant] -> SUCCESS | updated(csv) | rc=0 | 32.77s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[persistent_topk] -> SUCCESS | updated(csv) | rc=0 | 23.84s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[prepare_moe_input] -> SUCCESS | updated(csv) | rc=0 | 23.27s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[reconstruct_indices_from_tree_mask] -> SUCCESS | updated(csv) | rc=0 | 47.94s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[reshape_and_cache] -> SUCCESS | updated(csv) | rc=0 | 65.34s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[reshape_and_cache_flash] -> SUCCESS | updated(csv) | rc=0 | 23.79s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[rms_norm] -> SUCCESS | updated(csv) | rc=0 | 308.32s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[rms_norm_dynamic_per_group_quant] -> SUCCESS | updated(csv) | rc=0 | 31.75s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[rms_norm_dynamic_per_group_quant_fp8] -> SUCCESS | updated(csv) | rc=0 | 24.42s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[rms_norm_dynamic_per_group_quant_int8] -> SUCCESS | updated(csv) | rc=0 | 25.09s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[rms_norm_dynamic_per_token_quant] -> SUCCESS | updated(csv) | rc=0 | 35.27s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[rms_norm_static_fp8_quant] -> SUCCESS | updated(csv) | rc=0 | 24.64s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[rotary_embedding] -> SUCCESS | updated(csv) | rc=0 | 367.70s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[segment_packbits] -> SUCCESS | updated(csv) | rc=0 | 24.27s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[selective_scan_fwd] -> SUCCESS | updated(csv) | rc=0 | 25.91s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[sgl_rotary_embedding] -> SUCCESS | updated(csv) | rc=0 | 24.72s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[sgl_topk_softmax] -> SUCCESS | updated(csv) | rc=0 | 25.82s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[silu_and_mul] -> SUCCESS | updated(csv) | rc=0 | 158.17s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[silu_and_mul_quant] -> SUCCESS | updated(csv) | rc=0 | 24.41s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[silu_and_mul_with_clamp] -> SUCCESS | updated(csv) | rc=0 | 25.21s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[static_scaled_fp8_quant] -> SUCCESS | updated(csv) | rc=0 | 24.88s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[static_scaled_int8_quant] -> SUCCESS | updated(csv) | rc=0 | 24.34s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[swap_blocks] -> SUCCESS | updated(csv) | rc=0 | 61.32s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[swigluoai_and_mul] -> SUCCESS | updated(csv) | rc=0 | 26.17s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[top_k_per_row_decode] -> SUCCESS | updated(csv) | rc=0 | 27.08s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[topk_sigmoid] -> SUCCESS | updated(csv) | rc=0 | 25.81s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[transfer_kv_all_layer] -> SUCCESS | updated(csv) | rc=0 | 25.16s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[transfer_kv_all_layer_direct_lf_pf] -> SUCCESS | updated(csv) | rc=0 | 482.52s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[transfer_kv_all_layer_lf_pf] -> SUCCESS | updated(csv) | rc=0 | 25.27s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[transfer_kv_all_layer_lf_ph] -> SUCCESS | updated(csv) | rc=0 | 27.97s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[transfer_kv_all_layer_mla] -> SUCCESS | updated(csv) | rc=0 | 24.26s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[transfer_kv_all_layer_mla_lf_pf] -> SUCCESS | updated(csv) | rc=0 | 24.51s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[transfer_kv_direct] -> SUCCESS | updated(csv) | rc=0 | 23.87s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[transfer_kv_per_layer] -> SUCCESS | updated(csv) | rc=0 | 24.38s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[transfer_kv_per_layer_direct_pf_lf] -> SUCCESS | updated(csv) | rc=0 | 533.87s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[transfer_kv_per_layer_mla] -> SUCCESS | updated(csv) | rc=0 | 24.47s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[transfer_kv_per_layer_mla_pf_lf] -> SUCCESS | updated(csv) | rc=0 | 25.02s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[transfer_kv_per_layer_pf_lf] -> SUCCESS | updated(csv) | rc=0 | 43.32s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[transfer_kv_per_layer_ph_lf] -> SUCCESS | updated(csv) | rc=0 | 108.13s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[tree_speculative_sampling_target_only] -> SUCCESS | updated(csv) | rc=0 | 26.51s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[verify_tree_greedy] -> SUCCESS | updated(csv) | rc=0 | 63.58s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[vllm_rotary_embedding] -> SUCCESS | updated(csv) | rc=0 | 24.65s
+  verify_pass=True acc=None perf=None action=None fatal=False
+[vllm_topk_softmax] -> SUCCESS | updated(csv) | rc=0 | 24.98s
+  verify_pass=True acc=None perf=None action=None fatal=False
+
+=== SUMMARY | mode=update | success=116 failed=0 skipped=0 | total=116 | 5551.4s ===

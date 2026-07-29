@@ -10,5 +10,5 @@
     "max_seq_len": 32768,
     "interleave": false,
     "enable_pdl": false,
-    "samples": 1000
+    "samples": 8000
 }

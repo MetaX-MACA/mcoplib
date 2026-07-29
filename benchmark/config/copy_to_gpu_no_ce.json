@@ -3,5 +3,5 @@
     "device_name": "MetaX C500",
     "dtype": "int32",
     "N": 72,
-    "samples": 1000
+    "samples": 200000
 }

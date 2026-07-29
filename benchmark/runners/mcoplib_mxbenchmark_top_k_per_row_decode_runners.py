@@ -47,8 +47,7 @@ class Top_k_per_row_decode_runner(OpBenchmarkBase):
                     indices,
                     self.num_rows,
                     stride0,
-                    stride1,
-                    self.top_k
+                    stride1
                 )
         return launcher
 
@@ -69,8 +68,7 @@ class Top_k_per_row_decode_runner(OpBenchmarkBase):
             indices_op,
             self.num_rows,
             stride0,
-            stride1,
-            self.top_k
+            stride1
         )
         ref_values_list = []
         op_values_list = []

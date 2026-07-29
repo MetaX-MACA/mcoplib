@@ -1,7 +1,7 @@
 cmake >= 3.26.1
 ninja >= 1.11.1.4
 pybind11 >= 2.13.1
-torch>=2.10.0
+torch>=2.4.0
 packaging>=24.2
 setuptools>=69.5.1,<80.0.0
 setuptools-scm>=8.0

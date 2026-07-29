@@ -1778,9 +1778,8 @@ void launch_silu_mul_quant_pack(T* input, T* output, T1* mask, int64_t num_token
             }
           }
         } else {
-            TORCH_CHECK(false, "silu_and_mul_mask_quant_pack_1mask: inner_hidden_size ", inner_hidden_size,
-                        " exceeds max supported (base*4=", base * 4, ", mask_size=", mask_size,
-                        ", sizeof(T1)=", sizeof(T1), ")");
+            printf("silu_and_mul_mask_quant_pack_1mask not supported\n");
+            assert(0);
         }
     } else if(mask_size == 2 && (N == 8&&(inner_hidden_size & (N - 1)) == 0 && (out_stride & (N -1)) == 0)) {
         int base = blocksize * N;
@@ -1887,10 +1886,8 @@ void launch_silu_mul_quant_pack(T* input, T* output, T1* mask, int64_t num_token
               }
             }
           } else {
-
-            TORCH_CHECK(false, "silu_and_mul_mask_quant_pack_2mask: inner_hidden_size ", inner_hidden_size,
-                        " exceeds max supported (base*4=", base * 4, ", mask_size=", mask_size,
-                        ", sizeof(T1)=", sizeof(T1), ")");
+            printf("silu_and_mul_mask_quant_pack_2mask not supported\n");
+              assert(0);
           }
         } else if(sizeof(T1) == 8) {
           if(inner_hidden_size <= 64 * N) {
@@ -1998,10 +1995,8 @@ void launch_silu_mul_quant_pack(T* input, T* output, T1* mask, int64_t num_token
               }
               // silu_and_mul_mask_quant_pack_2mask<T, T1, float4, float2, float4, 4, 512, type><<<gridsize, 512,0,stream>>>(input, output, mask, gridsize, num_tokens, inner_hidden_size, out_stride);
           } else {
-
-            TORCH_CHECK(false, "silu_and_mul_mask_quant_pack_2mask: inner_hidden_size ", inner_hidden_size,
-                        " exceeds max supported (base*4=", base * 4, ", mask_size=", mask_size,
-                        ", sizeof(T1)=", sizeof(T1), ")");
+            printf("silu_and_mul_mask_quant_pack_2mask not supported\n");
+              assert(0);
           }
         }
         
@@ -2118,13 +2113,12 @@ void launch_silu_mul_quant_pack(T* input, T* output, T1* mask, int64_t num_token
               }
             }
         } else {
-          TORCH_CHECK(false, "silu_and_mul_mask_quant_pack: inner_hidden_size ", inner_hidden_size,
-                        " exceeds max supported (base*4=", base * 4, ", mask_size=", mask_size,
-                        ", sizeof(T1)=", sizeof(T1), ")");
+          printf("silu_and_mul_mask_quant_pack not supported\n");
+            assert(0);
         }
     } else {
-      TORCH_CHECK(false, "silu_and_mul_mask_quant_pack1: inner_hidden_size ", inner_hidden_size," mask_size=", mask_size,
-                        ", sizeof(T1)=", sizeof(T1), ")");
+      printf("silu_and_mul_mask_quant_pack1 not supported\n");
+        assert(0);
     }
 }
 
@@ -2146,9 +2140,8 @@ void launch_silu_mul_quan_no_mask(T* input, int8_t* output, float* scale, int64_
         } else if(inner_hidden_size <= base*4 + 4096) {
             silu_and_mul_sm_quant<T, float4, float2, 4><<<num_tokens, blocksize,0,stream>>>(input, output, scale, inner_hidden_size, blocksize);
         } else {
-            TORCH_CHECK(false, "launch_silu_mul_quan_no_mask: inner_hidden_size ", inner_hidden_size,
-                        " exceeds max supported (base*4 + 4096", base * 4, ", N=", N,
-                        ", sizeof(T1)=", sizeof(T), ")");
+            printf("silu_and_mul_quant not support\n");
+            assert(0);
         }
     } else if(N == 4 && (inner_hidden_size & (N - 1)) == 0) {
         int base = blocksize * N;
@@ -2163,14 +2156,12 @@ void launch_silu_mul_quan_no_mask(T* input, int8_t* output, float* scale, int64_
         } else if(inner_hidden_size <= base * 8) {
             silu_and_mul_quant<T, float4, float, 8><<<num_tokens, blocksize,0,stream>>>(input, output, scale, inner_hidden_size, blocksize);
         } else {
-            TORCH_CHECK(false, "launch_silu_mul_quan_no_mask: inner_hidden_size ", inner_hidden_size,
-                        " exceeds max supported (base*8", base * 4, ", N=", N,
-                        ", sizeof(T)=", sizeof(T), ")");
+            printf("silu_and_mul_quant not support\n");
+            assert(0);
         }
     } else {
-        TORCH_CHECK(false, "launch_silu_mul_quan_no_mask: inner_hidden_size=", inner_hidden_size,
-              " not supported and N=", N,
-              ", sizeof(T)=", sizeof(T));
+      printf("silu_and_mul_quant not supported\n");
+        assert(0);
     }
 }
 
@@ -2536,9 +2527,8 @@ void launch_silu_mul_nomask_quant_nopack(T* input, int8_t* output, float* scale,
               }
             }
         } else {
-            TORCH_CHECK(false, "silu_and_mul_nomask_quant_nopack: inner_hidden_size ", inner_hidden_size,
-                        " exceeds max supported (base*4 + 4996 =", (base * 4 + 4096), ", N=", N,
-                        ", sizeof(T)=", sizeof(T), ")");
+            printf("silu_and_mul_nomask_quant_nopack not support inner_hidden_size=%ld\n", (long)inner_hidden_size);
+            assert(0);
         }
     } else if(N == 4 && (inner_hidden_size & (N - 1)) == 0) {
         int base = blocksize * N;
@@ -2613,14 +2603,12 @@ void launch_silu_mul_nomask_quant_nopack(T* input, int8_t* output, float* scale,
               }
             }
         } else {
-            TORCH_CHECK(false, "silu_and_mul_nomask_quant_nopack: inner_hidden_size ", inner_hidden_size,
-                        " exceeds max supported (base*8 ", base * 8, ", N=", N,
-                        ", sizeof(T)=", sizeof(T), ")");
+            printf("silu_and_mul_nomask_quant_nopack not support inner_hidden_size=%ld\n", (long)inner_hidden_size);
+            assert(0);
         }
     } else {
-        TORCH_CHECK(false, "silu_and_mul_nomask_quant_nopack: inner_hidden_size=", inner_hidden_size,
-                        " not supported and N=", N,
-                        ", sizeof(T)=", sizeof(T));
+        printf("silu_and_mul_nomask_quant_nopack not support inner_hidden_size=%ld N=%d\n", (long)inner_hidden_size, N);
+        assert(0);
     }
 }
 

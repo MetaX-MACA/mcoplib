@@ -98,8 +98,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
 
   // SwiGLU activation with input clamping.
   ops.def(
-      "silu_and_mul_with_clamp(Tensor! result, Tensor input, float limit, "
-      "float alpha=1.0, float beta=0.0) -> ()");
+      "silu_and_mul_with_clamp(Tensor! result, Tensor input, float limit) "
+      "-> ()");
   ops.impl("silu_and_mul_with_clamp", torch::kCUDA, &silu_and_mul_clamp);
 
   ops.def(
@@ -160,7 +160,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
 
   // In-place fused Add and RMS Normalization.
   ops.def(
-      "fused_add_rms_norm(Tensor! input, Tensor! residual, Tensor? weight, "
+      "fused_add_rms_norm(Tensor! input, Tensor! residual, Tensor weight, "
       "float epsilon) -> ()");
   ops.impl("fused_add_rms_norm", torch::kCUDA, &fused_add_rms_norm);
 
@@ -540,20 +540,6 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "int nranks,"
       "float eps) -> (Tensor, Tensor)");
   ops.impl("minimax_allreduce_rms_qk", torch::kCUDA, &minimax_allreduce_rms_qk);
-
-  // Horizontally-fused MiniMax-M3 QK-norm + partial NeoX RoPE + KV-insert.
-  ops.def(
-      "fused_minimax_m3_qknorm_rope_kv_insert("
-      "Tensor! qkv, Tensor q_norm_weight, Tensor k_norm_weight, "
-      "Tensor cos_sin_cache, Tensor positions, int num_heads, "
-      "int num_kv_heads, int rotary_dim, float eps, "
-      "Tensor? index_q_norm_weight, Tensor? index_k_norm_weight, "
-      "int num_index_heads, "
-      "Tensor? slot_mapping, Tensor? index_slot_mapping, "
-      "Tensor!? kv_cache, Tensor!? index_cache, "
-      "int block_size, Tensor!? q_out, Tensor!? index_q_out, "
-      "str kv_cache_dtype) -> ()");
-  ops.impl("fused_minimax_m3_qknorm_rope_kv_insert", torch::kCUDA, &fused_minimax_m3_qknorm_rope_kv_insert);
 
 }
 

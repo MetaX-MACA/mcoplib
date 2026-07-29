@@ -7,5 +7,5 @@
     "intermediate_size": 2048,
     "hidden_size": 4096,
     "dtype": "int32",
-    "samples": 1000
+    "samples": 10000
 }

@@ -62,10 +62,8 @@ void merge_attn_states(
 void rms_norm(torch::Tensor& out, torch::Tensor& input,
               std::optional<torch::Tensor> weight, double epsilon);
 
-void fused_add_rms_norm(torch::Tensor& input,     // [..., hidden_size]
-                        torch::Tensor& residual,  // [..., hidden_size]
-                        std::optional<torch::Tensor> weight,
-                        double epsilon);
+void fused_add_rms_norm(torch::Tensor& input, torch::Tensor& residual,
+                        torch::Tensor& weight, double epsilon);
 
 //Todo：fused_qk_norm_rope算子新增参数，部分依赖（async_util.cuh），先保持原样
 // void fused_qk_norm_rope(torch::Tensor& qkv, int64_t num_heads_q,
@@ -180,8 +178,7 @@ void batched_rotary_embedding(torch::Tensor& positions, torch::Tensor& query,
 
 void silu_and_mul(torch::Tensor& out, torch::Tensor& input);
 
-void silu_and_mul_clamp(torch::Tensor& out, torch::Tensor& input, double limit,
-                        double alpha = 1.0, double beta = 0.0);
+void silu_and_mul_clamp(torch::Tensor& out, torch::Tensor& input, double limit);
 
 void silu_and_mul_quant(torch::Tensor& out, torch::Tensor& input,
                         torch::Tensor& scale);
@@ -395,22 +392,3 @@ std::tuple<torch::Tensor, torch::Tensor> minimax_allreduce_rms_qk(
     torch::Tensor const& norm_weight_k, torch::Tensor workspace,
     int64_t const q_size, int64_t const kv_size, int64_t const rank,
     int64_t const nranks, double const eps);
-
-// Horizontally-fused MiniMax-M3 QK-norm + partial NeoX RoPE (+ optional KV /
-// index-cache insert). Dense layer: norm+RoPE only; sparse layer: also packs
-// the index branch and scatters k/v/index_k into their paged caches.
-void fused_minimax_m3_qknorm_rope_kv_insert(
-    torch::Tensor& qkv, torch::Tensor const& q_norm_weight,
-    torch::Tensor const& k_norm_weight,
-    torch::Tensor const& cos_sin_cache,
-    torch::Tensor const& positions, int64_t num_heads,
-    int64_t num_kv_heads, int64_t rotary_dim, double eps,
-    std::optional<torch::Tensor> index_q_norm_weight,
-    std::optional<torch::Tensor> index_k_norm_weight,
-    int64_t num_index_heads, std::optional<torch::Tensor> slot_mapping,
-    std::optional<torch::Tensor> index_slot_mapping,
-    std::optional<torch::Tensor> kv_cache,
-    std::optional<torch::Tensor> index_cache, int64_t block_size,
-    std::optional<torch::Tensor> q_out,
-    std::optional<torch::Tensor> index_q_out,
-    const std::string& kv_cache_dtype);

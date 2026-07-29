@@ -1,8 +1,8 @@
 {
     "device_id": 0,
-    "device_name": "MetaX C500",
+    "device_name": "MetaX C280",
     "rows": 4096,
     "cols": 4096,
     "dtype": "float16",
-    "samples": 1000
+    "samples": 100000
 }

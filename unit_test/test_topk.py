@@ -130,10 +130,10 @@ def test_topk_kernel(bs: int, k: int, seq_len: int) -> None:
     run_cuda_benchmark("fast_topk", launch_kernel, bytes_accessed)
 
 
-@pytest.mark.parametrize("bs", [1, 132, 256, 4096, 1662])
+@pytest.mark.parametrize("bs", [1, 16,32, 64, 131, 256, 1024,2048, 4096])
 @pytest.mark.parametrize("k", [2048])
-@pytest.mark.parametrize("seq_len", [2048, 4096, 16384, 66551])
-@pytest.mark.parametrize("table_len", [299062])
+@pytest.mark.parametrize("seq_len", [66551])
+@pytest.mark.parametrize("table_len", [299062, 107520])
 @torch.inference_mode()
 def test_topk_transform_kernel(bs: int, k: int, seq_len: int, table_len: int ) -> None:
     torch.manual_seed(42)

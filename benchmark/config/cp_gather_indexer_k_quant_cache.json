@@ -1,6 +1,6 @@
 {
     "device_id": 0,
-    "device_name": "MetaX C500",
+    "device_name": "MetaX C280",
     "batch_size": 512,
     "head_dim": 128,
     "quant_block_size": 32,
@@ -8,5 +8,5 @@
     "num_blocks": 131072,
     "seq_len": 4096,
     "dtype": "int8",
-    "samples": 1000
+    "samples": 2000
 }

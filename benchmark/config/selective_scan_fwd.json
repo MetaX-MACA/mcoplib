@@ -1,11 +1,11 @@
 {
     "device_id": 0,
-    "device_name": "MetaX C500",
+    "device_name": "MetaX C280",
     "batch": 8,
     "dim": 256,
     "seqlen": 512,
     "dstate": 16,
     "n_groups": 1,
     "dtype": "bfloat16",
-    "samples": 1000
+    "samples": 100000
 }

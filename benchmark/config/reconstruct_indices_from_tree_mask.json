@@ -4,5 +4,5 @@
     "batch_size": 8192,
     "draft_token_num": 16,
     "dtype": "bool",
-    "samples": 1000
+    "samples": 10000
 }

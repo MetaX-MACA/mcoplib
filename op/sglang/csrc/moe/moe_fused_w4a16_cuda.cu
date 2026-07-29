@@ -38,9 +38,7 @@ int64_t mctlass_moe_w4a16_gemm_kernel_mnk(int64_t num_valid_tokens, int64_t N, i
     int group_size = 64;
     mctlass::Status status = mctlass_op.gemm_kernel_mnk(problem_size, kernel_size, pack_factor, group_size);
     if (status != mctlass::Status::kSuccess) {
-        TORCH_CHECK(false, "mctlass_moe_w4a16_gemm_kernel_mnk: failed to find a supported kernel for "
-                    "problem_size (m=", num_valid_tokens, ", n=", N, ", k=", K, ", group=", group,
-                    "), mctlass status=", static_cast<int>(status));
+        printf("Error: Not find supported kernel!\n");
     }
     return static_cast<int64_t>(kernel_size.m());
 }

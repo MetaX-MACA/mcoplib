@@ -5,5 +5,5 @@
     "num_reduced": 1024,
     "hidden_dim": 4096,
     "dtype": "bfloat16",
-    "samples": 1000
+    "samples": 10000
 }
