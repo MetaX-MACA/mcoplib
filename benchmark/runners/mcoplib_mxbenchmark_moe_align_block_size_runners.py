@@ -19,7 +19,7 @@ class Moe_align_block_size_runner(OpBenchmarkBase):
     def define_metrics(self, state):
         state.add_summary("Op", self.name)
         state.add_summary("dtype", "int32")
-        shape_str = f"({self.num_tokens} {self.num_experts} {self.block_size})"
+        shape_str = f"({self.num_tokens} {self.top_k} {self.num_experts} {self.block_size})"
         state.add_summary("Shape", shape_str)
         total_ids = self.num_tokens * self.top_k
         state.add_element_count(total_ids)

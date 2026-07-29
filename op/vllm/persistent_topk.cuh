@@ -11,6 +11,8 @@
 #include <cub/cub.cuh>
 #include <cstdint>
 
+#include "topk_histogram_4096.cuh"
+
 namespace vllm {
 namespace persistent {
 
@@ -139,13 +141,13 @@ __device__ __noinline__ void histogram_2048_topk(
     int32_t seq_len) {
   extern __shared__ int decode_smem[];
   const int tx = threadIdx.x;
-  const int lane = tx & 31;
+  const int lane = tx & 63;
 
   // ---- Layout constants ----
-  constexpr int SBASE = 8192 - 8;           // 8184
+  constexpr int SBASE = 16384 - 8;           // 16376
   constexpr int RHIST = RADIX + 128;        // 384
   constexpr int BOFF = 2 * RHIST;           // 768
-  constexpr int DBUF = (SBASE - BOFF) / 2;  // 3708
+  constexpr int DBUF = (SBASE - BOFF) / 2;  // 7808
   constexpr int MAX_ITEMS_PER_THREAD =
       (HIST2048_THRESHOLD + kThreadsPerBlock - 1) / kThreadsPerBlock;
 
@@ -247,29 +249,29 @@ __device__ __noinline__ void histogram_2048_topk(
         const bool is_above = is_valid_elem && (bin > uthr);
         const bool is_equal = is_valid_elem && (bin == uthr);
 
-        const uint32_t above_mask = __ballot_sync(0xffffffff, is_above);
+        const uint32_t above_mask = __ballot_sync(0xffffffffffffffffULL, is_above);
         if (above_mask) {
           const int above_count = __popc(above_mask);
-          const int above_rank = __popc(above_mask & ((1u << lane) - 1));
+          const int above_rank = __popc(above_mask & ((1ULL << lane) - 1));
           int above_base;
           if (lane == 0) {
             above_base = atomicAdd(&decode_smem[sOUT_abs], above_count);
           }
-          above_base = __shfl_sync(0xffffffff, above_base, 0);
+          above_base = __shfl_sync(0xffffffffffffffffULL, above_base, 0);
           if (is_above) {
             output_indices[above_base + above_rank] = elem_idx;
           }
         }
 
-        const uint32_t equal_mask = __ballot_sync(0xffffffff, is_equal);
+        const uint32_t equal_mask = __ballot_sync(0xffffffffffffffffULL, is_equal);
         if (equal_mask) {
           const int equal_count = __popc(equal_mask);
-          const int equal_rank = __popc(equal_mask & ((1u << lane) - 1));
+          const int equal_rank = __popc(equal_mask & ((1ULL << lane) - 1));
           int equal_base;
           if (lane == 0) {
             equal_base = atomicAdd(&decode_smem[sBUF0_abs], equal_count);
           }
-          equal_base = __shfl_sync(0xffffffff, equal_base, 0);
+          equal_base = __shfl_sync(0xffffffffffffffffULL, equal_base, 0);
           if (is_equal && __builtin_expect(equal_base + equal_rank < DBUF, 1)) {
             bufs[0][equal_base + equal_rank] = elem_idx;
           }
@@ -785,10 +787,10 @@ __device__ void radix_topk(const float* __restrict__ row_input,
   for (uint32_t i = tx; i < actual_chunk_size; i += kThreadsPerBlock) {
     if (shared_ordered[i] > ordered_pivot) my_gt_count++;
   }
-  for (int offset = 16; offset > 0; offset /= 2) {
-    my_gt_count += __shfl_down_sync(0xffffffff, my_gt_count, offset);
+  for (int offset = 32; offset > 0; offset /= 2) {
+    my_gt_count += __shfl_down_sync(0xffffffffffffffffULL, my_gt_count, offset);
   }
-  if (tx % 32 == 0 && my_gt_count > 0) {
+  if (tx % 64 == 0 && my_gt_count > 0) {
     atomicAdd(&suffix_sum[0], my_gt_count);
   }
   __syncthreads();
@@ -907,8 +909,16 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 2)
 }  // namespace persistent
 
 // ============================================================================
-// FlashInfer FilteredTopK (BS>32 dispatch) — float32 only.
-// Extracted from flashinfer_topk.cuh. Lives in namespace vllm (not persistent).
+// ============================================================================
+// Optimized FilteredTopK — single CTA per row for bs > 32.
+// Kept with persistent_topk so the portable fallback owns the non-cluster path.
+// ============================================================================
+namespace filtered_topk {
+
+namespace hist4096 = topk_histogram_4096;
+
+// ============================================================================
+// FilteredTopK — single CTA per row for bs > 32
 // Adapted from https://github.com/flashinfer-ai/flashinfer/pull/2215
 // ============================================================================
 
@@ -933,13 +943,6 @@ struct vec_t {
 #pragma unroll
     for (size_t i = 0; i < N; ++i) {
       data[i] = ptr[i];
-    }
-  }
-
-  FLASHINFER_INLINE void cast_store(T* ptr) const {
-#pragma unroll
-    for (size_t i = 0; i < N; ++i) {
-      ptr[i] = data[i];
     }
   }
 };
@@ -974,9 +977,9 @@ struct FilteredTopKTraits<float> {
 
 constexpr uint32_t FILTERED_TOPK_BLOCK_THREADS = 1024;
 constexpr uint32_t FILTERED_TOPK_SMEM_INPUT_SIZE =
-    14 * 1024;  // 14K indices per buffer
+    5 * 1024;  // 5K indices per buffer
 constexpr size_t FILTERED_TOPK_SMEM_DYNAMIC =
-    sizeof(int) * 2 * FILTERED_TOPK_SMEM_INPUT_SIZE;  // 128KB
+    sizeof(int) * 2 * FILTERED_TOPK_SMEM_INPUT_SIZE;  // 40KB
 
 /*!
  * \brief Filtered Top-K kernel for ragged sequences.
@@ -985,7 +988,8 @@ constexpr size_t FILTERED_TOPK_SMEM_DYNAMIC =
  * \tparam IdType Index type (int32_t)
  * \tparam VEC_SIZE Vector size for input loads (1, 2, 4, or 8)
  */
-template <typename DType, typename IdType, int VEC_SIZE, uint32_t MAX_K = 2048>
+template <typename DType, typename IdType, int VEC_SIZE, uint32_t MAX_K = 2048,
+          bool UsePredicatedShortLoads = false>
 __global__ void __launch_bounds__(FILTERED_TOPK_BLOCK_THREADS)
     FilteredTopKUnifiedKernel(const DType* __restrict__ input,
                               IdType* __restrict__ output,
@@ -1003,6 +1007,7 @@ __global__ void __launch_bounds__(FILTERED_TOPK_BLOCK_THREADS)
 
   const int length =
       (lengths != nullptr) ? lengths[bid] : static_cast<int>(max_len);
+
   const DType* score = input + bid * max_len;
   IdType* dst = output + bid * top_k;
 
@@ -1010,6 +1015,19 @@ __global__ void __launch_bounds__(FILTERED_TOPK_BLOCK_THREADS)
   if (length <= static_cast<int>(top_k)) {
     for (int i = tx; i < static_cast<int>(top_k); i += BLOCK_SIZE) {
       dst[i] = (i < length) ? static_cast<IdType>(i) : static_cast<IdType>(-1);
+    }
+    return;
+  }
+
+  // Short path
+  if (length <= 32768) {
+    extern __shared__ uint8_t _smem_reg[];
+    if constexpr (UsePredicatedShortLoads) {
+      hist4096::histogram_4096_topk_predicated<MAX_K, 12, 8>(score, dst, length,
+                                                             _smem_reg);
+    } else {
+      hist4096::histogram_4096_topk<MAX_K, 12, 8>(score, dst, length,
+                                                  _smem_reg);
     }
     return;
   }
@@ -1241,8 +1259,8 @@ constexpr int ComputeFilteredTopKVecSize(uint32_t max_len) {
 }
 
 template <typename DType, typename IdType, uint32_t MAX_K = 2048>
-cudaError_t FilteredTopKRaggedTransform(DType* input, IdType* output_indices,
-                                        IdType* lengths, uint32_t num_rows,
+cudaError_t FilteredTopKRaggedTransform(const DType* input, IdType* output_indices,
+                                        const IdType* lengths, uint32_t num_rows,
                                         uint32_t top_k_val, uint32_t max_len,
                                         cudaStream_t stream = 0) {
   constexpr size_t smem_size = FILTERED_TOPK_SMEM_DYNAMIC;
@@ -1255,14 +1273,15 @@ cudaError_t FilteredTopKRaggedTransform(DType* input, IdType* output_indices,
 
   const int vec_size = ComputeFilteredTopKVecSize<DType>(max_len);
 
-#define DISPATCH_VEC_SIZE(VS)                                               \
-  if (vec_size == VS) {                                                     \
-    auto kernel = FilteredTopKUnifiedKernel<DType, IdType, VS, MAX_K>;      \
-    FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(                              \
-        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));   \
-    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, grid, block, args, \
-                                          smem_size, stream));              \
-    return cudaSuccess;                                                     \
+#define DISPATCH_VEC_SIZE(VS)                                                 \
+  if (vec_size == VS) {                                                       \
+    auto kernel =                                                             \
+        FilteredTopKUnifiedKernel<DType, IdType, VS, MAX_K, (VS != MAX_VEC)>; \
+    FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(                                \
+        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));     \
+    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, grid, block, args,   \
+                                          smem_size, stream));                \
+    return cudaSuccess;                                                       \
   }
 
   DISPATCH_VEC_SIZE(1)
@@ -1274,6 +1293,19 @@ cudaError_t FilteredTopKRaggedTransform(DType* input, IdType* output_indices,
 #undef DISPATCH_VEC_SIZE
 
   return cudaSuccess;
+}
+
+}  // namespace filtered_topk
+
+template <typename DType, typename IdType, uint32_t MAX_K = 2048>
+cudaError_t FilteredTopKRaggedTransform(const DType* input,
+                                        IdType* output_indices,
+                                        const IdType* lengths,
+                                        uint32_t num_rows, uint32_t top_k_val,
+                                        uint32_t max_len,
+                                        cudaStream_t stream = 0) {
+  return filtered_topk::FilteredTopKRaggedTransform<DType, IdType, MAX_K>(
+      input, output_indices, lengths, num_rows, top_k_val, max_len, stream);
 }
 
 }  // namespace vllm

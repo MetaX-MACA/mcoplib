@@ -1,10 +1,11 @@
 {
     "device_id": 0,
     "device_name": "MetaX C500",
-    "num_tokens": 131072,
-    "block_size": 16,
+    "num_tokens": 5163,
+    "block_size": 64,
     "head_dim": 128,
-    "num_blocks": 16384,
+    "cache_stride":132,
+    "num_blocks": 1690,
     "dtype": "float16",
     "samples": 1000
 }

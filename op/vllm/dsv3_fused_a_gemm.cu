@@ -25,6 +25,7 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <torch/all.h>
+#include <c10/cuda/CUDAGuard.h>
 
 #include "core/registration.h"
 
@@ -727,6 +728,8 @@ void dsv3_fused_a_gemm(torch::Tensor& output, torch::Tensor const& mat_a,
               "Only BFloat16 input dtype is supported")
   TORCH_CHECK(output.scalar_type() == torch::kBFloat16,
               "Only BFloat16 output dtype is supported")
+
+  at::cuda::OptionalCUDAGuard const device_guard(mat_a.device());
 
   TORCH_CHECK(getSMVersion() >= 90, "required CUDA ARCH >= SM_90");
 

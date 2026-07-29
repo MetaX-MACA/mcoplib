@@ -100,18 +100,18 @@ __device__ float __forceinline__ convertTofloat(maca_bfloat16 value) {
 typedef __NATIVE_VECTOR__(4, float) v4f32;
 typedef __NATIVE_VECTOR__(4, _Float16) v4f16;
 
-//SRC_T bfloat or half DST_T __maca_fp8_e4m3
-__global__ void per_token_cast_to_f8_kernel(const maca_bfloat16* input, __maca_fp8_e4m3* dst_quant, float* scale, int num_elems) {
+template<typename T>
+__global__ void per_token_cast_to_f8_kernel(const T* input, __maca_fp8_e4m3* dst_quant, float* scale, int num_elems) {
     float reg_in[8];
     int num_threads = blockDim.x;
     int thread_offset = (blockIdx.x * num_threads + threadIdx.x) * 8;
     float abs_max = 1e-4f;
     if(thread_offset < num_elems) {
         float4 tmp = *(float4*)(input + thread_offset);
-        maca_bfloat16* ptr_tmp = (maca_bfloat16*)&tmp;
+        T* ptr_tmp = (T*)&tmp;
         #pragma unroll 8
         for(int i = 0; i < 8; i++) {
-            reg_in[i] = convertTofloat<maca_bfloat16>(ptr_tmp[i]);
+            reg_in[i] = convertTofloat<T>(ptr_tmp[i]);
             abs_max = max(fabs(reg_in[i]), abs_max);
         }
     }
@@ -135,7 +135,7 @@ __global__ void per_token_cast_to_f8_kernel(const maca_bfloat16* input, __maca_f
 
     if(thread_offset < num_elems) {
         __maca_fp8_e4m3 reg_dst[8];
-        
+
         float div = 448.0 / sm_max[group_id];
         #pragma unroll 8
         for(int i = 0; i < 8; i++) {
@@ -157,10 +157,87 @@ __global__ void per_token_cast_to_f8_kernel(const maca_bfloat16* input, __maca_f
         copy<sizeof(__maca_fp8_e4m3) * 8>((void*)reg_dst, (void*)(dst_quant + thread_offset));
     }
 }
+__device__ __forceinline__ float group16_max_bcast_smem(float v, float* smem) {
+    #pragma unroll
+    for (int off = 8; off >= 1; off >>= 1) {
+        v = fmaxf(__shfl_down_sync_16(0xffffffffffffffffULL, v, off), v);
+    }
+    const int lane_id  = threadIdx.x & 15;
+    const int group_id = threadIdx.x >> 4;
+    if (lane_id == 0) smem[group_id] = v;
+    __syncthreads();
+    return smem[group_id];
+}
+
+template<typename T>
+__global__ __launch_bounds__(256, 4)
+void per_token_cast_to_f8_kernel_opt(
+    const T* __restrict__ input,
+    __maca_fp8_e4m3* __restrict__ dst_quant,
+    float* __restrict__ scale,
+    int num_elems)
+{
+    constexpr int VEC = 8;
+    const int tid = threadIdx.x;
+    const int thread_offset = (blockIdx.x * blockDim.x + tid) * VEC;
+
+    float reg_f32[VEC];
+    float abs_max = 1e-4f;
+
+    if (thread_offset < num_elems) {
+        float4 raw = *reinterpret_cast<const float4*>(input + thread_offset);
+        T* ptr_raw = reinterpret_cast<T*>(&raw);
+        #pragma unroll
+        for (int i = 0; i < VEC; ++i) {
+            reg_f32[i] = convertTofloat<T>(ptr_raw[i]);
+            abs_max   = fmaxf(abs_max, fabsf(reg_f32[i]));
+        }
+    }
+
+    __shared__ float sm_amax[16];
+    abs_max = group16_max_bcast_smem(abs_max, sm_amax);
+
+    const int lane_id      = tid & 15;
+    const int scale_offset = thread_offset >> 7;
+
+    if (lane_id == 0 && thread_offset < num_elems) {
+        scale[scale_offset] = abs_max * (1.0f / 448.0f);
+    }
+
+    if (thread_offset >= num_elems) return;
+
+    const float div = __fdividef(448.0f, abs_max);
+    #pragma unroll
+    for (int i = 0; i < VEC; ++i) {
+        reg_f32[i] = reg_f32[i] * div;
+    }
+
+    __maca_fp8_e4m3 reg_dst[VEC];
+
+#ifdef _USE_C600_
+    v4f16 reg_tmp0, reg_tmp1;
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        reg_tmp0[i] = _Float16(reg_f32[i]);
+        reg_tmp1[i] = _Float16(reg_f32[i + 4]);
+    }
+    *reinterpret_cast<uint32_t*>(reg_dst)     = __builtin_mxc_cvt_pk4_f16tof8(reg_tmp0);
+    *reinterpret_cast<uint32_t*>(reg_dst + 4) = __builtin_mxc_cvt_pk4_f16tof8(reg_tmp1);
+#else
+    *reinterpret_cast<uint32_t*>(reg_dst)     =
+        __builtin_mxc_cvt_pk4_f32tof8(*reinterpret_cast<v4f32*>(reg_f32));
+    *reinterpret_cast<uint32_t*>(reg_dst + 4) =
+        __builtin_mxc_cvt_pk4_f32tof8(*reinterpret_cast<v4f32*>(reg_f32 + 4));
+#endif
+
+    copy<sizeof(__maca_fp8_e4m3) * 8>(
+        reinterpret_cast<void*>(reg_dst),
+        reinterpret_cast<void*>(dst_quant + thread_offset));
+}
 
 void per_token_cast_to_fp8(
     torch::Tensor& out,
-    torch::Tensor& scale,   
+    torch::Tensor& scale,
     torch::Tensor const& input)
 {
     TORCH_CHECK(input.is_contiguous());
@@ -169,17 +246,43 @@ void per_token_cast_to_fp8(
     int64_t const hidden_size = input.size(-1);
     TORCH_CHECK((hidden_size % 128) == 0);
     int64_t num_elems = input.numel();
+    int64_t const token_size = num_elems / hidden_size;
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    if(out.dtype() == torch::kFloat8_e4m3fn && input.dtype() == at::ScalarType::BFloat16) {
+    if (hidden_size <= 256 && token_size <= 4096) {
         int block_size = 512;
         int64_t gridSize = (num_elems + block_size * 8 - 1) / (block_size * 8);
-        auto input_buffer = reinterpret_cast<maca_bfloat16*>(input.data_ptr<at::BFloat16>());
         auto out_buffer = reinterpret_cast<__maca_fp8_e4m3 *>(out.data_ptr<at::Float8_e4m3fn>());
         auto scale_buffer = reinterpret_cast<float*>(scale.data_ptr());
-        per_token_cast_to_f8_kernel<<<gridSize, block_size, 0, stream>>>((const maca_bfloat16*)input_buffer, out_buffer, scale_buffer, num_elems);
-        return;
+        if(out.dtype() == torch::kFloat8_e4m3fn && input.dtype() == at::ScalarType::BFloat16) {
+            auto input_buffer = reinterpret_cast<maca_bfloat16*>(input.data_ptr<at::BFloat16>());
+            per_token_cast_to_f8_kernel<maca_bfloat16><<<gridSize, block_size, 0, stream>>>((const maca_bfloat16*)input_buffer, out_buffer, scale_buffer, num_elems);
+            return;
+        } else if(out.dtype() == torch::kFloat8_e4m3fn && input.dtype() == at::ScalarType::Half) {
+            auto input_buffer = reinterpret_cast<half*>(input.data_ptr<at::Half>());
+            per_token_cast_to_f8_kernel<half><<<gridSize, block_size, 0, stream>>>((const half*)input_buffer, out_buffer, scale_buffer, num_elems);
+            return;
+        } else {
+                TORCH_CHECK(0, "per_token_cast_to_fp8 doesn't support this type");
+        }
     } else {
-            TORCH_CHECK(0,
-                "per_token_cast_to_fp8 doesn't support this type");
+        #ifdef _USE_C600_
+            const int block_size = 256;
+        #else
+            const int block_size = 128;
+        #endif
+            const int64_t gridSize = (num_elems + block_size * 8 - 1) / (block_size * 8);
+
+        auto scale_buf = reinterpret_cast<float*>(scale.data_ptr());
+        auto out_buf   = reinterpret_cast<__maca_fp8_e4m3*>(out.data_ptr<at::Float8_e4m3fn>());
+
+        if (out.dtype() == torch::kFloat8_e4m3fn && input.dtype() == at::ScalarType::BFloat16) {
+            auto in_buf = reinterpret_cast<maca_bfloat16*>(input.data_ptr<at::BFloat16>());
+            per_token_cast_to_f8_kernel_opt<maca_bfloat16><<<gridSize, block_size, 0, stream>>>(in_buf, out_buf, scale_buf, num_elems);
+        } else if (out.dtype() == torch::kFloat8_e4m3fn && input.dtype() == at::ScalarType::Half) {
+            auto in_buf = reinterpret_cast<half*>(input.data_ptr<at::Half>());
+            per_token_cast_to_f8_kernel_opt<half><<<gridSize, block_size, 0, stream>>>(in_buf, out_buf, scale_buf, num_elems);
+        } else {
+            TORCH_CHECK(0, "per_token_cast_to_fp8 doesn't support this type");
+        }
     }
 }

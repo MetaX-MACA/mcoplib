@@ -383,7 +383,12 @@ if (BUILD_VLLM_SUBMODULE)
     #"${VLLM_SRC_DIR}/moe/moe_lora_align_sum_kernels.cu"
     "${VLLM_SRC_DIR}/moe/topk_softmax_kernels.cu"
     "${VLLM_SRC_DIR}/moe/topk_softplus_sqrt_kernels.cu"
-    "${VLLM_SRC_DIR}/moe/grouped_topk_kernels.cu")
+    "${VLLM_SRC_DIR}/moe/grouped_topk_kernels.cu"
+    "${VLLM_SRC_DIR}/moe/dsv3_router_gemm_bf16_out.cu"
+    "${VLLM_SRC_DIR}/moe/dsv3_router_gemm_entry.cu"
+    "${VLLM_SRC_DIR}/moe/dsv3_router_gemm_float_out.cu"
+    "${VLLM_SRC_DIR}/moe/moe_permute_unpermute_op.cu"
+    "${VLLM_SRC_DIR}/moe/permute_unpermute_kernels/moe_permute_unpermute_kernel.cu")
 
   if (USE_MACA AND ENABLE_BLAS_API)
     #list(APPEND VLLM_MOE_EXT_SRC "${VLLM_SRC_DIR}/moe/moe_ops.cpp")

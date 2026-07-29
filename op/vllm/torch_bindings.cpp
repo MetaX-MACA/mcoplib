@@ -5,7 +5,7 @@
 
 #include <torch/library.h>
 #include <torch/version.h>
-
+#include <torch/csrc/stable/library.h>
 // Note on op signatures:
 // The X_meta signatures are for the meta functions corresponding to op X.
 // They must be kept in sync with the signature for X. Generally, only
@@ -101,6 +101,19 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "silu_and_mul_with_clamp(Tensor! result, Tensor input, float limit, "
       "float alpha=1.0, float beta=0.0) -> ()");
   ops.impl("silu_and_mul_with_clamp", torch::kCUDA, &silu_and_mul_clamp);
+
+  ops.def(
+      "persistent_masked_m_silu_mul_quant(Tensor input, Tensor counts, Tensor! "
+      "y_q, Tensor! y_s, bool use_ue8m0) -> ()");
+  ops.impl("persistent_masked_m_silu_mul_quant",torch::kCUDA, &persistent_masked_m_silu_mul_quant);
+
+  // SwiGLU-step variant: SiLU(gate) clamped to [_, limit], up clamped to
+  // [-limit, limit], then per-group FP8 quant.
+  ops.def(
+      "persistent_masked_m_swiglu_mul_quant(Tensor input, Tensor counts, "
+      "Tensor! y_q, Tensor! y_s, Tensor limit, bool use_ue8m0) -> ()");
+  ops.impl("persistent_masked_m_swiglu_mul_quant", torch::kCUDA,
+           &persistent_masked_m_swiglu_mul_quant);
 
   ops.def(
       "silu_and_mul_quant(Tensor! result, Tensor input, Tensor scale) -> ()");
@@ -540,21 +553,6 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "int nranks,"
       "float eps) -> (Tensor, Tensor)");
   ops.impl("minimax_allreduce_rms_qk", torch::kCUDA, &minimax_allreduce_rms_qk);
-
-  // Horizontally-fused MiniMax-M3 QK-norm + partial NeoX RoPE + KV-insert.
-  ops.def(
-      "fused_minimax_m3_qknorm_rope_kv_insert("
-      "Tensor! qkv, Tensor q_norm_weight, Tensor k_norm_weight, "
-      "Tensor cos_sin_cache, Tensor positions, int num_heads, "
-      "int num_kv_heads, int rotary_dim, float eps, "
-      "Tensor? index_q_norm_weight, Tensor? index_k_norm_weight, "
-      "int num_index_heads, "
-      "Tensor? slot_mapping, Tensor? index_slot_mapping, "
-      "Tensor!? kv_cache, Tensor!? index_cache, "
-      "int block_size, Tensor!? q_out, Tensor!? index_q_out, "
-      "str kv_cache_dtype) -> ()");
-  ops.impl("fused_minimax_m3_qknorm_rope_kv_insert", torch::kCUDA, &fused_minimax_m3_qknorm_rope_kv_insert);
-
 }
 
 TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cache_ops), cache_ops) {
@@ -690,3 +688,24 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cuda_utils), cuda_utils) {
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)
+
+STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
+    //在 PyTorch 的 Schema 定义语言中（这与 Python 和 C++ 的函数传参规则完全一致）：一旦某个参数被赋予了默认值，那么它后面的所有参数都必须拥有默认值。不能出现“带默认值的参数”后面紧跟着“不带默认值的参数”
+    ops.def(
+      "fused_minimax_m3_qknorm_rope_kv_insert("
+      "Tensor! qkv, Tensor q_norm_weight, Tensor k_norm_weight, "
+      "Tensor cos_sin_cache, Tensor positions, int num_heads, "
+      "int num_kv_heads, int rotary_dim, float eps, "
+      "Tensor? index_q_norm_weight=None, Tensor? index_k_norm_weight=None, " 
+      "int num_index_heads=0, "                                              
+      "Tensor? slot_mapping=None, Tensor? index_slot_mapping=None, "        
+      "Tensor!? kv_cache=None, Tensor!? index_cache=None, "                  
+      "int block_size=0, Tensor!? q_out=None, Tensor!? index_q_out=None, "   
+      "str kv_cache_dtype=\"auto\") -> ()");                                                           
+}
+
+STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
+    ops.impl("fused_minimax_m3_qknorm_rope_kv_insert",
+           TORCH_BOX(&fused_minimax_m3_qknorm_rope_kv_insert));
+}
+REGISTER_EXTENSION(_C_stable_libtorch)

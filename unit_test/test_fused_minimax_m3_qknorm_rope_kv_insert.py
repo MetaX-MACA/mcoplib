@@ -1,10 +1,20 @@
-import math
-import time
-import numpy as np
-import torch
-import pytest
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Unit test for the horizontally-fused MiniMax-M3 attention pre-processing
+kernel:
 
-import mcoplib.lmdeploy
+  fused_minimax_m3_qknorm_rope_kv_insert
+    - q / k / index_q / index_k: Gemma RMSNorm + partial NeoX RoPE (in place)
+    - sparse (insert) mode: scatter k/v into the paged bf16 KV cache and the
+      index key into the index cache by its own slot mapping.
+
+Reference: PyTorch Gemma RMSNorm with the same dtype materialization boundary
+as the unfused path, followed by vLLM CUDA rotary_embedding-style NeoX RoPE.
+"""
+
+import pytest
+import torch
+
 import mcoplib._C
 
 HEAD_DIM = 128
@@ -46,6 +56,7 @@ def gemma_rmsnorm(x, weight, eps):
 
 def apply_rope_neox_partial(x, positions, cos_sin_cache, rotary_dim):
     """NeoX-style RoPE on the leading rotary_dim dims; rest pass through.
+
     x: [num_tokens, num_heads, head_dim]
     cos_sin_cache: [max_pos, rotary_dim] (cos||sin), read as float (matches the
     kernel, which loads the bf16 cache and converts to fp32).
@@ -94,7 +105,7 @@ def test_dense_norm_rope(num_tokens, num_heads, num_kv_heads):
     qkv = torch.randn(num_tokens, qsz + 2 * kvsz, dtype=dtype, device=device)
     qkv_orig = qkv.clone()
 
-    ops.fused_minimax_m3_qknorm_rope_kv_insert(
+    torch.ops._C.fused_minimax_m3_qknorm_rope_kv_insert(
         qkv,
         q_w,
         k_w,
@@ -126,7 +137,7 @@ def test_dense_norm_rope(num_tokens, num_heads, num_kv_heads):
     torch.testing.assert_close(v_out, v_in, rtol=0, atol=0)
 
 
-# ── Test 2: sparse mode (full: index branch + cache inserts) ─────────────────
+#── Test 2: sparse mode (full: index branch + cache inserts) ─────────────────
 
 
 @pytest.mark.parametrize("num_tokens", [1, 7, 64, 513])
@@ -181,7 +192,7 @@ def test_sparse_full(num_tokens, block_size, kv_cache_dtype):
     q_out = torch.empty(num_tokens, qsz, dtype=dtype, device=device)
     index_q = torch.empty(num_tokens, iqsz, dtype=dtype, device=device)
 
-    ops.fused_minimax_m3_qknorm_rope_kv_insert(
+    torch.ops._C.fused_minimax_m3_qknorm_rope_kv_insert(
         qkv,
         q_w,
         k_w,
@@ -201,7 +212,7 @@ def test_sparse_full(num_tokens, block_size, kv_cache_dtype):
         block_size,
         q_out,
         index_q,
-        kv_cache_dtype,
+        kv_cache_dtype=kv_cache_dtype,
     )
 
     # ── norm+rope parity. q/index_q land in their gather buffers; k/index_k are
@@ -242,7 +253,7 @@ def test_sparse_full(num_tokens, block_size, kv_cache_dtype):
     if kv_cache_dtype == "fp8":
         expected_kv_cache = torch.zeros_like(kv_cache)
         scale = torch.ones((), device=device)
-        ops.reshape_and_cache_flash(
+        torch.ops._C_cache_ops.reshape_and_cache_flash(
             k_out.view(num_tokens, num_kv_heads, HEAD_DIM),
             v_out.view(num_tokens, num_kv_heads, HEAD_DIM),
             expected_kv_cache[:, 0],
@@ -275,11 +286,6 @@ def test_sparse_full(num_tokens, block_size, kv_cache_dtype):
 # (the index dtype must not perturb the main branch), and (2) the e4m3 index
 # outputs dequantize close to the bf16 reference.
 
-
-@pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 9),
-    reason="e4m3 conversion requires CUDA SM89+.",
-)
 @pytest.mark.parametrize("num_tokens", [1, 7, 64, 513])
 @pytest.mark.parametrize("block_size", [16, 64])
 def test_sparse_full_fp8_index(num_tokens, block_size):
@@ -325,7 +331,7 @@ def test_sparse_full_fp8_index(num_tokens, block_size):
         )
         q_out = torch.empty(num_tokens, qsz, dtype=dtype, device=device)
         index_q = torch.empty(num_tokens, iqsz, dtype=index_dtype, device=device)
-        ops.fused_minimax_m3_qknorm_rope_kv_insert(
+        torch.ops._C.fused_minimax_m3_qknorm_rope_kv_insert(
             qkv,
             q_w,
             k_w,
@@ -345,6 +351,7 @@ def test_sparse_full_fp8_index(num_tokens, block_size):
             block_size,
             q_out,
             index_q,
+            kv_cache_dtype="auto",
         )
         return qkv, kv_cache, index_cache, q_out, index_q
 

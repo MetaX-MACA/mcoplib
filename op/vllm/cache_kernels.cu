@@ -115,7 +115,12 @@ void swap_blocks_batch(const torch::Tensor& src_ptrs,
     return reinterpret_cast<BatchFn>(fn_ptr);
   }();
 
-  if (batch_fn != nullptr) {
+  // cuMemcpyBatchAsync rejects the legacy default stream (handle 0 /
+  // cudaStreamLegacy) with CUDA_ERROR_INVALID_VALUE; route it to the per-copy
+  // fallback below, which is correct on any stream. Real and per-thread-default
+  // streams take the batch fast path.
+  const bool usable_stream = stream != nullptr && stream != cudaStreamLegacy;
+  if (batch_fn != nullptr && usable_stream) {
     CUmemcpyAttributes attr = {};
     // ANY lets the DMA engine prefetch source bytes out of stream order,
     // which is only safe when no GPU stream is concurrently writing the
@@ -522,7 +527,7 @@ __global__ void indexer_k_quant_and_cache_kernel(
     const int head_dim,                        // dimension of each head
     const int quant_block_size,                // quantization block size
     const int cache_block_size,                // cache block size
-    const int cache_stride,  // stride for each token in kv_cache
+    const int cache_block_stride,  // stride for each block in kv_cache
 
     const bool use_ue8m0  // use ue8m0 scale format
 ) {
@@ -563,7 +568,7 @@ __global__ void indexer_k_quant_and_cache_kernel(
     scale = exp2f(ceilf(log2f(scale)));
   }
 
-  const int64_t dst_offset = block_idx * cache_block_size * cache_stride +
+  const int64_t dst_offset = block_idx * cache_block_stride +
                              block_offset * head_dim + head_dim_idx;
   for (int i = 0; i < VEC_SIZE; i++) {
     kv_cache[dst_offset + i] =
@@ -571,7 +576,7 @@ __global__ void indexer_k_quant_and_cache_kernel(
   }
   if (threadIdx.x == 0) {
     const int64_t dst_scale_idx =
-        block_idx * cache_block_size * cache_stride +
+        block_idx * cache_block_stride +
         cache_block_size * head_dim +
         (block_offset * head_dim + head_dim_idx) * 4 / quant_block_size;
     reinterpret_cast<float*>(kv_cache)[dst_scale_idx / 4] = scale;
@@ -585,7 +590,8 @@ __global__ void indexer_k_cache_kernel(
     const int64_t* __restrict__ slot_mapping,  // [num_tokens]
     const int head_dim,                        // dimension of each head
     const int cache_block_size,                // cache block size
-    const int cache_stride  // stride for each token in kv_cache
+    const int cache_stride,  // stride for each token in kv_cache
+    const int num_blocks
 ) {
   constexpr int VEC_SIZE = 4;
   const int64_t token_idx = blockIdx.x;
@@ -597,7 +603,9 @@ __global__ void indexer_k_cache_kernel(
   const int64_t block_offset = slot_idx % cache_block_size;
 
   // NOTE: slot_idx can be -1 if the token is padded
-  if (slot_idx < 0 || (head_dim_idx >= head_dim)) {
+  const int64_t max_slots = static_cast<int64_t>(num_blocks) * cache_block_size;
+  //const int64_t max_slots = 1690 * cache_block_size;
+  if (slot_idx < 0 || slot_idx >= max_slots || (head_dim_idx >= head_dim)) {
     return;
   }
 
@@ -606,7 +614,7 @@ __global__ void indexer_k_cache_kernel(
   scalar_t* k_val_ptr = reinterpret_cast<scalar_t*>(&k_val);
 
   const int64_t dst_offset = block_idx * cache_block_size * cache_stride +
-                             block_offset * head_dim + head_dim_idx;
+                             block_offset * cache_stride + head_dim_idx;
   for (int i = 0; i < VEC_SIZE; i++) {
     kv_cache[dst_offset + i] = k_val_ptr[i];
   }
@@ -1480,7 +1488,7 @@ void cp_gather_and_upconvert_fp8_kv_cache(
       reinterpret_cast<KV_T*>(k.data_ptr()),                               \
       reinterpret_cast<CACHE_T*>(kv_cache.data_ptr()),                     \
       slot_mapping.data_ptr<int64_t>(), head_dim, cache_block_size,        \
-      cache_stride);
+      cache_stride, num_blocks);
 
 void indexer_k_cache(
     torch::Tensor& k,            // [num_tokens, head_dim]
@@ -1491,6 +1499,9 @@ void indexer_k_cache(
   int head_dim = k.size(1);
   int cache_block_size = kv_cache.size(1);
   int cache_stride = kv_cache.size(2);
+  int num_blocks = kv_cache.size(0);
+  TORCH_CHECK(k.dtype() == kv_cache.dtype(),
+              "indexer_k_cache op no quant k and kv_cache must have the same dtype");
 
   TORCH_CHECK(k.device() == kv_cache.device(),
               "k and kv_cache must be on the same device");
@@ -1512,7 +1523,7 @@ void indexer_k_cache(
           reinterpret_cast<KV_T*>(k.data_ptr()),                        \
           reinterpret_cast<CACHE_T*>(kv_cache.data_ptr()),              \
           slot_mapping.data_ptr<int64_t>(), head_dim, quant_block_size, \
-          cache_block_size, cache_stride, use_ue8m0);
+          cache_block_size, cache_block_stride, use_ue8m0);
 
 void indexer_k_quant_and_cache(
     torch::Tensor& k,             // [num_tokens, head_dim]
@@ -1523,7 +1534,8 @@ void indexer_k_quant_and_cache(
   int num_tokens = k.size(0);
   int head_dim = k.size(1);
   int cache_block_size = kv_cache.size(1);
-  int cache_stride = kv_cache.size(2);
+  //int cache_stride = kv_cache.size(2);
+  int64_t cache_block_stride = kv_cache.stride(0);
   bool use_ue8m0 = scale_fmt == "ue8m0";
 
   TORCH_CHECK(k.device() == kv_cache.device(),

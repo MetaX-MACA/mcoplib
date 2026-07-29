@@ -6,7 +6,7 @@
 #include "core/scalar_type.hpp"
 
 #include <vector>
-
+#include <torch/csrc/stable/ops.h>
 torch::Tensor weak_ref_tensor(torch::Tensor& tensor) {
   // Ensure tensor is on CUDA
   if (!tensor.is_cuda()) {
@@ -177,6 +177,25 @@ void batched_rotary_embedding(torch::Tensor& positions, torch::Tensor& query,
                               int64_t head_size, torch::Tensor& cos_sin_cache,
                               bool is_neox, int64_t rot_dim,
                               torch::Tensor& cos_sin_cache_offsets);
+
+void persistent_masked_m_silu_mul_quant(
+    const torch::Tensor& input,              // (E, T, 2*H)
+    const torch::Tensor& tokens_per_expert,  // (E)
+    torch::Tensor& y_q,                      // (E, T, H) [OUT]
+    torch::Tensor& y_s,  // (E, T, H//group_size) [OUT]
+    bool use_ue8m0);
+
+// SwiGLU-step variant: Gate_act = min(SiLU(gate), limit);
+// Up_act = clip(up, -limit, limit); Result = Gate_act * Up_act.
+// limit is a scalar tensor (bf16 or fp32).
+void persistent_masked_m_swiglu_mul_quant(
+    const torch::Tensor& input,              // (E, T, 2*H)
+    const torch::Tensor& tokens_per_expert,  // (E)
+    torch::Tensor& y_q,                      // (E, T, H) [OUT]
+    torch::Tensor& y_s,  // (E, T, H//group_size) [OUT]
+    const torch::Tensor& limit,              // scalar tensor (bf16 or fp32)
+    bool use_ue8m0);
+    
 
 void silu_and_mul(torch::Tensor& out, torch::Tensor& input);
 
@@ -400,17 +419,18 @@ std::tuple<torch::Tensor, torch::Tensor> minimax_allreduce_rms_qk(
 // index-cache insert). Dense layer: norm+RoPE only; sparse layer: also packs
 // the index branch and scatters k/v/index_k into their paged caches.
 void fused_minimax_m3_qknorm_rope_kv_insert(
-    torch::Tensor& qkv, torch::Tensor const& q_norm_weight,
-    torch::Tensor const& k_norm_weight,
-    torch::Tensor const& cos_sin_cache,
-    torch::Tensor const& positions, int64_t num_heads,
+    torch::stable::Tensor& qkv, torch::stable::Tensor const& q_norm_weight,
+    torch::stable::Tensor const& k_norm_weight,
+    torch::stable::Tensor const& cos_sin_cache,
+    torch::stable::Tensor const& positions, int64_t num_heads,
     int64_t num_kv_heads, int64_t rotary_dim, double eps,
-    std::optional<torch::Tensor> index_q_norm_weight,
-    std::optional<torch::Tensor> index_k_norm_weight,
-    int64_t num_index_heads, std::optional<torch::Tensor> slot_mapping,
-    std::optional<torch::Tensor> index_slot_mapping,
-    std::optional<torch::Tensor> kv_cache,
-    std::optional<torch::Tensor> index_cache, int64_t block_size,
-    std::optional<torch::Tensor> q_out,
-    std::optional<torch::Tensor> index_q_out,
+    std::optional<torch::stable::Tensor> index_q_norm_weight,
+    std::optional<torch::stable::Tensor> index_k_norm_weight,
+    int64_t num_index_heads, std::optional<torch::stable::Tensor> slot_mapping,
+    std::optional<torch::stable::Tensor> index_slot_mapping,
+    std::optional<torch::stable::Tensor> kv_cache,
+    std::optional<torch::stable::Tensor> index_cache, int64_t block_size,
+    std::optional<torch::stable::Tensor> q_out,
+    std::optional<torch::stable::Tensor> index_q_out,
     const std::string& kv_cache_dtype);
+

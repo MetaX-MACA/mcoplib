@@ -614,12 +614,11 @@ void fused_silu_mul_per_group_quant(
               "out dtype must be int8 or float8_e4m3fn, got ",
               out.dtype());
 
-  // Safety CHECK on swiglu_limit per the explicit requirement.
-  // When provided, it must be a strictly positive, finite scalar. A non-positive
-  // or non-finite value would either collapse all activations to 0 (clamp to a
-  // degenerate range) or poison the FP pipeline (NaN/Inf), making the output
-  // meaningless. Default of 10.0 is applied when the caller omits the arg.
-  constexpr double kDefaultSwigluLimit = 10.0;
+  // When swiglu_limit is provided, it must be a strictly positive, finite
+  // scalar. A non-positive or non-finite value would either collapse all
+  // activations to 0 (clamp to a degenerate range) or poison the FP pipeline
+  // (NaN/Inf). When omitted (None), the kernel skips the clamp entirely —
+  // no default limit is applied.
   float swiglu_limit = 0.0f;
   bool use_limit = false;
   if (_swiglu_limit.has_value()) {
@@ -629,9 +628,6 @@ void fused_silu_mul_per_group_quant(
     TORCH_CHECK(v > 0.0,
                 "swiglu_limit must be strictly positive (got ", v, ")");
     swiglu_limit = static_cast<float>(v);
-    use_limit = true;
-  } else {
-    swiglu_limit = static_cast<float>(kDefaultSwigluLimit);
     use_limit = true;
   }
 

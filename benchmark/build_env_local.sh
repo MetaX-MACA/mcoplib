@@ -21,10 +21,10 @@ pip3 install cmake==3.30.4 setuptools-scm==8.0 pybind11 build -i https://repo.me
 echo "start to build mxbench lib"
 echo "pull mxbench source code"
 if [[ ! -d "${PROJECT_ROOT}/.deps/mxbench" ]]; then
-    mkdir -p ${PROJECT_ROOT}/.deps/mxbench
-    cd ${PROJECT_ROOT}/.deps/mxbench
-    source <( wget -qO - http://sw-minios3-lg:9000/share/devtools/install_devtools.sh )
-    git clone ssh://yiyu@gerrit.metax-internal.com:29418/PDE/AI/mxbench -b master
+    # mkdir -p ${PROJECT_ROOT}/.deps/mxbench
+    cd ${PROJECT_ROOT}/.deps
+    #source <( wget -qO - http://sw-minios3-lg:9000/share/devtools/install_devtools.sh )
+    git clone ssh://yiyu@gerrit.sh.metax-internal.com:29418/PDE/AI/mxbench -b master
     # echo "[ERROR] mxbench source code not exit, please clone mxbench source code to ${PROJECT_ROOT}/.deps dir first."
     # exit 1
 fi
@@ -93,7 +93,7 @@ echo " mxbench python package building "
 python setup.py bdist_wheel
 
 echo " installing mxbench python package "
-pip3 install ./dist/*.whl
+pip3 install ./dist/*.whl --no-deps
 echo "========================================"
 echo "[SUCCESS] all done"
 echo "========================================"

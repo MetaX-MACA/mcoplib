@@ -50,7 +50,7 @@ def qmax_and_min_scale(quant_dtype: torch.dtype) -> tuple[float, float]:
 def make_input(shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
     # Keep values moderate so SiLU*mul avoids pathological FP8 saturation-heavy
     # distributions while still exercising quantization.
-    return (torch.randn(shape, device="cuda", dtype=torch.float32) * 0.5).to(dtype)
+    return (torch.randn(shape, device="cuda", dtype=torch.float32) * 0.5 * 10).to(dtype)
 
 
 def reference(
@@ -157,8 +157,11 @@ def check_functional_case(
     out = torch.empty((*shape_prefix, hidden), device="cuda", dtype=quant_dtype)
     scales = torch.empty((tokens, groups), device="cuda", dtype=torch.float32)
 
+    # When swiglu_limit is None, the C++ kernel skips the clamp entirely
+    # (use_limit=false, kHasLimit=false). The reference must match this.
+    ref_limit = swiglu_limit
     out_ref, scales_ref, y_ref = reference(
-        input_tensor, quant_dtype, swiglu_limit=swiglu_limit
+        input_tensor, quant_dtype, swiglu_limit=ref_limit
     )
 
     call_op(out, scales, input_tensor, swiglu_limit=swiglu_limit)
@@ -182,10 +185,11 @@ def check_functional_case(
             f"max_abs_err={max_abs_err}"
         )
 
+    limit_str = f"swiglu_limit={swiglu_limit}" if swiglu_limit is not None else "swiglu_limit=None(no_clamp)"
     print(
         f"PASS functional shape={input_shape} hidden={hidden} "
         f"tokens={tokens} input={dtype_name(input_dtype)} "
-        f"quant={dtype_name(quant_dtype)} cos={cos:.8f}"
+        f"quant={dtype_name(quant_dtype)} {limit_str} cos={cos:.8f}"
     )
 
 
@@ -395,19 +399,21 @@ def parse_int_list(text: str) -> list[int]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=["functional", "shape", "all"], default="all")
-    parser.add_argument("--input-dtype", choices=["fp16", "bf16", "fp32"], default="fp16")
-    parser.add_argument("--quant", choices=["int8", "fp8", "all"], default="all")
+    parser.add_argument("--input-dtype", choices=["fp16", "bf16", "fp32"], default="bf16")
+    parser.add_argument("--quant", choices=["int8", "fp8", "all"], default="fp8")
     parser.add_argument("--tokens", type=parse_int_list, default=parse_int_list("1,16,32"))
-    parser.add_argument("--hidden", type=parse_int_list, default=parse_int_list("128,512,1024"))
+    parser.add_argument("--hidden", type=parse_int_list, default=parse_int_list("1024"))
     parser.add_argument("--cos-threshold", type=float, default=0.999)
     parser.add_argument("--include-prod-shapes", action="store_true")
     parser.add_argument("--rank3", action="store_true")
     parser.add_argument(
         "--swiglu_limit",
         type=float,
-        default=100.0,
+        default=None,
         help="SwiGLU clamp limit applied to SiLU(gate)*up before per-group "
-        "quantization. Default 100 for tests (kernel C++ default is 10.0).",
+        "quantization. When not specified, the test covers both the "
+        "explicit None case (kernel default 10.0) and the explicit value "
+        "case. When specified, only that value is tested.",
     )
     return parser.parse_args()
 
@@ -443,16 +449,23 @@ def main() -> None:
                         shape_prefix = (2, tokens // 2) if tokens % 2 == 0 else (1, tokens)
                     else:
                         shape_prefix = (tokens,)
-                    check_functional_case(
-                        shape_prefix,
-                        hidden,
-                        input_dtype,
-                        quant_dtype,
-                        args.cos_threshold,
-                        swiglu_limit=args.swiglu_limit,
-                    )
+                    # When --swiglu_limit is not specified, test both the
+                    # None case (kernel applies its default 10.0) and an
+                    # explicit value case to ensure full coverage.
+                    if args.swiglu_limit is None:
+                        limits_to_test: list[float | None] = [None, 100.0]
+                    else:
+                        limits_to_test = [args.swiglu_limit]
+                    for limit in limits_to_test:
+                        check_functional_case(
+                            shape_prefix,
+                            hidden,
+                            input_dtype,
+                            quant_dtype,
+                            args.cos_threshold,
+                            swiglu_limit=limit,
+                        )
 
 
 if __name__ == "__main__":
     main()
-

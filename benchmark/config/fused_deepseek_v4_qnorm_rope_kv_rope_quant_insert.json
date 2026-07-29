@@ -1,0 +1,18 @@
+{
+    "device_id": 0,
+    "batch_size": 2048,
+    "num_heads": 64,
+    "num_kv_heads": 1,
+    "head_dim": 512,
+    "rotary_dim": 64,
+    "max_position": 4096,
+    "block_size": 64,
+    "eps": 1e-6,
+    "dtype": "bfloat16",
+    "kv_cache_dtype": "uint8",
+    "num_tokens": 2048,
+    "positions_dtype": "int64",
+    "fp8_scale": 1.0,
+    "q_fp8_scale_inv": 1.0,
+    "samples": 100
+}

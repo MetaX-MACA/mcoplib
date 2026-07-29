@@ -563,58 +563,11 @@ static void launchFusedDeepseekV4Templated(
   int const grid =
       static_cast<int>((total_warps + kWarpsPerBlock - 1) / kWarpsPerBlock);
 
-  // PDL: enable programmatic stream serialization whenever the hardware
-  // supports it (SM90+).  On pre-Hopper GPUs the attribute is unavailable,
-  // so leave numAttrs = 0 and launch as a regular kernel.
-#ifndef USE_ROCM
-  static int const sm_version = getSMVersion();
-  // Host-side guard: the device kernel body is compiled as a no-op for
-  // bf16 on pre-Ampere (sm_70/sm_75) because _typeConvert<BFloat16> is
-  // unavailable there.  Refuse the launch loudly instead of silently
-  // skipping the work.
-  TORCH_CHECK(
-      sm_version >= 80,
-      "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert requires sm_80+ "
-      "(Ampere or newer); got sm_",
-      sm_version);
-  cudaLaunchConfig_t config;
-  config.gridDim = dim3(grid);
-  config.blockDim = dim3(kBlockSize);
-  config.dynamicSmemBytes = 0;
-  config.stream = stream;
-  cudaLaunchAttribute attrs[1];
-  attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-  attrs[0].val.programmaticStreamSerializationAllowed = 1;
-  config.attrs = attrs;
-  config.numAttrs = (sm_version >= 90) ? 1 : 0;
-
-  if (num_tokens_full < NUM_TOKEN_CUTOFF) {
-    cudaLaunchKernelEx(
-        &config,
-        fusedDeepseekV4QNormRopeKVRopeQuantInsertKernel<scalar_t_in,
-                                                        kNumHeadsQPadded>,
-        q_in, q_out, kv_in, k_cache, slot_mapping, position_ids, cos_sin_cache,
-        eps, num_tokens_full, num_tokens_insert, num_heads_q, cache_block_size,
-        kv_block_stride);
-  } else {
-    config.gridDim = dim3(num_tokens_full);
-    cudaLaunchKernelEx(
-        &config,
-        fusedDeepseekV4QNormRopeKVRopeQuantInsertKernelReducedGrid<
-            scalar_t_in, kNumHeadsQPadded>,
-        q_in, q_out, kv_in, k_cache, slot_mapping, position_ids, cos_sin_cache,
-        eps, num_tokens_full, num_tokens_insert, num_heads_q, cache_block_size,
-        kv_block_stride);
-  }
-#else
-  // ROCm: use standard kernel launch syntax (no PDL/stream serialization)
-  // clang-format off
   fusedDeepseekV4QNormRopeKVRopeQuantInsertKernel<scalar_t_in, kNumHeadsQPadded>
       <<<grid, kBlockSize, 0, stream>>>(
           q_in, q_out, kv_in, k_cache, slot_mapping, position_ids,
           cos_sin_cache, eps, num_tokens_full, num_tokens_insert, num_heads_q,
           cache_block_size, kv_block_stride);
-#endif
 }
 
 // Runtime dispatch into one of the precompiled `kNumHeadsQPadded`
@@ -938,32 +891,12 @@ static void launchFullCacheKernel(
       static_cast<int>((total_warps + kWarpsPerBlock - 1) / kWarpsPerBlock);
   auto* kernel =
       fusedDeepseekV4FullCacheKernel<scalar_t_in, STORE_Q_FP8, STORE_KV_FP8>;
-#ifndef USE_ROCM
-  static int const sm_version = getSMVersion();
-  TORCH_CHECK(sm_version >= 80, op_name,
-                  " requires sm_80+ (Ampere or newer); got sm_", sm_version);
-  cudaLaunchConfig_t config;
-  config.gridDim = dim3(grid);
-  config.blockDim = dim3(kBlockSize);
-  config.dynamicSmemBytes = 0;
-  config.stream = stream;
-  cudaLaunchAttribute attrs[1];
-  attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-  attrs[0].val.programmaticStreamSerializationAllowed = 1;
-  config.attrs = attrs;
-  config.numAttrs = (sm_version >= 90) ? 1 : 0;
-  cudaLaunchKernelEx(&config, kernel, q_inout, q_fp8_out, q_fp8_stride0,
-                     q_fp8_stride1, kv_in, k_cache, slot_mapping, position_ids,
-                     cos_sin_cache, fp8_scale, q_fp8_scale_inv, eps,
-                     num_tokens_full, num_tokens_insert, num_heads_q,
-                     cache_block_size, kv_block_stride, kv_token_stride);
-#else
+
   kernel<<<grid, kBlockSize, 0, stream>>>(
       q_inout, q_fp8_out, q_fp8_stride0, q_fp8_stride1, kv_in, k_cache,
       slot_mapping, position_ids, cos_sin_cache, fp8_scale, q_fp8_scale_inv,
       eps, num_tokens_full, num_tokens_insert, num_heads_q, cache_block_size,
       kv_block_stride, kv_token_stride);
-#endif
 }
 
 }  // namespace deepseek_v4_fused_ops

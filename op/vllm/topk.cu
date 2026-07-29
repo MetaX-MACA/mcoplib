@@ -3,6 +3,7 @@
 
 #include <torch/all.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <cuda_runtime.h>
 #include <algorithm>
 
@@ -19,6 +20,7 @@ void launch_persistent_topk(const torch::Tensor& logits,
                             torch::Tensor& workspace, int64_t max_seq_len) {
   namespace P = vllm::persistent;
 
+  at::cuda::OptionalCUDAGuard const device_guard(logits.device());
   const int64_t num_rows = logits.size(0);
   const int64_t stride = logits.stride(0);
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -33,11 +35,12 @@ void launch_persistent_topk(const torch::Tensor& logits,
                            cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
   }
 
-  if (num_rows > 32 && max_smem_per_block >= vllm::FILTERED_TOPK_SMEM_DYNAMIC + 12000) {
+  constexpr size_t kFilteredTopKMinSmem = sizeof(int) * 2 * (7 * 1024) + 2048;
+  if (num_rows > 32 && max_smem_per_block >= kFilteredTopKMinSmem) {
     // 确保即使以后移植到更小显存的卡也能准确报错
-    TORCH_CHECK(max_smem_per_block >= (vllm::FILTERED_TOPK_SMEM_DYNAMIC + 12000),
+    TORCH_CHECK(max_smem_per_block >= kFilteredTopKMinSmem,
                 "persistent_topk would oversubscribe and the FilteredTopK "
-                "fallback requires >= ", (vllm::FILTERED_TOPK_SMEM_DYNAMIC + 12000),
+                "fallback requires >= ", kFilteredTopKMinSmem,
                 " bytes smem per block (have ", max_smem_per_block, ").");
 
     cudaError_t status =
@@ -137,9 +140,9 @@ void launch_persistent_topk(const torch::Tensor& logits,
     // If the cooperative launch wouldn't fit, fall back to FilteredTopK
     // instead of deadlocking. Only relevant when needs_cooperative.
     if (needs_cooperative && total_ctas > hw_resident_cap) {
-      TORCH_CHECK(max_smem_per_block >= (vllm::FILTERED_TOPK_SMEM_DYNAMIC + 12000),
+      TORCH_CHECK(max_smem_per_block >= kFilteredTopKMinSmem,
                   "persistent_topk would oversubscribe and the FilteredTopK "
-                  "fallback requires >= ", (vllm::FILTERED_TOPK_SMEM_DYNAMIC + 12000),
+                  "fallback requires >= ", kFilteredTopKMinSmem,
                   " bytes smem per block (have ", max_smem_per_block, "). total_ctas=", total_ctas,
                   " > num_sms*occupancy=", hw_resident_cap, " (TopK=", TopK,
                   ", vec_size=", vec_size, ", ctas_per_group=", ctas_per_group,
@@ -248,6 +251,8 @@ void persistent_topk(const torch::Tensor& logits, const torch::Tensor& lengths,
   TORCH_CHECK(k == 512 || k == 1024 || k == 2048,
               "persistent_topk supports k=512, k=1024, or k=2048, got k=", k);
   TORCH_CHECK(logits.stride(1) == 1, "logits strides[1] must be 1");
+
+  at::cuda::OptionalCUDAGuard const device_guard(logits.device());
 
   if (k == 512) {
     launch_persistent_topk<512>(logits, lengths, output, workspace,

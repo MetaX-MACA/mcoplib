@@ -31,15 +31,16 @@ rms_input_row(const scalar_t *input, int64_t input_stride_d2,
 }
 
 // Existing two-pass implementation retained for unaligned and untested shapes.
-template <typename scalar_t, int VEC_SIZE, int NUM_DIMS, bool HAS_WEIGHT>
+template <typename scalar_t, int VEC_SIZE, int NUM_DIMS, bool HAS_WEIGHT, bool PER_TOKEN_WEIGHT>
 __global__ void rms_norm_default_kernel(
     scalar_t *__restrict__ out, const scalar_t *__restrict__ input,
     int64_t input_stride_d2, int64_t input_stride_d3, int64_t input_stride_d4,
     int64_t input_shape_d2, int64_t input_shape_d3,
-    const scalar_t *__restrict__ weight, float epsilon, int num_tokens,
+    const scalar_t *__restrict__ weight, int64_t weight_stride, float epsilon, int num_tokens,
     int hidden_size) {
   __shared__ float s_variance;
   float variance = 0.0f;
+  const int token_idx = blockIdx.x;
   const scalar_t *input_row = rms_input_row<scalar_t, NUM_DIMS>(
       input, input_stride_d2, input_stride_d3, input_stride_d4, input_shape_d2,
       input_shape_d3);
@@ -72,21 +73,41 @@ __global__ void rms_norm_default_kernel(
   auto *output_vec = reinterpret_cast<vec_n_t<scalar_t, VEC_SIZE> *>(out_row);
 
   if constexpr (HAS_WEIGHT) {
-    const auto *weight_vec =
-        reinterpret_cast<const vec_n_t<scalar_t, VEC_SIZE> *>(weight);
-    for (int i = threadIdx.x; i < hidden_size / VEC_SIZE; i += blockDim.x) {
-      vec_n_t<scalar_t, VEC_SIZE> dst;
-      const vec_n_t<scalar_t, VEC_SIZE> src = input_vec[i];
-      const vec_n_t<scalar_t, VEC_SIZE> w = weight_vec[i];
+    if constexpr (!PER_TOKEN_WEIGHT) {
+      const auto *weight_vec =
+          reinterpret_cast<const vec_n_t<scalar_t, VEC_SIZE> *>(weight);
+      for (int i = threadIdx.x; i < hidden_size / VEC_SIZE; i += blockDim.x) {
+        vec_n_t<scalar_t, VEC_SIZE> dst;
+        const vec_n_t<scalar_t, VEC_SIZE> src = input_vec[i];
+        const vec_n_t<scalar_t, VEC_SIZE> w = weight_vec[i];
 #pragma unroll
-      for (int j = 0; j < VEC_SIZE; ++j) {
-        const float x = static_cast<float>(src.val[j]);
-        const float wf = static_cast<float>(w.val[j]);
-        dst.val[j] = static_cast<scalar_t>(x * s_variance * wf);
+        for (int j = 0; j < VEC_SIZE; ++j) {
+          const float x = static_cast<float>(src.val[j]);
+          const float wf = static_cast<float>(w.val[j]);
+          dst.val[j] = static_cast<scalar_t>(x * s_variance * wf);
+        }
+        output_vec[i] = dst;
       }
-      output_vec[i] = dst;
+    } else {
+      const scalar_t *token_weight = weight + token_idx * weight_stride;
+      const auto *weight_vec =
+          reinterpret_cast<const vec_n_t<scalar_t, VEC_SIZE> *>(token_weight);
+      for (int i = threadIdx.x; i < hidden_size / VEC_SIZE; i += blockDim.x) {
+        vec_n_t<scalar_t, VEC_SIZE> dst;
+        const vec_n_t<scalar_t, VEC_SIZE> src = input_vec[i];
+        const vec_n_t<scalar_t, VEC_SIZE> w = weight_vec[i];
+#pragma unroll
+        for (int j = 0; j < VEC_SIZE; ++j) {
+          const float x = static_cast<float>(src.val[j]);
+          const float wf = static_cast<float>(w.val[j]);
+          dst.val[j] =
+              static_cast<scalar_t>(x * s_variance * wf);
+        }
+        output_vec[i] = dst;
+      }
     }
-  } else {
+  }
+  else {
     for (int i = threadIdx.x; i < hidden_size / VEC_SIZE; i += blockDim.x) {
       vec_n_t<scalar_t, VEC_SIZE> dst;
       const vec_n_t<scalar_t, VEC_SIZE> src = input_vec[i];
@@ -102,16 +123,17 @@ __global__ void rms_norm_default_kernel(
 
 // The input packs stay in registers across the reduction. This eliminates the
 // second global input read while keeping the cached representation packed.
-template <typename scalar_t, int VEC_SIZE, int NUM_DIMS, bool HAS_WEIGHT,
+template <typename scalar_t, int VEC_SIZE, int NUM_DIMS, bool HAS_WEIGHT, bool PER_TOKEN_WEIGHT,
           int BLOCK_SIZE, int ITEMS_PER_THREAD>
 __global__ __launch_bounds__(BLOCK_SIZE) void rms_norm_cached_kernel(
     scalar_t *__restrict__ out, const scalar_t *__restrict__ input,
     int64_t input_stride_d2, int64_t input_stride_d3, int64_t input_stride_d4,
     int64_t input_shape_d2, int64_t input_shape_d3,
-    const scalar_t *__restrict__ weight, float epsilon, int num_tokens,
+    const scalar_t *__restrict__ weight, int64_t weight_stride, float epsilon, int num_tokens,
     int hidden_size) {
   using Vec = vec_n_t<scalar_t, VEC_SIZE>;
   const int vec_count = hidden_size / VEC_SIZE;
+  const int token_idx = blockIdx.x;
   const scalar_t *input_row = rms_input_row<scalar_t, NUM_DIMS>(
       input, input_stride_d2, input_stride_d3, input_stride_d4, input_shape_d2,
       input_shape_d3);
@@ -144,15 +166,28 @@ __global__ __launch_bounds__(BLOCK_SIZE) void rms_norm_cached_kernel(
 
   scalar_t *out_row = out + blockIdx.x * hidden_size;
   auto *output_vec = reinterpret_cast<Vec *>(out_row);
-  const auto *weight_vec = reinterpret_cast<const Vec *>(weight);
+  const Vec *weight_vec = nullptr;
+  if constexpr (HAS_WEIGHT) {
+    if constexpr (!PER_TOKEN_WEIGHT) {
+      weight_vec = reinterpret_cast<const Vec *>(weight);
+    }
+  }
 #pragma unroll
   for (int item = 0; item < ITEMS_PER_THREAD; ++item) {
     const int vec_idx = threadIdx.x + item * BLOCK_SIZE;
-    if (vec_idx < vec_count) {
-      Vec dst;
-      Vec w{};
-      if constexpr (HAS_WEIGHT)
-        w = weight_vec[vec_idx];
+    if (vec_idx < vec_count) { 
+      Vec dst; 
+      Vec w{}; 
+      if constexpr (HAS_WEIGHT) { 
+        if constexpr (PER_TOKEN_WEIGHT) {
+          const scalar_t *token_weight = weight + token_idx * weight_stride;
+          const auto *token_weight_vec =
+              reinterpret_cast<const Vec *>(token_weight); 
+          w = token_weight_vec[vec_idx];
+        } else { 
+          w = weight_vec[vec_idx];
+        }
+      }
 #pragma unroll
       for (int j = 0; j < VEC_SIZE; ++j) {
         float value = static_cast<float>(cached[item].val[j]) * s_variance;
@@ -166,19 +201,19 @@ __global__ __launch_bounds__(BLOCK_SIZE) void rms_norm_cached_kernel(
   }
 }
 
-template <typename scalar_t, int VEC_SIZE, int NUM_DIMS, bool HAS_WEIGHT>
+template <typename scalar_t, int VEC_SIZE, int NUM_DIMS, bool HAS_WEIGHT, bool PER_TOKEN_WEIGHT>
 bool launch_rms_norm_cached(int block_size, int items_per_thread, dim3 grid,
                             cudaStream_t stream, scalar_t *out,
                             const scalar_t *input, int64_t input_stride_d2,
                             int64_t input_stride_d3, int64_t input_stride_d4,
                             int64_t input_shape_d2, int64_t input_shape_d3,
-                            const scalar_t *weight, float epsilon,
+                            const scalar_t *weight, int64_t weight_stride, float epsilon,
                             int num_tokens, int hidden_size) {
 #define LAUNCH_RMS_CACHED(BLOCK, ITEMS)                                        \
-  rms_norm_cached_kernel<scalar_t, VEC_SIZE, NUM_DIMS, HAS_WEIGHT, BLOCK,      \
+  rms_norm_cached_kernel<scalar_t, VEC_SIZE, NUM_DIMS, HAS_WEIGHT, PER_TOKEN_WEIGHT, BLOCK,      \
                          ITEMS><<<grid, BLOCK, 0, stream>>>(                   \
       out, input, input_stride_d2, input_stride_d3, input_stride_d4,           \
-      input_shape_d2, input_shape_d3, weight, epsilon, num_tokens,             \
+      input_shape_d2, input_shape_d3, weight, weight_stride, epsilon, num_tokens,             \
       hidden_size)
 
 #define DISPATCH_ITEMS(BLOCK)                                                  \
@@ -385,14 +420,30 @@ void rms_norm(torch::Tensor &out, torch::Tensor &input,
   TORCH_CHECK(input.stride(-1) == 1);
 
   const bool has_weight = weight.has_value();
-  if (has_weight) {
-    TORCH_CHECK(weight->is_contiguous());
-    TORCH_CHECK(weight->size(0) == input.size(-1));
-    TORCH_CHECK(weight->scalar_type() == input.scalar_type());
-  }
-
   const int hidden_size = input.size(-1);
   const int num_tokens = input.numel() / hidden_size;
+
+  bool per_token_weight = false;
+  int64_t weight_stride = 0;
+
+  if (has_weight) {
+    TORCH_CHECK(weight->is_contiguous());
+    TORCH_CHECK(weight->scalar_type() == input.scalar_type());
+
+    if (weight->dim() == 1) {
+      TORCH_CHECK(weight->size(0) == hidden_size);
+      per_token_weight = false;
+    } else if (weight->dim() == 2) {
+      TORCH_CHECK(weight->size(0) == num_tokens);
+      TORCH_CHECK(weight->size(1) == hidden_size);
+      weight_stride = weight->stride(0);
+      per_token_weight = true;
+    } else {
+      TORCH_CHECK(false,
+                  "rms_norm weight only supports [hidden] or [tokens,hidden]");
+    }
+  }
+  
   const int num_dims = input.dim();
   const int64_t input_stride_d2 = input.stride(-2);
   const int64_t input_stride_d3 = num_dims >= 3 ? input.stride(-3) : 0;
@@ -439,42 +490,42 @@ void rms_norm(torch::Tensor &out, torch::Tensor &input,
                   input_stride_d4);
 
           if (can_use_cached) {
-            if (has_weight) {
-              launched = vllm::launch_rms_norm_cached<scalar_t, vec_size,
-                                                      tensor_rank, true>(
-                  cached_block, items_per_thread, grid, stream,
-                  out.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(),
-                  input_stride_d2, input_stride_d3, input_stride_d4,
-                  input_shape_d2, input_shape_d3, weight_ptr,
-                  static_cast<float>(epsilon), num_tokens, hidden_size);
+            if (!has_weight) {
+              launched = vllm::launch_rms_norm_cached<scalar_t, vec_size, tensor_rank, false, false>(
+                    cached_block, items_per_thread, grid, stream, out.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(),
+                    input_stride_d2, input_stride_d3, input_stride_d4, input_shape_d2, input_shape_d3, nullptr, 0,
+                    static_cast<float>(epsilon), num_tokens, hidden_size);
+            } else if (per_token_weight) {
+              launched = vllm::launch_rms_norm_cached<scalar_t, vec_size, tensor_rank, true, true>(
+                    cached_block, items_per_thread, grid, stream, out.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(),
+                    input_stride_d2, input_stride_d3, input_stride_d4, input_shape_d2, input_shape_d3,
+                    weight_ptr, weight_stride, static_cast<float>(epsilon), num_tokens, hidden_size);
             } else {
-              launched = vllm::launch_rms_norm_cached<scalar_t, vec_size,
-                                                      tensor_rank, false>(
-                  cached_block, items_per_thread, grid, stream,
-                  out.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(),
-                  input_stride_d2, input_stride_d3, input_stride_d4,
-                  input_shape_d2, input_shape_d3, weight_ptr,
-                  static_cast<float>(epsilon), num_tokens, hidden_size);
+              launched = vllm::launch_rms_norm_cached<scalar_t, vec_size, tensor_rank, true, false>(
+                    cached_block, items_per_thread, grid, stream, out.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(),
+                    input_stride_d2, input_stride_d3, input_stride_d4, input_shape_d2, input_shape_d3,
+                    weight_ptr, 0, static_cast<float>(epsilon), num_tokens, hidden_size);
             }
           }
         }
 
         if (!launched) {
           const dim3 block(fallback_block);
-          if (has_weight) {
-            vllm::rms_norm_default_kernel<scalar_t, vec_size, tensor_rank, true>
-                <<<grid, block, 0, stream>>>(
-                    out.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(),
-                    input_stride_d2, input_stride_d3, input_stride_d4,
-                    input_shape_d2, input_shape_d3, weight_ptr,
+          if (!has_weight) {
+            vllm::rms_norm_default_kernel<scalar_t, vec_size, tensor_rank, false, false><<<grid, block, 0, stream>>>(
+                    out.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(), input_stride_d2, input_stride_d3,
+                    input_stride_d4, input_shape_d2, input_shape_d3, nullptr, 0, static_cast<float>(epsilon),
+                    num_tokens, hidden_size);
+          } else if (per_token_weight) {
+            vllm::rms_norm_default_kernel<scalar_t, vec_size, tensor_rank, true, true><<<grid, block, 0, stream>>>(
+                    out.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(), input_stride_d2, input_stride_d3,
+                    input_stride_d4, input_shape_d2, input_shape_d3, weight_ptr, weight_stride,
                     static_cast<float>(epsilon), num_tokens, hidden_size);
           } else {
-            vllm::rms_norm_default_kernel<scalar_t, vec_size, tensor_rank,
-                                          false><<<grid, block, 0, stream>>>(
-                out.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(),
-                input_stride_d2, input_stride_d3, input_stride_d4,
-                input_shape_d2, input_shape_d3, weight_ptr,
-                static_cast<float>(epsilon), num_tokens, hidden_size);
+            vllm::rms_norm_default_kernel<scalar_t, vec_size, tensor_rank, true, false><<<grid, block, 0, stream>>>(
+                    out.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(), input_stride_d2, input_stride_d3,
+                    input_stride_d4, input_shape_d2, input_shape_d3, weight_ptr, 0, static_cast<float>(epsilon),
+                    num_tokens, hidden_size);
           }
         }
       });
