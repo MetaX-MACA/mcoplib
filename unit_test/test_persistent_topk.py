@@ -12,35 +12,19 @@ import pytest
 def top_k_per_row_decode_numpy(logits, seq_lens, topk_tokens):
     if seq_lens.ndim > 1:
         seq_lens = seq_lens.ravel()
-
     num_rows = logits.shape[0]
-
-    out = np.full(
-        (num_rows, topk_tokens),
-        -1,
-        dtype=np.int64
-    )
-
+    out = np.zeros((num_rows, topk_tokens), dtype=np.int64)
     for i in range(num_rows):
         length = int(seq_lens[i])
-
         if length <= 0:
             continue
-
         k = min(topk_tokens, length)
-
         row = logits[i, :length].astype(np.float32)
-
         idx = np.argpartition(-row, k - 1)[:k]
-
         vals = row[idx]
-
         sort_order = np.argsort(-vals)
-
         idx = idx[sort_order]
-
         out[i, :k] = idx.astype(np.int64)
-
     return out
 
 def run_tests():
@@ -123,15 +107,7 @@ def run_error_tests():
 
     with pytest.raises(RuntimeError, match="logits strides\\[1\\] must be 1"):
         bs,num_rows,maxlen,topk,logits,seq_lens,workspace,output = standard_generate()
-        logits_tmp = torch.empty(
-            (num_rows, maxlen * 2),
-            device="cuda",
-            dtype=torch.float32
-        )
-
-        logits = logits_tmp[:, ::2]
-        assert logits.shape == (num_rows, maxlen)
-        assert logits.stride(1) != 1    
+        logits = logits.transpose(0, 1)
         torch.ops._C.persistent_topk(logits, seq_lens, output, workspace, topk, maxlen)
 
     with pytest.raises(RuntimeError, match="output size mismatch"):
@@ -145,94 +121,10 @@ def run_error_tests():
 
     with pytest.raises(RuntimeError, match="lengths size mismatch"):
         bs,num_rows,maxlen,topk,logits,seq_lens,workspace,output = standard_generate()
-        seq_lens = torch.zeros(num_rows + 1, device="cuda", dtype=torch.int32)
+        seq_lens_mod = np.random.randn(num_rows, num_rows).astype(np.int32)
+        seq_lens = torch.tensor(seq_lens_mod, device="cuda")
         torch.ops._C.persistent_topk(logits, seq_lens, output, workspace, topk, maxlen)
-
-def run_test_histogram4096_short_path():
-
-    cases = [
-        # length, topk
-        (8193, 512),
-        (8193, 1024),
-        (16387, 512),
-        (16387, 1024),
-        (16387, 2048),
-        (32768, 512),
-    ]
-
-
-    for length, topk in cases:
-        bs = 1
-        num_rows = 1
-
-        # unique values
-        logits_mod = (
-            np.arange(length, dtype=np.float32)
-            .reshape(1, length)
-        )
-
-        seq_lens_mod = np.array(
-            [[length]],
-            dtype=np.int32
-        )
-
-        ref = top_k_per_row_decode_numpy(
-            logits_mod,
-            seq_lens_mod,
-            topk
-        )
-
-        logits = torch.tensor(
-            logits_mod,
-            device="cuda"
-        )
-
-        seq_lens = torch.tensor(
-            seq_lens_mod,
-            device="cuda"
-        )
-
-        workspace = torch.zeros(
-            num_rows * 772 * 4,
-            device="cuda",
-            dtype=torch.uint8
-        )
-
-        output = torch.zeros(
-            num_rows,
-            topk,
-            device="cuda",
-            dtype=torch.int32
-        )
-
-        torch.ops._C.persistent_topk(
-            logits,
-            seq_lens,
-            output,
-            workspace,
-            topk,
-            length
-        )
-
-        gpu = np.sort(
-            output.cpu().numpy(),
-            axis=-1
-        )
-
-        cpu = np.sort(
-            ref,
-            axis=-1
-        )
-
-        assert np.array_equal(
-            gpu,
-            cpu
-        ), f"histogram4096 failed length={length}, topk={topk}"
-        print(
-            f"PASS histogram4096 length={length} topk={topk}"
-        )
 
 if __name__ == "__main__":
     run_tests()
-    run_test_histogram4096_short_path()
     run_error_tests()

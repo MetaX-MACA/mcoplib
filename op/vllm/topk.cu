@@ -3,7 +3,6 @@
 
 #include <torch/all.h>
 #include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
 #include <cuda_runtime.h>
 #include <algorithm>
 
@@ -20,7 +19,6 @@ void launch_persistent_topk(const torch::Tensor& logits,
                             torch::Tensor& workspace, int64_t max_seq_len) {
   namespace P = vllm::persistent;
 
-  at::cuda::OptionalCUDAGuard const device_guard(logits.device());
   const int64_t num_rows = logits.size(0);
   const int64_t stride = logits.stride(0);
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -251,8 +249,6 @@ void persistent_topk(const torch::Tensor& logits, const torch::Tensor& lengths,
   TORCH_CHECK(k == 512 || k == 1024 || k == 2048,
               "persistent_topk supports k=512, k=1024, or k=2048, got k=", k);
   TORCH_CHECK(logits.stride(1) == 1, "logits strides[1] must be 1");
-
-  at::cuda::OptionalCUDAGuard const device_guard(logits.device());
 
   if (k == 512) {
     launch_persistent_topk<512>(logits, lengths, output, workspace,

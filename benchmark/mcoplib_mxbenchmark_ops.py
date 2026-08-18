@@ -138,10 +138,7 @@ SUPPORTED_OPERATORS = [
     "silu_and_mul_with_clamp",
     "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert",
     "fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert",
-    "fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert",
-    "dsv3_router_gemm",
-    "moe_permute",
-    "moe_unpermute"
+    "fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert"
 ]
 # =============================================================================
 #  Global Config: Ignored Operators

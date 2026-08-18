@@ -103,19 +103,6 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("silu_and_mul_with_clamp", torch::kCUDA, &silu_and_mul_clamp);
 
   ops.def(
-      "persistent_masked_m_silu_mul_quant(Tensor input, Tensor counts, Tensor! "
-      "y_q, Tensor! y_s, bool use_ue8m0) -> ()");
-  ops.impl("persistent_masked_m_silu_mul_quant",torch::kCUDA, &persistent_masked_m_silu_mul_quant);
-
-  // SwiGLU-step variant: SiLU(gate) clamped to [_, limit], up clamped to
-  // [-limit, limit], then per-group FP8 quant.
-  ops.def(
-      "persistent_masked_m_swiglu_mul_quant(Tensor input, Tensor counts, "
-      "Tensor! y_q, Tensor! y_s, Tensor limit, bool use_ue8m0) -> ()");
-  ops.impl("persistent_masked_m_swiglu_mul_quant", torch::kCUDA,
-           &persistent_masked_m_swiglu_mul_quant);
-
-  ops.def(
       "silu_and_mul_quant(Tensor! result, Tensor input, Tensor scale) -> ()");
   ops.impl("silu_and_mul_quant", torch::kCUDA, &silu_and_mul_quant);
 

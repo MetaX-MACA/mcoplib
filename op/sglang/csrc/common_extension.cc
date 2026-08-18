@@ -389,7 +389,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor(a!) out, "
       "Tensor(b!) scales, "
       "Tensor input, "
-      "float? _swiglu_limit = None"
+      "float? _swiglu_limit = 10.0"
       ") -> ()"
       );
   m.impl(
