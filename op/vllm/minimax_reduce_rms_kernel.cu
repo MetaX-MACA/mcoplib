@@ -271,10 +271,15 @@ __global__ void __launch_bounds__(1024)
   float4 clear_vec = get_neg_zero();
 
   LamportComm<NRanks> comm(params.workspace, params.rank);
-  int clear_access = comm.clear_size / kElemsPerAccess<DType>;
+  
+
+  // comm.clear_size 记录的是上一次调用的 DType 元素个数。
+  int clear_access = (comm.clear_size * sizeof(DType) + 15) / 16;
+
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   asm volatile("griddepcontrol.wait;");
 #endif
+
   for (int idx = access_id; idx < tot_access;
        idx += access_stride, token_id += token_stride) {
     alignas(16) DType vals[kElemsPerAccess<DType>];
@@ -332,10 +337,19 @@ __global__ void __launch_bounds__(1024)
     reinterpret_cast<float4*>(params.rms_norm_out)[idx] =
         *reinterpret_cast<float4*>(vals);
   }
-  for (int idx = access_id; idx < clear_access; idx += access_stride) {
+
+
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  int stride = gridDim.x * blockDim.x;
+  for (int idx = tid; idx < clear_access; idx += stride) {
     reinterpret_cast<float4*>(comm.clear_buf)[idx] = clear_vec;
   }
-  comm.update(params.size_q * NRanks);
+
+
+  int64_t next_clear_bytes = static_cast<int64_t>(tot_tokens) * NRanks * sizeof(float);
+  int64_t next_clear_dtype_elems = next_clear_bytes / sizeof(DType);
+  comm.update(next_clear_dtype_elems);
+
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   asm volatile("griddepcontrol.launch_dependents;");
 #endif
@@ -752,27 +766,37 @@ void dispatch_dtype(MiniMaxReduceRMSParams const& params) {
   //  - the full (NRanks * per-rank) dimensions match the MiniMax M2 shape.
   // Otherwise fall back to the scalar kernel.
   bool use_float4 = (params.allreduce_in_k != nullptr) &&
-                    (params.hidden_dim * params.nranks == 6144) &&
-                    (params.hidden_dim_k * params.nranks == 1024);
+                    (params.hidden_dim * params.nranks == 6144) && 
+                    ((params.hidden_dim_k * params.nranks == 1024) || (params.hidden_dim_k * params.nranks == 2048));
 
   if (params.dtype == at::ScalarType::Half) {
     if (use_float4) {
-      minimax_reduce_rms_kernel_launcher_float4<half, NRanks, 6144, 1024>(
-          params);
+      if(params.hidden_dim_k * params.nranks == 1024){
+        minimax_reduce_rms_kernel_launcher_float4<half, NRanks, 6144, 1024>(params);
+      }else if(params.hidden_dim_k * params.nranks == 2048){
+        minimax_reduce_rms_kernel_launcher_float4<half, NRanks, 6144, 2048>(params);
+      } 
     } else {
       minimax_reduce_rms_kernel_launcher<half, NRanks>(params);
     }
   } else if (params.dtype == at::ScalarType::BFloat16) {
     if (use_float4) {
-      minimax_reduce_rms_kernel_launcher_float4<__nv_bfloat16, NRanks, 6144,
-                                                1024>(params);
+        if (params.hidden_dim_k * params.nranks == 1024) {
+          minimax_reduce_rms_kernel_launcher_float4<__nv_bfloat16, NRanks, 6144, 1024>(params);
+        } else if (params.hidden_dim_k * params.nranks == 2048) {
+          minimax_reduce_rms_kernel_launcher_float4<__nv_bfloat16, NRanks, 6144, 2048>(params);
+        }
     } else {
       minimax_reduce_rms_kernel_launcher<__nv_bfloat16, NRanks>(params);
     }
   } else if (params.dtype == at::ScalarType::Float) {
     if (use_float4) {
-      minimax_reduce_rms_kernel_launcher_float4<float, NRanks, 6144, 1024>(
-          params);
+      if(params.hidden_dim_k * params.nranks == 1024){
+        minimax_reduce_rms_kernel_launcher_float4<float, NRanks, 6144, 1024>(params);
+      }else if(params.hidden_dim_k * params.nranks == 2048){
+        minimax_reduce_rms_kernel_launcher_float4<float, NRanks, 6144, 2048>(params);
+      }
+
     } else {
       minimax_reduce_rms_kernel_launcher<float, NRanks>(params);
     }
