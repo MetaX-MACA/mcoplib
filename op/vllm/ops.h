@@ -178,25 +178,6 @@ void batched_rotary_embedding(torch::Tensor& positions, torch::Tensor& query,
                               bool is_neox, int64_t rot_dim,
                               torch::Tensor& cos_sin_cache_offsets);
 
-void persistent_masked_m_silu_mul_quant(
-    const torch::Tensor& input,              // (E, T, 2*H)
-    const torch::Tensor& tokens_per_expert,  // (E)
-    torch::Tensor& y_q,                      // (E, T, H) [OUT]
-    torch::Tensor& y_s,  // (E, T, H//group_size) [OUT]
-    bool use_ue8m0);
-
-// SwiGLU-step variant: Gate_act = min(SiLU(gate), limit);
-// Up_act = clip(up, -limit, limit); Result = Gate_act * Up_act.
-// limit is a scalar tensor (bf16 or fp32).
-void persistent_masked_m_swiglu_mul_quant(
-    const torch::Tensor& input,              // (E, T, 2*H)
-    const torch::Tensor& tokens_per_expert,  // (E)
-    torch::Tensor& y_q,                      // (E, T, H) [OUT]
-    torch::Tensor& y_s,  // (E, T, H//group_size) [OUT]
-    const torch::Tensor& limit,              // scalar tensor (bf16 or fp32)
-    bool use_ue8m0);
-    
-
 void silu_and_mul(torch::Tensor& out, torch::Tensor& input);
 
 void silu_and_mul_clamp(torch::Tensor& out, torch::Tensor& input, double limit,

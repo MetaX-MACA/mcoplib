@@ -8,7 +8,7 @@ import argparse
 import tempfile
 import torch
 import difflib  # Used for similarity matching
-import itertools  # Used for config expansion
+
 try:
     import cuda.bench._nvbench as bench
 except ImportError:
@@ -135,14 +135,9 @@ SUPPORTED_OPERATORS = [
     "fused_silu_mul_per_group_quant_fp8",
     "fused_silu_mul_per_group_quant_int8",
     "fused_minimax_m3_qknorm_rope_kv_insert",
-    "silu_and_mul_with_clamp",
-    "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert",
-    "fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert",
-    "fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert",
-    "dsv3_router_gemm",
-    "moe_permute",
-    "moe_unpermute"
+    "silu_and_mul_with_clamp"
 ]
+
 # =============================================================================
 #  Global Config: Ignored Operators
 # =============================================================================
@@ -168,7 +163,7 @@ def list_supported_operators():
             print(f"  * {op}")
     print("="*40 + "\n")
 
-def load_operator_runner_components(op_name):
+def load_operator_runner(op_name):
     current_dir = get_base_dir()
     if current_dir not in sys.path:
         sys.path.append(current_dir)
@@ -291,52 +286,8 @@ def load_operator_runner_components(op_name):
         sys.exit(1)
 
     print(f"[LOADER] Loaded Class: {target_cls.__name__} (Benchmark Name: {canonical_name})")
-
-    return canonical_name, target_cls, config
-
-def load_operator_runner(op_name):
-    """Backward-compatible wrapper: returns a single op instance (first config)."""
-    canonical_name, runner_cls, config = load_operator_runner_components(op_name)
-    return runner_cls(canonical_name, config)
-
-# =============================================================================
-#  Config Expansion: Support array parameters in JSON
-# =============================================================================
-def expand_config(config):
-    """Expand config with array parameters into a list of single-value configs.
-
-    For each parameter that is a list, generate all combinations.
-    Scalar parameters are kept as-is. 'device_id', 'device_name', and 'samples'
-    are never expanded.
-    """
-    non_expandable = {"device_id", "device_name", "samples", "batch_size_list"}
-
-    # Separate expandable and non-expandable keys
-    array_keys = []
-    array_values = []
-    single_config = {}
-
-    for key, value in config.items():
-        if key in non_expandable:
-            single_config[key] = value
-        elif isinstance(value, list):
-            array_keys.append(key)
-            array_values.append(value)
-        else:
-            single_config[key] = value
-
-    if not array_keys:
-        return [config]
-
-    # Generate all combinations
-    expanded = []
-    for combo in itertools.product(*array_values):
-        new_config = dict(single_config)
-        for key, val in zip(array_keys, combo):
-            new_config[key] = val
-        expanded.append(new_config)
-
-    return expanded
+    
+    return target_cls(canonical_name, config)
 
 # =============================================================================
 #  Benchmark Wrapper (Integrated Sync Fix)
@@ -481,14 +432,14 @@ def _write_csv(path, header, rows):
         print(f"[ERROR] Failed to write CSV: {e}")
 
 def _append_compare_row(csv_path, op_name, cur_gpu_str, base_gpu_str,
-                        acc_status, perf_ratio_str, shape="", datatype=""):
+                        acc_status, perf_ratio_str):
     """Append one compare-result row to csv_path.
 
     Creates the file with a fixed header if it does not exist; otherwise
     appends only the data row. Parent directories are created as needed.
     """
-    header = ["Op_Name", "shape", "datatype", "Current Batch GPU",
-              "Base Batch GPU", "ACC verify", "Performance verify"]
+    header = ["Op_Name", "Current Batch GPU", "Base Batch GPU",
+              "ACC verify", "Performance verify"]
     target_dir = os.path.dirname(csv_path)
     if target_dir and not os.path.exists(target_dir):
         os.makedirs(target_dir, exist_ok=True)
@@ -497,8 +448,8 @@ def _append_compare_row(csv_path, op_name, cur_gpu_str, base_gpu_str,
         writer = csv.writer(f)
         if not file_exists:
             writer.writerow(header)
-        writer.writerow([op_name, shape, datatype, cur_gpu_str,
-                         base_gpu_str, acc_status, perf_ratio_str])
+        writer.writerow([op_name, cur_gpu_str, base_gpu_str,
+                         acc_status, perf_ratio_str])
 
 # =============================================================================
 #  Update / Generate / Compare Logic
@@ -515,13 +466,13 @@ def perform_smart_update(temp_csv_path, target_csv_path):
     combined_header = list(old_h)
     for col in new_h:
         if col not in combined_header: combined_header.append(col)
-
+    
     if "op_name" in combined_header:
         combined_header.remove("op_name")
         combined_header.insert(0, "op_name")
 
     history_map = {get_row_key(r, combined_header): idx for idx, r in enumerate(old_r)}
-
+    
     updated_cnt = 0
     kept_cnt = 0
     final_rows = list(old_r)
@@ -529,41 +480,35 @@ def perform_smart_update(temp_csv_path, target_csv_path):
     for new_row in new_r:
         for col in combined_header:
             if col not in new_row: new_row[col] = ""
-
+            
         key = get_row_key(new_row, combined_header)
         match_idx = history_map.get(key, -1)
-
+        
         new_time = get_effective_gpu_time(new_row)
         d_type = new_row.get("dtype", "")
-        shape = new_row.get("Shape", "")
         op_str = get_op_display_name(new_row)
-        label = f"{op_str} [{d_type}] {shape}" if d_type else f"{op_str} {shape}"
+        if d_type: op_str += f" [{d_type}]"
 
         if match_idx >= 0:
             old_row = final_rows[match_idx]
             old_time = get_effective_gpu_time(old_row)
-
+            
             if new_time is not None and old_time is not None and old_time > 0:
                 ratio = (old_time - new_time) / old_time
                 if ratio > 0.05:
                     final_rows[match_idx].update(new_row)
                     updated_cnt += 1
-                    print(f"[UPDATE] {label:<55} | Gain: {ratio*100:>6.2f}%")
+                    print(f"[UPDATE] {op_str:<35} | Gain: {ratio*100:>6.2f}%")
                 else:
                     kept_cnt += 1
                     if ratio >= 0:
-                        print(f"[KEEP]   {label:<55} | Gain: {ratio*100:>6.2f}% (<5%)")
+                        print(f"[KEEP]   {op_str:<35} | Gain: {ratio*100:>6.2f}%")
                     else:
-                        print(f"[KEEP]   {label:<55} | Loss: {ratio*100:>6.2f}%")
+                        print(f"[KEEP]   {op_str:<35} | Loss: {ratio*100:>6.2f}%")
             else:
                 kept_cnt += 1
-                print(f"[KEEP]   {label:<55} | N/A (Invalid Time)")
-        else:
-            # New row not in baseline - append it
-            final_rows.append(new_row)
-            updated_cnt += 1
-            print(f"[NEW]    {label:<55} | Added to baseline")
-
+                print(f"[KEEP]   {op_str:<35} | N/A (Invalid Time)")
+        
     _write_csv(target_csv_path, combined_header, final_rows)
     print("-" * 80 + f"\n[SUMMARY] Updated: {updated_cnt}, Kept: {kept_cnt}\n" + "=" * 80 + "\n")
 
@@ -584,13 +529,13 @@ def perform_generate(temp_csv_path, target_csv_path):
     else:
         for col in new_h:
             if col not in combined_header: combined_header.append(col)
-
+            
     if "op_name" in combined_header:
         combined_header.remove("op_name")
         combined_header.insert(0, "op_name")
 
     history_map = {get_row_key(r, combined_header): idx for idx, r in enumerate(old_r)}
-
+    
     final_rows = list(old_r)
     rows_to_append = []
     append_cnt = 0
@@ -599,10 +544,10 @@ def perform_generate(temp_csv_path, target_csv_path):
     for new_row in new_r:
         for col in combined_header:
             if col not in new_row: new_row[col] = ""
-
+            
         key = get_row_key(new_row, combined_header)
         match_idx = history_map.get(key, -1)
-
+        
         d_type = new_row.get("dtype", "")
         op_str = get_op_display_name(new_row)
         if d_type: op_str += f" [{d_type}]"
@@ -631,9 +576,6 @@ def perform_comparison(cur_raw, hist_raw, output_csv=None):
     row_fmt = "{:<15} | {:<15} | {:<10} | {:<15} | {:<15} | {:<20}"
     dummy_header = list(cur_rows[0].keys())
 
-    # Aggregate per-op results
-    op_results = {}  # op_name -> list of (acc_pass, perf_ratio_pct or None)
-
     for row in cur_rows:
         key = get_row_key(row, dummy_header)
 
@@ -641,7 +583,6 @@ def perform_comparison(cur_raw, hist_raw, output_csv=None):
         cpu = parse_time_val(row.get("CPU Time (sec)", ""))
         op_name = get_op_display_name(row)
         d_type = row.get("dtype", "-")
-
         time_label = "Batch GPU"
         if parse_time_val(row.get("Batch GPU (sec)", "")) is None and \
            parse_time_val(row.get("GPU Time (sec)", "")) is not None:
@@ -664,7 +605,6 @@ def perform_comparison(cur_raw, hist_raw, output_csv=None):
                 matches.append((idx, h_row))
 
         perf_ratio_str = "None"
-        perf_ratio_pct = None
         h_gpu = None
 
         if matches:
@@ -673,8 +613,7 @@ def perform_comparison(cur_raw, hist_raw, output_csv=None):
             h_cpu = parse_time_val(h_row.get("CPU Time (sec)", ""))
 
             if gpu and h_gpu:
-                perf_ratio_pct = h_gpu / gpu * 100
-                perf_ratio_str = f"{perf_ratio_pct:.2f}%"
+                perf_ratio_str = f"{h_gpu/gpu*100:.2f}%"
                 gr = perf_ratio_str
             else:
                 gr = "N/A"
@@ -683,60 +622,20 @@ def perform_comparison(cur_raw, hist_raw, output_csv=None):
             print(row_fmt.format("Base", format_duration(h_gpu), gr, format_duration(h_cpu), cr, ""))
         else:
             print(f"{'Base':<15} | {'N/A':<15} | {'N/A':<10} | {'N/A':<15} | {'N/A':<15} |")
-
         print("Result:")
         print(f"Acc verify:{acc_status}")
         print(f"Performance verify:{perf_ratio_str}")
         print("\n")
 
-        # Track per-op aggregate
-        if op_name not in op_results:
-            op_results[op_name] = []
-        op_results[op_name].append((acc_status == "Pass", perf_ratio_pct))
-
         if output_csv:
             base_gpu_str = format_duration(h_gpu) if matches else "N/A"
-            shape_str = row.get("Shape", "")
             try:
                 _append_compare_row(output_csv, op_name,
                                     format_duration(gpu), base_gpu_str,
-                                    acc_status, perf_ratio_str,
-                                    shape=shape_str, datatype=d_type)
+                                    acc_status, perf_ratio_str)
                 print(f"[OUTPUT] Appended compare result for '{op_name}' -> {output_csv}")
             except Exception as e:
                 print(f"[WARN] Failed to append compare result to '{output_csv}': {e}")
-
-    # Print per-op aggregate summary
-    if len(op_results) > 0:
-        print("\n" + "="*95)
-        print(f"{' Overall Operator Summary ':^95}")
-        print("="*95)
-        for op_name, results in op_results.items():
-            all_acc_pass = all(acc for acc, _ in results)
-            any_acc_fail = any(not acc for acc, _ in results)
-            ratios = [r for _, r in results if r is not None]
-
-            if any_acc_fail:
-                agg_acc = "Fail"
-                avg_perf_str = "None"
-                min_perf_str = "None"
-            else:
-                agg_acc = "Pass"
-                if not ratios:
-                    avg_perf_str = "None"
-                    min_perf_str = "None"
-                else:
-                    avg_ratio = sum(ratios) / len(ratios)
-                    min_ratio = min(ratios)
-                    avg_perf_str = f"{avg_ratio:.2f}%"
-                    min_perf_str = f"{min_ratio:.2f}%"
-
-            print(f"  Op Name: {op_name},")
-            print(f"  Acc verify:{agg_acc},")
-            print(f"  Average Performance Ratio:{avg_perf_str},")
-            print(f"  Mini Performance Ratio:{min_perf_str},")
-            print(f"  Number Configs:{len(results)}")
-        print("="*95 + "\n")
 
 # =============================================================================
 #  Main Execution Block
@@ -748,9 +647,9 @@ if __name__ == "__main__":
     parser.add_argument("--csv", type=str, default=None, help="Path to result CSV")
     parser.add_argument("--output", type=str, default=None,
                         help="CSV file to append --compare results (Op_Name, "
-                             "shape, datatype, Current Batch GPU, Base Batch GPU, "
-                             "ACC verify, Performance verify). File is created "
-                             "with header if absent; rows are appended otherwise. "
+                             "Current Batch GPU, Base Batch GPU, ACC verify, "
+                             "Performance verify). File is created with header "
+                             "if absent; rows are appended otherwise. "
                              "Only effective in --compare mode.")
     
     group = parser.add_mutually_exclusive_group()
@@ -784,17 +683,9 @@ if __name__ == "__main__":
         print(f"[IGNORED] {op_name} is in the ignored list, skipping nvbench run.")
         sys.exit(0)
 
-    # 3. Load Operator (get config + runner class, then expand)
-    canonical_name, runner_cls, base_config = load_operator_runner_components(op_name)
-    expanded_configs = expand_config(base_config)
-
-    if len(expanded_configs) > 1:
-        print(f"\n[MULTI-CONFIG] {len(expanded_configs)} shape/dtype combinations detected")
-        for i, cfg in enumerate(expanded_configs):
-            shape_info = {k: v for k, v in cfg.items() if k not in ("device_id", "device_name", "samples")}
-            print(f"  [{i+1}/{len(expanded_configs)}] {shape_info}")
-        print()
-
+    # 3. Load Operator
+    op_instance = load_operator_runner(op_name)
+    
     # 4. Handle CSV Default Logic
     default_csv_path = "statistics/mcoplib_ops_performance_C500.csv"
     if args.csv is None:
@@ -841,51 +732,39 @@ if __name__ == "__main__":
         if args.compare or args.update:
             check_header, check_rows = load_csv_data(abs_csv_path)
             _, check_clean_rows = preprocess_data(check_header, check_rows)
-
-            target_name = canonical_name
+            
+            target_name = op_instance.name
             op_found = False
-
+            
             for row in check_clean_rows:
                 if row.get("op_name") == target_name:
                     op_found = True
                     break
-
+            
             if not op_found:
                 print("\n" + "-"*80)
                 print(f" [WARN] Operator '{target_name}' not found in baseline CSV.")
                 print(f"        CSV Path: {abs_csv_path}")
                 print(f"        Mode: --{'compare' if args.compare else 'update'}")
                 print("        >> Skipping execution due to missing baseline data.")
-                print("-" * 80 + "\n")
-
+                print("-"*80 + "\n")
+                
                 if args.compare:
                     print("Result:")
                     print("Acc verify:None")
                     print("Performance verify:None")
                     print("\n")
-
-                sys.exit(0)
+                
+                sys.exit(0) 
         # =========================================================================
 
-    # 6. Run benchmarks for each expanded config
-    all_temp_csvs = []
-
-    for cfg_idx, single_config in enumerate(expanded_configs):
-        op_instance = runner_cls(canonical_name, single_config)
-
-        if len(expanded_configs) > 1:
-            shape_info = {k: v for k, v in single_config.items()
-                          if k not in ("device_id", "device_name", "samples")}
-            print(f"\n{'='*60}")
-            print(f"[CONFIG {cfg_idx+1}/{len(expanded_configs)}] {shape_info}")
-            print(f"{'='*60}")
-
-        bench.register(create_benchmark_wrapper(op_instance)).set_name(op_instance.name)
+    # 6. Register Benchmark
+    bench.register(create_benchmark_wrapper(op_instance)).set_name(op_instance.name)
 
     # 7. Prepare Temp File
     need_temp_csv = active_mode
     temp_csv = None
-
+    
     if need_temp_csv:
         try:
             fd, temp_csv = tempfile.mkstemp(suffix=".csv")
@@ -895,13 +774,13 @@ if __name__ == "__main__":
 
     try:
         run_args = [sys.argv[0]]
-
+        
         has_cli_device = any(x.startswith("--device") or x == "-d" for x in unknown)
-
+        
         if has_cli_device:
             print(">> [DEVICE] Source: CLI Argument")
         else:
-            config_device = base_config.get("device_id")
+            config_device = op_instance.config.get("device_id")
             if config_device is not None:
                 run_args.extend(["--device", str(config_device)])
                 print(f">> [DEVICE] Source: Config File (ID: {config_device})")
@@ -909,16 +788,16 @@ if __name__ == "__main__":
                 run_args.extend(["--device", "0"])
                 print(">> [DEVICE] Source: Default (ID: 0)")
 
-        if temp_csv:
+        if temp_csv: 
             run_args.extend(["--csv", temp_csv])
 
         run_args.extend(["--min-time", "1.5"])
         run_args.extend(["--timeout", "600"])
         run_args.extend(["--throttle-threshold", "0"])
         run_args.extend(unknown)
-
+        
         bench.run_all_benchmarks(run_args)
-
+        
     except Exception as e:
         if temp_csv and os.path.exists(temp_csv): os.remove(temp_csv)
         raise e

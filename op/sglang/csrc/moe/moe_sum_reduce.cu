@@ -67,140 +67,6 @@ union alignas(16) BF16Vec8 {
   }
 };
 
-
-template <int WARPS_PER_BLOCK, int TOPK>
-__launch_bounds__(WARPS_PER_BLOCK * 64)
-__global__ void moe_sum_reduce_kernel(
-    const at::BFloat16* __restrict__ x,
-    at::BFloat16* __restrict__ y,
-    const int64_t token_num,
-    const int64_t hidden_dim,
-    const int64_t stride_token,
-    const int64_t stride_topk,
-    const int64_t out_stride_token,
-    const float scale) {
-  // One warp processes one token, 64*8=512 BF16 per iteration
-  const int warp_id = threadIdx.x >> 6;
-  const int lane_id = threadIdx.x & 63;
-  const int64_t t = static_cast<int64_t>(blockIdx.y) * WARPS_PER_BLOCK + warp_id;
-
-  if (t >= token_num) return;
-
-  const int64_t n_chunks = hidden_dim >> 3;
-
-  for (int64_t chunk = static_cast<int64_t>(blockIdx.x) * 64 + lane_id;
-       chunk < n_chunks;
-       chunk += static_cast<int64_t>(gridDim.x) * 64) {
-
-    const int64_t d = chunk << 3;
-    const int64_t base = t * stride_token + d;
-
-    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
-    float a4 = 0.0f, a5 = 0.0f, a6 = 0.0f, a7 = 0.0f;
-
-    #pragma unroll
-    for (int k = 0; k < TOPK; ++k) {
-      const int64_t offset_k = base + static_cast<int64_t>(k) * stride_topk;
-
-      BF16Vec8 v0;
-      v0.load(x + offset_k);
-
-      a0 += __bfloat162float(v0.nv_bf16[0]);
-      a1 += __bfloat162float(v0.nv_bf16[1]);
-      a2 += __bfloat162float(v0.nv_bf16[2]);
-      a3 += __bfloat162float(v0.nv_bf16[3]);
-      a4 += __bfloat162float(v0.nv_bf16[4]);
-      a5 += __bfloat162float(v0.nv_bf16[5]);
-      a6 += __bfloat162float(v0.nv_bf16[6]);
-      a7 += __bfloat162float(v0.nv_bf16[7]);
-    }
-
-    a0 *= scale; a1 *= scale; a2 *= scale; a3 *= scale;
-    a4 *= scale; a5 *= scale; a6 *= scale; a7 *= scale;
-
-    const int64_t dst = t * out_stride_token + d;
-    BF16Vec8 out0;
-
-    out0.nv_bf16[0] = __float2bfloat16_rn(a0);
-    out0.nv_bf16[1] = __float2bfloat16_rn(a1);
-    out0.nv_bf16[2] = __float2bfloat16_rn(a2);
-    out0.nv_bf16[3] = __float2bfloat16_rn(a3);
-    out0.nv_bf16[4] = __float2bfloat16_rn(a4);
-    out0.nv_bf16[5] = __float2bfloat16_rn(a5);
-    out0.nv_bf16[6] = __float2bfloat16_rn(a6);
-    out0.nv_bf16[7] = __float2bfloat16_rn(a7);
-
-    out0.store(y + dst);
-  }
-}
-
-template <int WARPS_PER_BLOCK>
-__launch_bounds__(WARPS_PER_BLOCK * 64)
-__global__ void moe_sum_reduce_dynamic_kernel(
-    const at::BFloat16* __restrict__ x,
-    at::BFloat16* __restrict__ y,
-    const int64_t token_num,
-    const int64_t hidden_dim,
-    const int64_t topk_num,
-    const int64_t stride_token,
-    const int64_t stride_topk,
-    const int64_t out_stride_token,
-    const float scale) {
-  const int warp_id = threadIdx.x / 64;
-  const int lane_id = threadIdx.x % 64;
-  const int64_t t = static_cast<int64_t>(blockIdx.y) * WARPS_PER_BLOCK + warp_id;
-
-  if (t >= token_num) return;
-
-  constexpr int VEC_SIZE = 8;
-  const int64_t n_chunks = hidden_dim / VEC_SIZE;
-
-  for (int64_t chunk = static_cast<int64_t>(blockIdx.x) * 64 + lane_id;
-       chunk < n_chunks;
-       chunk += static_cast<int64_t>(gridDim.x) * 64) {
-
-    const int64_t d = chunk * VEC_SIZE;
-    const int64_t base = t * stride_token + d;
-
-    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
-    float a4 = 0.0f, a5 = 0.0f, a6 = 0.0f, a7 = 0.0f;
-
-    #pragma unroll 4
-    for (int k = 0; k < topk_num; ++k) {
-      const int64_t offset_k = base + static_cast<int64_t>(k) * stride_topk;
-
-      BF16Vec8 v0;
-      v0.load(x + offset_k);
-
-      a0 += __bfloat162float(v0.nv_bf16[0]);
-      a1 += __bfloat162float(v0.nv_bf16[1]);
-      a2 += __bfloat162float(v0.nv_bf16[2]);
-      a3 += __bfloat162float(v0.nv_bf16[3]);
-      a4 += __bfloat162float(v0.nv_bf16[4]);
-      a5 += __bfloat162float(v0.nv_bf16[5]);
-      a6 += __bfloat162float(v0.nv_bf16[6]);
-      a7 += __bfloat162float(v0.nv_bf16[7]);
-    }
-
-    a0 *= scale; a1 *= scale; a2 *= scale; a3 *= scale;
-    a4 *= scale; a5 *= scale; a6 *= scale; a7 *= scale;
-
-    const int64_t dst = t * out_stride_token + d;
-    BF16Vec8 out0;
-
-    out0.nv_bf16[0] = __float2bfloat16_rn(a0);
-    out0.nv_bf16[1] = __float2bfloat16_rn(a1);
-    out0.nv_bf16[2] = __float2bfloat16_rn(a2);
-    out0.nv_bf16[3] = __float2bfloat16_rn(a3);
-    out0.nv_bf16[4] = __float2bfloat16_rn(a4);
-    out0.nv_bf16[5] = __float2bfloat16_rn(a5);
-    out0.nv_bf16[6] = __float2bfloat16_rn(a6);
-    out0.nv_bf16[7] = __float2bfloat16_rn(a7);
-
-    out0.store(y + dst);
-  }
-}
-
 // =============================================================================
 // Optimized Kernel with Vectorized Loads (Compile-time TOPK)
 // =============================================================================
@@ -282,6 +148,111 @@ __global__ void moe_sum_reduce_optimized_kernel(
     a12 *= scale; a13 *= scale; a14 *= scale; a15 *= scale;
 
     // Convert back to BF16 and store
+    const int64_t dst = t * out_stride_token + d;
+    BF16Vec8 out0, out1;
+
+    out0.nv_bf16[0] = __float2bfloat16_rn(a0);
+    out0.nv_bf16[1] = __float2bfloat16_rn(a1);
+    out0.nv_bf16[2] = __float2bfloat16_rn(a2);
+    out0.nv_bf16[3] = __float2bfloat16_rn(a3);
+    out0.nv_bf16[4] = __float2bfloat16_rn(a4);
+    out0.nv_bf16[5] = __float2bfloat16_rn(a5);
+    out0.nv_bf16[6] = __float2bfloat16_rn(a6);
+    out0.nv_bf16[7] = __float2bfloat16_rn(a7);
+
+    out1.nv_bf16[0] = __float2bfloat16_rn(a8);
+    out1.nv_bf16[1] = __float2bfloat16_rn(a9);
+    out1.nv_bf16[2] = __float2bfloat16_rn(a10);
+    out1.nv_bf16[3] = __float2bfloat16_rn(a11);
+    out1.nv_bf16[4] = __float2bfloat16_rn(a12);
+    out1.nv_bf16[5] = __float2bfloat16_rn(a13);
+    out1.nv_bf16[6] = __float2bfloat16_rn(a14);
+    out1.nv_bf16[7] = __float2bfloat16_rn(a15);
+
+    out0.store(y + dst);
+    out1.store(y + dst + 8);
+  }
+}
+
+// =============================================================================
+// Optimized Dynamic TOPK Kernel (runtime topk with manual unrolling)
+// =============================================================================
+
+template <int WARPS_PER_BLOCK>
+__launch_bounds__(WARPS_PER_BLOCK * 32)
+__global__ void moe_sum_reduce_dynamic_kernel(
+    const at::BFloat16* __restrict__ x,
+    at::BFloat16* __restrict__ y,
+    const int64_t token_num,
+    const int64_t hidden_dim,
+    const int64_t topk_num,
+    const int64_t stride_token,
+    const int64_t stride_topk,
+    const int64_t out_stride_token,
+    const float scale) {
+  //
+  // Optimized dynamic kernel with:
+  // 1. Scalar accumulators for better register allocation
+  // 2. Manual loop unrolling hint
+  // 3. Vectorized memory access
+  //
+
+  const int warp_id = threadIdx.x / 32;
+  const int lane_id = threadIdx.x % 32;
+  const int64_t t = static_cast<int64_t>(blockIdx.y) * WARPS_PER_BLOCK + warp_id;
+
+  if (t >= token_num) return;
+
+  constexpr int VEC_SIZE = 16;
+  const int64_t n_chunks = hidden_dim / VEC_SIZE;
+
+  for (int64_t chunk = static_cast<int64_t>(blockIdx.x) * 32 + lane_id;
+       chunk < n_chunks;
+       chunk += static_cast<int64_t>(gridDim.x) * 32) {
+
+    const int64_t d = chunk * VEC_SIZE;
+    const int64_t base = t * stride_token + d;
+
+    // Use scalar accumulators for better performance
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    float a4 = 0.0f, a5 = 0.0f, a6 = 0.0f, a7 = 0.0f;
+    float a8 = 0.0f, a9 = 0.0f, a10 = 0.0f, a11 = 0.0f;
+    float a12 = 0.0f, a13 = 0.0f, a14 = 0.0f, a15 = 0.0f;
+
+    // Runtime topk loop with hint for partial unrolling
+    #pragma unroll 4
+    for (int k = 0; k < topk_num; ++k) {
+      const int64_t offset_k = base + static_cast<int64_t>(k) * stride_topk;
+
+      BF16Vec8 v0, v1;
+      v0.load(x + offset_k);
+      v1.load(x + offset_k + 8);
+
+      a0 += __bfloat162float(v0.nv_bf16[0]);
+      a1 += __bfloat162float(v0.nv_bf16[1]);
+      a2 += __bfloat162float(v0.nv_bf16[2]);
+      a3 += __bfloat162float(v0.nv_bf16[3]);
+      a4 += __bfloat162float(v0.nv_bf16[4]);
+      a5 += __bfloat162float(v0.nv_bf16[5]);
+      a6 += __bfloat162float(v0.nv_bf16[6]);
+      a7 += __bfloat162float(v0.nv_bf16[7]);
+      a8 += __bfloat162float(v1.nv_bf16[0]);
+      a9 += __bfloat162float(v1.nv_bf16[1]);
+      a10 += __bfloat162float(v1.nv_bf16[2]);
+      a11 += __bfloat162float(v1.nv_bf16[3]);
+      a12 += __bfloat162float(v1.nv_bf16[4]);
+      a13 += __bfloat162float(v1.nv_bf16[5]);
+      a14 += __bfloat162float(v1.nv_bf16[6]);
+      a15 += __bfloat162float(v1.nv_bf16[7]);
+    }
+
+    // Apply scale
+    a0 *= scale; a1 *= scale; a2 *= scale; a3 *= scale;
+    a4 *= scale; a5 *= scale; a6 *= scale; a7 *= scale;
+    a8 *= scale; a9 *= scale; a10 *= scale; a11 *= scale;
+    a12 *= scale; a13 *= scale; a14 *= scale; a15 *= scale;
+
+    // Store result
     const int64_t dst = t * out_stride_token + d;
     BF16Vec8 out0, out1;
 
@@ -527,12 +498,12 @@ void moe_sum_reduce(at::Tensor& input, at::Tensor& output, double routed_scaling
     const float scale = static_cast<float>(routed_scaling_factor);
 
     if (token_num > 128) {
-      //optimized: warp=64 threads, 128-bit load per thread
+      // Warp-per-token strategy for large batches
       constexpr int WARPS_PER_BLOCK = 8;
-      constexpr int THREADS = WARPS_PER_BLOCK * 64;
+      constexpr int THREADS = WARPS_PER_BLOCK * 32;
 
-      const int64_t n_chunks = hidden_dim / 8;
-      int64_t grid_x = (n_chunks + 64 - 1) / 64;
+      const int64_t n_chunks = hidden_dim / 16;
+      int64_t grid_x = (n_chunks + 32 - 1) / 32;
       if (grid_x > 65535) grid_x = 65535;
 
       int64_t grid_y = (token_num + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
@@ -541,24 +512,25 @@ void moe_sum_reduce(at::Tensor& input, at::Tensor& output, double routed_scaling
       dim3 block(THREADS);
       dim3 grid(static_cast<unsigned>(grid_x), static_cast<unsigned>(grid_y));
 
-      #define LAUNCH_KERNEL(TOPK) \
-        moe_sum_reduce_kernel<WARPS_PER_BLOCK, TOPK><<<grid, block, 0, stream>>>( \
+      // Dispatch based on topk_num (add support for common values including 9)
+      #define LAUNCH_OPT_KERNEL(TOPK) \
+        moe_sum_reduce_optimized_kernel<WARPS_PER_BLOCK, TOPK><<<grid, block, 0, stream>>>( \
             reinterpret_cast<const at::BFloat16*>(input.data_ptr<at::BFloat16>()), \
             reinterpret_cast<at::BFloat16*>(output.data_ptr<at::BFloat16>()), \
             token_num, hidden_dim, \
             in_stride_token, in_stride_topk, out_stride_token, scale);
 
       switch (topk_num) {
-        case 1:  LAUNCH_KERNEL(1);  break;
-        case 2:  LAUNCH_KERNEL(2);  break;
-        case 3:  LAUNCH_KERNEL(3);  break;
-        case 4:  LAUNCH_KERNEL(4);  break;
-        case 6:  LAUNCH_KERNEL(6);  break;
-        case 8:  LAUNCH_KERNEL(8);  break;
-        case 9:  LAUNCH_KERNEL(9);  break;
-        case 12: LAUNCH_KERNEL(12); break;
-        case 16: LAUNCH_KERNEL(16); break;
-        case 32: LAUNCH_KERNEL(32); break;
+        case 1:  LAUNCH_OPT_KERNEL(1);  break;
+        case 2:  LAUNCH_OPT_KERNEL(2);  break;
+        case 3:  LAUNCH_OPT_KERNEL(3);  break;
+        case 4:  LAUNCH_OPT_KERNEL(4);  break;
+        case 6:  LAUNCH_OPT_KERNEL(6);  break;
+        case 8:  LAUNCH_OPT_KERNEL(8);  break;
+        case 9:  LAUNCH_OPT_KERNEL(9);  break;  // DeepSeek uses topk=9
+        case 12: LAUNCH_OPT_KERNEL(12); break;
+        case 16: LAUNCH_OPT_KERNEL(16); break;
+        case 32: LAUNCH_OPT_KERNEL(32); break;
         default:
           moe_sum_reduce_dynamic_kernel<WARPS_PER_BLOCK><<<grid, block, 0, stream>>>(
               reinterpret_cast<const at::BFloat16*>(input.data_ptr<at::BFloat16>()),
@@ -567,7 +539,7 @@ void moe_sum_reduce(at::Tensor& input, at::Tensor& output, double routed_scaling
               in_stride_token, in_stride_topk, out_stride_token, scale);
           break;
       }
-      #undef LAUNCH_KERNEL
+      #undef LAUNCH_OPT_KERNEL
 
     } else {
       // Small token: block-per-token strategy with vectorized loads

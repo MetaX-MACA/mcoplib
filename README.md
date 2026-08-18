@@ -415,17 +415,17 @@ Traceback (most recent call last):
     2：编译时， 修改/opt/maca/Version.txt 对应的MACA版本
 
 ## Release
-### Release 0.4.10
+### Release 0.4.9
 - add cv op kernel
 - support sglang  0.5.13 op
 - optimize mcoplib project build
 - support mxbench for auto test op kernel `s perfromance
 - support profiler tools check op kernel `s perfromance
-- support for vllm 0.25.0  op kernels
-- support Project-customized op kernels
-- support k-transformer op kernels
+<<<<<<< HEAD
+- support for vllm 0.23.0  op kernels
+=======
+- support for vllm 0.24.0  op kernels
 - support verl op kernels
-- support all of mcopZoo op kernels
 - support auto print and dump op input params by setting env
 - support auto build mxbench running env by shell script
 - support auto test torch/py/c op api by mxbench cmd

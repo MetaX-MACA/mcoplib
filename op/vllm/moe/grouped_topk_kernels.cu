@@ -19,7 +19,6 @@
  */
 #include "moeTopKFuncs.cuh"
 #include <c10/cuda/CUDAStream.h>
-#include <c10/cuda/CUDAGuard.h>
 #include <torch/all.h>
 #include <cmath>
 #include <cuda_fp16.h>
@@ -44,8 +43,6 @@ static constexpr int NumTopGroupScores = 2;
 static constexpr int DefaultMaxNumTopExperts = 8;
 static constexpr int MaxSupportedTopExperts = 22;
 static constexpr int MaxNumTopGroups = 4;
-// The empirical value for small batch
-static constexpr int PDLEnableTokens = 16;
 
 namespace warp_topk {
 
@@ -956,7 +953,7 @@ void invokeNoAuxTc(T* scores, float* topk_values, IdxT* topk_indices,
                    int64_t const num_experts, int64_t const n_group,
                    int64_t const topk_group, int64_t const topk,
                    bool const renormalize, double const routed_scaling_factor,
-                   const bool enable_pdl = false, cudaStream_t const stream = 0) {
+                   bool enable_pdl = false, cudaStream_t const stream = 0) {
   cudaLaunchConfig_t config;
   config.stream = stream;
   cudaLaunchAttribute attrs[1];
@@ -1051,7 +1048,7 @@ void invokeNoAuxTc(T* scores, float* topk_values, IdxT* topk_indices,
       int64_t const num_tokens, int64_t const num_experts,                   \
       int64_t const n_group, int64_t const topk_group, int64_t const topk,   \
       bool const renormalize, double const routed_scaling_factor,            \
-      const bool enable_pdl, cudaStream_t const stream);
+      bool enable_pdl, cudaStream_t const stream);
 
 INSTANTIATE_NOAUX_TC(float, float, int32_t, SCORING_SIGMOID);
 INSTANTIATE_NOAUX_TC(float, half, int32_t, SCORING_SIGMOID);
@@ -1105,10 +1102,6 @@ std::tuple<torch::Tensor, torch::Tensor> grouped_topk(
   torch::Tensor topk_indices = torch::empty(
       {num_tokens, topk}, torch::dtype(torch::kInt32).device(torch::kCUDA));
 
-  const bool pdl_flag = num_tokens <= vllm::moe::PDLEnableTokens;
-
-  at::cuda::OptionalCUDAGuard const device_guard(scores.device());
-
   auto stream = c10::cuda::getCurrentCUDAStream(scores.get_device());
   auto const sf = static_cast<vllm::moe::ScoringFunc>(scoring_func);
 
@@ -1122,7 +1115,7 @@ std::tuple<torch::Tensor, torch::Tensor> grouped_topk(
             reinterpret_cast<IdxT*>(topk_indices.mutable_data_ptr()),         \
             reinterpret_cast<BiasT const*>(bias.data_ptr()), num_tokens,      \
             num_experts, n_group, topk_group, topk, renormalize,              \
-            routed_scaling_factor, pdl_flag, stream);                            \
+            routed_scaling_factor, false, stream);                            \
         break;                                                                \
       case vllm::moe::SCORING_SIGMOID:                                        \
         vllm::moe::invokeNoAuxTc<T, BiasT, IdxT, vllm::moe::SCORING_SIGMOID>( \
@@ -1131,7 +1124,7 @@ std::tuple<torch::Tensor, torch::Tensor> grouped_topk(
             reinterpret_cast<IdxT*>(topk_indices.mutable_data_ptr()),         \
             reinterpret_cast<BiasT const*>(bias.data_ptr()), num_tokens,      \
             num_experts, n_group, topk_group, topk, renormalize,              \
-            routed_scaling_factor, pdl_flag, stream);                            \
+            routed_scaling_factor, false, stream);                            \
         break;                                                                \
       default:                                                                \
         throw std::invalid_argument("Unsupported scoring_func");              \

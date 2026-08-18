@@ -1,10 +1,10 @@
 {
     "device_id": 0,
     "device_name": "MetaX C500",
-    "num_tokens": [4096, 65536, 1048576],
-    "top_k": [2, 4],
-    "num_experts": [8, 64, 256],
-    "block_size": [64],
+    "num_tokens": 1048576,
+    "top_k": 2,
+    "num_experts": 256,
+    "block_size": 64,
     "dtype": "int32",
     "samples": 1000
 }

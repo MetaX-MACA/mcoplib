@@ -1,12 +1,12 @@
 {
     "device_id": 0,
     "device_name": "MetaX C500",
-    "M": [1, 16, 128, 2048],
-    "N": [4096, 8192],
-    "K": [4096, 8192],
-    "group_size": [128],
-    "split_k_iters": [1],
-    "pack_factor": [8],
-    "dtype": ["float16"],
+    "M": 2048,
+    "N": 4096,
+    "K": 4096,
+    "group_size": 128,
+    "split_k_iters": 1,
+    "pack_factor": 8,
+    "dtype": "float16",
     "samples": 1000
 }

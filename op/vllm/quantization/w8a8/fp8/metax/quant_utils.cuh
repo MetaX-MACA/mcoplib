@@ -66,6 +66,5 @@ __inline__ __device__ Tout scaled_convert(const Tin& x, const float scale) {
     } else {                                                                   \
       STD_TORCH_CHECK(false, "Unsupported data type of kv cache: ", KV_DTYPE); \
     }
-
 }  // namespace fp8
 }  // namespace vllm

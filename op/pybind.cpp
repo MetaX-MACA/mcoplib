@@ -75,14 +75,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("swiglu_limit") = 0.0f,
         py::arg("weight") = py::none()
         );
-    m.def(
-        "silu_mul_mask",
-        &silu_mul_mask_interface,
-        py::arg("out"),
-        py::arg("input"),
-        py::arg("mask"),
-        py::arg("swiglu_limit") = 0.0f
-    );
     m.def("fused_silu_mul_dq_mask_fp8_quant", &fused_silu_mul_dq_mask_quant_fp8_pack);
     m.def("fused_silu_mul_dq_reorder_quant", &fused_silu_mul_dq_quant_reordered_topk_interface);
     m.def("fused_silu_mul_dq_quant", &fused_silu_mul_dq_quant_interface);

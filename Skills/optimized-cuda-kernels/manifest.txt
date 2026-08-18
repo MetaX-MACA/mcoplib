@@ -1,0 +1,3 @@
+# Files for kernels skills add
+SKILL.md
+references/c500-optimization-guide.md

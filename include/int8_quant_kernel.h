@@ -25,10 +25,3 @@ void fused_silu_mul_dq_quant_interface(
     torch::Tensor& out,
     torch::Tensor& scale,   
     torch::Tensor const& input);
-
-void silu_mul_mask_interface(
-    at::Tensor& out,
-    at::Tensor const& input,
-    at::Tensor const& mask,
-    c10::optional<double> _swiglu_limit
-);

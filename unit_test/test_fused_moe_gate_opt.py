@@ -26,7 +26,6 @@ def set_seed(seed=42):
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)   # 多GPU
 
-
 def cosine_similarity(a, b):
     """
     计算两个tensor的余弦相似度
@@ -189,7 +188,6 @@ class TestMoeGate(unittest.TestCase):
 
     def test_moe_gate_256_experts_float16_t_1(self):
         moe_gate_func(q_len=6, num_experts=256, topk=8, num_expert_group=1, top_k_group=1, renormalize=True, num_shared_experts=0, test_dtype=torch.bfloat16, scale_factor=2.5,test_name="test_moe_gate_256_experts_float16_t_1")
-
 
     def test_moe_gate_288_experts_float32_t_0(self):
         moe_gate_func(q_len=32, num_experts=288, topk=8, num_expert_group=1, top_k_group=1, renormalize=True, num_shared_experts=0, test_dtype=torch.float32, scale_factor=1.0,test_name="test_moe_gate_288_experts_float32_t_0")
