@@ -16,7 +16,16 @@ def _is_profiler_enabled() -> bool:
 
 
 def _timestamp() -> str:
-    return datetime.now().strftime("%Y%m%dT%H%M%S")
+    return datetime.now().strftime("%Y%m%dT%H%M%S%f")
+
+
+def _trace_file_path(output_dir, func_name, rank):
+    safe_name = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in func_name)[:128]
+    filename = (
+        f"{safe_name}_trace_rank_{rank}_"
+        f"{_timestamp()}_pid_{os.getpid()}_tid_{threading.get_ident()}.json"
+    )
+    return os.path.join(output_dir, filename)
 
 
 def _track_handler(prof, output_dir, func_name):
@@ -48,8 +57,8 @@ def _track_handler(prof, output_dir, func_name):
             # If distributed environment is not initialized, use default value 0
             rank = 0
 
-        # Export trace to local directory
-        trace_path = os.path.join(output_dir, f"{func_name}_trace_rank_{rank}.json")
+        # Export trace to a unique file so repeated benchmark runs do not overwrite evidence.
+        trace_path = _trace_file_path(output_dir, func_name, rank)
         prof.export_chrome_trace(trace_path)
         print(f"Chrome trace exported to: {trace_path}")
 
