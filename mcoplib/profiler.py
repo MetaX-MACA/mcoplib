@@ -19,6 +19,16 @@ def _timestamp() -> str:
     return datetime.now().strftime("%Y%m%dT%H%M%S")
 
 
+def _normalize_profile_count(name, value, minimum):
+    try:
+        count = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be an integer, got {value!r}") from exc
+    if count < minimum:
+        raise ValueError(f"{name} must be >= {minimum}, got {count}")
+    return count
+
+
 def _track_handler(prof, output_dir, func_name):
     """
     Track handler implementation that matches test.py track_handler format.
@@ -81,6 +91,9 @@ def profiler(
       warmup: number of warmup calls (not profiled)
       repeat: number of times to call function inside a profiler run
     """
+    warmup_count = _normalize_profile_count("warmup", warmup, 0)
+    repeat_count = _normalize_profile_count("repeat", repeat, 1)
+
     def decorator(func):
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
@@ -98,7 +111,7 @@ def profiler(
 
             # Warm-up (no profiling) to stabilize JIT / caches
             try:
-                for _ in range(max(0, int(warmup))):
+                for _ in range(warmup_count):
                     func(*args, **kwargs)
             except Exception:
                 # keep raising actual function exceptions
@@ -116,9 +129,9 @@ def profiler(
                         activities=activities,
                         schedule=torch.profiler.schedule(
                             wait=0,
-                            warmup=warmup,
+                            warmup=0,
                             active=1,
-                            repeat=repeat
+                            repeat=repeat_count
                         ),
                         on_trace_ready=lambda prof: _track_handler(prof, output_dir, func.__name__),
                         with_modules=True,
@@ -128,7 +141,7 @@ def profiler(
 
                         # Run the function the specified number of times
                         result = None
-                        for _ in range(max(1, int(repeat))):
+                        for _ in range(repeat_count):
                             result = func(*args, **kwargs)
                             prof.step()  # Step the profiler
 
