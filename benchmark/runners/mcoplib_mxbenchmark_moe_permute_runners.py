@@ -26,7 +26,7 @@ class Moe_permute_runner(OpBenchmarkBase):
 
         state.add_summary(
             "Shape",
-            f"({self.num_tokens} {self.top_k} {self.hidden_size})"
+            f"({self.num_tokens},{self.top_k},{self.hidden_size})"
         )
 
         elements = self.num_tokens * self.top_k * self.hidden_size

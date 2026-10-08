@@ -126,55 +126,5 @@ def test_topk_transform_v1(bs: int, seq_len: int) -> None:
     #     assert bw >= 800.0, f"bandwidth {bw:.1f} GB/s below target 800 GB/s (bs={bs}, seq={seq_len})"
 
 
-@pytest.mark.parametrize("seq_len", [4096, 20000], ids=["histogram", "radix"])
-@torch.inference_mode()
-def test_topk_transform_v1_cuda_graph_replay(seq_len: int) -> None:
-    """Captured execution must replay correctly with changed score contents."""
-    bs = 2
-    score = torch.randn(bs, seq_len, dtype=torch.float32, device="cuda")
-    seq_lens = torch.full((bs,), seq_len, dtype=torch.int32, device="cuda")
-    page_table = torch.arange(TABLE_LEN, dtype=torch.int32, device="cuda")
-    page_table = page_table.unsqueeze(0).expand(bs, -1).contiguous()
-    page_indices = torch.empty((bs, TOPK), dtype=torch.int32, device="cuda")
-    raw_indices = torch.empty_like(page_indices)
-
-    def launch() -> None:
-        torch.ops.sgl_kernel.topk_transform_v1.default(
-            score, seq_lens, page_indices, page_table, PAGE_SIZE, raw_indices
-        )
-
-    # Initialize one-time function attributes before capture.
-    launch()
-    torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    try:
-        with torch.cuda.graph(graph):
-            launch()
-    except Exception as exc:
-        pytest.fail(
-            f"topk_transform_v1 graph capture failed for {seq_len=}: "
-            f"{type(exc).__name__}: {exc}"
-        )
-
-    for seed in (101, 202):
-        generator = torch.Generator(device="cuda").manual_seed(seed)
-        score.copy_(torch.randn(score.shape, generator=generator, device="cuda"))
-        graph.replay()
-        # Keep raw indices in their original (unsorted) order for the page
-        # mapping check. Only sort copies for the unordered Top-K comparison.
-        graph_raw = raw_indices.clone()
-        graph_raw_sorted = torch.sort(graph_raw, dim=-1).values
-        graph_page = page_indices.clone()
-
-        launch()
-        torch.cuda.synchronize()
-        eager_raw = torch.sort(raw_indices, dim=-1).values
-        assert_equal(score, eager_raw, graph_raw_sorted, bs, TOPK, seq_len)
-        expected_page = _ref_page_to_indices(graph_raw, page_table, PAGE_SIZE)
-        assert torch.equal(expected_page, graph_page), (
-            f"graph page transform mismatch for {seq_len=}, {seed=}"
-        )
-
-
 if __name__ == "__main__":
     pytest.main(["-s", "-v", __file__])

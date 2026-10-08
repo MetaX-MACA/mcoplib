@@ -1,7 +1,6 @@
 #pragma once
 
 #include <optional>
-#include <tuple>
 #include <torch/library.h>
 
 #include "core/scalar_type.hpp"
@@ -61,12 +60,13 @@ void merge_attn_states(
     const std::optional<torch::Tensor>& output_scale = std::nullopt);
 
 void rms_norm(torch::Tensor& out, torch::Tensor& input,
-              std::optional<torch::Tensor> weight, double epsilon,
-              bool zero_centered = false);
+              std::optional<torch::Tensor> weight, double epsilon);
+
 void fused_add_rms_norm(torch::Tensor& input,     // [..., hidden_size]
                         torch::Tensor& residual,  // [..., hidden_size]
                         std::optional<torch::Tensor> weight,
-                        double epsilon, bool zero_centered = false);
+                        double epsilon);
+
 //Todo：fused_qk_norm_rope算子新增参数，部分依赖（async_util.cuh），先保持原样
 // void fused_qk_norm_rope(torch::Tensor& qkv, int64_t num_heads_q,
 //                         int64_t num_heads_k, int64_t num_heads_v,
@@ -80,47 +80,12 @@ void fused_qk_norm_rope(torch::Tensor& qkv, int64_t num_heads_q,
                         int64_t head_dim, double eps, torch::Tensor& q_weight,
                         torch::Tensor& k_weight, torch::Tensor& cos_sin_cache,
                         bool is_neox, torch::Tensor& position_ids);
-
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
-step5_fused_qk_norm_rope(
-    const torch::Tensor& qkv, const torch::Tensor& q_weight,
-    const torch::Tensor& k_weight, const torch::Tensor& cos,
-    const torch::Tensor& sin, const torch::Tensor& positions,
-    int64_t num_q_heads, int64_t num_kv_heads, int64_t head_dim,
-    int64_t rotary_pairs, double eps, double norm_weight_bias,
-    const std::optional<torch::Tensor>& q_out,
-    const std::optional<torch::Tensor>& k_out,
-    const std::optional<torch::Tensor>& v_out);
-                        
-torch::stable::Tensor fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
-    torch::stable::Tensor const& q_in, torch::stable::Tensor const& kv,
-    torch::stable::Tensor& k_cache, torch::stable::Tensor const& slot_mapping,
-    torch::stable::Tensor const& position_ids,
-    torch::stable::Tensor const& cos_sin_cache, int64_t q_head_padded,
-    double eps, int64_t cache_block_size, bool apply_q_norm);
-
-void fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_out(
-    torch::Tensor const& q_in, torch::Tensor const& kv,
-    torch::Tensor& q_out, torch::Tensor& k_cache,
-    torch::Tensor const& slot_mapping,
-    torch::Tensor const& position_ids,
-    torch::Tensor const& cos_sin_cache, int64_t q_head_padded,
-    double eps, int64_t cache_block_size);
-
-// Metax-added: same as above, but the KV NoPE plane is quantized with plain
-// symmetric int8 (absmax/127, fp32 per-tile scale) instead of UE8M0 FP8, for
-// the SWA int8 cache path.
-torch::Tensor fused_deepseek_v4_qnorm_rope_kv_rope_int8_insert(
+//Todo：该算子后续替换成int8量化
+torch::Tensor fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
     torch::Tensor const& q_in, torch::Tensor const& kv, torch::Tensor& k_cache,
     torch::Tensor const& slot_mapping, torch::Tensor const& position_ids,
     torch::Tensor const& cos_sin_cache, int64_t q_head_padded, double eps,
     int64_t cache_block_size);
-
-torch::Tensor fused_deepseek_v41_qnorm_rope_kv_rope_int8_insert(
-    const torch::Tensor& q_in, const torch::Tensor& kv, torch::Tensor& k_cache,
-    const torch::Tensor& slot_mapping, const torch::Tensor& position_ids,
-    const torch::Tensor& cos_sin_cache, int64_t q_head_padded, double eps,
-    int64_t cache_block_size,  bool apply_q_norm);
 
 void fused_deepseek_v4_qnorm_rope_kv_rope_insert(
     torch::Tensor& q, torch::Tensor const& kv, torch::Tensor& k_cache,
@@ -128,21 +93,21 @@ void fused_deepseek_v4_qnorm_rope_kv_rope_insert(
     torch::Tensor const& cos_sin_cache, double eps, int64_t cache_block_size);
 
 void fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert(
-    torch::stable::Tensor& q, torch::stable::Tensor const& kv,
-    torch::stable::Tensor& k_cache, torch::stable::Tensor const& slot_mapping,
-    torch::stable::Tensor const& position_ids,
-    torch::stable::Tensor const& cos_sin_cache, double eps,
-    int64_t cache_block_size, bool apply_q_norm);
+    torch::Tensor& q, torch::Tensor const& kv,
+    torch::Tensor& k_cache, torch::Tensor const& slot_mapping,
+    torch::Tensor const& position_ids,
+    torch::Tensor const& cos_sin_cache, double eps,
+    int64_t cache_block_size);
 
 void fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert(
-    torch::stable::Tensor const& q, torch::stable::Tensor const& kv,
-    torch::stable::Tensor& q_fp8, torch::stable::Tensor& k_cache,
-    torch::stable::Tensor const& slot_mapping,
-    torch::stable::Tensor const& position_ids,
-    torch::stable::Tensor const& cos_sin_cache,
-    torch::stable::Tensor const& fp8_scale,
-    torch::stable::Tensor const& q_fp8_scale_inv, double eps,
-    int64_t cache_block_size, bool apply_q_norm);
+    torch::Tensor const& q, torch::Tensor const& kv,
+    torch::Tensor& q_fp8, torch::Tensor& k_cache,
+    torch::Tensor const& slot_mapping,
+    torch::Tensor const& position_ids,
+    torch::Tensor const& cos_sin_cache,
+    torch::Tensor const& fp8_scale,
+    torch::Tensor const& q_fp8_scale_inv, double eps,
+    int64_t cache_block_size);
     
 void apply_repetition_penalties_(torch::Tensor& logits,
                                  const torch::Tensor& prompt_mask,
@@ -164,9 +129,6 @@ void top_k_per_row_decode(const torch::Tensor& logits, int64_t next_n,
 void persistent_topk(const torch::Tensor& logits, const torch::Tensor& lengths,
                      torch::Tensor& output, torch::Tensor& workspace, int64_t k,
                      int64_t max_seq_len);
-
-torch::Tensor region_topk_ids(const torch::Tensor& logits,
-                              const torch::Tensor& lengths, int64_t topk);
 
 void stable_topk_gathered(torch::Tensor gathered, torch::Tensor out,
                           int64_t topk);
@@ -207,16 +169,6 @@ void silu_and_mul_per_block_quant(torch::Tensor& out,
                                   torch::Tensor& scales, int64_t group_size,
                                   std::optional<torch::Tensor> scale_ub,
                                   bool is_scale_transposed);
-// SwiGLU-step + per-group quant:
-//   result = min(SiLU_alpha(gate), limit) * (clamp(up, -limit, limit) + beta)
-// with SiLU_alpha(x) = x * sigmoid(alpha * x). Supports FP8-e4m3fn and INT8
-// output; group_size 64/128; scales [M, ceil(H/gs)] or transposed [G, M].
-void swiglu_step_and_mul_per_block_quant(
-    torch::Tensor& out, torch::Tensor const& input, double limit,
-    torch::Tensor& scales, int64_t group_size,
-    std::optional<torch::Tensor> scale_ub, bool is_scale_transposed,
-    double alpha = 1.0, double beta = 0.0);
-    
 
 void rotary_embedding(torch::Tensor& positions, torch::Tensor& query,
                       std::optional<torch::Tensor> key, int64_t head_size,
@@ -360,25 +312,25 @@ void dynamic_per_token_scaled_fp8_quant(
     torch::Tensor& out, torch::Tensor const& input, torch::Tensor& scale,
     std::optional<torch::Tensor> const& scale_ub);
 
-void per_token_group_quant_fp8(const torch::stable::Tensor& input,
-                               torch::stable::Tensor& output_q,
-                               torch::stable::Tensor& output_s,
-                               int64_t group_size, double eps, double fp8_min,
-                               double fp8_max, bool scale_ue8m0,
-                               bool dummy_is_scale_transposed,
-                               bool dummy_is_tma_aligned);
+void per_token_group_quant_fp8(
+    torch::Tensor const& input, torch::Tensor& output_q,
+    torch::Tensor& output_s, int64_t group_size, double eps, double fp8_min,
+    double fp8_max, bool scale_ue8m0,
+    bool dummy_is_scale_transposed = false,
+    bool dummy_is_tma_aligned = false);
 
 // Fused activation quantisation + DeepGEMM-compatible UE8M0-packed scales.
-void per_token_group_quant_8bit_packed(const torch::stable::Tensor& input,
-                                       torch::stable::Tensor& output_q,
-                                       torch::stable::Tensor& output_s_packed,
+void per_token_group_quant_8bit_packed(const torch::Tensor& input,
+                                       torch::Tensor& output_q,
+                                       torch::Tensor& output_s_packed,
                                        int64_t group_size, double eps,
                                        double min_8bit, double max_8bit);
-void per_token_group_quant_int8(const torch::stable::Tensor& input,
-                                torch::stable::Tensor& output_q,
-                                torch::stable::Tensor& output_s,
+
+void per_token_group_quant_int8(const torch::Tensor& input,
+                                torch::Tensor& output_q,
+                                torch::Tensor& output_s,
                                 int64_t group_size, double eps, double int8_min,
-                                double int8_max);
+                                double int8_max);   
 
 void selective_scan_fwd(const torch::Tensor& u, const torch::Tensor& delta,
                         const torch::Tensor& A, const torch::Tensor& B,
@@ -433,8 +385,7 @@ void fused_minimax_m3_qknorm_rope_kv_insert(
     std::optional<torch::stable::Tensor> index_cache, int64_t block_size,
     std::optional<torch::stable::Tensor> q_out,
     std::optional<torch::stable::Tensor> index_q_out,
-    const std::string& kv_cache_dtype, bool skip_index_branch,
-    std::optional<torch::stable::Tensor> q_fp8_out, double q_fp8_scale);
+    const std::string& kv_cache_dtype, bool skip_index_branch);
 
 void fused_kimi_k3_mla_key_concat_kv_cache_insert(
     torch::Tensor& q, torch::Tensor const& k_nope,
@@ -451,16 +402,6 @@ void fused_kimi_k3_mla_key_concat_ds_mla_insert(
     torch::Tensor const& slot_mapping, int64_t cache_block_size,
     std::optional<torch::Tensor> position_ids,
     std::optional<torch::Tensor> cos_sin_cache);
-
-void fused_kimi_k3_mla_kv_concat(torch::Tensor const& k_nope,
-                                 torch::Tensor const& k_pe,
-                                 torch::Tensor& k_out);
-
-void fused_kimi_k3_mla_kv_concat_quant_fp8(torch::Tensor const& k_nope,
-                                           torch::Tensor const& k_pe,
-                                           torch::Tensor const& v,
-                                           torch::Tensor& k_fp8,
-                                           torch::Tensor& v_fp8);
 
 void fused_kimi_k3_mla_qkv_quant_kv_cache_fp8_insert(
     torch::Tensor const& q, torch::Tensor const& k_nope,
@@ -512,18 +453,6 @@ void fused_kda_decode(
     torch::Tensor& out, std::optional<double> lower_bound,
     std::optional<torch::Tensor> output_gate,
     std::optional<torch::Tensor> norm_weight, double norm_eps);
-
-void fused_gdn_decode_post_conv_mtp(
-    torch::Tensor const& mixed_qkv, torch::Tensor const& a,
-    torch::Tensor const& b, torch::Tensor const& a_log,
-    torch::Tensor const& dt_bias,
-    torch::Tensor const& state_indices,
-    torch::Tensor const& cu_seqlens,
-    torch::Tensor const& num_accepted_tokens,
-    torch::Tensor& state, torch::Tensor const& output_gate,
-    torch::Tensor const& norm_weight, torch::Tensor& out,
-    double scale, double norm_eps);
-
 #endif
 
 #ifdef VLLM_ENABLE_KIMI_K3_ATTN_RES

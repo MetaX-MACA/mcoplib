@@ -507,18 +507,10 @@ __device__ inline float sigmoid_accurate(float x) {
   return 0.5f * tanhf(0.5f * x) + 0.5f;
 }
 
-// Fast sigmoid via hardware exp2 + hardware reciprocal:
-// __expf maps to MUFU.EX2 (1 mul + 1 ex2); __frcp_rn maps to MUFU.RCP.
-// The plain `1.0f / y` compiles to a slow IEEE fdiv (this target is built
-// without --use_fast_math), so use the explicit fast-reciprocal intrinsic.
-__device__ inline float sigmoid_fast(float x) {
-  return __frcp_rn(1.0f + __expf(-x));
-}
-
 template <typename T>
 __device__ inline T apply_sigmoid(T val) {
   float f = cuda_cast<float, T>(val);
-  return cuda_cast<T, float>(sigmoid_fast(f));
+  return cuda_cast<T, float>(sigmoid_accurate(f));
 }
 
 template <ScoringFunc SF, typename T>
@@ -958,6 +950,8 @@ __global__ void grouped_topk_fused_small_expert_count_kernel(
 #endif
 }
 
+// Adapted from
+// https://github.com/flashinfer-ai/flashinfer/blob/06400d062a2d51564bbe781f6f811d0b75ca593e/include/flashinfer/trtllm/fused_moe/RoutingKernelTopK.cuh
 namespace single_group_topk {
 namespace detail {
 
@@ -1158,8 +1152,8 @@ __global__ void __launch_bounds__(BlockDim)
 
     float top_scores[MaxNumTopExperts];
     int32_t top_experts[MaxNumTopExperts];
-    reduce_topk::warpTopKBitonic<NumChunks, MaxNumTopExperts>(
-        local_scores, local_indices, top_scores, top_experts, InvalidScore);
+    reduce_topk::reduceTopK(warp, top_scores, top_experts, local_scores,
+                            local_indices, InvalidScore, topk_i32);
     float const lane_score = lane < topk_i32 ? top_scores[lane] : InvalidScore;
     int32_t const lane_expert = lane < topk_i32 ? top_experts[lane] : -1;
     float const lane_unbiased =
@@ -1262,8 +1256,8 @@ __global__ void __launch_bounds__(WarpTopKLaunchConfig<MaxNumExperts>::BlockDim)
     } else {
       float top_scores[MaxNumTopExperts];
       int32_t top_experts[MaxNumTopExperts];
-      reduce_topk::warpTopKBitonic<NumChunks, MaxNumTopExperts>(
-          local_scores, local_indices, top_scores, top_experts, InvalidScore);
+      reduce_topk::reduceTopK(warp, top_scores, top_experts, local_scores,
+                              local_indices, InvalidScore, topk_i32);
       lane_score = lane < topk_i32 ? top_scores[lane] : InvalidScore;
       lane_expert = lane < topk_i32 ? top_experts[lane] : -1;
     }
@@ -1317,54 +1311,48 @@ void launch(T* scores, float* topk_values, IdxT* topk_indices,
   if (use_block_kernel) {
     config.gridDim = static_cast<uint32_t>(num_tokens);
     config.blockDim = BlockDim;
-    // MACA: cudaLaunchKernelEx is not traced/launched reliably; use the
-    // standard <<<>>> launch syntax like the fused-kernel path below.
-    single_group_topk_block_kernel<T, BiasT, IdxT, SF, MaxNumExperts,
-                                   MaxNumTopExperts>
-        <<<config.gridDim, config.blockDim, config.dynamicSmemBytes,
-           config.stream>>>(
-            scores, topk_values, topk_indices, bias, num_experts, topk,
-            renormalize, static_cast<float>(routed_scaling_factor), enable_pdl);
+    cudaLaunchKernelEx(
+        &config,
+        &single_group_topk_block_kernel<T, BiasT, IdxT, SF, MaxNumExperts,
+                                        MaxNumTopExperts>,
+        scores, topk_values, topk_indices, bias, num_experts, topk, renormalize,
+        static_cast<float>(routed_scaling_factor), enable_pdl);
   } else {
     using WarpConfig = WarpTopKLaunchConfig<MaxNumExperts>;
     config.gridDim = WarpConfig::grid_dim(num_tokens);
     config.blockDim = WarpConfig::BlockDim;
-    single_group_topk_warp_kernel<T, BiasT, IdxT, SF, MaxNumExperts,
-                                  MaxNumTopExperts>
-        <<<config.gridDim, config.blockDim, config.dynamicSmemBytes,
-           config.stream>>>(
-            scores, topk_values, topk_indices, bias, num_tokens, num_experts,
-            topk, renormalize, static_cast<float>(routed_scaling_factor),
-            enable_pdl);
+    cudaLaunchKernelEx(
+        &config,
+        &single_group_topk_warp_kernel<T, BiasT, IdxT, SF, MaxNumExperts,
+                                       MaxNumTopExperts>,
+        scores, topk_values, topk_indices, bias, num_tokens, num_experts, topk,
+        renormalize, static_cast<float>(routed_scaling_factor), enable_pdl);
   }
 }
 
-template <typename T, typename BiasT, typename IdxT, ScoringFunc SF,
-          typename Tier>
-bool dispatch_tier(T* scores, float* topk_values, IdxT* topk_indices,
-                   BiasT const* bias, int64_t num_tokens, int64_t num_experts,
-                   int64_t topk, bool renormalize, double routed_scaling_factor,
-                   bool enable_pdl, cudaLaunchConfig_t& config) {
-  if (num_experts <= Tier::kExperts && topk <= Tier::kTopK) {
-    launch<T, BiasT, IdxT, SF, Tier::kExperts, Tier::kTopK>(
-        scores, topk_values, topk_indices, bias, num_tokens, num_experts, topk,
-        renormalize, routed_scaling_factor, enable_pdl, config);
-    return true;
-  }
+template <typename T, typename BiasT, typename IdxT, ScoringFunc SF>
+bool dispatch(TierList<>*, T*, float*, IdxT*, BiasT const*, int64_t, int64_t,
+              int64_t, bool, double, bool, cudaLaunchConfig_t&) {
   return false;
 }
 
 template <typename T, typename BiasT, typename IdxT, ScoringFunc SF,
-          typename... Tiers>
-bool dispatch(TierList<Tiers...>*, T* scores, float* topk_values,
+          typename First, typename... Rest>
+bool dispatch(TierList<First, Rest...>*, T* scores, float* topk_values,
               IdxT* topk_indices, BiasT const* bias, int64_t num_tokens,
               int64_t num_experts, int64_t topk, bool renormalize,
               double routed_scaling_factor, bool enable_pdl,
               cudaLaunchConfig_t& config) {
-  return (dispatch_tier<T, BiasT, IdxT, SF, Tiers>(
-              scores, topk_values, topk_indices, bias, num_tokens, num_experts,
-              topk, renormalize, routed_scaling_factor, enable_pdl, config) ||
-          ...);
+  if (num_experts <= First::kExperts && topk <= First::kTopK) {
+    launch<T, BiasT, IdxT, SF, First::kExperts, First::kTopK>(
+        scores, topk_values, topk_indices, bias, num_tokens, num_experts, topk,
+        renormalize, routed_scaling_factor, enable_pdl, config);
+    return true;
+  }
+  return dispatch<T, BiasT, IdxT, SF>(
+      static_cast<TierList<Rest...>*>(nullptr), scores, topk_values,
+      topk_indices, bias, num_tokens, num_experts, topk, renormalize,
+      routed_scaling_factor, enable_pdl, config);
 }
 
 }  // namespace detail

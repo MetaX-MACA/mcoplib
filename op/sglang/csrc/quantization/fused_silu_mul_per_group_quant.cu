@@ -135,22 +135,17 @@ __device__ __forceinline__ float silu_mul_value(
     const T* __restrict__ up,
     int64_t idx,
     float swiglu_limit) {
-  float gate_v = static_cast<float>(gate[idx]);
-  float up_v = static_cast<float>(up[idx]);
-  
-  if constexpr(kHasLimit) {
-    gate_v = fminf(gate_v, swiglu_limit);
-    up_v = fmaxf(-swiglu_limit, fminf(up_v, swiglu_limit));
-  }
+  const float gate_v = static_cast<float>(gate[idx]);
+  const float up_v = static_cast<float>(up[idx]);
 
   const float silu =
       gate_v * __builtin_mxc_rcpf(1.0f + __builtin_expf(-gate_v));
 
   float v = silu * up_v;
 
-  // if constexpr (kHasLimit) {
-  //   v = fmaxf(-swiglu_limit, fminf(v, swiglu_limit));
-  // }
+  if constexpr (kHasLimit) {
+    v = fmaxf(-swiglu_limit, fminf(v, swiglu_limit));
+  }
 
   return v;
 }
@@ -228,7 +223,7 @@ __global__ void fused_silu_mul_per_group_quant_default_kernel(
   }
 
   const float qmax = quant_qmax<quant_t>();
-  const float absmax = fmaxf(smem[0], 1e-10f);
+  const float absmax = fmaxf(smem[0], quant_min_absmax<quant_t>());
   const float scale = absmax / qmax;
   const float inv_scale = qmax * __builtin_mxc_rcpf(absmax);
 
@@ -325,20 +320,17 @@ __global__ void fused_silu_mul_per_group_quant_vec_kernel(
 
 #pragma unroll
   for (int i = 0; i < VEC; ++i) {
-    float gate_v = static_cast<float>(gate_vec.data[i]);
-    float up_v = static_cast<float>(up_vec.data[i]);
-    if constexpr(kHasLimit) {
-      gate_v = fminf(gate_v, swiglu_limit);
-      up_v = fmaxf(-swiglu_limit, fminf(up_v, swiglu_limit));
-    }
+    const float gate_v = static_cast<float>(gate_vec.data[i]);
+    const float up_v = static_cast<float>(up_vec.data[i]);
+
     const float silu =
         gate_v * __builtin_mxc_rcpf(1.0f + __builtin_expf(-gate_v));
 
     float v = silu * up_v;
 
-    // if constexpr (kHasLimit) {
-    //   v = fmaxf(-swiglu_limit, fminf(v, swiglu_limit));
-    // }
+    if constexpr (kHasLimit) {
+      v = fmaxf(-swiglu_limit, fminf(v, swiglu_limit));
+    }
 
     vals[i] = v;
     local_absmax = fmaxf(local_absmax, fabsf(v));
@@ -352,7 +344,7 @@ __global__ void fused_silu_mul_per_group_quant_vec_kernel(
   }
 
   const float qmax = quant_qmax<quant_t>();
-  const float absmax = fmaxf(local_absmax, 1e-10f);
+  const float absmax = fmaxf(local_absmax, quant_min_absmax<quant_t>());
   const float scale = absmax / qmax;
   const float inv_scale = qmax * __builtin_mxc_rcpf(absmax);
 

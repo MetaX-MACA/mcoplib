@@ -31,7 +31,8 @@ constexpr size_t kMediumScalarsBytes = 5 * sizeof(int);               // 20
 constexpr size_t kMediumHeaderSize =
     (kMediumHistBytes + kMediumScalarsBytes + 127) & ~size_t(127);  // 3200
 constexpr int MAX_BUFFERED_ITEMS = 4096;
-constexpr size_t kSmemMedium = 64 * 1024;
+constexpr size_t kSmemMedium =
+    kMediumHeaderSize + 2 * MAX_BUFFERED_ITEMS * sizeof(int);  // 35968
 constexpr uint32_t RADIX_THRESHOLD = 32768;
 
 // Decode path constants
@@ -247,31 +248,30 @@ __device__ __noinline__ void histogram_2048_topk(
         const bool is_valid_elem = (elem_idx < seq_len);
         const bool is_above = is_valid_elem && (bin > uthr);
         const bool is_equal = is_valid_elem && (bin == uthr);
-        constexpr uint64_t kWarpMask = 0xffffffffffffffffULL;
 
-        const uint64_t above_mask = __ballot_sync(kWarpMask, is_above);
+        const uint32_t above_mask = __ballot_sync(0xffffffffffffffffULL, is_above);
         if (above_mask) {
-          const int above_count = __popcll(above_mask);
-          const int above_rank = __popcll(above_mask & ((1ULL << lane) - 1ULL));
+          const int above_count = __popc(above_mask);
+          const int above_rank = __popc(above_mask & ((1ULL << lane) - 1));
           int above_base;
           if (lane == 0) {
             above_base = atomicAdd(&decode_smem[sOUT_abs], above_count);
           }
-          above_base = __shfl_sync(kWarpMask, above_base, 0);
+          above_base = __shfl_sync(0xffffffffffffffffULL, above_base, 0);
           if (is_above) {
             output_indices[above_base + above_rank] = elem_idx;
           }
         }
 
-        const uint64_t equal_mask = __ballot_sync(kWarpMask, is_equal);
+        const uint32_t equal_mask = __ballot_sync(0xffffffffffffffffULL, is_equal);
         if (equal_mask) {
-          const int equal_count = __popcll(equal_mask);
-          const int equal_rank = __popcll(equal_mask & ((1ULL << lane) - 1ULL));
+          const int equal_count = __popc(equal_mask);
+          const int equal_rank = __popc(equal_mask & ((1ULL << lane) - 1));
           int equal_base;
           if (lane == 0) {
             equal_base = atomicAdd(&decode_smem[sBUF0_abs], equal_count);
           }
-          equal_base = __shfl_sync(kWarpMask, equal_base, 0);
+          equal_base = __shfl_sync(0xffffffffffffffffULL, equal_base, 0);
           if (is_equal && __builtin_expect(equal_base + equal_rank < DBUF, 1)) {
             bufs[0][equal_base + equal_rank] = elem_idx;
           }
@@ -627,6 +627,7 @@ __device__ __forceinline__ void wait_ge(int* ptr, int target_val,
 
 // ============================================================================
 // Multi-CTA cooperative RadixTopK for a single large row.
+// Adapted from https://github.com/flashinfer-ai/flashinfer/pull/2215
 // ============================================================================
 
 template <int TopK, uint32_t VEC_SIZE>
@@ -869,7 +870,6 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 2)
   RadixRowState* state = &params.row_states[group_id];
 
   int barrier_phase = 0;
-  uint32_t radix_iter = 0;
   const uint32_t total_iters = (params.num_rows + num_groups - 1) / num_groups;
 
   for (uint32_t iter = 0; iter < total_iters; iter++) {
@@ -877,26 +877,7 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 2)
     uint32_t row_idx = group_id + iter * num_groups;
     if (row_idx >= params.num_rows) break;
 
-    // Clamp the row length before any decision is made on it.
-    //
-    // `lengths` is int32 and is consumed here as uint32, so a negative value
-    // (e.g. a padded decode slot whose per-token context length underflowed)
-    // would reinterpret as ~4e9 and sail past every threshold below. Any
-    // value beyond the row width would also read into the next row.
-    //
-    // Clamping to max_seq_len additionally keeps this per-row decision
-    // consistent with the `cta_in_group != 0` early exit above, which is
-    // taken from the host-side scalar: when max_seq_len <= RADIX_THRESHOLD
-    // the non-leader CTAs return immediately, so a leader that reached the
-    // cooperative radix path would wait on the inter-CTA barrier for peers
-    // that no longer exist and spin until the kernel is killed.
-    const int32_t raw_len = params.lengths[row_idx];
-    const uint32_t row_bound =
-        params.stride < params.max_seq_len ? params.stride : params.max_seq_len;
-    const uint32_t non_negative_len =
-        raw_len > 0 ? static_cast<uint32_t>(raw_len) : 0u;
-    const uint32_t seq_len =
-        non_negative_len < row_bound ? non_negative_len : row_bound;
+    const uint32_t seq_len = params.lengths[row_idx];
     int32_t* row_output = params.output + row_idx * params.top_k;
     const float* row_input = params.input + row_idx * params.stride;
 
@@ -921,8 +902,7 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 2)
     radix_topk<TopK, VEC_SIZE>(
         row_input, row_output, seq_len, my_chunk_start, chunk_size,
         local_histogram, suffix_sum, shared_scalars, shared_ordered, state,
-        cta_in_group, ctas_per_group, barrier_phase, radix_iter, tx);
-    radix_iter++;
+        cta_in_group, ctas_per_group, barrier_phase, iter, tx);
   }
 }
 
@@ -939,6 +919,7 @@ namespace hist4096 = topk_histogram_4096;
 
 // ============================================================================
 // FilteredTopK — single CTA per row for bs > 32
+// Adapted from https://github.com/flashinfer-ai/flashinfer/pull/2215
 // ============================================================================
 
 #define FLASHINFER_CUDA_CALL(func, ...) \

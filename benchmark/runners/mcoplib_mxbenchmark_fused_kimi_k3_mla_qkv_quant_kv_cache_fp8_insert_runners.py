@@ -21,7 +21,7 @@ class Fused_kimi_k3_mla_qkv_quant_kv_cache_fp8_insert_runner(OpBenchmarkBase):
 
     def define_metrics(self, state):
         state.add_summary("Op", self.name)
-        state.add_summary("Shape", f"tokens={self.num_tokens} heads={self.num_heads} dim={self.head_dim}")
+        state.add_summary("Shape", f"tokens={self.num_tokens},heads={self.num_heads},dim={self.head_dim}")
 
     def prepare_and_get_launcher(self, dev_id, tc_s):
         if self.seed is not None:

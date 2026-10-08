@@ -100,27 +100,13 @@ At import time `mcoplib/__init__.py` runs three checks against the running MACA 
 
 ## Debugging operator inputs
 
-Debug instrumentation has two independent layers, all **off by default**:
-
-- **Layer 1 — output format** (independent, `=1`/`ON`/`on` to enable): `MCOP_DEBUG_TRACE` (print shape/dtype to stderr) and `MCOP_DEBUG_PARAMS_DUMP` (write parameter JSON to disk).
-- **Layer 2 — operator filter** (off by default; unset = nothing fires): `MCOP_DEBUG_FILTER` (substring match on C++ function name).
+Set env vars to trace or dump operator inputs at runtime:
 
 ```bash
-export MCOP_DEBUG_FILTER=op_name            # only this op (substring match on C++ function name)
-export MCOP_DEBUG_FILTER=op1,op2            # several ops (comma-separated; surrounding spaces are trimmed)
-export MCOP_DEBUG_FILTER=all                # every instrumented op
-export MCOP_DEBUG_TRACE=1                   # enable stderr trace
-export MCOP_DEBUG_PARAMS_DUMP=1             # enable JSON dump
-```
-
-Every switch defaults to off, so you need `MCOP_DEBUG_FILTER` **and** at least one output switch (`=1`) for anything to fire:
-
-```bash
-export MCOP_DEBUG_FILTER=all                # layer 2: which ops
-export MCOP_DEBUG_TRACE=1                   # layer 1: trace and/or dump
-export MCOP_DEBUG_PARAMS_DUMP=1
-export MCOP_TENSOR_DUMP_SAMPLE_SIZE=20      # sample first N + last N elements per tensor (default 20, so 40 total)
-export MCOP_TENSOR_DUMP_FULL=1              # dump entire tensor contents instead of sampling
+export MCOP_DEBUG_TRACE=1                  # print dtype/shape of each op's inputs to stderr
+export MCOP_DEBUG_PARAMS_DUMP=1            # dump full input params to disk as JSON
+export MCOP_TENSOR_DUMP_SAMPLE_SIZE=20     # sample N elements per tensor (default)
+export MCOP_TENSOR_DUMP_FULL=1             # dump entire tensor contents
 ```
 
 ## Architecture

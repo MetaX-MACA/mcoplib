@@ -271,8 +271,7 @@ __launch_bounds__(TPB) __global__ void moeTopK(
     const int end_expert,
     const bool renormalize,
     const float* bias,
-    const double routed_scaling_factor,
-    const bool* is_padding)
+    const double routed_scaling_factor)
 {
 
     using cub_kvp = cub::KeyValuePair<int, float>;
@@ -326,14 +325,12 @@ __launch_bounds__(TPB) __global__ void moeTopK(
             const int expert = result_kvp.key;
             const bool node_uses_expert = expert >= start_expert && expert < end_expert;
             const bool should_process_row = row_is_active && node_uses_expert;
-            const bool is_pad_row = is_padding != nullptr && is_padding[block_row];
 
             const int idx = k * block_row + k_idx;
             // Return the unbiased scores for output weights
             output[idx] = inputs_after_softmax[thread_read_offset + expert];
-            indices[idx] = is_pad_row ? static_cast<IndType>(-1)
-                                       : (should_process_row ? (expert - start_expert) : num_experts);
-            assert(is_pad_row || indices[idx] >= 0);
+            indices[idx] = should_process_row ? (expert - start_expert) : num_experts;
+            assert(indices[idx] >= 0);
             source_rows[idx] = k_idx * num_rows + block_row;
             if (renormalize) {
                 selected_sum += inputs_after_softmax[thread_read_offset + expert];
@@ -377,7 +374,7 @@ template <int VPT, int NUM_EXPERTS, int WARPS_PER_CTA, int BYTES_PER_LDG, int WA
 __launch_bounds__(WARPS_PER_CTA* WARP_SIZE_PARAM) __global__
     void topkGating(const InputType* input, const bool* finished, float* output, const int num_rows, IndType* indices,
         int* source_rows, const int k, const int start_expert, const int end_expert, const bool renormalize,
-        const float* bias, const double routed_scaling_factor, const bool* is_padding)
+        const float* bias, const double routed_scaling_factor)
 {
     static_assert(std::is_same_v<InputType, float> || std::is_same_v<InputType, __nv_bfloat16> ||
                       std::is_same_v<InputType, __half>,
@@ -431,9 +428,7 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE_PARAM) __global__
     {
         return;
     }
-    const bool row_is_active =
-        (finished == nullptr || !finished[thread_row]) &&
-        (is_padding == nullptr || !is_padding[thread_row]);
+    const bool row_is_active = finished ? !finished[thread_row] : true;
 
     // We finally start setting up the read pointers for each thread. First, each thread jumps to the start of the
     // row it will read.
@@ -560,6 +555,7 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE_PARAM) __global__
     // NaN gating (from degenerate hidden states in CUDA graph padding) causes
     // softmax to produce all-NaN, which makes the argmax loop always pick
     // expert 0 for every top-k slot, producing duplicate expert IDs that
+    // crash FlashInfer's three-step MoE sort.
     // With 0s, the argmax uses index tie-breaking to pick [0,1,2,...,k-1].
 #pragma unroll
     for (int ii = 0; ii < VPT; ++ii) {
@@ -676,15 +672,14 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE_PARAM) __global__
             // Add a guard to ignore experts not included by this node
             const bool node_uses_expert = expert >= start_expert && expert < end_expert;
             const bool should_process_row = row_is_active && node_uses_expert;
-            const bool is_pad_row = is_padding != nullptr && is_padding[thread_row];
 
             // The lead thread from each sub-group will write out the final results to global memory. (This will be a
             // single) thread per row of the input/output matrices.
             const int idx = k * thread_row + k_idx;
-            output[idx] = should_process_row ? max_val : 0.0f;
-            indices[idx] = should_process_row ? static_cast<IndType>(expert - start_expert) : static_cast<IndType>(NUM_EXPERTS);
+            output[idx] = max_val;
+            indices[idx] = should_process_row ? (expert - start_expert) : NUM_EXPERTS;
             source_rows[idx] = k_idx * num_rows + thread_row;
-            if (renormalize && should_process_row) {
+            if (renormalize) {
                 selected_sum += max_val;
             }
         }
@@ -709,12 +704,12 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE_PARAM) __global__
     if (thread_group_idx == 0) {
       float scale = static_cast<float>(routed_scaling_factor);
       if (renormalize) {
-        const float denom = selected_sum > 0.f ? selected_sum : 1.0f;
+        const float denom = selected_sum > 0.f ? selected_sum : 1.f;
         scale /= denom;
       }
       for (int k_idx = 0; k_idx < k; ++k_idx) {
         const int idx = k * thread_row + k_idx;
-        output[idx] *= scale;
+        output[idx] = output[idx] * scale;
       }
     }
 }
@@ -723,7 +718,7 @@ template <typename index_t, typename InputType, int VPT = 4, int NUM_EXPERTS = 1
 __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__
     void topkGatingSoftmaxDecode(const InputType* input, const bool* finished, float* output, const int num_rows, index_t* indices,
         int* source_rows, const int k, const int start_expert, const int end_expert, const bool renormalize, 
-        const float* bias, const int topk = 8, const double routed_scaling_factor = 1.0, const bool* is_padding = nullptr)
+        const float* bias,const int topk = 8)
 {
     static int THREADS_PER_ROW = WARPS_PER_ROW * WARP_SIZE;
     const int thread_row = blockIdx.x * ROWS_PER_CTA + threadIdx.x / THREADS_PER_ROW;
@@ -736,7 +731,7 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__
     const int row_in_block = threadIdx.x / THREADS_PER_ROW;
     float idx_and_weight[2];
     float idx_and_weight_2[2];
-    const bool row_is_active = (finished ? !finished[thread_row] : true) && (is_padding ? !is_padding[thread_row] : true);
+    const bool row_is_active = finished ? !finished[thread_row] : true;
     __shared__ float shared_experts[64][2];
     __shared__ float max_val[128];
     __shared__ float sum_val[128];
@@ -815,11 +810,7 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__
         if (tid_in_row < topk) {
             int64_t res = *(int64_t*)idx_and_weight_2;
             max_val_ordered = get_weight(res);
-            int expert_id_ordered = static_cast<int>(res >> 32);
-
-            if (bias != nullptr && expert_id_ordered >= 0 && expert_id_ordered < NUM_EXPERTS) {
-                max_val_ordered -= bias[expert_id_ordered];
-            }
+            int expert_id_ordered = (res >> 32);
             // subtract bias，restore origin row_val(after topk)
             // if (bias != nullptr) {
             //     float bias_val = (expert_id_ordered < NUM_EXPERTS) ? bias[expert_id_ordered] : 0.0f;
@@ -836,29 +827,25 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__
             indices[idx] = should_process_row ? (expert_id_ordered - start_expert) : NUM_EXPERTS;
             source_rows[idx] = tid_in_row * num_rows + thread_row;
             if (renormalize) {
-                norm[row_in_block * topk + tid_in_row] = should_process_row ? static_cast<float>(max_val_ordered) : 0.0f;
+                norm[row_in_block * topk + tid_in_row] = static_cast<float>(max_val_ordered);
             } else {
-                output[idx] = should_process_row ? static_cast<float>(max_val_ordered) * static_cast<float>(routed_scaling_factor) : 0.0f;
+                output[idx] = static_cast<float>(max_val_ordered);
             }
         }
     }
     __shared__ float norm_val[ROWS_PER_CTA];
     if (renormalize) {
         __syncthreads();
-        if (tid_in_row == 0) {
-            norm_val[row_in_block] = 0.0f;
+        if (tid_in_row == 0){
+            norm_val[row_in_block] = 0;
             for (int i = 0; i < topk; i++) {
                 norm_val[row_in_block] += norm[row_in_block * topk + i];
-            }
-            if (norm_val[row_in_block] <= 0.0f) {
-                norm_val[row_in_block] = 1.0f;
             }
         }
         __syncthreads();
         if (tid_in_row < topk) {
             const int idx = topk * thread_row + tid_in_row;
-            const float denom = norm_val[row_in_block];
-            output[idx] = row_is_active ? static_cast<float>(max_val_ordered) / denom * static_cast<float>(routed_scaling_factor) : 0.0f;
+            output[idx] = static_cast<float>(max_val_ordered) / norm_val[row_in_block];
         }
     }
 }
@@ -878,14 +865,14 @@ __launch_bounds__(256) __global__
     void topkGatingSoftmaxDecode256(const InputType* input, const bool* finished, float* output,
         const int num_rows, index_t* indices, int* source_rows, const int k,
         const int start_expert, const int end_expert, const bool renormalize,
-        const float* bias, const int topk = 8, const double routed_scaling_factor = 1.0,const bool* is_padding = nullptr)
+        const float* bias, const int topk = 8)
 {
     constexpr int NUM_EXPERTS = 256;
     constexpr int WARP = 64;              // physical warp lanes
     constexpr int WARPS_PER_ROW = 4;      // 4*64 = 256 experts
     const int thread_row = blockIdx.x;    // 1 row per block
     if (thread_row >= num_rows) return;
-    const bool row_is_active = (finished == nullptr || !finished[thread_row]) && (is_padding == nullptr || !is_padding[thread_row]);
+    const bool row_is_active = finished ? !finished[thread_row] : true;
 
     const int tid = threadIdx.x;          // 0..255, == expert id
     const int warp_id = tid / WARP;       // 0..3
@@ -974,9 +961,9 @@ __launch_bounds__(256) __global__
             indices[idx] = should ? (sel_expert - start_expert) : NUM_EXPERTS;
             source_rows[idx] = lane * num_rows + thread_row;
             if (renormalize) {
-                s_norm[lane] = should ? sel_prob : 0.0f;
+                s_norm[lane] = sel_prob;
             } else {
-                output[idx] = should ? sel_prob * static_cast<float>(routed_scaling_factor) : 0.0f;
+                output[idx] = sel_prob;
             }
         }
     }
@@ -985,12 +972,12 @@ __launch_bounds__(256) __global__
         if (tid == 0) {
             float z = 0.f;
             for (int i = 0; i < topk; ++i) z += s_norm[i];
-            s_rep = z > 0.f ? 1.0f / z : 1.0f;   // reuse
+            s_rep = 1.0f / z;   // reuse
         }
         __syncthreads();
         if (tid < WARP && lane < topk) {
             const int idx = topk * thread_row + lane;
-            output[idx] = row_is_active ? sel_prob * s_rep * static_cast<float>(routed_scaling_factor) : 0.0f;
+            output[idx] = sel_prob * s_rep;
         }
     }
 }
@@ -1007,8 +994,7 @@ __global__ void topkGatingSigmoid288Opt(
     const int end_expert,
     const bool renormalize,
     const float* __restrict__ bias,
-    const double routed_scaling_factor,
-    const bool* __restrict__ is_padding = nullptr)
+    const double routed_scaling_factor)
 {
     constexpr int NUM_EXPERTS = 288;
     constexpr int TOPK = 8;
@@ -1038,10 +1024,7 @@ __global__ void topkGatingSigmoid288Opt(
         }
     }
 
-    bool row_is_active = finished ? !finished[thread_row] : true;
-    if (is_padding != nullptr && is_padding[thread_row]) {
-        row_is_active = false;
-    }
+    const bool row_is_active = finished ? !finished[thread_row] : true;
     
     float idx_and_weight[2];
     idx_and_weight[0] = row_val_for_choice;
@@ -1090,9 +1073,10 @@ __global__ void topkGatingSigmoid288Opt(
             indices[idx] = should_process_row ? (expert_id_ordered - start_expert) : NUM_EXPERTS;
 
             if (renormalize) {
-                sm_norm_vals[row_in_block][lane_id] = should_process_row ? max_val_ordered : 0.0f;
+                sm_norm_vals[row_in_block][lane_id] = max_val_ordered;
             } else {
-                output[idx] = should_process_row ? max_val_ordered * static_cast<float>(routed_scaling_factor) : 0.0f;
+                output[idx] =
+                    max_val_ordered * static_cast<float>(routed_scaling_factor);
             }
         }
     }
@@ -1105,14 +1089,14 @@ __global__ void topkGatingSigmoid288Opt(
             for (int i = 0; i < TOPK; i++) {
                 sum += sm_norm_vals[row_in_block][i];
             }
-            sm_sum_norm[row_in_block] = sum > 0.0f ? sum : 1.0f;
+            sm_sum_norm[row_in_block] = sum;
         }
         __syncthreads();
 
         if (warp_in_row == 0 && lane_id < TOPK) {
             const int idx = TOPK * thread_row + lane_id;
             float const rcp_norm = __builtin_mxc_rcpf(sm_sum_norm[row_in_block]);
-            output[idx] = row_is_active ? sm_norm_vals[row_in_block][lane_id] * rcp_norm * static_cast<float>(routed_scaling_factor) : 0.0f;
+            output[idx] = sm_norm_vals[row_in_block][lane_id] * rcp_norm * static_cast<float>(routed_scaling_factor);
         }
     }
 }
@@ -1121,7 +1105,7 @@ template <int VPT, typename IndType,
           typename InputType = float>
 __global__ void topkGatingSigmoidCommonOpt(const InputType* input, const bool* finished, float* output, const int num_rows, IndType* indices,
         const int start_expert, const int end_expert, const int num_experts, const int rows_per_cta, const bool renormalize,
-        const float* bias, const int topk = 8, const double routed_scaling_factor = 1.0, const bool* is_padding = nullptr)
+        const float* bias, const int topk = 8, const double routed_scaling_factor = 1.0)
 {
     static_assert(std::is_same_v<InputType, float> || std::is_same_v<InputType, __nv_bfloat16> ||
                       std::is_same_v<InputType, __half>,
@@ -1149,10 +1133,7 @@ __global__ void topkGatingSigmoidCommonOpt(const InputType* input, const bool* f
         }
     }
 
-    bool row_is_active = finished ? !finished[thread_row] : true;
-    if (is_padding != nullptr && is_padding[thread_row]) {
-        row_is_active = false;
-    }
+    bool row_is_active  = finished ? !finished[thread_row] : true;
     
     int64_t expert_id_opt = static_cast<int64_t>(tid_in_row);
 
@@ -1172,7 +1153,6 @@ __global__ void topkGatingSigmoidCommonOpt(const InputType* input, const bool* f
     __syncthreads();
 
     float max_val_ordered;
-    bool should_process_row = false;
     if(tid_in_row < 64){
         idx_and_weight_2[0] = -3.4e38;
         *((int64_t*)idx_and_weight) |= (tid_in_row << 32);
@@ -1192,7 +1172,7 @@ __global__ void topkGatingSigmoidCommonOpt(const InputType* input, const bool* f
 
             // Add a guard to ignore experts not included by this node
             const bool node_uses_expert = expert_id_ordered >= start_expert && expert_id_ordered < end_expert;
-            should_process_row = row_is_active && node_uses_expert;
+            const bool should_process_row = row_is_active && node_uses_expert;
 
             // The lead thread from each sub-group will write out the final results to global memory. (This will be a
             // single) thread per row of the input/output matrices.
@@ -1201,9 +1181,9 @@ __global__ void topkGatingSigmoidCommonOpt(const InputType* input, const bool* f
             
         // source_rows[idx] = tid_in_row * num_rows + thread_row;
             if (renormalize) {
-                norm[row_in_block * topk + tid_in_row] = should_process_row ? static_cast<float>(max_val_ordered) : 0.0f;
+                norm[row_in_block * topk + tid_in_row] = static_cast<float>(max_val_ordered);
             } else {
-                output[idx] = should_process_row ? static_cast<float>(max_val_ordered) * static_cast<float>(routed_scaling_factor) : 0.0f;
+                output[idx] = static_cast<float>(max_val_ordered) * static_cast<float>(routed_scaling_factor);
             }
         }
     }
@@ -1216,15 +1196,11 @@ __global__ void topkGatingSigmoidCommonOpt(const InputType* input, const bool* f
             for (int i = 0; i < topk; i++) {
                 norm_val[row_in_block] += norm[row_in_block * topk + i];
             }
-            if (norm_val[row_in_block] <= 0.0f) {
-                norm_val[row_in_block] = 1.0f;
-            }
         }
         __syncthreads();
         if (tid_in_row < topk) {
             const int idx = topk * thread_row + tid_in_row;
-            const float denom = norm_val[row_in_block];
-            output[idx] = should_process_row ? static_cast<float>(max_val_ordered) / denom * static_cast<float>(routed_scaling_factor) : 0.0f;
+            output[idx] = static_cast<float>(max_val_ordered) / norm_val[row_in_block] * static_cast<float>(routed_scaling_factor);
         }
     }
 }
@@ -1254,8 +1230,7 @@ __global__ void topkGatingSoftmaxCommonOpt(
     const int rows_per_cta,
     const bool renormalize,
     const float* __restrict__ bias,
-    const int topk,
-    const bool* is_padding = nullptr)
+    const int topk)
 {
     constexpr int WARP = 64;
     const int warps_per_row = (num_experts + WARP - 1) / WARP;
@@ -1269,7 +1244,7 @@ __global__ void topkGatingSoftmaxCommonOpt(
     const int warp_in_row = tid / WARP;
     const int lane = tid % WARP;
     const bool valid = active_row && (tid < num_experts);
-    const bool row_is_active = active_row && (finished == nullptr || !finished[thread_row]) && (is_padding == nullptr || !is_padding[thread_row]);
+    const bool row_is_active = active_row && (finished ? !finished[thread_row] : true);
 
     // 1) Load this thread's logit (one expert per thread).
     float logit = -3.4e38f;
@@ -1350,15 +1325,12 @@ __global__ void topkGatingSoftmaxCommonOpt(
             const bool node_uses_expert = eid >= start_expert && eid < end_expert;
             const bool should_process_row = row_is_active && node_uses_expert;
             const int idx = topk * thread_row + tid;
-            indices[idx] = should_process_row ? static_cast<IndType>(eid - start_expert) : static_cast<IndType>(num_experts);
+            indices[idx] = should_process_row ? (eid - start_expert) : num_experts;
             if (token_expert_indices != nullptr) {
                 token_expert_indices[idx] = tid * num_rows + thread_row;
             }
-            if (renormalize) {
-                normR[tid] = should_process_row ? w : 0.0f;
-            } else {
-                output[idx] = should_process_row ? w : 0.0f;
-            }
+            if (renormalize) normR[tid] = w;
+            else output[idx] = w;
         }
     }
 
@@ -1369,9 +1341,8 @@ __global__ void topkGatingSoftmaxCommonOpt(
             float sum = 0.0f;
 #pragma unroll 1
             for (int i = 0; i < topk; ++i) sum += normR[i];
-            const float denom = sum > 0.0f ? sum : 1.0f;
             const int idx = topk * thread_row + tid;
-            output[idx] = normR[tid] * __builtin_mxc_rcpf(denom);
+            output[idx] = normR[tid] * __builtin_mxc_rcpf(sum);
         }
     }
 }
@@ -1394,7 +1365,7 @@ struct TopkConstants
 template <int EXPERTS, int WARPS_PER_TB, int WARP_SIZE_PARAM, int MAX_BYTES_PER_LDG, typename IndType, typename InputType, ScoringFunc SF>
 void topkGatingLauncherHelper(const InputType* input, const bool* finished, float* output, IndType* indices,
     int* source_row, const int num_rows, const int k, const int start_expert, const int end_expert, const bool renormalize,
-    const float* bias, const double routed_scaling_factor, cudaStream_t stream, const bool* is_padding)
+    const float* bias, const double routed_scaling_factor, cudaStream_t stream)
 {
     static constexpr int BYTES_PER_LDG = MIN(MAX_BYTES_PER_LDG, sizeof(InputType) * EXPERTS);
     using Constants = detail::TopkConstants<EXPERTS, BYTES_PER_LDG, WARP_SIZE_PARAM, InputType>;
@@ -1405,7 +1376,7 @@ void topkGatingLauncherHelper(const InputType* input, const bool* finished, floa
 
     dim3 block_dim(WARP_SIZE_PARAM, WARPS_PER_TB);
     topkGating<VPT, EXPERTS, WARPS_PER_TB, BYTES_PER_LDG, WARP_SIZE_PARAM, IndType, InputType, SF><<<num_blocks, block_dim, 0, stream>>>(
-        input, finished, output, num_rows, indices, source_row, k, start_expert, end_expert, renormalize, bias, routed_scaling_factor, is_padding);
+        input, finished, output, num_rows, indices, source_row, k, start_expert, end_expert, renormalize, bias, routed_scaling_factor);
 }
 
 #ifndef USE_ROCM
@@ -1420,7 +1391,7 @@ void topkGatingLauncherHelper(const InputType* input, const bool* finished, floa
                              IndType, InputType, SF>(                         \
         gating_output, nullptr, topk_weights, topk_indices,                   \
         token_expert_indices, num_tokens, topk, 0, num_experts, renormalize,  \
-        bias, routed_scaling_factor, stream, is_padding);
+        bias, routed_scaling_factor, stream);
   #define LAUNCH_TOPK(NUM_EXPERTS, WARPS_PER_TB, MAX_BYTES)                   \
     LAUNCH_TOPK_WS(NUM_EXPERTS, WARPS_PER_TB, 32, MAX_BYTES)
 #else
@@ -1430,13 +1401,13 @@ void topkGatingLauncherHelper(const InputType* input, const bool* finished, floa
                                IndType, InputType, SF>(                        \
           gating_output, nullptr, topk_weights, topk_indices,                  \
           token_expert_indices, num_tokens, topk, 0, num_experts, renormalize, \
-          bias, routed_scaling_factor, stream, is_padding);                                                       \
+          bias, routed_scaling_factor, stream);                                                       \
     } else if (WARP_SIZE == 32) {                                              \
       topkGatingLauncherHelper<NUM_EXPERTS, WARPS_PER_TB, 32, MAX_BYTES,       \
                                IndType, InputType, SF>(                        \
           gating_output, nullptr, topk_weights, topk_indices,                  \
           token_expert_indices, num_tokens, topk, 0, num_experts, renormalize, \
-          bias, routed_scaling_factor, stream, is_padding);                                                       \
+          bias, routed_scaling_factor, stream);                                                       \
     } else {                                                                   \
       assert(false &&                                                          \
              "Unsupported warp size. Only 32 and 64 are supported for ROCm");  \
@@ -1445,8 +1416,8 @@ void topkGatingLauncherHelper(const InputType* input, const bool* finished, floa
 
 template <int EXPERTS, int WARPS_PER_TB, int WARP_SIZE_PARAM, typename IndType, typename InputType, ScoringFunc SF>
 void topkDecodeGatingSoftmaxLauncherHelper(const InputType* input, const bool* finished, float* output, IndType* indices,
-    int* source_row, const int num_rows, const int k, const int start_expert, const int end_expert, const bool renormalize,
-    const float* bias, const double routed_scaling_factor, cudaStream_t stream, const bool* is_padding) {
+    int* source_row, const int num_rows, const int k, const int start_expert, const int end_expert, const bool renormalize, 
+    const float* bias, const double routed_scaling_factor, cudaStream_t stream) {
     if (k == 8 and num_rows < 1024){
         static constexpr int MAX_BYTES_PER_LDG = 8;
         static constexpr int BYTES_PER_LDG = MIN(MAX_BYTES_PER_LDG, sizeof(float) * EXPERTS);
@@ -1455,10 +1426,10 @@ void topkDecodeGatingSoftmaxLauncherHelper(const InputType* input, const bool* f
         static constexpr int VPT = Constants::VPT;
         static constexpr int ROWS_PER_WARP = Constants::ROWS_PER_WARP;
         const int num_warps = (num_rows + ROWS_PER_WARP - 1) / ROWS_PER_WARP;
-        const int num_blocks = (num_rows + 1) / 2;
+        const int num_blocks = num_rows + 1 / 2;
         dim3 block_dim(WARP_SIZE * 2, WARPS_PER_TB);
         topkGatingSoftmaxDecode<IndType, InputType><<<num_blocks, 256, 0, stream>>>(
-            input, finished, output, num_rows, indices, source_row, k, start_expert, end_expert, renormalize, bias, k, routed_scaling_factor, is_padding);
+            input, finished, output, num_rows, indices, source_row, k, start_expert, end_expert, renormalize, bias, k);
     } else {
         static constexpr std::size_t MAX_BYTES_PER_LDG = 16;
 
@@ -1471,36 +1442,39 @@ void topkDecodeGatingSoftmaxLauncherHelper(const InputType* input, const bool* f
 
         dim3 block_dim(WARP_SIZE, WARPS_PER_TB);
         topkGating<VPT, EXPERTS, WARPS_PER_TB, BYTES_PER_LDG, WARP_SIZE_PARAM, IndType, InputType, SF><<<num_blocks, block_dim, 0, stream>>>(
-            input, finished, output, num_rows, indices, source_row, k, start_expert, end_expert, renormalize, bias, routed_scaling_factor, is_padding);
+            input, finished, output, num_rows, indices, source_row, k, start_expert, end_expert, renormalize, bias, routed_scaling_factor);
     }
 }
 
-#define LAUNCH_SOFTMAX_OPT(NUM_EXPERTS, WARPS_PER_TB, MAX_BYTES) \
-    topkDecodeGatingSoftmaxLauncherHelper<NUM_EXPERTS, WARPS_PER_TB, WARP_SIZE, IndType, InputType, SF>( \
-        gating_output, nullptr, topk_weights, topk_indices, token_expert_indices, num_tokens, topk, 0, num_experts, \
-        renormalize, bias, routed_scaling_factor, stream, is_padding);
+#define LAUNCH_SOFTMAX_OPT(NUM_EXPERTS, WARPS_PER_TB, MAX_BYTES)       \
+    topkDecodeGatingSoftmaxLauncherHelper<NUM_EXPERTS, WARPS_PER_TB, WARP_SIZE, IndType, InputType, SF>(  \
+        gating_output, nullptr, topk_weights, topk_indices,            \
+        token_expert_indices, num_tokens, topk, 0, num_experts,         \
+        renormalize, bias, routed_scaling_factor, stream);
 
 
 template <int WARPS_PER_TB, int MAX_BYTES, typename IndType, typename InputType, ScoringFunc SF>
 void launchTopk256Decode(const InputType* gating_output, float* topk_weights, IndType* topk_indices,
     int* token_expert_indices, const int num_tokens, const int topk, const bool renormalize,
-    const int num_experts, const float* bias, const double routed_scaling_factor, cudaStream_t stream, const bool* is_padding) {
+    const int num_experts, const float* bias, const double routed_scaling_factor, cudaStream_t stream) {
     if constexpr (SF == vllm::moe::SCORING_SOFTMAX) {
         if (topk == 8 && num_tokens < 1024) {
             topkGatingSoftmaxDecode256<IndType, InputType><<<num_tokens, 256, 0, stream>>>(
-                gating_output, nullptr, topk_weights, num_tokens, topk_indices, token_expert_indices, topk, 0, num_experts, renormalize, bias, topk, routed_scaling_factor, is_padding);
+                gating_output, nullptr, topk_weights, num_tokens, topk_indices,
+                token_expert_indices, topk, 0, num_experts, renormalize, bias, topk);
             return;
         }
         if (topk == 8 && num_tokens >= 1024) {
             topkGatingLauncherHelper<256, 32, 8, MAX_BYTES, IndType, InputType, SF>(
-                gating_output, nullptr, topk_weights, topk_indices, token_expert_indices, num_tokens, topk, 0, num_experts,
-                renormalize, bias, routed_scaling_factor, stream, is_padding);
+                gating_output, nullptr, topk_weights, topk_indices,
+                token_expert_indices, num_tokens, topk, 0, num_experts,
+                renormalize, bias, routed_scaling_factor, stream);
             return;
         }
     }
     topkGatingLauncherHelper<256, WARPS_PER_TB, 32, MAX_BYTES, IndType, InputType, SF>(
-        gating_output, nullptr, topk_weights, topk_indices, token_expert_indices, num_tokens, topk, 0, num_experts,
-        renormalize, bias, routed_scaling_factor, stream, is_padding);
+        gating_output, nullptr, topk_weights, topk_indices, token_expert_indices,
+        num_tokens, topk, 0, num_experts, renormalize, bias, routed_scaling_factor, stream);
 }
 
 template <typename IndType, typename InputType, ScoringFunc SF>
@@ -1516,8 +1490,7 @@ void topkGatingKernelLauncher(
     const bool renormalize,
     const float* bias,
     const double routed_scaling_factor,
-    cudaStream_t stream,
-    const bool* is_padding) {
+    cudaStream_t stream) {
     static constexpr int WARPS_PER_TB = 4;
     static constexpr int BYTES_PER_LDG_POWER_OF_2 = 16;
 #ifndef USE_ROCM
@@ -1548,7 +1521,7 @@ void topkGatingKernelLauncher(
             topkGatingSoftmaxCommonOpt<IndType, InputType><<<num_blocks, block_threads, smem_bytes, stream>>>(
                 (const InputType*)gating_output, nullptr, topk_weights, num_tokens,
                 topk_indices, token_expert_indices, 0, num_experts, num_experts,
-                rows_per_cta, renormalize, bias, topk, is_padding);
+                rows_per_cta, renormalize, bias, topk);
             return;
         }
     }
@@ -1569,8 +1542,7 @@ void topkGatingKernelLauncher(
                 num_experts,   
                 renormalize, 
                 bias,
-                routed_scaling_factor,
-                is_padding
+                routed_scaling_factor
             );
             return;
         } else if(num_experts <= 256 && topk <=16 ) {
@@ -1582,7 +1554,7 @@ void topkGatingKernelLauncher(
             int num_blocks = (num_tokens + rows_per_cta - 1) / rows_per_cta;
 
             topkGatingSigmoidCommonOpt<1, IndType, InputType><<<num_blocks, block_threads, sizeof(float) * (rows_per_cta * topk + rows_per_cta), stream>>>(
-                (const InputType*)gating_output, nullptr, topk_weights, num_tokens, topk_indices, 0, num_experts, num_experts, rows_per_cta, renormalize, bias, topk, routed_scaling_factor, is_padding);
+                (const InputType*)gating_output, nullptr, topk_weights, num_tokens, topk_indices, 0, num_experts, num_experts, rows_per_cta, renormalize, bias, topk, routed_scaling_factor);
             return; 
         }
     }
@@ -1616,7 +1588,7 @@ void topkGatingKernelLauncher(
             // topkGatingSoftmaxDecode256. Prefill: generic topkGating (WS=32).
             launchTopk256Decode<WARPS_PER_TB, BYTES_PER_LDG_POWER_OF_2, IndType, InputType, SF>(
                 gating_output, topk_weights, topk_indices, token_expert_indices,
-                num_tokens, topk, renormalize, num_experts, bias, routed_scaling_factor,stream, is_padding);
+                num_tokens, topk, renormalize, num_experts, bias, routed_scaling_factor,stream);
             break;
         case 512:
             LAUNCH_TOPK(512, WARPS_PER_TB, BYTES_PER_LDG_POWER_OF_2);
@@ -1665,7 +1637,7 @@ void topkGatingKernelLauncher(
             }
             moeTopK<TPB><<<num_tokens, TPB, 0, stream>>>(
                 workspace, nullptr, topk_weights, topk_indices, token_expert_indices,
-                num_experts, topk, 0, num_experts, renormalize, bias, routed_scaling_factor, is_padding);
+                num_experts, topk, 0, num_experts, renormalize, bias, routed_scaling_factor);
         }
     }
 }
@@ -1684,8 +1656,7 @@ void dispatch_topk_launch(
     int num_tokens, int num_experts, int topk, bool renormalize,
     std::optional<torch::Tensor> bias,
     double routed_scaling_factor,
-    cudaStream_t stream,
-    std::optional<torch::Tensor> is_padding)
+    cudaStream_t stream)
  {
     const float* bias_ptr = nullptr;
     if (bias.has_value()) {
@@ -1697,18 +1668,6 @@ void dispatch_topk_launch(
       bias_ptr = bias_tensor.data_ptr<float>();
     }
 
-    const bool* is_padding_ptr = nullptr;
-    if (is_padding.has_value()) {
-      const torch::Tensor& is_padding_tensor = is_padding.value();
-      TORCH_CHECK(is_padding_tensor.scalar_type() == torch::headeronly::ScalarType::Bool,
-                      "is_padding tensor must be bool");
-      TORCH_CHECK(is_padding_tensor.dim() == 1, "is_padding tensor must be 1D");
-      TORCH_CHECK(is_padding_tensor.size(0) == num_tokens,
-                      "is_padding size mismatch, expected: ", num_tokens);
-      TORCH_CHECK(is_padding_tensor.is_contiguous(), "is_padding tensor must be contiguous");
-      is_padding_ptr = is_padding_tensor.const_data_ptr<bool>();
-    }
-
     if (topk_indices.scalar_type() == at::ScalarType::Int) {
         vllm::moe::topkGatingKernelLauncher<int, ComputeType, SF>(
             reinterpret_cast<const ComputeType*>(gating_output.data_ptr()),
@@ -1717,7 +1676,7 @@ void dispatch_topk_launch(
             token_expert_indices.data_ptr<int>(),
             softmax_workspace.data_ptr<float>(),
             num_tokens, num_experts, topk, renormalize,
-            bias_ptr, routed_scaling_factor, stream, is_padding_ptr);
+            bias_ptr, routed_scaling_factor, stream);
     } else if (topk_indices.scalar_type() == at::ScalarType::UInt32) {
         vllm::moe::topkGatingKernelLauncher<uint32_t, ComputeType, SF>(
             reinterpret_cast<const ComputeType*>(gating_output.data_ptr()),
@@ -1726,7 +1685,7 @@ void dispatch_topk_launch(
             token_expert_indices.data_ptr<int>(),
             softmax_workspace.data_ptr<float>(),
             num_tokens, num_experts, topk, renormalize,
-            bias_ptr, routed_scaling_factor, stream, is_padding_ptr);
+            bias_ptr, routed_scaling_factor, stream);
     } else {
         TORCH_CHECK(topk_indices.scalar_type() == at::ScalarType::Long);
         vllm::moe::topkGatingKernelLauncher<int64_t, ComputeType, SF>(
@@ -1736,7 +1695,7 @@ void dispatch_topk_launch(
             token_expert_indices.data_ptr<int>(),
             softmax_workspace.data_ptr<float>(),
             num_tokens, num_experts, topk, renormalize,
-            bias_ptr, routed_scaling_factor, stream, is_padding_ptr);
+            bias_ptr, routed_scaling_factor, stream);
     }
 }
 
@@ -1746,8 +1705,7 @@ void topk_softmax(
     torch::Tensor& token_expert_indices,        // [num_tokens, topk]
     torch::Tensor& gating_output,               // [num_tokens, num_experts]
     bool renormalize,
-    std::optional<torch::Tensor> bias,
-    std::optional<torch::Tensor> is_padding)
+    std::optional<torch::Tensor> bias)
 {
     const int num_experts = gating_output.size(-1);
     const auto num_tokens = gating_output.numel() / num_experts;
@@ -1765,15 +1723,15 @@ void topk_softmax(
     if (gating_output.scalar_type() == at::ScalarType::Float) {
         dispatch_topk_launch<float, vllm::moe::SCORING_SOFTMAX>(gating_output, topk_weights, topk_indices,
             token_expert_indices, softmax_workspace, num_tokens, num_experts, topk, renormalize,
-            bias, 1.0, stream, is_padding);
+            bias, 1.0, stream);
     } else if (gating_output.scalar_type() == at::ScalarType::Half) {
         dispatch_topk_launch<__half, vllm::moe::SCORING_SOFTMAX>(gating_output, topk_weights, topk_indices,
             token_expert_indices, softmax_workspace, num_tokens, num_experts, topk, renormalize,
-            bias, 1.0, stream, is_padding);
+            bias, 1.0, stream);
     } else if (gating_output.scalar_type() == at::ScalarType::BFloat16) {
         dispatch_topk_launch<__nv_bfloat16, vllm::moe::SCORING_SOFTMAX>(gating_output, topk_weights, topk_indices,
             token_expert_indices, softmax_workspace, num_tokens, num_experts, topk, renormalize,
-            bias, 1.0, stream, is_padding);
+            bias, 1.0, stream);
     } else {
         TORCH_CHECK(false, "Unsupported gating_output data type: ", gating_output.scalar_type());
     }
@@ -1786,8 +1744,7 @@ void topk_sigmoid(
     torch::Tensor& gating_output,               // [num_tokens, num_experts]
     bool renormalize,
     std::optional<torch::Tensor> bias,
-    double routed_scaling_factor,
-    std::optional<torch::Tensor> is_padding)
+    double routed_scaling_factor)
 {
 
     // ================= 开始插入的单条打印语句 =================
@@ -1819,15 +1776,15 @@ void topk_sigmoid(
     if (gating_output.scalar_type() == at::ScalarType::Float) {
         dispatch_topk_launch<float, vllm::moe::SCORING_SIGMOID>(gating_output, topk_weights, topk_indices,
             token_expert_indices, workspace, num_tokens, num_experts, topk, renormalize,
-            bias, routed_scaling_factor, stream, is_padding);
+            bias, routed_scaling_factor, stream);
     } else if (gating_output.scalar_type() == at::ScalarType::Half) {
         dispatch_topk_launch<__half, vllm::moe::SCORING_SIGMOID>(gating_output, topk_weights, topk_indices,
             token_expert_indices, workspace, num_tokens, num_experts, topk, renormalize,
-            bias, routed_scaling_factor, stream, is_padding);
+            bias, routed_scaling_factor, stream);
     } else if (gating_output.scalar_type() == at::ScalarType::BFloat16) {
         dispatch_topk_launch<__nv_bfloat16, vllm::moe::SCORING_SIGMOID>(gating_output, topk_weights, topk_indices,
             token_expert_indices, workspace, num_tokens, num_experts, topk, renormalize,
-            bias, routed_scaling_factor, stream, is_padding);
+            bias, routed_scaling_factor, stream);
     } else {
         TORCH_CHECK(false, "Unsupported gating_output data type: ", gating_output.scalar_type());
     }

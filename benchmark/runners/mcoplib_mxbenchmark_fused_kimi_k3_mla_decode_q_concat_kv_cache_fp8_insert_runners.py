@@ -22,7 +22,7 @@ class Fused_kimi_k3_mla_decode_q_concat_kv_cache_fp8_insert_runner(OpBenchmarkBa
 
     def define_metrics(self, state):
         state.add_summary("Op", self.name)
-        state.add_summary("Shape", f"tokens={self.num_tokens} heads={self.num_heads}")
+        state.add_summary("Shape", f"tokens={self.num_tokens}, heads={self.num_heads}")
 
         q_elements = self.num_tokens * self.num_heads * (self.ql_nope_dim + self.q_pe_dim)
         cache_elements = self.num_tokens * (self.kv_lora_rank + self.pe_dim)

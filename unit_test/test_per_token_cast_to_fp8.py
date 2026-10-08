@@ -17,7 +17,8 @@ def per_token_cast_to_fp8_ref(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tens
     x_amax = x_view.abs().float().amax(dim=2).view(m, -1).clamp(1e-4)
     # Match kernel C600 path: scale to [0,448] then round through float16 -> fp8
     scaled = x_view * (448.0 / x_amax.unsqueeze(2))
-    fp8_data = scaled.to(torch.float8_e4m3fn)
+    scaled_f16 = scaled.float().to(torch.float16).float()
+    fp8_data = scaled_f16.to(torch.float8_e4m3fn)
     return fp8_data.view(m, n + pad_size)[:, :n], (x_amax / 448.0).view(m, -1)
 
 

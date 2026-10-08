@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2025 by SGLang team.
- * Copyright (c) 2024-2025 by team.
+ * Copyright (c) 2024-2025 by FlashInfer team.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,261 +18,14 @@
 #define SPECULATIVE_SAMPLING_CUH_
 
 #include <assert.h>
-#include <sstream>
-#include <numeric>
-#include "mcoplib_sgl_common.cuh"
-#include <cub/cub.cuh>
 
-namespace mcoplib {
+#include <flashinfer/sampling.cuh>
 
-// ---------------------------------------------------------------------------
-// The symbols below (ceil_div, DISPATCH_ALIGNED_VEC_SIZE, DISPATCH_DETERMINISTIC,
-// SamplingTempStorage, DeterministicInclusiveSum, DeviceSamplingFromProb) were
-// previously provided by the third-party flashinfer headers. They are ported
-// here (parallel re-implementation) so that mcoplib's sglang subproject no
-// longer depends on flashinfer. The `vec_t` vectorized load/store type comes
-// from the vendored op/sglang/include/vec_dtypes.cuh (included transitively via
-// mcoplib_sgl_common.cuh) and lives in namespace mcoplib as well.
-// ---------------------------------------------------------------------------
+namespace flashinfer {
 
 namespace sampling {
 
 using namespace cub;
-constexpr BlockScanAlgorithm SCAN_ALGO = BLOCK_SCAN_WARP_SCANS;
-constexpr BlockReduceAlgorithm REDUCE_ALGO = BLOCK_REDUCE_WARP_REDUCTIONS;
-
-#if (__CUDACC_VER_MAJOR__ * 10000 + __CUDACC_VER_MINOR__ * 100 >= 120100)
-#define MCOPLIB_CUB_SUBTRACTLEFT_DEFINED
-#endif
-
-#define DISPATCH_DETERMINISTIC(deterministic, DETERMINISTIC, ...) \
-  if (deterministic) {                                            \
-    constexpr bool DETERMINISTIC = true;                          \
-    __VA_ARGS__                                                   \
-  } else {                                                        \
-    constexpr bool DETERMINISTIC = false;                         \
-    __VA_ARGS__                                                   \
-  }
-
-#define DISPATCH_ALIGNED_VEC_SIZE(aligned_vec_size, ALIGNED_VEC_SIZE, ...) \
-  switch (aligned_vec_size) {                                              \
-    case 16: {                                                             \
-      constexpr size_t ALIGNED_VEC_SIZE = 16;                              \
-      __VA_ARGS__                                                          \
-      break;                                                               \
-    }                                                                      \
-    case 8: {                                                              \
-      constexpr size_t ALIGNED_VEC_SIZE = 8;                               \
-      __VA_ARGS__                                                          \
-      break;                                                               \
-    }                                                                      \
-    case 4: {                                                              \
-      constexpr size_t ALIGNED_VEC_SIZE = 4;                               \
-      __VA_ARGS__                                                          \
-      break;                                                               \
-    }                                                                      \
-    case 2: {                                                              \
-      constexpr size_t ALIGNED_VEC_SIZE = 2;                               \
-      __VA_ARGS__                                                          \
-      break;                                                               \
-    }                                                                      \
-    case 1: {                                                              \
-      constexpr size_t ALIGNED_VEC_SIZE = 1;                               \
-      __VA_ARGS__                                                          \
-      break;                                                               \
-    }                                                                      \
-    default: {                                                            \
-      std::ostringstream err_msg;                                          \
-      err_msg << "Unsupported aligned_vec_size: " << aligned_vec_size;     \
-      throw std::invalid_argument(err_msg.str());                         \
-    }                                                                      \
-  }
-
-template <typename T>
-struct Pair {
-  T value;
-  int count;
-
-  __device__ Pair operator+(const Pair& other) const {
-    return {value + other.value, count + other.count};
-  }
-  __device__ Pair& operator+=(const Pair& other) {
-    value += other.value;
-    count += other.count;
-    return *this;
-  }
-};
-
-struct BoolDiffOp {
-  __device__ __forceinline__ bool operator()(const bool& lhs, const bool& rhs) const {
-    return lhs != rhs;
-  }
-};
-
-template <typename T, uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
-          BlockReduceAlgorithm REDUCE_ALGORITHM>
-struct SamplingTempStorage {
-  union {
-    T deterministic_scan[BLOCK_THREADS / 64];
-    typename BlockScan<T, BLOCK_THREADS, SCAN_ALGORITHM>::TempStorage scan;
-    typename BlockReduce<T, BLOCK_THREADS, REDUCE_ALGORITHM>::TempStorage reduce;
-    typename BlockReduce<Pair<T>, BLOCK_THREADS, REDUCE_ALGORITHM>::TempStorage reduce_pair;
-    typename BlockAdjacentDifference<bool, BLOCK_THREADS>::TempStorage adj_diff;
-  } block_prim;
-  struct {
-    int32_t sampled_id;
-    union {
-      T value;
-      Pair<T> pair;
-      T max_p;
-    } block_aggregate;
-  };
-};
-
-/*!
- * \brief Deterministic inclusive scan implementation, use Belloch scan algorithm.
- * \note This implementation is slower than the cub::BlockScan, but it is deterministic.
- */
-template <uint32_t VEC_SIZE, uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
-          BlockReduceAlgorithm REDUCE_ALGORITHM, typename T>
-__device__ __forceinline__ void DeterministicInclusiveSum(
-    const T* in_data, T* out_data,
-    SamplingTempStorage<T, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM>* temp_storage) {
-  T* smem_prefix_sum = temp_storage->block_prim.deterministic_scan;
-  T thread_data[VEC_SIZE];
-  T thread_sum = 0;
-#pragma unroll
-  for (uint32_t i = 0; i < VEC_SIZE; ++i) {
-    thread_sum += in_data[i];
-    thread_data[i] = thread_sum;
-  }
-
-  T thread_exclusive_prefix_sum = thread_sum;
-
-#pragma unroll
-  for (uint32_t offset = 1; offset < 64; offset *= 2) {
-    T tmp = __shfl_up_sync(uint64_t(-1), thread_exclusive_prefix_sum, offset);
-    if ((threadIdx.x + 1) % (offset * 2) == 0) {
-      thread_exclusive_prefix_sum += tmp;
-    }
-  }
-
-  T warp_sum = __shfl_sync(uint64_t(-1), thread_exclusive_prefix_sum, threadIdx.x | uint64_t(-1));
-  if (threadIdx.x % 64 == 63) {
-    thread_exclusive_prefix_sum = 0;
-  }
-
-#pragma unroll
-  for (uint32_t offset = 32; offset >= 1; offset /= 2) {
-    T tmp = __shfl_xor_sync(uint64_t(-1), thread_exclusive_prefix_sum, offset);
-    if ((threadIdx.x + 1) % (offset * 2) == 0) {
-      thread_exclusive_prefix_sum = tmp + thread_exclusive_prefix_sum;
-    }
-    if ((threadIdx.x + 1) % (offset * 2) == offset) {
-      thread_exclusive_prefix_sum = tmp;
-    }
-  }
-
-  smem_prefix_sum[threadIdx.x / 64] = warp_sum;
-  __syncthreads();
-
-  if (threadIdx.x < 64) {
-    T warp_exclusive_prefix_sum =
-        (threadIdx.x < BLOCK_THREADS / 64) ? smem_prefix_sum[threadIdx.x] : 0;
-
-#pragma unroll
-    for (uint32_t offset = 1; offset < 64; offset *= 2) {
-      T tmp = __shfl_up_sync(uint64_t(-1), warp_exclusive_prefix_sum, offset);
-      if ((threadIdx.x + 1) % (offset * 2) == 0) {
-        warp_exclusive_prefix_sum += tmp;
-      }
-    }
-
-    if (threadIdx.x % 64 == 63) {
-      warp_exclusive_prefix_sum = 0;
-    }
-
-#pragma unroll
-    for (uint32_t offset = 32; offset >= 1; offset /= 2) {
-      T tmp = __shfl_xor_sync(uint64_t(-1), warp_exclusive_prefix_sum, offset);
-      if ((threadIdx.x + 1) % (offset * 2) == 0) {
-        warp_exclusive_prefix_sum = tmp + warp_exclusive_prefix_sum;
-      }
-      if ((threadIdx.x + 1) % (offset * 2) == offset) {
-        warp_exclusive_prefix_sum = tmp;
-      }
-    }
-    if (threadIdx.x < BLOCK_THREADS / 64) {
-      smem_prefix_sum[threadIdx.x] = warp_exclusive_prefix_sum;
-    }
-  }
-  __syncthreads();
-
-#pragma unroll
-  for (uint32_t i = 0; i < VEC_SIZE; ++i) {
-    out_data[i] = smem_prefix_sum[threadIdx.x / 64] + thread_exclusive_prefix_sum + thread_data[i];
-  }
-}
-
-template <uint32_t VEC_SIZE, uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
-          BlockReduceAlgorithm REDUCE_ALGORITHM, bool DETERMINISTIC, typename T, typename Predicate>
-__device__ __forceinline__ void DeviceSamplingFromProb(
-    uint32_t i, uint32_t d, Predicate pred, T u, vec_t<T, VEC_SIZE> prob_vec, T& aggregate,
-    SamplingTempStorage<T, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM>* temp_storage) {
-  const uint32_t tx = threadIdx.x;
-  T prob_greater_than_threshold[VEC_SIZE];
-  T inclusive_cdf[VEC_SIZE];
-  bool greater_than_u[VEC_SIZE], valid[VEC_SIZE];
-#pragma unroll
-  for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-    prob_greater_than_threshold[j] = pred(prob_vec[j]) ? prob_vec[j] : T(0);
-    valid[j] = pred(prob_vec[j]) && (i * BLOCK_THREADS + tx) * VEC_SIZE < d;
-  }
-  T aggregate_local =
-      BlockReduce<T, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage->block_prim.reduce)
-          .Sum(prob_greater_than_threshold);
-  if (tx == 0) {
-    temp_storage->block_aggregate.value = aggregate_local;
-  }
-  __syncthreads();
-  aggregate_local = temp_storage->block_aggregate.value;
-
-  if (aggregate + aggregate_local > u) {
-    if constexpr (DETERMINISTIC) {
-      DeterministicInclusiveSum<VEC_SIZE, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM, T>(
-          prob_greater_than_threshold, inclusive_cdf, temp_storage);
-    } else {
-      BlockScan<T, BLOCK_THREADS, SCAN_ALGORITHM>(temp_storage->block_prim.scan)
-          .InclusiveSum(prob_greater_than_threshold, inclusive_cdf);
-
-      __syncthreads();
-    }
-
-#pragma unroll
-    for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-      greater_than_u[j] = (inclusive_cdf[j] + aggregate > u) && valid[j];
-    }
-
-    bool greater_than_u_diff[VEC_SIZE];
-#ifdef MCOPLIB_CUB_SUBTRACTLEFT_DEFINED
-    BlockAdjacentDifference<bool, BLOCK_THREADS>(temp_storage->block_prim.adj_diff)
-        .SubtractLeft(greater_than_u, greater_than_u_diff, BoolDiffOp());
-#else
-    BlockAdjacentDifference<bool, BLOCK_THREADS>(temp_storage->block_prim.adj_diff)
-        .FlagHeads(greater_than_u_diff, greater_than_u, BoolDiffOp(), 0);
-#endif
-    __syncthreads();
-
-#pragma unroll
-    for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-      if (greater_than_u_diff[j]) {
-        atomicMin(&(temp_storage->sampled_id), (i * BLOCK_THREADS + tx) * VEC_SIZE + j);
-      }
-    }
-    __syncthreads();
-  }
-  aggregate += aggregate_local;
-}
 
 template <
     uint32_t BLOCK_THREADS,
@@ -465,14 +218,14 @@ cudaError_t TreeSpeculativeSamplingTargetOnly(
             DType,
             IdType,
             IdType2>;
-        MCOPLIB_CUDA_CALL(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-        MCOPLIB_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+        FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+        FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
       })});
   return cudaSuccess;
 }
 
 }  // namespace sampling
 
-}  // namespace mcoplib
+}  // namespace flashinfer
 
 #endif  // SPECULATIVE_SAMPLING_CUH_

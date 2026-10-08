@@ -17,7 +17,6 @@ class Apply_rope_pos_ids_cos_sin_cache_runner(OpBenchmarkBase):
         self.rotary_dim = config.get("rotary_dim", 128)
         self.max_seq_len = config.get("max_seq_len", 8192)
         self.interleave = config.get("interleave", False)
-        self.seed = config.get("seed", None)
         self.enable_pdl = config.get("enable_pdl", False)
 
     def define_metrics(self, state):
@@ -43,9 +42,6 @@ class Apply_rope_pos_ids_cos_sin_cache_runner(OpBenchmarkBase):
         state.add_element_count(total_q_elements + total_k_elements)
 
     def prepare_and_get_launcher(self, dev_id, tc_s):
-        if self.seed is not None:
-            torch.manual_seed(self.seed)
-            torch.cuda.manual_seed_all(self.seed)
         dev = torch.device(f'cuda:{dev_id}')
         
         q = torch.randn(self.nnz, self.num_q_heads, self.head_dim, dtype=self.dtype, device=dev)

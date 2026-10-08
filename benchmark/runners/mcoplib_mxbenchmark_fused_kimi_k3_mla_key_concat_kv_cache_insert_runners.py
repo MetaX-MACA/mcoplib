@@ -15,12 +15,11 @@ class Fused_kimi_k3_mla_key_concat_kv_cache_insert_runner(OpBenchmarkBase):
         self.num_tokens = config.get("num_tokens", 32)
         self.num_heads = config.get("num_heads", 4)
         self.block_size = config.get("block_size", 8)
-        self.seed = config.get("seed", None)
 
     def define_metrics(self, state):
         state.add_summary("Op", self.name)
         state.add_summary("dtype", str(self.dtype))
-        state.add_summary("Shape", f"tokens={self.num_tokens} heads={self.num_heads}")
+        state.add_summary("Shape", f"tokens={self.num_tokens},heads={self.num_heads}")
 
         read_elements = self.num_tokens * (self.num_heads * 192 + self.num_heads * 128 + 64 + 512)
         write_elements = self.num_tokens * (self.num_heads * 192 + 576)
@@ -36,9 +35,6 @@ class Fused_kimi_k3_mla_key_concat_kv_cache_insert_runner(OpBenchmarkBase):
         return torch.cat([freqs.cos(), freqs.sin()], dim=-1)
 
     def prepare_and_get_launcher(self, dev_id, tc_s):
-        if self.seed is not None:
-            torch.manual_seed(self.seed)
-            torch.cuda.manual_seed_all(self.seed)
         with torch.cuda.stream(tc_s):
             dev = f"cuda:{dev_id}"
 

@@ -147,15 +147,22 @@ void per_token_cast_to_f8_kernel(const T* __restrict__ input,
         scale[TRANS_SCATTER ? (g % G) * m + g / G : g] = abs_max * (1.0f / 448.0f);
     }
 
-    const float div = 448.0f * __builtin_mxc_rcpf(abs_max);
+    const float div = __fdividef(448.0f, abs_max);
     #pragma unroll
     for (int i = 0; i < VEC; ++i) f[i] *= div;
 
     __maca_fp8_e4m3 d[VEC];
     #pragma unroll
     for (int k = 0; k < VEC / 4; ++k) {
+#ifdef _USE_C600_
+        v4f16 t;
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) t[i] = _Float16(f[k * 4 + i]);
+        *reinterpret_cast<uint32_t*>(d + k * 4) = __builtin_mxc_cvt_pk4_f16tof8(t);
+#else
         *reinterpret_cast<uint32_t*>(d + k * 4) =
             __builtin_mxc_cvt_pk4_f32tof8(*reinterpret_cast<v4f32*>(f + k * 4));
+#endif
     }
 
     auto* dp = dst_quant + off;

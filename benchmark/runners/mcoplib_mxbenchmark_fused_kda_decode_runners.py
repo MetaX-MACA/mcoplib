@@ -15,13 +15,12 @@ class Fused_kda_decode_runner(OpBenchmarkBase):
         self.num_seqs = config.get("num_seqs", 1)
         self.head_dim = config.get("head_dim", 128)
         self.width = config.get("width", 4)
-        self.seed = config.get("seed", None)
         self.lower_bound = config.get("lower_bound", -5.0)
 
     def define_metrics(self, state):
         state.add_summary("Op", self.name)
         state.add_summary("dtype", self.config.get("dtype", str(self.dtype)))
-        state.add_summary("Shape", f"heads={self.num_heads} seqs={self.num_seqs} dim={self.head_dim}")
+        state.add_summary("Shape", f"heads={self.num_heads},seqs={self.num_seqs},dim={self.head_dim}")
 
         dim = self.num_heads * self.head_dim
         elements = self.num_seqs * dim * 3
@@ -32,9 +31,6 @@ class Fused_kda_decode_runner(OpBenchmarkBase):
         state.add_global_memory_writes(bytes_size)
 
     def prepare_and_get_launcher(self, dev_id, tc_s):
-        if self.seed is not None:
-            torch.manual_seed(self.seed)
-            torch.cuda.manual_seed_all(self.seed)
         with torch.cuda.stream(tc_s):
             dev = f"cuda:{dev_id}"
             D = self.head_dim

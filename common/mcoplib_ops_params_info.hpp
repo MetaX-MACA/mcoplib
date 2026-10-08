@@ -5,81 +5,16 @@
 #include <string>
 #include <cstdlib>
 #include <optional>
-#include <mutex>
-#include <unordered_map>
 #include <ATen/ATen.h> // 确保包含 ATen
 
 // ==========================================
 // Part 1: 辅助工具函数 (保持不变)
 // ==========================================
 namespace debug_utils {
-    // 第一层开关（默认关）：只有显式设为 1/ON/on 才 trace
     inline bool is_trace_enabled() {
-        static const bool enabled = []() {
-            const char* env = std::getenv("MCOP_DEBUG_TRACE");
-            if (env == nullptr) return false;  // 默认关
-            std::string v(env);
-            return (v == "1" || v == "ON" || v == "on");
-        }();
+        static const char* env_p = std::getenv("MCOP_DEBUG_TRACE");
+        static const bool enabled = (env_p != nullptr && (std::string(env_p) == "1" || std::string(env_p) == "ON"));
         return enabled;
-    }
-
-    // 第二层过滤开关：MCOP_DEBUG_FILTER 未设置 -> 全关（不打印、不 dump）；
-    // 设 "all" -> 全部算子；否则按逗号分隔的函数名子串匹配
-    inline bool name_matches(const char* func_name) {
-        static const char* filter_p = std::getenv("MCOP_DEBUG_FILTER");
-        if (filter_p == nullptr || filter_p[0] == '\0') return false;
-        const std::string name(func_name ? func_name : "");
-        const std::string filter(filter_p);
-        if (filter == "all") return true;
-        size_t start = 0;
-        while (start <= filter.size()) {
-            size_t comma = filter.find(',', start);
-            std::string token = filter.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
-            // 去掉首尾空白，支持 "op1, op2" 带空格的写法
-            size_t b = token.find_first_not_of(" \t\r\n");
-            if (b == std::string::npos) {
-                token.clear();
-            } else {
-                size_t e = token.find_last_not_of(" \t\r\n");
-                token = token.substr(b, e - b + 1);
-            }
-            if (!token.empty() && name.find(token) != std::string::npos) return true;
-            if (comma == std::string::npos) break;
-            start = comma + 1;
-        }
-        return false;
-    }
-
-    // 每个算子最多打印多少次调用（默认 20，第 21 次起不再打印）。
-    // 与 dump 共用 MCOP_DEBUG_DUMP_MAX_CALLS 这个上限，保证终端和 json 打印的是同一批前 N 次。
-    inline size_t get_max_trace_calls() {
-        static const size_t limit = []() {
-            const char* env = std::getenv("MCOP_DEBUG_DUMP_MAX_CALLS");
-            if (!env) return size_t(20);
-            try { size_t v = std::stoul(env); return v > 0 ? v : size_t(20); }
-            catch (...) { return size_t(20); }
-        }();
-        return limit;
-    }
-
-    // 每个算子一个计数器，限制最多打印 N 次。
-    // inline 函数内 static 保证跨编译单元共享；mutex 保证多线程调用线程安全。
-    // 返回本次是第几次（从 1 起），返回 0 表示已超上限、应跳过。
-    inline size_t record_trace_call(const char* function_name) {
-        static std::mutex mtx;
-        static std::unordered_map<std::string, size_t> counts;
-        std::lock_guard<std::mutex> lock(mtx);
-        size_t& c = counts[function_name];
-        if (c >= get_max_trace_calls()) return 0;
-        return ++c;
-    }
-
-    // 是否该对这个算子输出 trace：第一层开关 && 第二层过滤 && 未超调用次数上限
-    inline bool should_trace(const char* func_name) {
-        if (!is_trace_enabled()) return false;
-        if (!name_matches(func_name)) return false;
-        return record_trace_call(func_name) != 0;
     }
 
     template <typename T>
@@ -166,7 +101,7 @@ namespace debug_utils {
 // 5. 用户接口宏
 #define DEBUG_TRACE_PARAMS(...) \
     do { \
-        if (debug_utils::should_trace(__func__)) { \
+        if (debug_utils::is_trace_enabled()) { \
             std::cout << "[MCOP_DEBUG] Call: " << __func__ << "\n"; \
             FOR_EACH(__VA_ARGS__) \
             std::cout << std::endl; \

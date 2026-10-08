@@ -4,8 +4,6 @@
 #include <torch/torch.h>
 #include <cub/cub.cuh>
 #include "../kernel/utils.h"
-#include "mcoplib_ops_params_info.hpp"
-#include "mcoplib_ops_params_dump.hpp"
 
 __host__ __device__ __forceinline__
 int ceil_div(int x, int y) {
@@ -109,7 +107,101 @@ __global__ void build_dst_info_kernel(
     }
 }
 
-template<typename scalar_t, int VPT, int TOPK, bool IS_SWIZZLE>
+// Build the inverse map for the bijective case (D == num_tokens, each dst token
+// owned by exactly one source row => a pure permutation, NO atomics needed).
+// inv[dst] = (src_row, weight_bits). The only scatter here is a single int2 per
+// row (8 B * D total) -- negligible vs the H-wide data movement.
+__global__ void build_inverse_kernel(
+    const int*   __restrict__ scatter_token_id,
+    const float* __restrict__ src_weight,
+    int2*        __restrict__ inv,
+    const int D)
+{
+    const int tid  = blockIdx.x * blockDim.x + threadIdx.x;
+    const int step = gridDim.x * blockDim.x;
+    for (int d = tid; d < D; d += step) {
+        const int dst = scatter_token_id[d];
+        inv[dst] = make_int2(d, __float_as_int(src_weight[d]));
+    }
+}
+
+// Output-ordered bijective gather: one block (or SRC_PER_BLOCK rows) per OUTPUT
+// row t. Writes output[t] and reads residual[t-start] SEQUENTIALLY (2 coalesced
+// streams); only the input[src] read is scattered. This flips the access
+// pattern from the forward kernel's "1 sequential + 2 scattered" to
+// "2 sequential + 1 scattered", improving HBM row-buffer locality on the write
+// + residual side (the write side is where scatter hurts most).
+template<typename scalar_t, int VPT, int ROWS_PER_BLOCK>
+__global__ void moe_gather_ordered_kernel(
+    const scalar_t* __restrict__ input,
+    const int2*     __restrict__ inv,
+    const scalar_t* __restrict__ residual,
+    scalar_t*       __restrict__ output,
+    const float     res_scale,
+    const int       res_token_start,
+    const int       res_token_end,
+    const int       res_row_stride,
+    const int       hidden_size,
+    const int       num_tokens)
+{
+    using VecType = AlignedArrayI4<scalar_t, VPT>;
+    const int t_base = blockIdx.x * ROWS_PER_BLOCK;
+    const int col    = threadIdx.x * VPT;
+
+    int nvalid = num_tokens - t_base;
+    if (nvalid <= 0) return;
+    if (nvalid > ROWS_PER_BLOCK) nvalid = ROWS_PER_BLOCK;
+
+    // Hoist the scattered input loads up front for memory-level parallelism.
+    int2 meta[ROWS_PER_BLOCK];
+    VecType v[ROWS_PER_BLOCK];
+    #pragma unroll
+    for (int s = 0; s < ROWS_PER_BLOCK; ++s) {
+        if (s < nvalid) {
+            meta[s] = inv[t_base + s];
+            v[s]    = *reinterpret_cast<const VecType*>(
+                          input + meta[s].x * hidden_size + col);
+        }
+    }
+
+    #pragma unroll
+    for (int s = 0; s < ROWS_PER_BLOCK; ++s) {
+        if (s >= nvalid) break;
+        const int   t = t_base + s;
+        const float w = __int_as_float(meta[s].y);
+
+        __maca_bfloat162* v2 = reinterpret_cast<__maca_bfloat162*>(&v[s]);
+        float acc[VPT];
+        #pragma unroll
+        for (int i = 0; i < VPT/2; ++i) {
+            acc[2*i    ] = __bfloat162float(v2[i].x) * w;
+            acc[2*i + 1] = __bfloat162float(v2[i].y) * w;
+        }
+
+        if (residual != nullptr && t >= res_token_start && t < res_token_end) {
+            const int r_row = (t - res_token_start) * res_row_stride;
+            VecType rv = *reinterpret_cast<const VecType*>(
+                             residual + r_row * hidden_size + col);
+            __maca_bfloat162* rv2 = reinterpret_cast<__maca_bfloat162*>(&rv);
+            #pragma unroll
+            for (int i = 0; i < VPT/2; ++i) {
+                acc[2*i    ] += __bfloat162float(rv2[i].x) * res_scale;
+                acc[2*i + 1] += __bfloat162float(rv2[i].y) * res_scale;
+            }
+        }
+
+        VecType out_v;
+        __maca_bfloat162* out2 = reinterpret_cast<__maca_bfloat162*>(&out_v);
+        #pragma unroll
+        for (int i = 0; i < VPT/2; ++i) {
+            out2[i].x = __float2bfloat16(acc[2*i    ]);
+            out2[i].y = __float2bfloat16(acc[2*i + 1]);
+        }
+        *reinterpret_cast<VecType*>(output + t * hidden_size + col) = out_v;
+    }
+}
+
+template<typename scalar_t, int VPT, int TOPK>
 __global__ void moe_gather_reverse_kernel(
     const scalar_t* __restrict__ input,
     const int2*     __restrict__ dst_info,
@@ -122,16 +214,7 @@ __global__ void moe_gather_reverse_kernel(
     const int64_t   hidden_size)
 {
     using VecType = AlignedArrayI4<scalar_t, VPT>;
-    int dst_row = blockIdx.x;
-    if constexpr (IS_SWIZZLE) {
-        const int TILE = 2;
-        const int ntile = (gridDim.x + TILE - 1) / TILE;
-        const int tile  = blockIdx.x / TILE;
-        const int lane  = blockIdx.x % TILE;
-        dst_row = ((tile * 2654435761u) % ntile) * TILE + lane;
-        if (dst_row >= gridDim.x) dst_row = blockIdx.x;
-    }
-
+    const int dst_row = blockIdx.x;
     const int col     = threadIdx.x * VPT;
 
     float acc[VPT];
@@ -246,7 +329,7 @@ void launch_moe_gather(
 
     const int mpc  = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
 
-    if (D <= num_tokens && vec_ok) {
+    if (D == num_tokens && vec_ok) {
         // VPT=8 (16 B/thread) gives block = H/8 threads. For H=1536 that is 192
         // threads = 3 full 64-wide warps; VPT=16 was measured ~2x SLOWER because
         // block=H/16=96 is only 1.5 warps (half-idle third warp + low occupancy).
@@ -298,15 +381,9 @@ void launch_moe_gather(
     if (vec_ok) {
         const int block = hidden_size / VPT;
         #define LAUNCH(TK) \
-            if (num_tokens % 2048 == 0) { \
-                moe_gather_reverse_kernel<scalar_t, VPT, TK, true><<<num_tokens, block, 0, stream>>>( \
-                    input, info_ptr, residual, output, \
-                    res_scale, res_token_start, res_end, res_row_stride, hidden_size); \
-            } else { \
-                moe_gather_reverse_kernel<scalar_t, VPT, TK, false><<<num_tokens, block, 0, stream>>>( \
-                    input, info_ptr, residual, output, \
-                    res_scale, res_token_start, res_end, res_row_stride, hidden_size); \
-            }
+            moe_gather_reverse_kernel<scalar_t, VPT, TK><<<num_tokens, block, 0, stream>>>( \
+                input, info_ptr, residual, output, \
+                res_scale, res_token_start, res_end, res_row_stride, hidden_size)
 
         switch (topk) {
             case 2:  LAUNCH(2);  return;
@@ -338,9 +415,6 @@ void moe_gather(at::Tensor scatter_tokens,
                 double res_scale = 1.0,
                 int64_t res_token_start = 0)
 {
-    DEBUG_TRACE_PARAMS(scatter_tokens, scatter_token_id, scatter_tokens_weight, convergent_tokens, residual_tokens, res_scale, res_token_start);
-    DEBUG_DUMP_PARAMS(scatter_tokens, scatter_token_id, scatter_tokens_weight, convergent_tokens, residual_tokens, res_scale, res_token_start);
-
     const int hidden_size = scatter_tokens.size(-1);
     const int D           = scatter_tokens.numel() / hidden_size;
     const int num_tokens  = convergent_tokens.size(0);

@@ -103,22 +103,10 @@ void register_graph_buffers(
 /*
  * From csrc/attention
  */
+void merge_state(
+    at::Tensor v_a, at::Tensor s_a, at::Tensor v_b, at::Tensor s_b, at::Tensor v_merged, at::Tensor s_merged);
 void merge_state_v2(
     at::Tensor v_a, at::Tensor s_a, at::Tensor v_b, at::Tensor s_b, at::Tensor v_merged, at::Tensor s_merged);
-
-std::vector<at::Tensor> sparse_attention_fwd(
-    const at::Tensor& q,
-    const at::Tensor& kv,
-    const at::Tensor& indices,
-    double sm_scale,
-    int64_t d_v,
-    bool return_lse);
-
-void sparse_attention_clear_cache();
-void chunk_kda_fwd_intra_token_parallel(
-    const at::Tensor& q, const at::Tensor& k, const at::Tensor& g,
-    const at::Tensor& beta, const at::Tensor& aqk, const at::Tensor& akk,
-    double scale);
 //     torch::Tensor const& out,
 //     torch::Tensor const& q_nope,
 //     torch::Tensor const& q_pe,
@@ -223,21 +211,6 @@ void fast_topk_transform_ragged_interface(
     const at::Tensor& topk_indices_offset,
     std::optional<at::Tensor> row_starts_opt = std::nullopt);
 
-// GLM-5.3-Flash NSA kpool transform. Selects a compile-time-specialized
-// number of pool groups, expands them to token indices, and optionally applies
-// a page-table mapping or per-row ragged offset. The token-level Top-K is
-// inferred from output.size(1), excluding the optional sequence-tail columns.
-void kpool_topk_transform_interface(
-    const at::Tensor& score,
-    const at::Tensor& lengths,
-    at::Tensor& output,
-    int64_t pool_size,
-    std::optional<at::Tensor> page_table_opt = std::nullopt,
-    std::optional<at::Tensor> topk_indices_offset_opt = std::nullopt,
-    std::optional<at::Tensor> row_starts_opt = std::nullopt,
-    std::optional<at::Tensor> seq_lens_opt = std::nullopt,
-    std::optional<at::Tensor> page_table_row_index_opt = std::nullopt);
-
 // Static, C500-optimized port of the JIT topk_transform_kernel
 // (op/sglang/jit_kernels/topk_v1.cuh). Picks TopK=512 largest scores per row
 // via radix-256 coarse + refine passes with float4 vectorized loads, then
@@ -284,38 +257,6 @@ void dsv4_fused_q_indexer_rope_hadamard_quant(
     const at::Tensor& freqs_cis,
     const at::Tensor& positions);
 
-void sgl_fused_hc_head(
-    torch::Tensor output,
-    torch::Tensor x,
-    torch::Tensor hc_fn,
-    torch::Tensor hc_scale,
-    torch::Tensor hc_base,
-    double norm_eps,
-    double hc_eps);
-/*
- * MiniMax-M3 fused GemmaRMSNorm + partial NeoX RoPE (AOT port of
- * sglang_jit/fused_gemma_qknorm_rope.cuh). Multi-group, in-place over qkv.
- */
-void fused_gemma_qknorm_rope(
-    at::Tensor qkv,
-    at::Tensor w0,
-    at::Tensor w1,
-    at::Tensor w2,
-    at::Tensor w3,
-    at::Tensor cos_sin_cache,
-    at::Tensor positions,
-    int64_t off0,
-    int64_t cnt0,
-    int64_t off1,
-    int64_t cnt1,
-    int64_t off2,
-    int64_t cnt2,
-    int64_t off3,
-    int64_t cnt3,
-    int64_t num_groups,
-    double eps);
-
-    
 /*
  * From csrc/gemm
  */
@@ -425,7 +366,7 @@ void moe_align_block_size(
     torch::Tensor num_tokens_post_pad,
     torch::Tensor cumsum_buffer,
     bool pad_sorted_token_ids,
-    bool ignore_invalid_expert = false);
+    bool ignore_invalid_expert);
 
 void topk_softmax(
     torch::Tensor& topk_weights,
@@ -830,6 +771,93 @@ void transfer_kv_all_layer_direct_lf_pf(
  */
 at::Tensor weak_ref_tensor(const at::Tensor& tensor);
 void store_kv_cache(at::Tensor k_cache, at::Tensor v_cache, at::Tensor out_loc, at::Tensor k, at::Tensor v);
+
+/*
+ * From FlashInfer
+ */
+// void min_p_sampling_from_probs(
+//     at::Tensor probs,
+//     at::Tensor output,
+//     std::optional<at::Tensor> maybe_indices,
+//     std::optional<at::Tensor> maybe_min_p_arr,
+//     double min_p_val,
+//     bool deterministic,
+//     std::optional<at::Generator> gen);
+
+// void top_k_renorm_probs(
+//     at::Tensor probs, at::Tensor renorm_probs, std::optional<at::Tensor> maybe_top_k_arr, int64_t top_k_val);
+
+// void top_p_renorm_probs(
+//     at::Tensor probs, at::Tensor renorm_probs, std::optional<at::Tensor> maybe_top_p_arr, double top_p_val);
+
+// void top_k_top_p_sampling_from_probs(
+//     at::Tensor probs,
+//     at::Tensor output,
+//     std::optional<at::Tensor> maybe_indices,
+//     std::optional<at::Tensor> maybe_top_k_arr,
+//     double top_k_val,
+//     std::optional<at::Tensor> maybe_top_p_arr,
+//     double top_p_val,
+//     bool deterministic,
+//     std::optional<at::Generator> gen);
+
+// void top_p_sampling_from_probs(
+//     at::Tensor probs,
+//     at::Tensor output,
+//     std::optional<at::Tensor> maybe_indices,
+//     std::optional<at::Tensor> maybe_top_p_arr,
+//     double top_p_val,
+//     bool deterministic,
+//     std::optional<at::Generator> gen);
+
+// void top_k_mask_logits(
+//     at::Tensor logits, at::Tensor mask_logits, std::optional<at::Tensor> maybe_top_k_arr, int64_t top_k_val);
+
+// namespace flash {
+// /*
+//  * From fa2 sparse
+//  */
+// std::vector<at::Tensor> mha_fwd_sparse(
+//     at::Tensor& q,        // batch_size x seqlen_q x num_heads x head_size
+//     const at::Tensor& k,  // batch_size x seqlen_k x num_heads_k x head_size
+//     const at::Tensor& v,  // batch_size x seqlen_k x num_heads_k x head_size
+//     const at::Tensor& block_count,
+//     const at::Tensor& block_offset,
+//     const at::Tensor& column_count,
+//     const at::Tensor& column_index,
+//     const std::optional<at::Tensor>& out_,           // batch_size x seqlen_q x num_heads x head_size
+//     const std::optional<at::Tensor>& alibi_slopes_,  // num_heads or batch_size x num_heads
+//     const double p_dropout,
+//     const double softmax_scale,
+//     bool is_causal,
+//     const double softcap,
+//     const bool return_softmax,
+//     std::optional<at::Generator> gen_);
+
+// std::vector<at::Tensor> mha_varlen_fwd_sparse(
+//     at::Tensor& q,        // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
+//     const at::Tensor& k,  // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i.
+//     const at::Tensor& v,  // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i.
+//     const at::Tensor& block_count,
+//     const at::Tensor& block_offset,
+//     const at::Tensor& column_count,
+//     const at::Tensor& column_index,
+//     const c10::optional<at::Tensor>& out_,  // total_q x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
+//     const at::Tensor& cu_seqlens_q,         // b+1
+//     const at::Tensor& cu_seqlens_k,         // b+1
+//     const c10::optional<at::Tensor>&
+//         seqused_k,  // b. If given, only this many elements of each batch element's keys are used.
+//     const c10::optional<at::Tensor>& alibi_slopes_,  // num_heads or b x num_heads
+//     int64_t max_seqlen_q,
+//     const int64_t max_seqlen_k,
+//     const double p_dropout,
+//     const double softmax_scale,
+//     const bool zero_tensors,
+//     bool is_causal,
+//     const double softcap,
+//     const bool return_softmax,
+//     c10::optional<at::Generator> gen_);
+// }  // namespace flash
 
 void convert_vertical_slash_indexes(
     torch::Tensor& block_count,      // [BATCH, N_HEADS, NUM_ROWS]

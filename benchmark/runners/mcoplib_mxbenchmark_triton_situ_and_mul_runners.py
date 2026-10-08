@@ -38,7 +38,7 @@ class Triton_situ_and_mul_runner(OpBenchmarkBase):
         state.add_summary(
             "Shape",
             (
-                f"tokens={self.tokens}, topk={self.topk} "
+                f"tokens={self.tokens}, topk={self.topk}, "
                 f"({self.rows} {self.input_width}) -> "
                 f"({self.rows} {self.hidden_size})"
             ),

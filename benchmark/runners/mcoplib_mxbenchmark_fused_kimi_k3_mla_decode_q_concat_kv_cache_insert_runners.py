@@ -20,7 +20,7 @@ class Fused_kimi_k3_mla_decode_q_concat_kv_cache_insert_runner(OpBenchmarkBase):
     def define_metrics(self,state):
         state.add_summary("Op",self.name)
         state.add_summary("dtype",str(self.dtype))
-        state.add_summary("Shape",f"tokens={self.num_tokens} heads={self.num_heads}")
+        state.add_summary("Shape",f"tokens={self.num_tokens},heads={self.num_heads}")
         elements=self.num_tokens*self.num_heads*576
         state.add_element_count(elements)
         state.add_global_memory_reads(self.num_tokens*(512+self.num_heads*64+512)*2)

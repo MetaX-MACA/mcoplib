@@ -1,7 +1,7 @@
 #include <ATen/cuda/CUDAContext.h>
 
 #include <cmath>
-#include "vec_dtypes.cuh"
+#include <flashinfer/vec_dtypes.cuh>
 
 #include "utils.h"
 
@@ -33,7 +33,7 @@ __global__ void per_token_quant_fp8_kernel(
   // Pass-1: Perform a warp reduce to find the max_value of a token's hidden_dim
   //
   float max_value = 0.f;
-  using vec_t = mcoplib::vec_t<T, kVecSize>;
+  using vec_t = flashinfer::vec_t<T, kVecSize>;
   const int32_t num_vec_elems = hidden_dim / kVecSize;
 
   for (int32_t i = lane_id; i < num_vec_elems; i += kWarpSize) {
@@ -108,7 +108,7 @@ __global__ void per_token_quant_fp8_small_batch_kernel(
   float max_value = 0.0f;
 
   // Use template parameter for vector size
-  using vec_t = mcoplib::vec_t<T, kVecSize>;
+  using vec_t = flashinfer::vec_t<T, kVecSize>;
   const int32_t num_vec_elems = hidden_dim / kVecSize;
 
   // Find max using vectorized loads

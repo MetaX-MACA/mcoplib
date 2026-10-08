@@ -469,25 +469,21 @@ void topk_transform_v1_interface(
   const auto grid = dim3{static_cast<uint32_t>(B)};
   const auto block = dim3{kThreadsPerBlock};
 
-  
-  cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
-  const auto capture_query = cudaStreamIsCapturing(stream, &capture_status);
-  TORCH_CHECK(capture_query == cudaSuccess,
-              "failed to query CUDA stream capture status: ",
-              ::cudaGetErrorString(capture_query));
-
-  bool use_hist4096;
-  if (capture_status != cudaStreamCaptureStatusNone) {
-    use_hist4096 = static_cast<uint64_t>(scores.size(1)) <= kHist4096MaxLen;
-  } else {
-    int32_t max_seq_len_host = 0;
-    auto seq_lens_cpu = seq_lens.cpu();
-    const auto* seq_lens_ptr = seq_lens_cpu.data_ptr<int32_t>();
-    for (int64_t i = 0; i < B; ++i) {
-      if (seq_lens_ptr[i] > max_seq_len_host) max_seq_len_host = seq_lens_ptr[i];
-    }
-    use_hist4096 = static_cast<uint32_t>(max_seq_len_host) <= kHist4096MaxLen;
+  // Decide which kernel to launch based on max seq_len in this batch.
+  // histogram_4096 supports up to kHist4096MaxLen (16384) floats per row.
+  // If any row exceeds that, fall back to the 2-pass radix path for ALL rows
+  // (mixing kernels in one launch is awkward; the radix path handles any len).
+  // We pick per-launch, using max_seq_len across the batch.
+  int32_t max_seq_len_host = 0;
+  // Cheap host-side max: copy seq_lens (small, B elements) to host.
+  // For very large B this is a tiny D2H; acceptable.
+  auto seq_lens_cpu = seq_lens.cpu();
+  const auto* seq_lens_ptr = seq_lens_cpu.data_ptr<int32_t>();
+  for (int64_t i = 0; i < B; ++i) {
+    if (seq_lens_ptr[i] > max_seq_len_host) max_seq_len_host = seq_lens_ptr[i];
   }
+
+  const bool use_hist4096 = (static_cast<uint32_t>(max_seq_len_host) <= kHist4096MaxLen);
 
   // SMEM-size branching for the radix path (seq_len > 16384):
   //   - 64K-smem chips (C500/C280): dynamic smem capped at ~32KB by MACA

@@ -20,7 +20,7 @@ class Masked_situ_and_mul_runner(OpBenchmarkBase):
     def define_metrics(self,state):
         state.add_summary("Op",self.name)
         state.add_summary("dtype",self.config.get("dtype",str(self.dtype)))
-        state.add_summary("Shape",f"({self.num_experts} {self.max_num_tokens} {self.hidden})")
+        state.add_summary("Shape",f"({self.num_experts},{self.max_num_tokens},{self.hidden})")
         elements=self.num_experts*self.max_num_tokens*self.hidden
         state.add_element_count(elements)
         bytes_per=2 if self.dtype in [torch.float16,torch.bfloat16] else 4

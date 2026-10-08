@@ -7,6 +7,5 @@
     "width": 4,
     "dtype": ["bfloat16"],
     "lower_bound": [-5.0, null],
-    "seed": 42,
     "samples": 1000
 }

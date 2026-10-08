@@ -34,17 +34,3 @@ void silu_mul_mask_interface(
     at::Tensor const& mask,
     c10::optional<double> _swiglu_limit
 );
-
-void fused_situ_mul_dq_mask_quant_pack(
-    torch::Tensor& output,
-    torch::Tensor const& input,
-    torch::Tensor const& mask,
-    float beta,
-    float linear_beta,
-    bool has_linear_beta
-);
-
-void per_token_quant_int8_pack(
-    at::Tensor& out,          // [..., hidden_size]
-    at::Tensor const& input  // [..., hidden_size]
-    );

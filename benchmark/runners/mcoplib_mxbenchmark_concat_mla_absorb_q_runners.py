@@ -10,7 +10,6 @@ class Concat_mla_absorb_q_runner(OpBenchmarkBase):
     def __init__(self, name, config):
         super().__init__(name, config)
         self.batch_size = config.get("batch_size", 64)
-        self.seed = config.get("seed", None)
         self.num_heads = config.get("num_heads", 128)
         
         self.dim_nope = 512
@@ -41,9 +40,6 @@ class Concat_mla_absorb_q_runner(OpBenchmarkBase):
         state.add_global_memory_writes(total_writes)
 
     def prepare_and_get_launcher(self, dev_id, tc_s):
-        if self.seed is not None:
-            torch.manual_seed(self.seed)
-            torch.cuda.manual_seed_all(self.seed)
         if not hasattr(torch.ops, "sgl_kernel") or not hasattr(torch.ops.sgl_kernel, "concat_mla_absorb_q"):
              raise RuntimeError("Operator 'torch.ops.sgl_kernel.concat_mla_absorb_q' not found. Please ensure the extension is loaded.")
 

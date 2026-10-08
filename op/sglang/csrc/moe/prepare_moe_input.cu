@@ -2,7 +2,7 @@
 #include <cudaTypedefs.h>
 #include <torch/all.h>
 
-#include "vec_dtypes.cuh"
+#include <flashinfer/vec_dtypes.cuh>
 #include <iostream>
 
 template <typename T, int N>
@@ -278,7 +278,7 @@ __global__ void apply_shuffle_mul_sum_kernel(
 
   constexpr uint32_t vec_size = 16 / sizeof(scalar_t);
   using t = float;
-  using vec_t = mcoplib::vec_t<t, vec_size>;
+  using vec_t = flashinfer::vec_t<t, vec_size>;
   int thread_idx = threadIdx.x;
   int stride = blockDim.x;
 

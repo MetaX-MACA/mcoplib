@@ -33,7 +33,7 @@ class Topk_softmax_runner(OpBenchmarkBase):
             topk_indices = torch.empty(self.batch_size, self.top_k, dtype=torch.int32, device=dev)
             token_expert_indices = torch.empty(self.batch_size, self.top_k, dtype=torch.int32, device=dev)
         return self.make_launcher(dev_id, torch.ops._moe_C.topk_softmax, 
-                                  topk_weights, topk_indices, token_expert_indices, gating_output, self.renormalize, None, None)
+                                  topk_weights, topk_indices, token_expert_indices, gating_output, self.renormalize)
 
     def run_verification(self, dev_id):
         dev = f'cuda:{dev_id}'
@@ -42,7 +42,7 @@ class Topk_softmax_runner(OpBenchmarkBase):
         out_weights = torch.empty(N, K, dtype=torch.float32, device=dev)
         out_indices = torch.empty(N, K, dtype=torch.int32, device=dev)
         out_expert_indices = torch.empty(N, K, dtype=torch.int32, device=dev)
-        torch.ops._moe_C.topk_softmax(out_weights, out_indices, out_expert_indices, gating, True, None, None)
+        torch.ops._moe_C.topk_softmax(out_weights, out_indices, out_expert_indices, gating, True)
         ref_vals, ref_idxs = torch.topk(gating.float(), K, dim=-1)
         ref_weights = torch.softmax(ref_vals, dim=-1)
         indices_match = (out_indices.long() == ref_idxs).all().item()

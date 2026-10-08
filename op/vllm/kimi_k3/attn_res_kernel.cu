@@ -54,7 +54,6 @@ namespace sm80 {
 namespace fwd_prod_v2 {
 
 constexpr int K_TILE = 1024;
-constexpr int N_CHUNK_DEFAULT = 4;
 // No producer warp on SM80: all 256 threads cooperate on load + compute.
 constexpr int BLK = 256;
 constexpr int CONSUMER_THREADS = BLK;
@@ -119,14 +118,14 @@ __device__ __forceinline__ void cp_async_row(void* smem_dst,
   }
 }
 
-template <int H, int N, int NC = N_CHUNK_DEFAULT, int B = 1,
-          bool RELEASE_TMEM = false, bool HAS_DELTA = false,
-          bool HAS_OUTPUT_NORM = false, bool OUTPUT_NORM_IN_SMEM = false>
+template <int H, int NC = NC_FIXED, bool RELEASE_TMEM = false,
+          bool HAS_DELTA = false, bool HAS_OUTPUT_NORM = false,
+          bool OUTPUT_NORM_IN_SMEM = false>
 __global__ void __launch_bounds__(BLK, 1) attn_res_fwd_online_v2_kernel(
     const bf16_t* __restrict__ block_res, bf16_t* __restrict__ layer_res,
     const bf16_t* __restrict__ delta, const bf16_t* __restrict__ res_w,
-    const bf16_t* __restrict__ rms_w, bf16_t* __restrict__ output, int T,
-    int block_stride_m, int block_stride_r, float rms_eps,
+    const bf16_t* __restrict__ rms_w, bf16_t* __restrict__ output, int N, int T,
+    int B, int block_stride_m, int block_stride_r, float rms_eps,
     const bf16_t* __restrict__ output_norm_weight, float output_norm_eps) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
   constexpr float LOG2_E = 1.4426950408889634f;
@@ -147,7 +146,7 @@ __global__ void __launch_bounds__(BLK, 1) attn_res_fwd_online_v2_kernel(
   const int lane = tid & 31;
   const int TB = T * B;
   const int num_ctas = gridDim.x;
-  constexpr int num_chunks = (N + N_CHUNK - 1) / N_CHUNK;
+  const int num_chunks = (N + N_CHUNK - 1) / N_CHUNK;
 
   const int group = (wid >= 4) ? 1 : 0;
   const int ct_in_group = tid & (CONSUMER_THREADS_PER_GROUP - 1);
@@ -178,16 +177,11 @@ __global__ void __launch_bounds__(BLK, 1) attn_res_fwd_online_v2_kernel(
     if constexpr (H == 7168) {
       if (si == SLICES_PER_GROUP - 1) {
         int h_base = 6 * K_TILE + group * (K_TILE / 2) + ct_in_group * 4;
-        int2 rms_v = *reinterpret_cast<const int2*>(rms_w + h_base);
-        int2 res_v = *reinterpret_cast<const int2*>(res_w + h_base);
-        auto* rms2 = reinterpret_cast<__nv_bfloat162*>(&rms_v);
-        auto* res2 = reinterpret_cast<__nv_bfloat162*>(&res_v);
 #pragma unroll
-        for (int k = 0; k < 2; k++) {
-          float2 rf = __bfloat1622float2(rms2[k]);
-          float2 sf = __bfloat1622float2(res2[k]);
-          q_cache[si * VEC + 2 * k] = rf.x * sf.x;
-          q_cache[si * VEC + 2 * k + 1] = rf.y * sf.y;
+        for (int j = 0; j < 4; j++) {
+          int h = h_base + j;
+          q_cache[si * VEC + j] =
+              __bfloat162float(rms_w[h]) * __bfloat162float(res_w[h]);
         }
         continue;
       }
@@ -195,16 +189,11 @@ __global__ void __launch_bounds__(BLK, 1) attn_res_fwd_online_v2_kernel(
     int dt = si * CONSUMER_GROUPS + group;
     if (dt >= NHT) continue;
     int h_base = dt * K_TILE + k_local;
-    int4 rms_v = *reinterpret_cast<const int4*>(rms_w + h_base);
-    int4 res_v = *reinterpret_cast<const int4*>(res_w + h_base);
-    auto* rms2 = reinterpret_cast<__nv_bfloat162*>(&rms_v);
-    auto* res2 = reinterpret_cast<__nv_bfloat162*>(&res_v);
 #pragma unroll
-    for (int k = 0; k < 4; k++) {
-      float2 rf = __bfloat1622float2(rms2[k]);
-      float2 sf = __bfloat1622float2(res2[k]);
-      q_cache[si * VEC + 2 * k] = rf.x * sf.x;
-      q_cache[si * VEC + 2 * k + 1] = rf.y * sf.y;
+    for (int j = 0; j < VEC; j++) {
+      int h = h_base + j;
+      q_cache[si * VEC + j] =
+          __bfloat162float(rms_w[h]) * __bfloat162float(res_w[h]);
     }
   }
 
@@ -220,7 +209,7 @@ __global__ void __launch_bounds__(BLK, 1) attn_res_fwd_online_v2_kernel(
     for (int i = 0; i < ACC_PER_THREAD; i++) {
       acc32[i] = 0.f;
     }
-#pragma unroll
+
     for (int ci = 0; ci < num_chunks; ci++, gci++) {
       int ns = ci * N_CHUNK;
       int an = min(N_CHUNK, N - ns);
@@ -650,13 +639,13 @@ __global__ void __launch_bounds__(BLK, 1) attn_res_fwd_online_v2_kernel(
 #endif
 }
 
-template <int H, int N, int NC = N_CHUNK_DEFAULT, bool RELEASE_TMEM = false,
+template <int H, int NC = NC_FIXED, bool RELEASE_TMEM = false,
           bool HAS_DELTA = false, bool HAS_OUTPUT_NORM = false,
           bool OUTPUT_NORM_IN_SMEM = false>
 static void launch_fwd(const bf16_t* block_residual, bf16_t* layer_residual,
                        const bf16_t* delta, const bf16_t* res_weight,
-                       const bf16_t* rms_weight, bf16_t* output, int T,
-                       float rms_eps, int num_sm, cudaStream_t stream,
+                       const bf16_t* rms_weight, bf16_t* output, int N, int T,
+                       int B, float rms_eps, int num_sm, cudaStream_t stream,
                        const bf16_t* output_norm_weight = nullptr,
                        float output_norm_eps = 0.f, int block_stride_m = 0,
                        int block_stride_r = 0) {
@@ -669,7 +658,7 @@ static void launch_fwd(const bf16_t* block_residual, bf16_t* layer_residual,
       ~size_t(15);
 
   auto kernel =
-      &attn_res_fwd_online_v2_kernel<H, N, NC, 1, RELEASE_TMEM, HAS_DELTA,
+      &attn_res_fwd_online_v2_kernel<H, NC, RELEASE_TMEM, HAS_DELTA,
                                      HAS_OUTPUT_NORM, OUTPUT_NORM_IN_SMEM>;
 
   static bool attrs_set = false;
@@ -687,7 +676,7 @@ static void launch_fwd(const bf16_t* block_residual, bf16_t* layer_residual,
 
   kernel<<<grid, BLK, smem_size, stream>>>(
       block_residual, layer_residual, delta, res_weight, rms_weight, output,
-      T, block_stride_m, block_stride_r, rms_eps, output_norm_weight,
+      N, T, B, block_stride_m, block_stride_r, rms_eps, output_norm_weight,
       output_norm_eps);
 }
 
@@ -706,14 +695,6 @@ void kimi_k3_attn_res(torch::Tensor& prefix,
   int const device = prefix.get_device();
   auto stream = at::cuda::getCurrentCUDAStream(device);
   cudaDeviceProp const* properties = at::cuda::getCurrentDeviceProperties();
-
-  int64_t const hidden_size = prefix.size(1);
-  TORCH_CHECK(prefix.stride(0) == hidden_size &&
-                      delta.stride(0) == hidden_size &&
-                      output.stride(0) == hidden_size,
-                  "Kimi K3 AttnRes requires densely packed rows; got strides ",
-                  prefix.stride(0), ", ", delta.stride(0), ", ",
-                  output.stride(0), " for hidden_size ", hidden_size);
 
   using namespace sm80::fwd_prod_v2;
   // HAS_DELTA / HAS_OUTPUT_NORM are selected at runtime based on whether the
@@ -739,103 +720,20 @@ void kimi_k3_attn_res(torch::Tensor& prefix,
   int const bsm = static_cast<int>(blocks.stride(0));
   int const bsr = static_cast<int>(blocks.stride(1));
 
-#define LAUNCH(N_VALUE, HAS_D, HAS_ON)                                               \
-  launch_fwd<7168, N_VALUE, NC_FIXED, false, HAS_D, HAS_ON, false>(                  \
-      bf_blocks, bf_prefix_w, bf_delta, bf_qk_w, bf_norm_w, bf_out_w,       \
-      num_tokens, static_cast<float>(eps), num_sm, stream2, bf_outnorm_w,\
+#define LAUNCH(HAS_D, HAS_ON)                                               \
+  launch_fwd<7168, NC_FIXED, false, HAS_D, HAS_ON, false>(                  \
+      bf_blocks, bf_prefix_w, bf_delta, bf_qk_w, bf_norm_w, bf_out_w, N,    \
+      num_tokens, 1, static_cast<float>(eps), num_sm, stream2, bf_outnorm_w,\
       static_cast<float>(output_norm_eps), bsm, bsr)
 
-  switch (num_blocks) {
-    case 1:
-      if (has_delta && has_output_norm) {
-        LAUNCH(2, true, true);
-      } else if (has_delta && !has_output_norm) {
-        LAUNCH(2, true, false);
-      } else if (!has_delta && has_output_norm) {
-        LAUNCH(2, false, true);
-      } else {
-        LAUNCH(2, false, false);
-      }
-      break;
-    case 2:
-      if (has_delta && has_output_norm) {
-        LAUNCH(3, true, true);
-      } else if (has_delta && !has_output_norm) {
-        LAUNCH(3, true, false);
-      } else if (!has_delta && has_output_norm) {
-        LAUNCH(3, false, true);
-      } else {
-        LAUNCH(3, false, false);
-      }
-      break;
-    case 3:
-      if (has_delta && has_output_norm) {
-        LAUNCH(4, true, true);
-      } else if (has_delta && !has_output_norm) {
-        LAUNCH(4, true, false);
-      } else if (!has_delta && has_output_norm) {
-        LAUNCH(4, false, true);
-      } else {
-        LAUNCH(4, false, false);
-      }
-      break;
-    case 4:
-      if (has_delta && has_output_norm) {
-        LAUNCH(5, true, true);
-      } else if (has_delta && !has_output_norm) {
-        LAUNCH(5, true, false);
-      } else if (!has_delta && has_output_norm) {
-        LAUNCH(5, false, true);
-      } else {
-        LAUNCH(5, false, false);
-      }
-      break;
-    case 5:
-      if (has_delta && has_output_norm) {
-        LAUNCH(6, true, true);
-      } else if (has_delta && !has_output_norm) {
-        LAUNCH(6, true, false);
-      } else if (!has_delta && has_output_norm) {
-        LAUNCH(6, false, true);
-      } else {
-        LAUNCH(6, false, false);
-      }
-      break;
-    case 6:
-      if (has_delta && has_output_norm) {
-        LAUNCH(7, true, true);
-      } else if (has_delta && !has_output_norm) {
-        LAUNCH(7, true, false);
-      } else if (!has_delta && has_output_norm) {
-        LAUNCH(7, false, true);
-      } else {
-        LAUNCH(7, false, false);
-      }
-      break;
-    case 7:
-      if (has_delta && has_output_norm) {
-        LAUNCH(8, true, true);
-      } else if (has_delta && !has_output_norm) {
-        LAUNCH(8, true, false);
-      } else if (!has_delta && has_output_norm) {
-        LAUNCH(8, false, true);
-      } else {
-        LAUNCH(8, false, false);
-      }
-      break;
-    case 8:
-      if (has_delta && has_output_norm) {
-        LAUNCH(9, true, true);
-      } else if (has_delta && !has_output_norm) {
-        LAUNCH(9, true, false);
-      } else if (!has_delta && has_output_norm) {
-        LAUNCH(9, false, true);
-      } else {
-        LAUNCH(9, false, false);
-      }
-      break;
-    default:
-      TORCH_CHECK(false, "Kimi K3 AttnRes: num_blocks must be 1..8, got ", num_blocks);
+  if (has_delta && has_output_norm) {
+    LAUNCH(true, true);
+  } else if (has_delta && !has_output_norm) {
+    LAUNCH(true, false);
+  } else if (!has_delta && has_output_norm) {
+    LAUNCH(false, true);
+  } else {
+    LAUNCH(false, false);
   }
 #undef LAUNCH
   cudaError_t const error = cudaGetLastError();

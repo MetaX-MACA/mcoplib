@@ -16,13 +16,12 @@ class Concat_and_cache_mla_grouped_runner(OpBenchmarkBase):
         self.kv_lora_rank = config.get("kv_lora_rank", 512)
         self.pe_dim = config.get("pe_dim", 64)
         self.block_size = config.get("block_size", 16)
-        self.seed = config.get("seed", None)
         self.dtype = torch.bfloat16
 
     def define_metrics(self, state):
         state.add_summary("Op", self.name)
         state.add_summary("dtype", str(self.dtype))
-        state.add_summary("Shape", f"layers={self.num_layers} tokens={self.num_tokens} dim={self.kv_lora_rank+self.pe_dim}")
+        state.add_summary("Shape", f"layers={self.num_layers}, tokens={self.num_tokens}, dim={self.kv_lora_rank+self.pe_dim}")
 
         elements = self.num_layers * self.num_tokens * (self.kv_lora_rank + self.pe_dim)
         bytes_size = elements * 2
@@ -33,9 +32,6 @@ class Concat_and_cache_mla_grouped_runner(OpBenchmarkBase):
 
 
     def prepare_and_get_launcher(self, dev_id, tc_s):
-        if self.seed is not None:
-            torch.manual_seed(self.seed)
-            torch.cuda.manual_seed_all(self.seed)
         with torch.cuda.stream(tc_s):
             dev = f"cuda:{dev_id}"
 

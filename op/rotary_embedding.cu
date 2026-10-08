@@ -4,8 +4,6 @@
 #include <torch/torch.h>
 #include <cub/cub.cuh>
 #include "../kernel/utils.h"
-#include "mcoplib_ops_params_info.hpp"
-#include "mcoplib_ops_params_dump.hpp"
 
 __device__ __forceinline__ float2 bf162_to_float2(__maca_bfloat162 v) {
     return {__bfloat162float(v.x), __bfloat162float(v.y)};
@@ -302,8 +300,6 @@ void rotary_embedding(
         const int kv_head_num,
         const int rope_offset = 0)
 {
-    DEBUG_TRACE_PARAMS(packed_qkv, q_len, accum_q_lens, cache_lens, cos, sin, q_head_num, kv_head_num, rope_offset);
-    DEBUG_DUMP_PARAMS(packed_qkv, q_len, accum_q_lens, cache_lens, cos, sin, q_head_num, kv_head_num, rope_offset);
     TORCH_CHECK(packed_qkv.dtype() == at::ScalarType::BFloat16, "bf16 only");
     TORCH_CHECK(cos.dtype() == at::kFloat && sin.dtype() == at::kFloat, "cos/sin fp32");
     TORCH_CHECK(accum_q_lens.dtype() == at::kInt && cache_lens.dtype() == at::kInt, "int32");

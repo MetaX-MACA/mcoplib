@@ -42,7 +42,6 @@ class Dsv4_fused_q_norm_rope_runner(OpBenchmarkBase):
         self.head_dim = config.get("head_dim", 192)
         self.rope_dim = config.get("rope_dim", 64)
         self.max_pos = config.get("max_pos", 512)
-        self.seed = config.get("seed", None)
         self.eps = config.get("eps", 1e-6)
 
     def define_metrics(self, state):
@@ -63,9 +62,6 @@ class Dsv4_fused_q_norm_rope_runner(OpBenchmarkBase):
         state.add_global_memory_writes(writes)
 
     def prepare_and_get_launcher(self, dev_id, tc_s):
-        if self.seed is not None:
-            torch.manual_seed(self.seed)
-            torch.cuda.manual_seed_all(self.seed)
         with torch.cuda.stream(tc_s):
             dev = f'cuda:{dev_id}'
             q_input = torch.randn(

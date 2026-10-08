@@ -71,7 +71,6 @@ if (USE_MACA)
     # add vLLM ops macro
     VLLM_ENABLE_KIMI_K3_ATTN_RES
     VLLM_ENABLE_FUSED_KDA_DECODE
-    VLLM_ENABLE_FUSED_GDN_DECODE
   )
   message(STATUS "MACA version: ${MACA_VERSION_MAJOR}.${MACA_VERSION_MINOR}.${MACA_VERSION_PATCH}.${MACA_VERSION_BUILD}")
 
@@ -94,7 +93,7 @@ install(CODE "set(CMAKE_INSTALL_LOCAL_ONLY TRUE)" ALL_COMPONENTS)
 #
 set(PYTHON_SUPPORTED_VERSIONS "3.9" "3.10" "3.11" "3.12")
 
-set(TORCH_SUPPORTED_VERSION_CUDA "2.10.0")
+set(TORCH_SUPPORTED_VERSION_CUDA "2.6.0")
 
 find_python_from_executable(${VLLM_PYTHON_EXECUTABLE} "${PYTHON_SUPPORTED_VERSIONS}")
 
@@ -102,9 +101,9 @@ find_python_from_executable(${VLLM_PYTHON_EXECUTABLE} "${PYTHON_SUPPORTED_VERSIO
 # This check must happen after find_package(Torch) because that's when CMAKE_CUDA_COMPILER_VERSION gets defined
 if(DEFINED CMAKE_CUDA_COMPILER_VERSION AND
    CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.8)
-  set(CUDA_SUPPORTED_ARCHS "8.0;8.6;8.7;8.9;9.0;10.0;10.1;12.0")
+  set(CUDA_SUPPORTED_ARCHS "7.0;7.2;7.5;8.0;8.6;8.7;8.9;9.0;10.0;10.1;12.0")
 else()
-  set(CUDA_SUPPORTED_ARCHS "8.0;8.6;8.7;8.9;9.0")
+  set(CUDA_SUPPORTED_ARCHS "7.0;7.2;7.5;8.0;8.6;8.7;8.9;9.0")
 endif()
 
 set(MCOPLIB_GPU_LANG "CUDA")
@@ -227,7 +226,6 @@ if (BUILD_VLLM_SUBMODULE)
     "${VLLM_SRC_DIR}/fused_kimi_k3_mla_key_concat_kv_cache_kernel.cu"
     "${VLLM_SRC_DIR}/sampler.cu"
     "${VLLM_SRC_DIR}/topk.cu"
-    "${VLLM_SRC_DIR}/region_topk_ids.cu"
     "${VLLM_SRC_DIR}/dsv3_fused_a_gemm.cu"
     "${VLLM_SRC_DIR}/cuda_view.cu"
     "${VLLM_SRC_DIR}/quantization/gptq/q_gemm.cu"
@@ -251,10 +249,6 @@ if (BUILD_VLLM_SUBMODULE)
     "${VLLM_SRC_DIR}/fp32_router_gemm_entry.cu"
     "${VLLM_SRC_DIR}/fp32_router_gemm.cu"
     "${VLLM_SRC_DIR}/ngram_embedding_kernels.cu"
-    "${VLLM_SRC_DIR}/gdn/fused_gdn_decode_kernel.cu"
-    "${VLLM_SRC_DIR}/attention/dcp_utils/dcp_direct_a2a_lse_reduce.cu"
-    "${VLLM_SRC_DIR}/attention/dcp_utils/dcp_direct_kv_gather.cu"
-    "${VLLM_SRC_DIR}/attention/dcp_utils/dcp_direct_q_gather.cu"
     "${VLLM_SRC_DIR}/torch_bindings.cpp")
     
 
@@ -434,7 +428,6 @@ if (BUILD_DEFAULT_OP_SUBMODULE)
       "${MCOPLIB_SRCS_DIR}/fused_softplus_sqrt.cu"
       "${MCOPLIB_SRCS_DIR}/moe_swiglu_dq.cu"
       "${MCOPLIB_SRCS_DIR}/moe_softmax_topk.cu"
-      "${MCOPLIB_SRCS_DIR}/chunk_gated_delta_rule_fwd_h_native.cu"
       "${MCOPLIB_SRCS_DIR}/all_reduce.cu"
       "${MCOPLIB_SRCS_DIR}/rotary_embedding.cu"
       "${MCOPLIB_SRCS_DIR}/moe_gather.cu"
@@ -455,15 +448,7 @@ if (BUILD_DEFAULT_OP_SUBMODULE)
       "${MCOPLIB_SRCS_DIR}/fused_deepseekv4_qkv_rms_norm_rope.cu"
       "${MCOPLIB_SRCS_DIR}/fused_split_qkv_gemma_rmsnorm_rope.cu"
       "${MCOPLIB_SRCS_DIR}/fused_rmsnorm_rope_quant_reshape_and_cache.cu"
-      "${MCOPLIB_SRCS_DIR}/fused_split_qkv_gemma_rmsnorm_rope_no_pack.cu"
-      "${MCOPLIB_SRCS_DIR}/moe_step4_weighted_topk_gather.cu"
-      "${MCOPLIB_SRCS_DIR}/fused_masked_situ_quant_int8_pack.cu"
-      "${MCOPLIB_SRCS_DIR}/per_token_quant_int8.cu"
-      "${MCOPLIB_SRCS_DIR}/router_bias_topk.cu"
-      "${MCOPLIB_SRCS_DIR}/silu_mul_clamp_dsv4.cu")
-  list(APPEND MCOPLIB_EXT_SRC
-      "${MCOPLIB_SRCS_DIR}/mhc_pre_big_fuse.cu"
-      "${MCOPLIB_SRCS_DIR}/mhc_post_cuda.cu")
+      "${MCOPLIB_SRCS_DIR}/fused_split_qkv_gemma_rmsnorm_rope_no_pack.cu")
 
   if (GLOBAL_ENABLE_BUILD_GPTQ_MARLIN)
       list(APPEND MCOPLIB_EXT_SRC
@@ -503,22 +488,17 @@ if (BUILD_SGLANG_SUBMODULE)
   set(SGLANG_KERNELS_SRCS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/op/sglang)
   set(MCOPLIB_SGLANG_KERNEL_SRC
       "${SGLANG_KERNELS_SRCS_DIR}/csrc/allreduce/custom_all_reduce.cu"
-      #"${SGLANG_KERNELS_SRCS_DIR}/csrc/attention/cascade.cu"
+      "${SGLANG_KERNELS_SRCS_DIR}/csrc/attention/cascade.cu"
       "${SGLANG_KERNELS_SRCS_DIR}/csrc/attention/merge_attn_states.cu"
-      "${SGLANG_KERNELS_SRCS_DIR}/csrc/attention/chunk_kda_fwd_intra_token_parallel.cu"
       "${SGLANG_KERNELS_SRCS_DIR}/csrc/attention/vertical_slash_index.cu"
       "${SGLANG_KERNELS_SRCS_DIR}/csrc/attention/fused_mla.cu"
-      "${SGLANG_KERNELS_SRCS_DIR}/csrc/attention/sparse_attention.cu"
       "${SGLANG_KERNELS_SRCS_DIR}/csrc/elementwise/activation.cu"
       "${SGLANG_KERNELS_SRCS_DIR}/csrc/elementwise/fused_add_rms_norm_kernel.cu"
-      "${SGLANG_KERNELS_SRCS_DIR}/csrc/elementwise/fused_hc_head.cu"
       "${SGLANG_KERNELS_SRCS_DIR}/csrc/elementwise/rope.cu"
       "${SGLANG_KERNELS_SRCS_DIR}/csrc/elementwise/pos_enc.cu"
       "${SGLANG_KERNELS_SRCS_DIR}/csrc/elementwise/topk.cu"
       "${SGLANG_KERNELS_SRCS_DIR}/csrc/elementwise/topk_decode.cu"
-      "${SGLANG_KERNELS_SRCS_DIR}/jit_kernels/fused_gemma_qknorm_rope.cu"
       "${SGLANG_KERNELS_SRCS_DIR}/jit_kernels/topk_v1.cu"
-      "${SGLANG_KERNELS_SRCS_DIR}/jit_kernels/kpool_topk_transform.cu"
       "${SGLANG_KERNELS_SRCS_DIR}/csrc/elementwise/copy.cu"
       "${SGLANG_KERNELS_SRCS_DIR}/csrc/elementwise/dsv4_norm_rope.cu"
       "${SGLANG_KERNELS_SRCS_DIR}/csrc/elementwise/concat_mla.cu"
@@ -553,10 +533,20 @@ if (BUILD_SGLANG_SUBMODULE)
       "${SGLANG_KERNELS_SRCS_DIR}/csrc/moe/moe_topk_sigmoid_kernels.cu"
       "${SGLANG_KERNELS_SRCS_DIR}/csrc/mamba/causal_conv1d.cu")
 
+
+
   set_gencode_flags_for_srcs(
     SRCS "${MCOPLIB_SGLANG_KERNEL_SRC}"
     CUDA_ARCHS "${CUDA_ARCHS}")
+  message(STATUS "Enabling mcoplib  sgl_kernel extension.")
 
+  #flashinfer 
+  set(FLASHINFER_INCLUDE 
+          ${PYTHON_PACKAGE}/flashinfer/data/include
+          ${PYTHON_PACKAGE}/flashinfer/data/gemm
+          ${PYTHON_PACKAGE}/flashinfer/data/include
+          ${PYTHON_PACKAGE}/flashinfer/data/csrc
+          cublas)
   define_gpu_extension_target(
     sgl_kernel
     DESTINATION mcoplib
@@ -566,6 +556,7 @@ if (BUILD_SGLANG_SUBMODULE)
     ARCHITECTURES ${VLLM_GPU_ARCHES}
     INCLUDE_DIRECTORIES ${SGLANG_KERNELS_SRCS_DIR}/include
     INCLUDE_DIRECTORIES ${SGLANG_KERNELS_SRCS_DIR}/csrc
+    INCLUDE_DIRECTORIES ${FLASHINFER_INCLUDE}
     INCLUDE_DIRECTORIES $ENV{MACA_PATH}/include
     INCLUDE_DIRECTORIES ${SGLANG_KERNELS_SRCS_DIR}/csrc/fast_hadamard_transform)
 
@@ -574,7 +565,7 @@ if (BUILD_SGLANG_SUBMODULE)
   target_compile_options(sgl_kernel PRIVATE
       $<$<COMPILE_LANGUAGE:CUDA>:-O3 -std=c++17 -Xcompiler -fPIC -gencode=arch=compute_75,code=sm_75 -gencode=arch=compute_80,code=sm_80 -gencode=arch=compute_89,code=sm_89 -gencode=arch=compute_90,code=sm_90>
       $<$<COMPILE_LANGUAGE:CUDA>:--ptxas-options=-v --expt-relaxed-constexpr  -use-fast-math  -DTORCH_API_INCLUDE_EXTENSION_H >
-      $<$<COMPILE_LANGUAGE:CUDA>: -DMCOPLIB_ENABLE_BF16 -DMCOPLIB_ENABLE_F16 -U__CUDA_NO_HALF2_OPERATORS__ -U__CUDA_NO_HALF_OPERATORS__ --offload-arch=xcore1000  --offload-arch=xcore1008 --offload-arch=xcore1500 --offload-arch=xcore1600>
+      $<$<COMPILE_LANGUAGE:CUDA>:-DFLASHINFER_ENABLE_BF16 -U__CUDA_NO_HALF2_OPERATORS__ -U__CUDA_NO_HALF_OPERATORS__ --offload-arch=xcore1000  --offload-arch=xcore1008 --offload-arch=xcore1500 --offload-arch=xcore1600>
   )
 
 

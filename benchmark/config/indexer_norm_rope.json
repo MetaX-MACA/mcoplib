@@ -1,7 +1,7 @@
 {
     "device_id": 0,
     "device_name": ["MetaX C500", "MetaX C600-UL", "Metax C600-U"],
-    "num_tokens": [512, 4096],
+    "num_tokens": [16, 512, 4096],
     "q_heads": [4, 16],
     "k_heads": 1,
     "head_dim": 256,

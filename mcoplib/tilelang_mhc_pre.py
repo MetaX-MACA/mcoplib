@@ -6,11 +6,6 @@ import tilelang
 import tilelang.language as T
 import torch
 
-try:
-    from mcoplib import op as _default_op
-except ImportError:
-    _default_op = None
-
 
 PASS_CONFIGS = {
     tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
@@ -52,10 +47,8 @@ def mhc_pre_tilelang_optimized(
         layer_input: T.Tensor[(num_tokens, hidden_size), T.bfloat16],
     ) -> None:
         with T.Kernel(num_tokens, threads=128) as pid:
-            rms_shared = T.alloc_shared(8, T.float32)
-            mix_shared = T.alloc_shared(
-                mhc_mult3 * mix_lanes_per_value, T.float32
-            )
+            mixes_shared = T.alloc_shared(mhc_mult3, T.float32)
+            rms_shared = T.alloc_shared(rms_lanes, T.float32)
 
             if rms_lanes == 1:
                 if T.get_thread_binding() == 0:
@@ -100,12 +93,12 @@ def mhc_pre_tilelang_optimized(
                         for i_split in T.serial(n_splits):
                             mixes[j] += gemm_out_mul[i_split, pid, j]
                         mixes[j] *= rms_shared[0]
-                    T.copy(mixes, mix_shared, disable_tma=True)
+                    T.copy(mixes, mixes_shared, disable_tma=True)
             else:
-                if (
-                    T.get_thread_binding()
-                    < mhc_mult3 * mix_lanes_per_value
-                ):
+                mix_partials = T.alloc_shared(
+                    mhc_mult3 * mix_lanes_per_value, T.float32
+                )
+                if T.get_thread_binding() < mhc_mult3 * mix_lanes_per_value:
                     mix_partial = T.alloc_fragment(1, T.float32)
                     mix_partial[0] = 0
                     mix_lane = T.get_thread_binding() // mhc_mult3
@@ -114,14 +107,12 @@ def mhc_pre_tilelang_optimized(
                         (n_splits + mix_lanes_per_value - 1)
                         // mix_lanes_per_value
                     ):
-                        i_split = (
-                            i_part * mix_lanes_per_value + mix_lane
-                        )
+                        i_split = i_part * mix_lanes_per_value + mix_lane
                         if i_split < n_splits:
                             mix_partial[0] += gemm_out_mul[
                                 i_split, pid, mix_index
                             ]
-                    mix_shared[T.get_thread_binding()] = mix_partial[0]
+                    mix_partials[T.get_thread_binding()] = mix_partial[0]
 
                 T.sync_threads()
 
@@ -129,10 +120,10 @@ def mhc_pre_tilelang_optimized(
                     mix_value = T.alloc_fragment(1, T.float32)
                     mix_value[0] = 0
                     for i_lane in T.serial(mix_lanes_per_value):
-                        mix_value[0] += mix_shared[
+                        mix_value[0] += mix_partials[
                             i_lane * mhc_mult3 + T.get_thread_binding()
                         ]
-                    mix_shared[T.get_thread_binding()] = (
+                    mixes_shared[T.get_thread_binding()] = (
                         mix_value[0] * rms_shared[0]
                     )
 
@@ -142,7 +133,7 @@ def mhc_pre_tilelang_optimized(
                 for j in T.Parallel(mhc_mult):
                     post_mix[pid, j] = (
                         T.sigmoid(
-                            mix_shared[j + mhc_mult] * mhc_scale[1]
+                            mixes_shared[j + mhc_mult] * mhc_scale[1]
                             + mhc_base[j + mhc_mult]
                         )
                         * mhc_post_mult_value
@@ -150,7 +141,7 @@ def mhc_pre_tilelang_optimized(
 
                 for j, k in T.Parallel(mhc_mult, mhc_mult):
                     cm[j, k] = (
-                        mix_shared[j * mhc_mult + k + mhc_mult * 2]
+                        mixes_shared[j * mhc_mult + k + mhc_mult * 2]
                         * mhc_scale[2]
                         + mhc_base[j * mhc_mult + k + mhc_mult * 2]
                     )
@@ -190,10 +181,11 @@ def mhc_pre_tilelang_optimized(
                 for j, k in T.Parallel(mhc_mult, mhc_mult):
                     comb_mix[pid, j * mhc_mult + k] = cm[j, k]
             else:
+                pre_mix_shared = T.alloc_shared(mhc_mult, T.float32)
                 for j in T.Parallel(mhc_mult):
-                    rms_shared[j] = (
+                    pre_mix_shared[j] = (
                         T.sigmoid(
-                            mix_shared[j] * mhc_scale[0]
+                            mixes_shared[j] * mhc_scale[0]
                             + mhc_base[j]
                         )
                         + mhc_pre_eps
@@ -203,13 +195,13 @@ def mhc_pre_tilelang_optimized(
                     hidden_size // hidden_block,
                     num_stages=num_stages,
                 ):
+                    xs = T.alloc_shared(
+                        (mhc_mult, hidden_block), T.bfloat16
+                    )
                     xl = T.alloc_fragment(
                         (mhc_mult, hidden_block), T.float32
                     )
                     if residual_use_shared:
-                        xs = T.alloc_shared(
-                            (mhc_mult, hidden_block), T.bfloat16
-                        )
                         T.copy(
                             residual[pid, 0, i0_h * hidden_block],
                             xs,
@@ -226,7 +218,7 @@ def mhc_pre_tilelang_optimized(
                     ol = T.alloc_fragment((hidden_block,), T.float32)
                     T.clear(ol)
                     for i_mhc in T.serial(mhc_mult):
-                        pre = rms_shared[i_mhc]
+                        pre = pre_mix_shared[i_mhc]
                         for i1_h in T.Parallel(hidden_block):
                             ol[i1_h] += pre * xl[i_mhc, i1_h]
 
@@ -282,61 +274,31 @@ def mhc_pre(
         num_tokens, hidden_size, dtype=torch.bfloat16, device=residual.device
     )
 
-    use_cuda_specialization = (
-        _default_op is not None
-        and hasattr(_default_op, "mhc_pre_big_fuse_out")
-        and hidden_size in (4096, 7168)
-        and mhc_mult == 4
-        and n_splits in (16, 64)
-        and rms_eps == 1e-6
-        and mhc_pre_eps == 1e-6
-        and mhc_sinkhorn_eps == 1e-6
-        and mhc_post_mult_value == 2.0
-        and sinkhorn_repeat == 20
+    kernel = mhc_pre_tilelang_optimized(
+        hidden_size,
+        rms_eps,
+        mhc_pre_eps,
+        mhc_sinkhorn_eps,
+        mhc_post_mult_value,
+        sinkhorn_repeat,
+        n_splits=n_splits,
+        mhc_mult=mhc_mult,
+        hidden_block_size=512,
+        num_stages=1,
+        sinkhorn_unroll_factor=19,
+        mix_lanes_per_value=4 if n_splits == 64 else 2,
+        residual_use_shared=not (32 <= num_tokens <= 280),
     )
-    if use_cuda_specialization:
-        _default_op.mhc_pre_big_fuse_out(
-            gemm_out_mul,
-            gemm_out_sqrsum,
-            mhc_scale,
-            mhc_base,
-            residual_flat,
-            post_mix,
-            comb_mix,
-            layer_input,
-            rms_eps,
-            mhc_pre_eps,
-            mhc_sinkhorn_eps,
-            mhc_post_mult_value,
-            sinkhorn_repeat,
-            n_splits,
-        )
-    else:
-        kernel = mhc_pre_tilelang_optimized(
-            hidden_size,
-            rms_eps,
-            mhc_pre_eps,
-            mhc_sinkhorn_eps,
-            mhc_post_mult_value,
-            sinkhorn_repeat,
-            n_splits=n_splits,
-            mhc_mult=mhc_mult,
-            hidden_block_size=512,
-            num_stages=1,
-            sinkhorn_unroll_factor=19,
-            mix_lanes_per_value=4 if n_splits == 64 else 2,
-            residual_use_shared=not (32 <= num_tokens <= 280),
-        )
-        kernel(
-            gemm_out_mul,
-            gemm_out_sqrsum,
-            mhc_scale,
-            mhc_base,
-            residual_flat,
-            post_mix,
-            comb_mix,
-            layer_input,
-        )
+    kernel(
+        gemm_out_mul,
+        gemm_out_sqrsum,
+        mhc_scale,
+        mhc_base,
+        residual_flat,
+        post_mix,
+        comb_mix,
+        layer_input,
+    )
 
     post_mix = post_mix.view(*outer_shape, mhc_mult, 1)
     comb_mix = comb_mix.view(*outer_shape, mhc_mult, mhc_mult)

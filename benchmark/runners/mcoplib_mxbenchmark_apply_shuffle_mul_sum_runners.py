@@ -12,7 +12,6 @@ class Apply_shuffle_mul_sum_runner(OpBenchmarkBase):
         self.num_elements = config.get("num_elements", 4096)
         self.num_reduced = config.get("num_reduced", 1024)
         self.hidden_dim = config.get("hidden_dim", 4096) 
-        self.seed = config.get("seed", None)
         assert self.num_elements % self.num_reduced == 0, "num_elements 必须能被 num_reduced 整除"
         self.topk = self.num_elements // self.num_reduced
 
@@ -32,9 +31,6 @@ class Apply_shuffle_mul_sum_runner(OpBenchmarkBase):
         state.add_global_memory_writes(write_bytes)
 
     def prepare_and_get_launcher(self, dev_id, tc_s):
-        if self.seed is not None:
-            torch.manual_seed(self.seed)
-            torch.cuda.manual_seed_all(self.seed)
         with torch.cuda.stream(tc_s):
             dev = f'cuda:{dev_id}'
             inp = torch.randn((self.num_elements, self.hidden_dim), dtype=self.dtype, device=dev)

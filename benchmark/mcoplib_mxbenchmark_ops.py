@@ -32,7 +32,6 @@ SUPPORTED_OPERATORS = [
     "batched_moe_align_block_size",
     "batched_rotary_embedding",
     "build_tree_kernel_efficient",
-    "causal_conv1d_fwd",
     "concat_and_cache_mla",
     "concat_mla_absorb_q",
     "concat_mla_k",
@@ -95,7 +94,6 @@ SUPPORTED_OPERATORS = [
     "prepare_moe_input",
     "qk_rms_norm",
     "quantize_k_cache",
-    "region_topk_ids",
     "reshape_and_cache",
     "reshape_and_cache_flash",
     "rms_norm",
@@ -149,11 +147,8 @@ SUPPORTED_OPERATORS = [
     "persistent_masked_m_swiglu_mul_quant",
     "kimi_k3_attn_res",
     "fused_kda_decode",
-    "fused_sigmoid_gating_delta_rule_update",
     "situ_and_mul",
     "triton_situ_and_mul",
-    "triton_sglang_chunk_delta_h",
-    "triton_sglang_per_token_quant_int8",
     "masked_situ_and_mul",
     "concat_and_cache_mla_grouped",
     "fused_kimi_k3_mla_key_concat_kv_cache_insert",
@@ -161,16 +156,7 @@ SUPPORTED_OPERATORS = [
     "fused_kimi_k3_mla_decode_q_concat_kv_cache_insert",
     "fused_kimi_k3_mla_qkv_quant_kv_cache_fp8_insert",
     "fused_kimi_k3_mla_decode_q_concat_ds_mla_insert",
-    "fused_kimi_k3_mla_decode_q_concat_kv_cache_fp8_insert",
-    "topk_softplus_sqrt",
-    "ngram_compute_n_gram_ids",
-    "relu_squared",
-    "fused_kimi_k3_mla_kv_concat_quant_fp8",
-    "fused_kimi_k3_mla_kv_concat",
-    "fused_gdn_decode_post_conv_mtp",
-    "cp_gather_and_upconvert_fp8_kv_cache",
-    "dsv3_fused_a_gemm",
-    "fused_deepseek_v4_qnorm_rope_kv_rope_int8_insert"
+    "fused_kimi_k3_mla_decode_q_concat_kv_cache_fp8_insert"
 ]
 # =============================================================================
 #  Global Config: Ignored Operators

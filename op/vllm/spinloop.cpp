@@ -7,7 +7,7 @@ extern "C" {
 
 #if defined(__i386__) || defined(__x86_64__)
   #include <cpuid.h>
-  #include <x86intrin.h>
+  #include <mwaitxintrin.h>
 #endif
 
 #if defined(CLOCK_MONOTONIC_RAW)

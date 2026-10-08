@@ -25,7 +25,7 @@ class Moe_unpermute_runner(OpBenchmarkBase):
 
         state.add_summary(
             "Shape",
-            f"({self.batch_size} {self.top_k} {self.hidden_size})"
+            f"({self.batch_size},{self.top_k},{self.hidden_size})"
         )
 
         element_size = 2
