@@ -687,9 +687,7 @@ __global__ void moe_lora_align_block_size_kernel(
 
   // Populate the token_mask based on the token-LoRA mapping
   int num_tokens = numel / topk_num;
-  // Only the even counting block owns per-LoRA metadata. The odd block only
-  // initializes sorted_token_ids and must not race the final count write.
-  if (blockIdx.x % 2 == 0 && threadIdx.x == 0) {
+  if (threadIdx.x == 0) {
     total_tokens_post_pad[lora_id] = 0;
 
     for (int i = 0; i < num_tokens; i++) {

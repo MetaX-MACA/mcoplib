@@ -7,8 +7,6 @@
 #include <cuda_bf16.h>
 #include <cstdint>
 #include <vector>
-#include "mcoplib_ops_params_info.hpp"
-#include "mcoplib_ops_params_dump.hpp"
 
 // ============================================================================
 // Metax C500 极致优化内核 (Zero-Shared-Memory, Multi-Head Block, SREG Caching)
@@ -255,9 +253,6 @@ std::vector<at::Tensor> gemma_fused_rmsnorm_rope_no_pack(
     double eps,
     at::Tensor const& cos_sin_cache)
 {
-    DEBUG_TRACE_PARAMS(qkv, q_weight, k_weight, positions, q_size, kv_size, head_dim, eps, cos_sin_cache);
-    DEBUG_DUMP_PARAMS(qkv, q_weight, k_weight, positions, q_size, kv_size, head_dim, eps, cos_sin_cache);
-
     at::Tensor q = at::empty({qkv.size(0), q_size}, qkv.options());
     at::Tensor k = at::empty({qkv.size(0), kv_size}, qkv.options());
     at::Tensor v = at::empty({qkv.size(0), kv_size}, qkv.options());

@@ -7,8 +7,6 @@
 #include "../kernel/utils.h"
 #include "../kernel/all_reduce_kernel.cuh"
 #include "../include/fused_rmsnorm_rope_quant_reshape_and_cache.h"
-#include "mcoplib_ops_params_info.hpp"
-#include "mcoplib_ops_params_dump.hpp"
 #include <torch/extension.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -457,7 +455,7 @@ __global__ void __launch_bounds__(kTPH* kHeadsPerBlock, kOcc)
   }
 }
 
-template <typename cache_t, int KV, int VST>
+template <typename cache_t, int KV>
 __global__ void fused_v_reshape_and_cache_kernel(
     const __maca_bfloat16* __restrict__ value,  // packed_qkv + V 段列偏移
     cache_t* __restrict__ value_cache,
@@ -467,6 +465,7 @@ __global__ void fused_v_reshape_and_cache_kernel(
     const int num_tokens) {
   constexpr int TILE_T = kTileT;
   constexpr int MAXCH = TILE_T / kVec;
+  constexpr int VST = 16 / sizeof(cache_t);
 
   float const inv_scale = (KV == KV_BF16) ? 1.0f : (1.0f / *v_scale);
 
@@ -542,19 +541,12 @@ __global__ void fused_v_reshape_and_cache_kernel(
         for (int k = 0; k < VST; ++k) {
           f[k] = __bfloat162float(smem[(t0 + k) * SP + d]) * inv_scale;
         }
-        if constexpr (VST == 16) {
-          uint4 out;
-          out.x = rc_pack4_fp8_e4m3(f[0], f[1], f[2], f[3]);
-          out.y = rc_pack4_fp8_e4m3(f[4], f[5], f[6], f[7]);
-          out.z = rc_pack4_fp8_e4m3(f[8], f[9], f[10], f[11]);
-          out.w = rc_pack4_fp8_e4m3(f[12], f[13], f[14], f[15]);
-          *reinterpret_cast<uint4*>(dst) = out;
-        } else {
-          uint2 out;
-          out.x = rc_pack4_fp8_e4m3(f[0], f[1], f[2], f[3]);
-          out.y = rc_pack4_fp8_e4m3(f[4], f[5], f[6], f[7]);
-          *reinterpret_cast<uint2*>(dst) = out;
-        }
+        uint4 out;
+        out.x = rc_pack4_fp8_e4m3(f[0], f[1], f[2], f[3]);
+        out.y = rc_pack4_fp8_e4m3(f[4], f[5], f[6], f[7]);
+        out.z = rc_pack4_fp8_e4m3(f[8], f[9], f[10], f[11]);
+        out.w = rc_pack4_fp8_e4m3(f[12], f[13], f[14], f[15]);
+        *reinterpret_cast<uint4*>(dst) = out;
       } else {
         cache_t tmp[VST];
 #pragma unroll
@@ -614,9 +606,6 @@ void fused_rmsnorm_rope_quant_reshape_and_cache(
     c10::optional<torch::Tensor> v_scale,
     const std::string& kv_cache_dtype,
     int64_t rope_offset, int64_t block_size, double eps) {
-  DEBUG_TRACE_PARAMS(packed_qkv, q_norm_weight, k_norm_weight, cos, sin, q_lens, cache_lens, accum_q_lens, k_cache, v_cache, slot_mapping, k_scale, v_scale, kv_cache_dtype, rope_offset, block_size, eps);
-  DEBUG_DUMP_PARAMS(packed_qkv, q_norm_weight, k_norm_weight, cos, sin, q_lens, cache_lens, accum_q_lens, k_cache, v_cache, slot_mapping, k_scale, v_scale, kv_cache_dtype, rope_offset, block_size, eps);
-
   TORCH_CHECK(packed_qkv.is_cuda() && packed_qkv.is_contiguous(),
               "packed_qkv must be a contiguous CUDA tensor");
   TORCH_CHECK(packed_qkv.dim() == 2, "packed_qkv must be [num_tokens, hidden]");
@@ -749,7 +738,7 @@ void fused_rmsnorm_rope_quant_reshape_and_cache(
     }                                                                           \
   } while (0)
 
-#define DISPATCH_KV(CACHE_T, KV, VST)                                           \
+#define DISPATCH_KV(CACHE_T, KV)                                                \
   do {                                                                          \
     if (rope_dim == 128) {                                                      \
       if (batch1) LAUNCH_QK(CACHE_T, KV, 128, true);                            \
@@ -758,7 +747,7 @@ void fused_rmsnorm_rope_quant_reshape_and_cache(
       if (batch1) LAUNCH_QK(CACHE_T, KV, 64, true);                             \
       else        LAUNCH_QK(CACHE_T, KV, 64, false);                            \
     }                                                                           \
-    fused_v_reshape_and_cache_kernel<CACHE_T, KV, VST>                          \
+    fused_v_reshape_and_cache_kernel<CACHE_T, KV>                               \
         <<<gridB, dim3(kBlockThreadsB), smem_bytes, stream>>>(                  \
             qkv_ptr + v_col_offset,                                             \
             reinterpret_cast<CACHE_T*>(v_cache.data_ptr()), slot_ptr,           \
@@ -768,16 +757,12 @@ void fused_rmsnorm_rope_quant_reshape_and_cache(
   } while (0)
 
   if (kv_cache_dtype == "bf16" || kv_cache_dtype == "bfloat16") {
-    DISPATCH_KV(__maca_bfloat16, KV_BF16, 8);
+    DISPATCH_KV(__maca_bfloat16, KV_BF16);
   } else if (kv_cache_dtype == "fp8" || kv_cache_dtype == "fp8_e4m3" ||
              kv_cache_dtype == "float8") {
-    if ((num_tokens & 15) == 8 && num_tokens < 256) {
-      DISPATCH_KV(__maca_fp8_e4m3, KV_FP8, 8);
-    } else {
-      DISPATCH_KV(__maca_fp8_e4m3, KV_FP8, 16);
-    }
+    DISPATCH_KV(__maca_fp8_e4m3, KV_FP8);
   } else if (kv_cache_dtype == "int8") {
-    DISPATCH_KV(int8_t, KV_INT8, 16);
+    DISPATCH_KV(int8_t, KV_INT8);
   } else {
     TORCH_CHECK(false, "unsupported kv_cache_dtype: ", kv_cache_dtype);
   }

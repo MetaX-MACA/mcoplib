@@ -4,8 +4,6 @@
 #include <torch/torch.h>
 #include <cub/cub.cuh>
 #include "../kernel/utils.h"
-#include "mcoplib_ops_params_info.hpp"
-#include "mcoplib_ops_params_dump.hpp"
 
 // ============================================================================
 // scale_dynamic_quant : per-token bf16 -> int8 dynamic (symmetric) quant with a
@@ -682,9 +680,6 @@ std::tuple<at::Tensor, at::Tensor> scale_dynamic_quant(
     const at::Tensor& smooth_scales,
     at::ScalarType dst_dtype = at::ScalarType::Char
 ) {
-    DEBUG_TRACE_PARAMS(hidden_states, smooth_scales);
-    DEBUG_DUMP_PARAMS(hidden_states, smooth_scales);
-
     CHECK_DEVICE(hidden_states);
     CHECK_DEVICE(smooth_scales);
 

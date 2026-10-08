@@ -4,7 +4,7 @@ requires = [
     "cmake>=3.26.1",
     "ninja",
     "pybind11 >= 2.13.1",
-    "torch>=2.10.0",
+    "torch>=2.4.0",
     "packaging>=24.2",
     "setuptools>=69.5.1,<80.0.0",
     "setuptools-scm>=8.0",
@@ -43,7 +43,8 @@ dependencies = [
     "pyyaml",
     "pydantic >= 2.10",
     "pybind11 >= 2.13.1",
+    "flashinfer >=0.2.6",
     "triton >= 2.0.0"
 ]
-requires-python = ">3.9,<3.13"
+requires-python = ">3.8,<3.13"
 dynamic = [ "version", "optional-dependencies"]

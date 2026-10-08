@@ -44,7 +44,7 @@ CMAKE_EXECUTABLE = 'cmake' if not USE_MACA else 'cmake_maca'
 #Python 当前解释器的扩展后缀
 ext_suffix = sysconfig.get_config_var('EXT_SUFFIX') or '.so'
 name="mcoplib"
-mcoplib_version="0.4.13"
+mcoplib_version="0.4.12"
 
 
 
@@ -116,38 +116,28 @@ class cmake_build_ext(build_ext):
     #
     # Determine number of compilation jobs and optionally nvcc compile threads.
     #
-    def compute_num_jobs(self):
-        # `num_jobs` 是并行的「编译动作」数(Ninja/-j)；`nvcc_threads` 是
-        # 单个 nvcc 进程内部的线程数（CMake 里透传为 --threads）。
-        # 二者相乘约等于峰值线程数，必须除以 nvcc_threads 保持 ≈ 逻辑核数，
-        # 否则会严重过订阅（例如 176 个动作 × 每个 8 线程 = 1408 线程 / 176 核）。
-        # num_jobs：优先取 MAX_JOBS 环境变量，否则用可用 CPU 数。
-        num_jobs = os.environ.get("MAX_JOBS", None)
-        if num_jobs is not None:
-            num_jobs = int(num_jobs)
-            logger.info("Using MAX_JOBS=%d as the number of jobs.", num_jobs)
-        else:
-            try:
-                # os.sched_getaffinity() 并非所有平台可用，失败则退回 cpu_count()。
-                num_jobs = len(os.sched_getaffinity(0))
-            except AttributeError:
-                num_jobs = os.cpu_count()
+    # def compute_num_jobs(self):
+    #     # `num_jobs` is either the value of the MAX_JOBS environment variable
+    #     # (if defined) or the number of CPUs available.
+    #     try:
+    #         # os.sched_getaffinity() isn't universally available, so fall
+    #         #  back to os.cpu_count() if we get an error here.
+    #         num_jobs = len(os.sched_getaffinity(0))
+    #     except AttributeError:
+    #         num_jobs = os.cpu_count()
 
-        # nvcc_threads：仅在使用 CUDA/MACA 的 nvcc/cucc 时才有意义。
-        nvcc_threads = None
-        if _is_cuda() or USE_MACA:
-            # 优先取 NVCC_THREADS 环境变量，否则默认 8（沿用本仓既有默认）。
-            nvcc_threads = os.environ.get("NVCC_THREADS", None)
-            if nvcc_threads is not None:
-                nvcc_threads = int(nvcc_threads)
-                logger.info("Using NVCC_THREADS=%d as the number of nvcc threads.",
-                            nvcc_threads)
-            else:
-                nvcc_threads = 8
-            # 关键：用 nvcc_threads 折减 num_jobs，避免总线程数过订阅。
-            num_jobs = max(1, num_jobs // nvcc_threads)
+    #     nvcc_threads = None
+    #     if _is_cuda() and get_nvcc_cuda_version() >= Version("11.2"):
+    #         # `nvcc_threads` is either the value of the NVCC_THREADS
+    #         # environment variable (if defined) or 1.
+    #         # when it is set, we reduce `num_jobs` to avoid
+    #         # overloading the system.
 
-        return num_jobs, nvcc_threads
+    #         nvcc_threads = 1
+    #         num_jobs = max(1, num_jobs // nvcc_threads)
+
+    #     return num_jobs, nvcc_threads
+
     def compute_num_jobs(self):
         # `num_jobs` is either the value of the MAX_JOBS environment variable
         # (if defined) or the number of CPUs available.
@@ -358,6 +348,53 @@ class custom_install(install):
         # After installation, apply mcoplib modifications
         #self.apply_mcoplib_after_install()
 			
+class repackage_wheel(build_ext):
+    """Extracts libraries and other files from an existing wheel."""
+
+
+    def run(self) -> None:
+
+
+        import zipfile
+
+
+        wheel_filename = "mcoplib-0.1.0-torch2.6.0-maca.3.0.0-x86_64.whl"
+
+        import tempfile
+
+        # create a temporary directory to store the wheel
+        temp_dir = tempfile.mkdtemp(prefix="mcoplib-wheels")
+        wheel_path = os.path.join(temp_dir, wheel_filename)
+
+        with zipfile.ZipFile(wheel_path) as wheel:
+            files_to_copy = [
+                "mcoplib/op.cpython-310-x86_64-linux-gnu.so",
+                "mcoplib/_moe_C.abi3.so",
+                "mcoplib/_C.abi3.so",
+                "mcoplib/lmdeploy.cpython-310-x86_64-linux-gnu.so",
+                "mcoplib/sgl_kernel.cpython-310-x86_64-linux-gnu.so",
+				"mcoplib/sgl_grouped_gemm_cuda.cpython-310-x86_64-linux-gnu.so",
+            ]
+
+            file_members = list(
+                filter(lambda x: x.filename in files_to_copy, wheel.filelist))
+
+
+            for file in file_members:
+                print(f"Extracting and including {file.filename} "
+                      "from existing wheel")
+                package_name = os.path.dirname(file.filename).replace("/", ".")
+                file_name = os.path.basename(file.filename)
+
+                if package_name not in package_data:
+                    package_data[package_name] = []
+
+                wheel.extract(file)
+                if file_name.endswith(".py") or file_name.endswith(".cu"):
+                    # python files shouldn't be added to package_data
+                    continue
+
+                package_data[package_name].append(file_name)
 
 class CustomDist(Distribution):
     def get_fullname(self):
@@ -818,7 +855,7 @@ def write_git_info_file(target_path):
         f'Min_Compatibility_Maca_Version = {MIN_COMPATIBILITY_MACA_VERSION!r}\n'
         f'GIT_BRANCH = {branch!r}\n'
         f'GIT_COMMIT = {commit!r}\n'
-        f'Vllm Op Version = 0.28.0\n'
+        f'Vllm Op Version = 0.27.0\n'
         f'SGlang Op Version  = 0.5.17\n'
     )
     os.makedirs(os.path.dirname(target_path), exist_ok=True)

@@ -51,18 +51,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   /*
    * From csrc/attention
    */
+  m.def("merge_state(Tensor v_a, Tensor s_a, Tensor v_b, Tensor s_b, Tensor! v_merged, Tensor! s_merged) -> ()");
+  m.impl("merge_state", torch::kCUDA, &merge_state);
   m.def("merge_state_v2(Tensor v_a, Tensor s_a, Tensor v_b, Tensor s_b, Tensor! v_merged, Tensor! s_merged) -> ()");
   m.impl("merge_state_v2", torch::kCUDA, &merge_state_v2);
-
-  m.def(
-      "sparse_attention_fwd(Tensor q, Tensor kv, Tensor indices, float sm_scale, int d_v=512, "
-      "bool return_lse=False) -> Tensor[]");
-  m.impl("sparse_attention_fwd", torch::kCUDA, &sparse_attention_fwd);
-
-  m.def("sparse_attention_clear_cache() -> ()", &sparse_attention_clear_cache);
-
-  m.def("chunk_kda_fwd_intra_token_parallel(Tensor q, Tensor k, Tensor g, Tensor beta, Tensor(a!) aqk, Tensor(b!) akk, float scale) -> ()");
-  m.impl("chunk_kda_fwd_intra_token_parallel", torch::kCUDA, &chunk_kda_fwd_intra_token_parallel);
 
   /*
    * From csrc/elementwise
@@ -72,11 +64,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   m.def("fused_add_rmsnorm(Tensor! input, Tensor! residual, Tensor weight, float eps, bool enable_pdl) -> ()");
   m.impl("fused_add_rmsnorm", torch::kCUDA, &sgl_fused_add_rmsnorm);
-
-
-  m.def("fused_hc_head(Tensor! output, Tensor x, Tensor hc_fn, Tensor hc_scale, "
-      "Tensor hc_base, float norm_eps, float hc_eps) -> ()");
-  m.impl("fused_hc_head", torch::kCUDA, &sgl_fused_hc_head);
 
 //   m.def("gemma_rmsnorm(Tensor! output, Tensor input, Tensor weight, float eps, bool enable_pdl) -> ()");
 //   m.impl("gemma_rmsnorm", torch::kCUDA, &gemma_rmsnorm);
@@ -258,7 +245,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def(
       "moe_align_block_size(Tensor topk_ids, int num_experts, int block_size, Tensor! sorted_token_ids, Tensor! "
       "experts_ids, Tensor! num_tokens_post_pad, Tensor! cumsum_buffer, bool "
-      "pad_sorted_token_ids, bool ignore_invalid_expert=False) -> ()");
+      "pad_sorted_token_ids, bool ignore_invalid_expert) -> ()");
   m.impl("moe_align_block_size", torch::kCUDA, &moe_align_block_size);
 
   m.def(
@@ -540,7 +527,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("weak_ref_tensor(Tensor tensor) -> Tensor");
   m.impl("weak_ref_tensor", torch::kCUDA, &weak_ref_tensor);
 
-
+  /*
+   * From FlashInfer
+   */
 //   m.def(
 //       "bmm_fp8(Tensor A, Tensor B, Tensor! D, Tensor A_scale, Tensor B_scale, Tensor workspace_buffer, int "
 //       "cublas_handle, int cuda_stream) -> ()",

@@ -958,6 +958,8 @@ __global__ void grouped_topk_fused_small_expert_count_kernel(
 #endif
 }
 
+// Adapted from
+// https://github.com/flashinfer-ai/flashinfer/blob/06400d062a2d51564bbe781f6f811d0b75ca593e/include/flashinfer/trtllm/fused_moe/RoutingKernelTopK.cuh
 namespace single_group_topk {
 namespace detail {
 

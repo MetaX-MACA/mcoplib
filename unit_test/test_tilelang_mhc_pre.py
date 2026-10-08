@@ -99,20 +99,20 @@ def torch_reference(
     return post_mix, comb_mix, layer_input
 
 
-def make_inputs(num_tokens: int, n_splits: int, hidden_size: int = HIDDEN):
+def make_inputs(num_tokens: int, n_splits: int):
     residual = torch.randn(
-        (num_tokens, HC, hidden_size), device="cuda", dtype=torch.bfloat16
+        (num_tokens, HC, HIDDEN), device="cuda", dtype=torch.bfloat16
     )
     fn = torch.randn(
-        (HC * (2 + HC), HC * hidden_size), device="cuda", dtype=torch.float32
-    ) / math.sqrt(HC * hidden_size)
+        (HC * (2 + HC), HC * HIDDEN), device="cuda", dtype=torch.float32
+    ) / math.sqrt(HC * HIDDEN)
     hc_scale = torch.randn((3,), device="cuda", dtype=torch.float32) * 0.2 + 1.0
     hc_base = torch.randn(
         (HC * (2 + HC),), device="cuda", dtype=torch.float32
     ) * 0.2
 
-    k_chunk = (HC * hidden_size) // n_splits
-    residual_2d = residual.view(num_tokens, HC * hidden_size).float()
+    k_chunk = (HC * HIDDEN) // n_splits
+    residual_2d = residual.view(num_tokens, HC * HIDDEN).float()
     gemm_out_mul = torch.empty(
         n_splits, num_tokens, HC * (2 + HC), device="cuda", dtype=torch.float32
     )
@@ -164,39 +164,24 @@ PREFILL_CASES = (
     (4096, 736),
 )
 
-# Production prefill shape family taken from the serving log
-# `prefill_10.0.82.204-0shape(1).log` (5246 [OPSHAPE][mhc_pre] calls, 13 distinct
-# residual shapes): residual [N, 4, 4096] bf16, fn [24, 16384] fp32,
-# hc_scale [3], hc_base [24], with the fixed eps / post-mult / sinkhorn-repeat
-# contract.  hidden_size == 4096 means these do not take the CUDA big-fuse
-# specialization (it requires hidden == 7168), so they exercise the TileLang path.
-HIDDEN_4096 = 4096
-PREFILL_4096_NUM_TOKENS = (
-    8, 16, 24, 32, 40, 48, 56, 64, 334, 366, 384, 419, 512,
-)
-
-CASES = (
-    tuple(("decode", n, None, HIDDEN) for n in DECODE_NUM_TOKENS)
-    + tuple(("prefill", n, count, HIDDEN) for n, count in PREFILL_CASES)
-    + tuple(
-        ("prefill4096", n, None, HIDDEN_4096) for n in PREFILL_4096_NUM_TOKENS
-    )
+CASES = tuple(("decode", n, None) for n in DECODE_NUM_TOKENS) + tuple(
+    ("prefill", n, count) for n, count in PREFILL_CASES
 )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="需要 CUDA GPU")
 @pytest.mark.parametrize(
-    "phase,num_tokens,workload_count,hidden_size",
+    "phase,num_tokens,workload_count",
     CASES,
-    ids=[f"{phase}-n{n}-h{h}" for phase, n, _, h in CASES],
+    ids=[f"{phase}-n{n}" for phase, n, _ in CASES],
 )
 def test_mhc_pre_big_fuse_accuracy_and_performance(
-    phase: str, num_tokens: int, workload_count: int | None, hidden_size: int
+    phase: str, num_tokens: int, workload_count: int | None
 ):
     n_splits = compute_num_split2(num_tokens)
     torch.manual_seed(20260817 + num_tokens)
     residual, fn, hc_scale, hc_base, gemm_out_mul, gemm_out_sqrsum = make_inputs(
-        num_tokens, n_splits, hidden_size
+        num_tokens, n_splits
     )
 
     def run():
@@ -270,11 +255,11 @@ def final_benchmark_cli() -> None:
     warmup = int(os.getenv("MHC_PRE_WARMUP", "20"))
     rounds = int(os.getenv("MHC_PRE_BENCH_ROUNDS", "3"))
 
-    for phase, num_tokens, workload_count, hidden_size in CASES:
+    for phase, num_tokens, workload_count in CASES:
         n_splits = compute_num_split2(num_tokens)
         torch.manual_seed(20260817 + num_tokens)
         residual, fn, hc_scale, hc_base, gemm_out_mul, gemm_out_sqrsum = make_inputs(
-            num_tokens, n_splits, hidden_size
+            num_tokens, n_splits
         )
 
         def run():
@@ -311,7 +296,7 @@ def final_benchmark_cli() -> None:
         bandwidth = effective_bandwidth_gbps(tensors, latency_ms)
 
         print(
-            f"final-{phase} | token={num_tokens} | hidden={hidden_size} | "
+            f"final-{phase} | token={num_tokens} | "
             f"n_splits={n_splits} | "
             f"workload_count={workload_count or '-'} | "
             f"latency={latency_ms:.4f} ms | "

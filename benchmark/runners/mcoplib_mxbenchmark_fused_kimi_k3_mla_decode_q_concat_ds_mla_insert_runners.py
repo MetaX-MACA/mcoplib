@@ -14,7 +14,6 @@ class Fused_kimi_k3_mla_decode_q_concat_ds_mla_insert_runner(OpBenchmarkBase):
         self.num_tokens=config.get("num_tokens",16)
         self.num_heads=config.get("num_heads",4)
         self.block_size=config.get("block_size",8)
-        self.seed = config.get("seed", None)
 
     def define_metrics(self,state):
         state.add_summary("Op",self.name)
@@ -23,9 +22,6 @@ class Fused_kimi_k3_mla_decode_q_concat_ds_mla_insert_runner(OpBenchmarkBase):
         state.add_element_count(elements)
 
     def prepare_and_get_launcher(self,dev_id,tc_s):
-        if self.seed is not None:
-            torch.manual_seed(self.seed)
-            torch.cuda.manual_seed_all(self.seed)
         with torch.cuda.stream(tc_s):
             dev=f"cuda:{dev_id}"
 

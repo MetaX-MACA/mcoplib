@@ -19,7 +19,7 @@ The kernel is imported via
 import pytest
 import torch
 import mcoplib._C
-#from tests.kernels.utils import bf16_ulp_distance, fp8_ulp_distance
+
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     get_fp8_min_max,
 )
@@ -46,37 +46,6 @@ HEAD_BYTES = NOPE_DIM + ROPE_DIM * 2 + 8  # 448 + 128 + 8 = 584
 
 
 # ── PyTorch reference implementations ────────────────────────────────────────
-
-
-# ── PyTorch reference implementations ────────────────────────────────────────
-
-def bf16_ulp_distance(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    """Representable-step distance between two bf16 tensors.
-
-    Reinterprets the bf16 bit patterns under the IEEE-754 total ordering so
-    that adjacent representable values differ by exactly 1.
-    """
-
-    def key(t: torch.Tensor) -> torch.Tensor:
-        u = t.contiguous().view(torch.int16).to(torch.int64) & 0xFFFF
-        return torch.where(u >= 0x8000, 0xFFFF - u, u + 0x8000)
-
-    return (key(a) - key(b)).abs()
-
-
-def fp8_ulp_distance(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    """Representable-step distance between two 8-bit fp8 tensors.
-
-    Reinterprets the fp8 bytes under a sign-magnitude total ordering so that
-    adjacent representable values differ by exactly 1. Inputs must already share
-    the same fp8 encoding (e.g. both FP8_STORE_DTYPE).
-    """
-
-    def key(t: torch.Tensor) -> torch.Tensor:
-        u = t.contiguous().view(torch.uint8).to(torch.int64)
-        return torch.where(u >= 0x80, 0xFF - u, u + 0x80)
-
-    return (key(a) - key(b)).abs()
 
 
 def make_cos_sin_cache(max_pos: int, rope_dim: int, dtype, device):
@@ -177,18 +146,9 @@ pytestmark = pytest.mark.skipif(
 
 
 def _call_fused(
-    q_in,
-    q_head_padded,
-    kv,
-    k_cache,
-    slot_mapping,
-    positions,
-    cos_sin_cache,
-    eps,
-    bs,
-    apply_q_norm=None,
+    q_in, q_head_padded, kv, k_cache, slot_mapping, positions, cos_sin_cache, eps, bs
 ):
-    args = (
+    return torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
         q_in,
         kv,
         k_cache,
@@ -199,11 +159,35 @@ def _call_fused(
         eps,
         bs,
     )
-    if apply_q_norm is None:
-        return torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(*args)
-    return torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
-        *args, apply_q_norm
-    )
+
+
+def _bf16_ulp_distance(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Representable-step distance between two bf16 tensors.
+
+    Reinterprets the bf16 bit patterns under the IEEE-754 total ordering so
+    that adjacent representable values differ by exactly 1.
+    """
+
+    def key(t: torch.Tensor) -> torch.Tensor:
+        u = t.contiguous().view(torch.int16).to(torch.int64) & 0xFFFF
+        return torch.where(u >= 0x8000, 0xFFFF - u, u + 0x8000)
+
+    return (key(a) - key(b)).abs()
+
+
+def _fp8_ulp_distance(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Representable-step distance between two 8-bit fp8 tensors.
+
+    Reinterprets the fp8 bytes under a sign-magnitude total ordering so that
+    adjacent representable values differ by exactly 1. Inputs must already share
+    the same fp8 encoding (e.g. both FP8_STORE_DTYPE).
+    """
+
+    def key(t: torch.Tensor) -> torch.Tensor:
+        u = t.contiguous().view(torch.uint8).to(torch.int64)
+        return torch.where(u >= 0x80, 0xFF - u, u + 0x80)
+
+    return (key(a) - key(b)).abs()
 
 
 def _as_stored_fp8(t: torch.Tensor) -> torch.Tensor:
@@ -229,7 +213,6 @@ def _dequant_cache(k_cache_2d, num_tokens, num_blocks, block_size):
         block_table,
         block_size,
         offset=0,
-        use_fnuz=USE_FNUZ,
     )
     return out[0, :num_tokens]
 
@@ -252,7 +235,7 @@ def _assert_kv_cache_parity(
         rec_fused[:, :NOPE_DIM], rec_ref[:, :NOPE_DIM], rtol=0, atol=0
     )
     max_ulp = int(
-        bf16_ulp_distance(rec_fused[:, NOPE_DIM:], rec_ref[:, NOPE_DIM:]).max().item()
+        _bf16_ulp_distance(rec_fused[:, NOPE_DIM:], rec_ref[:, NOPE_DIM:]).max().item()
     )
     assert max_ulp <= 1, f"RoPE bf16 region differs by {max_ulp} ULP (>1)"
 
@@ -314,42 +297,6 @@ def test_q_path_matches_reference(num_tokens: int, n_heads: int, padded_heads: i
         )
 
 
-@pytest.mark.parametrize("num_tokens", [4, 2048])
-def test_q_path_without_qnorm_matches_rope_only_reference(num_tokens: int):
-    """Disabling Q norm must apply RoPE directly to the projected query."""
-    torch.manual_seed(7)
-    device = "cuda"
-    dtype = torch.bfloat16
-    eps = 1e-6
-    n_heads = 8
-    padded_heads = 16
-    block_size = 16
-
-    q = torch.randn(num_tokens, n_heads, HEAD_DIM, dtype=dtype, device=device)
-    positions = torch.arange(num_tokens, dtype=torch.int64, device=device)
-    cos_sin_cache = make_cos_sin_cache(4096, ROPE_DIM, torch.float32, device)
-    q_ref = apply_rope_gptj_last_k(q, positions, cos_sin_cache)
-    kv = torch.zeros(num_tokens, HEAD_DIM, dtype=dtype, device=device)
-    k_cache = torch.zeros(2, block_size * HEAD_BYTES, dtype=torch.uint8, device=device)
-    slot_mapping = torch.full((num_tokens,), -1, dtype=torch.int64, device=device)
-
-    q_out = _call_fused(
-        q,
-        padded_heads,
-        kv,
-        k_cache,
-        slot_mapping,
-        positions,
-        cos_sin_cache,
-        eps,
-        block_size,
-        apply_q_norm=False,
-    )
-
-    torch.testing.assert_close(q_out[:, :n_heads], q_ref, rtol=0, atol=0)
-    assert q_out[:, n_heads:].count_nonzero().item() == 0
-
-
 # ── Test 2: KV path round-trip byte/value parity ─────────────────────────────
 
 
@@ -386,7 +333,10 @@ def test_kv_path_matches_reference(num_tokens: int, block_size: int):
         num_blocks, block_size * HEAD_BYTES, dtype=torch.uint8, device=device
     )
     quantize_and_insert_k_cache(
-        kv_ref, k_cache_ref, slot_mapping, block_size=block_size, use_fnuz=USE_FNUZ
+        kv_ref,
+        k_cache_ref,
+        slot_mapping,
+        block_size=block_size,
     )
 
     # ── Fused path (dummy q, padded to FlashMLA's min head count 64) ───────
@@ -425,7 +375,6 @@ def test_kv_path_matches_reference(num_tokens: int, block_size: int):
             block_table,
             block_size,
             offset=0,
-            use_fnuz=USE_FNUZ,
         )
         return out[0, :num_tokens]
 
@@ -463,7 +412,7 @@ def test_kv_path_matches_reference(num_tokens: int, block_size: int):
 @pytest.mark.parametrize("block_size", [16, 64])
 def test_kv_path_with_dp_padding(num_tokens: int, pad: int, block_size: int):
     """slot_mapping.size(0) < q.size(0): the kernel must skip padded
-    tokens in the KV branch while still processing Q on all rows."""
+    tokens in the KV branch while still running Q-norm+RoPE on all rows."""
     torch.manual_seed(3)
     device = "cuda"
     dtype = torch.bfloat16
@@ -486,7 +435,10 @@ def test_kv_path_with_dp_padding(num_tokens: int, pad: int, block_size: int):
         num_blocks, block_size * HEAD_BYTES, dtype=torch.uint8, device=device
     )
     quantize_and_insert_k_cache(
-        kv_ref, k_cache_ref, slot_mapping, block_size=block_size, use_fnuz=USE_FNUZ
+        kv_ref,
+        k_cache_ref,
+        slot_mapping,
+        block_size=block_size,
     )
 
     # Fused: pass full-sized q/kv/positions, shorter slot_mapping.
@@ -555,7 +507,10 @@ def test_combined_q_and_kv(
         num_blocks, block_size * HEAD_BYTES, dtype=torch.uint8, device=device
     )
     quantize_and_insert_k_cache(
-        kv_ref, k_cache_ref, slot_mapping, block_size=block_size, use_fnuz=USE_FNUZ
+        kv_ref,
+        k_cache_ref,
+        slot_mapping,
+        block_size=block_size,
     )
 
     # Fused single call.
@@ -582,6 +537,10 @@ def test_combined_q_and_kv(
         k_cache_fused, k_cache_ref, num_tokens, num_blocks, block_size
     )
 
+
+# ── Full-cache (FlashInfer) path parity ──────────────────────────────────────
+
+
 def _call_full_cache_fp8_fused(
     q,
     kv,
@@ -594,9 +553,8 @@ def _call_full_cache_fp8_fused(
     q_fp8_scale_inv,
     eps,
     bs,
-    apply_q_norm=None,
 ):
-    args = (
+    torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert(
         q,
         kv,
         q_fp8,
@@ -609,11 +567,6 @@ def _call_full_cache_fp8_fused(
         eps,
         bs,
     )
-    op = torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert
-    if apply_q_norm is None:
-        op(*args)
-    else:
-        op(*args, apply_q_norm)
 
 
 def _call_full_cache_bf16_fused(
@@ -625,9 +578,8 @@ def _call_full_cache_bf16_fused(
     cos_sin_cache,
     eps,
     bs,
-    apply_q_norm=None,
 ):
-    args = (
+    torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert(
         q,
         kv,
         k_cache,
@@ -637,11 +589,6 @@ def _call_full_cache_bf16_fused(
         eps,
         bs,
     )
-    op = torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert
-    if apply_q_norm is None:
-        op(*args)
-    else:
-        op(*args, apply_q_norm)
 
 
 def _fp8_full_cache_reference(
@@ -656,9 +603,8 @@ def _fp8_full_cache_reference(
     block_size,
     fp8_scale,
     q_fp8_scale_inv,
-    apply_q_norm,
 ):
-    q_ref = rmsnorm_no_weight(q, eps) if apply_q_norm else q.float()
+    q_ref = rmsnorm_no_weight(q, eps)
     q_ref = apply_rope_gptj_last_k(q_ref, positions, cos_sin_cache)
     q_fp8.copy_(
         torch.clamp(q_ref.float() * q_fp8_scale_inv, -FP8_MAX, FP8_MAX).to(
@@ -685,10 +631,9 @@ def _bf16_full_cache_reference(
     cos_sin_cache,
     eps,
     block_size,
-    apply_q_norm,
 ):
-    q_ref = rmsnorm_no_weight(q, eps) if apply_q_norm else q.float()
-    # Kernel keeps optional RMSNorm+RoPE in fp32 and rounds once at the store.
+    q_ref = rmsnorm_no_weight(q, eps)
+    # Kernel keeps RMSNorm+RoPE in fp32 and rounds to bf16 once at the store.
     q_ref = apply_rope_gptj_last_k(q_ref, positions, cos_sin_cache).to(q.dtype)
 
     kv_ref = apply_rope_gptj_last_k(kv, positions, cos_sin_cache)
@@ -707,19 +652,10 @@ def _bf16_full_cache_reference(
 @pytest.mark.parametrize("num_tokens", [4, 17])
 @pytest.mark.parametrize("n_heads", [8, 17])
 @pytest.mark.parametrize("positions_dtype", [torch.int32, torch.int64])
-@pytest.mark.parametrize(
-    "apply_q_norm",
-    [
-        pytest.param(None, id="qnorm_default"),
-        pytest.param(True, id="qnorm_explicit"),
-        pytest.param(False, id="rope_only"),
-    ],
-)
 def test_full_cache_per_tensor_fp8_matches_reference(
     num_tokens: int,
     n_heads: int,
     positions_dtype: torch.dtype,
-    apply_q_norm: bool | None,
 ):
     torch.manual_seed(4)
     device = "cuda"
@@ -762,7 +698,6 @@ def test_full_cache_per_tensor_fp8_matches_reference(
         block_size,
         fp8_scale,
         q_fp8_scale_inv,
-        apply_q_norm is not False,
     )
     _call_full_cache_fp8_fused(
         q.clone(),
@@ -776,14 +711,13 @@ def test_full_cache_per_tensor_fp8_matches_reference(
         q_fp8_scale_inv,
         eps,
         block_size,
-        apply_q_norm,
     )
 
-    # Q uses optional RMSNorm followed by RoPE in fp32 before fp8 quant. The
-    # kernel and torch reference can land on opposite sides of an fp8
-    # round-to-nearest tie, so allow <=1 fp8 ULP.
+    # Q is RMSNorm(no-weight)+RoPE in fp32 before fp8 quant; the RMSNorm
+    # reduction and RoPE rotation can land the kernel and the torch reference on
+    # opposite sides of an fp8 round-to-nearest tie, so allow <=1 fp8 ULP.
     q_fused = _as_stored_fp8(q_fp8_fused)
-    q_max_ulp = int(fp8_ulp_distance(q_fused, q_fp8_ref).max().item())
+    q_max_ulp = int(_fp8_ulp_distance(q_fused, q_fp8_ref).max().item())
     assert q_max_ulp <= 1, f"Q fp8 differs by {q_max_ulp} ULP (>1)"
 
     # K-cache NoPE region [0, NOPE_DIM) is a deterministic per-tensor fp8 quant
@@ -797,7 +731,7 @@ def test_full_cache_per_tensor_fp8_matches_reference(
         atol=0,
     )
     k_max_ulp = int(
-        fp8_ulp_distance(k_fused[..., NOPE_DIM:], k_cache_ref[..., NOPE_DIM:])
+        _fp8_ulp_distance(k_fused[..., NOPE_DIM:], k_cache_ref[..., NOPE_DIM:])
         .max()
         .item()
     )
@@ -811,19 +745,10 @@ def test_full_cache_per_tensor_fp8_matches_reference(
 @pytest.mark.parametrize("num_tokens", [4, 17])
 @pytest.mark.parametrize("n_heads", [8, 17])
 @pytest.mark.parametrize("positions_dtype", [torch.int32, torch.int64])
-@pytest.mark.parametrize(
-    "apply_q_norm",
-    [
-        pytest.param(None, id="qnorm_default"),
-        pytest.param(True, id="qnorm_explicit"),
-        pytest.param(False, id="rope_only"),
-    ],
-)
 def test_full_cache_bf16_matches_reference(
     num_tokens: int,
     n_heads: int,
     positions_dtype: torch.dtype,
-    apply_q_norm: bool | None,
 ):
     torch.manual_seed(5)
     device = "cuda"
@@ -854,7 +779,6 @@ def test_full_cache_bf16_matches_reference(
         cos_sin_cache,
         eps,
         block_size,
-        apply_q_norm is not False,
     )
     _call_full_cache_bf16_fused(
         q_fused,
@@ -865,8 +789,72 @@ def test_full_cache_bf16_matches_reference(
         cos_sin_cache,
         eps,
         block_size,
-        apply_q_norm,
     )
 
     torch.testing.assert_close(q_fused, q_ref, rtol=1e-2, atol=1e-2)
     torch.testing.assert_close(k_cache_fused, k_cache_ref, rtol=0, atol=0)
+
+# ── Test: Q path for fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_out ──
+
+
+def _q_out_op_available():
+    return hasattr(
+        torch.ops._C,
+        "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_out",
+    )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not _q_out_op_available(),
+    reason="CUDA not available or fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_out not built in",
+)
+@pytest.mark.parametrize("num_tokens", [1, 4, 17, 64, 2048])
+@pytest.mark.parametrize("n_heads,padded_heads", [(1, 8), (8, 8), (8, 16), (16, 16), (16, 32), (32, 32), (8, 64), (64, 64), (64, 128)])
+def test_q_path_matches_reference_out(num_tokens, n_heads, padded_heads):
+    torch.manual_seed(0)
+    device = "cuda"
+    dtype = torch.bfloat16
+    eps = 1e-6
+    max_pos = 4096
+
+    q = torch.randn(num_tokens, n_heads, HEAD_DIM, dtype=dtype, device=device)
+    positions = torch.arange(num_tokens, dtype=torch.int64, device=device)
+    cos_sin_cache = make_cos_sin_cache(max_pos, ROPE_DIM, torch.float32, device)
+
+    num_blocks = 2
+    block_size = 16
+    kv = torch.zeros(num_tokens, HEAD_DIM, dtype=dtype, device=device)
+    k_cache = torch.zeros(num_blocks, block_size, HEAD_BYTES, dtype=torch.uint8, device=device).view(num_blocks, -1)
+    slot_mapping = torch.full((num_tokens,), -1, dtype=torch.int64, device=device)
+    q_out = torch.empty(num_tokens, padded_heads, HEAD_DIM, dtype=dtype, device=device)
+
+    # Reference: per-head RMSNorm without weight + GPT-J RoPE.
+    q_ref = rmsnorm_no_weight(q, eps)
+    q_ref = apply_rope_gptj_last_k(q_ref, positions, cos_sin_cache).to(dtype)
+
+    # Fused _out operator.
+    torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_out(q, kv, q_out, k_cache, slot_mapping, positions, cos_sin_cache, padded_heads, eps, block_size)
+
+    torch.cuda.synchronize(device)
+
+    print("\n" + "=" * 80)
+    print("Q Path: fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_out")
+    print("=" * 80)
+    print(f"num_tokens    : {num_tokens}")
+    print(f"n_heads       : {n_heads}")
+    print(f"padded_heads  : {padded_heads}")
+    print(f"q.shape       : {tuple(q.shape)}")
+    print(f"q_out.shape   : {tuple(q_out.shape)}")
+
+    # Compare only valid Q heads.
+    torch.testing.assert_close(q_out[:, :n_heads], q_ref, rtol=1e-2, atol=1e-2)
+
+    # Padded head region must be zero.
+    if n_heads < padded_heads:
+        pad_region = q_out[:, n_heads:padded_heads]
+        assert pad_region.abs().max().item() == 0.0, "padded head slots must be exact zero"
+
+    # KV branch is disabled by slot_mapping=-1.
+    assert k_cache.numel() == num_blocks * block_size * HEAD_BYTES
+
+    print("Q path verification: PASS")

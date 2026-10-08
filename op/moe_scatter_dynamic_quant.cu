@@ -6,9 +6,6 @@
 #include "../kernel/utils.h"
 #include "../kernel/all_reduce_kernel.cuh"
 #include "../include/moe_scatter_dynamic_quant.h"
-#include "mcoplib_ops_params_info.hpp"
-#include "mcoplib_ops_params_dump.hpp"
-
 static constexpr int kWave = 64;
 using wave_mask_t = uint64_t;
 static constexpr wave_mask_t kFullWaveMask = 0xffffffffffffffffULL;
@@ -31,6 +28,7 @@ __device__ __forceinline__ int32_t WarpInclusiveScan8(int32_t val) {
     return val;
 }
 
+constexpr int kFastScatterExperts = 16;
 constexpr int kFastScatterTopK = 8;
 constexpr int kFastScatterHidden = 4096;
 constexpr int kFastScatterTokenBits = 20;
@@ -93,7 +91,6 @@ template <> struct QuantTraits<__maca_fp8_e4m3> {
     }
 };
 
-template <int NUM_EXPERTS>
 __global__ void moe_scatter_count_fast_16x8(
         const int* __restrict__ selected_experts,
         int* __restrict__ experts_token_count,
@@ -101,10 +98,10 @@ __global__ void moe_scatter_count_fast_16x8(
         const int num_tokens) {
     constexpr int kBlock = 256;
     constexpr int kWavesPerBlock = kBlock / kWave;
-    __shared__ int wave_counts[kWavesPerBlock][NUM_EXPERTS];
-    __shared__ int counts[NUM_EXPERTS];
+    __shared__ int wave_counts[kWavesPerBlock][kFastScatterExperts];
+    __shared__ int counts[kFastScatterExperts];
 
-    for (int i = threadIdx.x; i < kWavesPerBlock * NUM_EXPERTS; i += blockDim.x) {
+    for (int i = threadIdx.x; i < kWavesPerBlock * kFastScatterExperts; i += blockDim.x) {
         reinterpret_cast<int*>(wave_counts)[i] = 0;
     }
     __syncthreads();
@@ -113,13 +110,13 @@ __global__ void moe_scatter_count_fast_16x8(
     const int total_routes = num_tokens * kFastScatterTopK;
     for (int r = threadIdx.x; r < total_routes; r += blockDim.x) {
         int e = selected_experts[r];
-        if (static_cast<unsigned>(e) < NUM_EXPERTS) {
+        if (static_cast<unsigned>(e) < kFastScatterExperts) {
             atomicAdd(&wave_counts[wave_id][e], 1);
         }
     }
     __syncthreads();
 
-    if (threadIdx.x < NUM_EXPERTS) {
+    if (threadIdx.x < kFastScatterExperts) {
         int c = 0;
         #pragma unroll
         for (int w = 0; w < kWavesPerBlock; ++w) c += wave_counts[w][threadIdx.x];
@@ -130,13 +127,13 @@ __global__ void moe_scatter_count_fast_16x8(
     if (threadIdx.x == 0) {
         int start = 0;
         #pragma unroll
-        for (int e = 0; e < NUM_EXPERTS; ++e) {
+        for (int e = 0; e < kFastScatterExperts; ++e) {
             int c = counts[e];
             experts_token_count[e] = c;
             experts_token_start[e] = start;
             start += c;
         }
-        experts_token_start[NUM_EXPERTS] = start;
+        experts_token_start[kFastScatterExperts] = start;
     }
 }
 
@@ -197,7 +194,7 @@ __global__ void moe_scatter_build_offsets_fast_16x8(
 // serialized the block-per-row design. WAVES_PER_BLOCK independent waves are
 // packed per block purely for occupancy; they never interact. hidden=4096 ->
 // 64 elems/thread (128 B coalesced bf16 read + 64 B int8 write per thread).
-template <typename scalar_t, typename out_t, int ITEMS_PER_THREAD, int WAVES_PER_BLOCK, int NUM_EXPERTS>
+template <typename scalar_t, typename out_t, int ITEMS_PER_THREAD, int WAVES_PER_BLOCK>
 __global__ __launch_bounds__(kWave * WAVES_PER_BLOCK)
 void moe_scatter_dynamic_quant_output_wave_4096(
         const scalar_t* __restrict__ hidden_states,
@@ -228,7 +225,7 @@ void moe_scatter_dynamic_quant_output_wave_4096(
     const int global_worker  = blockIdx.x * WAVES_PER_BLOCK + wave_in_block;
     const int expert         = global_worker / blocks_per_expert;
     const int expert_worker  = global_worker - expert * blocks_per_expert;
-    if (expert >= NUM_EXPERTS) return;
+    if (expert >= kFastScatterExperts) return;
 
     const int expert_start = experts_token_start[expert];
     const int counted_end  = expert_start + experts_token_count[expert];
@@ -344,7 +341,7 @@ void moe_scatter_dynamic_quant_output_wave_4096(
 //   TPR=256 -> 16 elems/thread, 4 waves/row (one 128-bit store/thread)
 //   TPR=128 -> 32 elems/thread, 2 waves/row (two 128-bit stores/thread)
 // ---------------------------------------------------------------------------
-template <typename scalar_t, typename out_t, int THREADS_PER_ROW, int NUM_EXPERTS>
+template <typename scalar_t, typename out_t, int THREADS_PER_ROW>
 __global__ __launch_bounds__(THREADS_PER_ROW)
 void moe_scatter_dynamic_quant_output_block_4096(
         const scalar_t* __restrict__ hidden_states,
@@ -379,7 +376,7 @@ void moe_scatter_dynamic_quant_output_block_4096(
     const int global_worker = blockIdx.x;
     const int expert        = global_worker / blocks_per_expert;
     const int expert_worker = global_worker - expert * blocks_per_expert;
-    if (expert >= NUM_EXPERTS) return;
+    if (expert >= kFastScatterExperts) return;
 
     const int expert_start = experts_token_start[expert];
     const int counted_end  = expert_start + experts_token_count[expert];
@@ -483,7 +480,7 @@ void moe_scatter_dynamic_quant_output_block_4096(
 // that block b -> expert b / blocks_per_expert), so all WPB waves in the block
 // share the same expert's smooth row.  Shared cost: 4096 * 4 B = 16 KB/block.
 // ---------------------------------------------------------------------------
-template <typename scalar_t, typename out_t, int WAVES_PER_BLOCK, int NUM_EXPERTS>
+template <typename scalar_t, typename out_t, int WAVES_PER_BLOCK>
 __global__ __launch_bounds__(kWave * WAVES_PER_BLOCK)
 void moe_scatter_dynamic_quant_output_wave_smsh_4096(
         const scalar_t* __restrict__ hidden_states,
@@ -513,7 +510,7 @@ void moe_scatter_dynamic_quant_output_wave_smsh_4096(
     const int block_in_expert= blockIdx.x - expert * blocks_per_expert;
     const int wave_in_block  = threadIdx.x >> 6;
     const int lane           = threadIdx.x & (kWave - 1);
-    if (expert >= NUM_EXPERTS) return;
+    if (expert >= kFastScatterExperts) return;
 
     const float* smooth_base = smooth_scale
         + static_cast<int64_t>(expert) * kFastScatterHidden;
@@ -837,7 +834,7 @@ __global__ void moe_scatter_dynamic_quant_kernel(
 constexpr int kFusedSmallMaxTokens = 128;
 constexpr int kFusedSmallMaxRoutes = kFusedSmallMaxTokens * kFastScatterTopK; // 1024
 
-template <typename scalar_t, typename out_t, int WAVES_PER_BLOCK, int NUM_EXPERTS>
+template <typename scalar_t, typename out_t, int WAVES_PER_BLOCK>
 __global__ __launch_bounds__(kWave * WAVES_PER_BLOCK)
 void moe_scatter_fused_small_16x8_4096(
         const scalar_t* __restrict__ hidden_states,
@@ -863,10 +860,10 @@ void moe_scatter_fused_small_16x8_4096(
 
     __shared__ unsigned char s_exp[kFusedSmallMaxRoutes];
     __shared__ int   s_packed[kFusedSmallMaxRoutes];
-    __shared__ int   s_count[NUM_EXPERTS];
-    __shared__ int   s_start[NUM_EXPERTS + 1];
-    __shared__ int   s_run[NUM_EXPERTS];
-    __shared__ int   s_wcnt[NUM_EXPERTS];
+    __shared__ int   s_count[kFastScatterExperts];
+    __shared__ int   s_start[kFastScatterExperts + 1];
+    __shared__ int   s_run[kFastScatterExperts];
+    __shared__ int   s_wcnt[kFastScatterExperts];
     __shared__ int   s_total;
 
     const int tid   = threadIdx.x;
@@ -874,27 +871,27 @@ void moe_scatter_fused_small_16x8_4096(
     const int wave  = tid >> 6;
     const int total_routes = num_tokens * kFastScatterTopK;
 
-    if (tid < NUM_EXPERTS) { s_count[tid] = 0; s_run[tid] = 0; }
+    if (tid < kFastScatterExperts) { s_count[tid] = 0; s_run[tid] = 0; }
     __syncthreads();
 
     for (int r = tid; r < total_routes; r += kThreads) {
         int e = selected_experts[r];
         unsigned ue = static_cast<unsigned>(e);
-        s_exp[r] = (ue < NUM_EXPERTS)
+        s_exp[r] = (ue < kFastScatterExperts)
                  ? static_cast<unsigned char>(e)
                  : static_cast<unsigned char>(0xFF);
-        if (ue < NUM_EXPERTS) atomicAdd(&s_count[e], 1);
+        if (ue < kFastScatterExperts) atomicAdd(&s_count[e], 1);
     }
     __syncthreads();
 
     if (tid == 0) {
         int acc = 0;
         #pragma unroll
-        for (int e = 0; e < NUM_EXPERTS; ++e) {
+        for (int e = 0; e < kFastScatterExperts; ++e) {
             s_start[e] = acc;
             acc += s_count[e];
         }
-        s_start[NUM_EXPERTS] = acc;
+        s_start[kFastScatterExperts] = acc;
         s_total = acc < output_capacity ? acc : output_capacity;
     }
     __syncthreads();
@@ -906,7 +903,7 @@ void moe_scatter_fused_small_16x8_4096(
 
             wave_mask_t mymask = 0;
             #pragma unroll
-            for (int eq = 0; eq < NUM_EXPERTS; ++eq) {
+            for (int eq = 0; eq < kFastScatterExperts; ++eq) {
                 wave_mask_t m = __ballot_sync(kFullWaveMask, e == eq);
                 if (e == eq) mymask = m;
                 if (lane == eq) s_wcnt[eq] = __popcll(m);
@@ -926,18 +923,18 @@ void moe_scatter_fused_small_16x8_4096(
                                   | (e    << kFastScatterExpertShift);
                 }
             }
-            if (lane < NUM_EXPERTS) s_run[lane] += s_wcnt[lane];
+            if (lane < kFastScatterExperts) s_run[lane] += s_wcnt[lane];
         }
     }
     __syncthreads();
 
     if (blockIdx.x == 0) {
-        if (tid < NUM_EXPERTS) {
+        if (tid < kFastScatterExperts) {
             experts_token_count[tid] = s_count[tid];
             experts_token_start[tid] = s_start[tid];
         }
-        if (tid == 0) experts_token_start[NUM_EXPERTS] =
-                          s_start[NUM_EXPERTS];
+        if (tid == 0) experts_token_start[kFastScatterExperts] =
+                          s_start[kFastScatterExperts];
         for (int o = tid; o < s_total; o += kThreads) {
             scatter_tokens_offset[o] = s_packed[o] & kFastScatterTokenMask;
         }
@@ -1022,9 +1019,10 @@ void launch_moe_scatter_dynamic_quant_kernel(
         const int num_tokens, const int output_capacity,
         const int num_experts_per_rank, const int topk,
         const int shared_tokens_per_sp, const cudaStream_t& stream) {
+
         if (hidden_size == kFastScatterHidden &&
         topk == kFastScatterTopK &&
-        (num_experts_per_rank == 8 || num_experts_per_rank == 16) &&
+        num_experts_per_rank == kFastScatterExperts &&
         num_shared_experts_per_rank == 0 &&
         num_tokens <= kFastScatterTokenMask) {
         if (num_tokens > 0 && num_tokens < kFusedSmallMaxTokens) {
@@ -1034,52 +1032,28 @@ void launch_moe_scatter_dynamic_quant_kernel(
                 at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
             int grid = (max_rows + WPB - 1) / WPB;
             if (grid > mpc) grid = mpc;
-            if (num_experts_per_rank == 8) {
-                moe_scatter_fused_small_16x8_4096<scalar_t, out_t, WPB, 8>
-                    <<<grid, kWave * WPB, 0, stream>>>(
-                        hidden_status, selected_experts, moe_weights, smooth_scale,
-                        scatter_tokens, scatter_per_token_scale,
-                        scatter_tokens_offset, experts_token_count,
-                        experts_token_start, num_tokens, output_capacity);
-            } else if (num_experts_per_rank == 16) {
-                moe_scatter_fused_small_16x8_4096<scalar_t, out_t, WPB, 16>
-                    <<<grid, kWave * WPB, 0, stream>>>(
-                        hidden_status, selected_experts, moe_weights, smooth_scale,
-                        scatter_tokens, scatter_per_token_scale,
-                        scatter_tokens_offset, experts_token_count,
-                        experts_token_start, num_tokens, output_capacity);
-            }            
+            moe_scatter_fused_small_16x8_4096<scalar_t, out_t, WPB>
+                <<<grid, kWave * WPB, 0, stream>>>(
+                    hidden_status, selected_experts, moe_weights, smooth_scale,
+                    scatter_tokens, scatter_per_token_scale,
+                    scatter_tokens_offset, experts_token_count,
+                    experts_token_start, num_tokens, output_capacity);
             return;
         }
 
         constexpr int route_block = 256;
-        if (num_experts_per_rank == 8) {
-            moe_scatter_count_fast_16x8<8><<<1, route_block, 0, stream>>>(
-                selected_experts, experts_token_count,
-                experts_token_start, num_tokens);
+        moe_scatter_count_fast_16x8<<<1, route_block, 0, stream>>>(
+            selected_experts, experts_token_count,
+            experts_token_start, num_tokens);
 
-            moe_scatter_build_offsets_fast_16x8<route_block, false>
-                <<<8, route_block, 0, stream>>>(
-                    selected_experts,
-                    scatter_tokens_offset,
-                    packed_route_workspace,
-                    nullptr,
-                    experts_token_start,
-                    num_tokens);
-        } else if (num_experts_per_rank == 16) {
-            moe_scatter_count_fast_16x8<16><<<1, route_block, 0, stream>>>(
-                selected_experts, experts_token_count,
-                experts_token_start, num_tokens);
-
-            moe_scatter_build_offsets_fast_16x8<route_block, false>
-                <<<16, route_block, 0, stream>>>(
-                    selected_experts,
-                    scatter_tokens_offset,
-                    packed_route_workspace,
-                    nullptr,
-                    experts_token_start,
-                    num_tokens);
-        }
+        moe_scatter_build_offsets_fast_16x8<route_block, false>
+            <<<kFastScatterExperts, route_block, 0, stream>>>(
+                selected_experts,
+                scatter_tokens_offset,
+                packed_route_workspace,
+                nullptr,
+                experts_token_start,
+                num_tokens);
 
         const int mpc = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
 
@@ -1097,47 +1071,25 @@ void launch_moe_scatter_dynamic_quant_kernel(
             // resident blocks per AP, distributed evenly across the 16 experts.
             constexpr int output_blocks_per_mpc = 8;
             int blocks_per_expert =
-                (mpc * output_blocks_per_mpc + num_experts_per_rank - 1)
-                / num_experts_per_rank;
-            int total_workers = blocks_per_expert * num_experts_per_rank;
-            if (tpr == 256) {
-                if (num_experts_per_rank == 8) {
-                    moe_scatter_dynamic_quant_output_block_4096<scalar_t, out_t, 256, 8>
-                        <<<total_workers, 256, 0, stream>>>(
-                            hidden_status, moe_weights, smooth_scale,
-                            scatter_tokens, scatter_per_token_scale,
-                            packed_route_workspace,
-                            experts_token_count, experts_token_start,
-                            output_capacity, blocks_per_expert);
-                } else if (num_experts_per_rank == 16) {
-                    moe_scatter_dynamic_quant_output_block_4096<scalar_t, out_t, 256, 16>
-                        <<<total_workers, 256, 0, stream>>>(
-                            hidden_status, moe_weights, smooth_scale,
-                            scatter_tokens, scatter_per_token_scale,
-                            packed_route_workspace,
-                            experts_token_count, experts_token_start,
-                            output_capacity, blocks_per_expert);
-                }
-            }
-            else {
-                if (num_experts_per_rank == 8) {
-                    moe_scatter_dynamic_quant_output_block_4096<scalar_t, out_t, 128, 8>
-                        <<<total_workers, 128, 0, stream>>>(
-                            hidden_status, moe_weights, smooth_scale,
-                            scatter_tokens, scatter_per_token_scale,
-                            packed_route_workspace,
-                            experts_token_count, experts_token_start,
-                            output_capacity, blocks_per_expert);
-                } else if (num_experts_per_rank == 16) {
-                    moe_scatter_dynamic_quant_output_block_4096<scalar_t, out_t, 128, 16>
-                        <<<total_workers, 128, 0, stream>>>(
-                            hidden_status, moe_weights, smooth_scale,
-                            scatter_tokens, scatter_per_token_scale,
-                            packed_route_workspace,
-                            experts_token_count, experts_token_start,
-                            output_capacity, blocks_per_expert);
-                }
-            }
+                (mpc * output_blocks_per_mpc + kFastScatterExperts - 1)
+                / kFastScatterExperts;
+            int total_workers = blocks_per_expert * kFastScatterExperts;
+            if (tpr == 256)
+                moe_scatter_dynamic_quant_output_block_4096<scalar_t, out_t, 256>
+                    <<<total_workers, 256, 0, stream>>>(
+                        hidden_status, moe_weights, smooth_scale,
+                        scatter_tokens, scatter_per_token_scale,
+                        packed_route_workspace,
+                        experts_token_count, experts_token_start,
+                        output_capacity, blocks_per_expert);
+            else
+                moe_scatter_dynamic_quant_output_block_4096<scalar_t, out_t, 128>
+                    <<<total_workers, 128, 0, stream>>>(
+                        hidden_status, moe_weights, smooth_scale,
+                        scatter_tokens, scatter_per_token_scale,
+                        packed_route_workspace,
+                        experts_token_count, experts_token_start,
+                        output_capacity, blocks_per_expert);
             return;
         }
 
@@ -1148,27 +1100,21 @@ void launch_moe_scatter_dynamic_quant_kernel(
             constexpr int output_blocks_per_mpc = 32;
             const int wpb = tpr == 644 ? 4 : (tpr == 642 ? 2 : 1);
             int blocks_per_expert =
-                (mpc * output_blocks_per_mpc / wpb + num_experts_per_rank - 1)
-                / num_experts_per_rank;
+                (mpc * output_blocks_per_mpc / wpb + kFastScatterExperts - 1)
+                / kFastScatterExperts;
             if (blocks_per_expert < 1) blocks_per_expert = 1;
-            int total_blocks = blocks_per_expert * num_experts_per_rank;
-            #define LAUNCH_SMSH(WPB, NUM_EXPERTS) \
-                moe_scatter_dynamic_quant_output_wave_smsh_4096<scalar_t, out_t, WPB, NUM_EXPERTS> \
+            int total_blocks = blocks_per_expert * kFastScatterExperts;
+            #define LAUNCH_SMSH(WPB) \
+                moe_scatter_dynamic_quant_output_wave_smsh_4096<scalar_t, out_t, WPB> \
                     <<<total_blocks, kWave * WPB, 0, stream>>>( \
                         hidden_status, moe_weights, smooth_scale, \
                         scatter_tokens, scatter_per_token_scale, \
                         packed_route_workspace, \
                         experts_token_count, experts_token_start, \
                         output_capacity, blocks_per_expert)
-            if (num_experts_per_rank == 8) {                        
-                if (tpr == 644)      LAUNCH_SMSH(4, 8);
-                else if (tpr == 642) LAUNCH_SMSH(2, 8);
-                else                 LAUNCH_SMSH(1, 8);
-            } else if (num_experts_per_rank == 16) {
-                if (tpr == 644)      LAUNCH_SMSH(4, 16);
-                else if (tpr == 642) LAUNCH_SMSH(2, 16);
-                else                 LAUNCH_SMSH(1, 16);
-            }
+            if (tpr == 644)      LAUNCH_SMSH(4);
+            else if (tpr == 642) LAUNCH_SMSH(2);
+            else                 LAUNCH_SMSH(1);
             #undef LAUNCH_SMSH
             return;
         }
@@ -1192,55 +1138,39 @@ void launch_moe_scatter_dynamic_quant_kernel(
         int blocks_per_expert;
         if (obpm_override > 0) {
             blocks_per_expert =
-                (mpc * obpm_override + num_experts_per_rank - 1) / num_experts_per_rank;
+                (mpc * obpm_override + kFastScatterExperts - 1) / kFastScatterExperts;
         } else {
             const int total_routes    = num_tokens * kFastScatterTopK;
             const int rows_per_expert =
-                (total_routes + num_experts_per_rank - 1) / num_experts_per_rank;
-            const int base_bpe = (mpc * 32  + num_experts_per_rank - 1) / num_experts_per_rank;
-            const int max_bpe  = (mpc * 192 + num_experts_per_rank - 1) / num_experts_per_rank;
+                (total_routes + kFastScatterExperts - 1) / kFastScatterExperts;
+            const int base_bpe = (mpc * 32  + kFastScatterExperts - 1) / kFastScatterExperts;
+            const int max_bpe  = (mpc * 192 + kFastScatterExperts - 1) / kFastScatterExperts;
             blocks_per_expert = rows_per_expert / 12;
             if (blocks_per_expert < base_bpe) blocks_per_expert = base_bpe;
             if (blocks_per_expert > max_bpe)  blocks_per_expert = max_bpe;
         }
         if (blocks_per_expert < 1) blocks_per_expert = 1;
-        int total_workers = blocks_per_expert * num_experts_per_rank;
+        int total_workers = blocks_per_expert * kFastScatterExperts;
 
         constexpr int wave_items = kFastScatterHidden / kWave;  // 64
-        if (num_experts_per_rank == 8) {
-            moe_scatter_dynamic_quant_output_wave_4096<scalar_t, out_t, wave_items, 1, 8>
-                <<<total_workers, kWave, 0, stream>>>(
-                    hidden_status, moe_weights, smooth_scale,
-                    scatter_tokens, scatter_per_token_scale,
-                    packed_route_workspace,
-                    experts_token_count, experts_token_start,
-                    output_capacity, blocks_per_expert);
-        } else if (num_experts_per_rank == 16) {
-            moe_scatter_dynamic_quant_output_wave_4096<scalar_t, out_t, wave_items, 1, 16>
-                <<<total_workers, kWave, 0, stream>>>(
-                    hidden_status, moe_weights, smooth_scale,
-                    scatter_tokens, scatter_per_token_scale,
-                    packed_route_workspace,
-                    experts_token_count, experts_token_start,
-                    output_capacity, blocks_per_expert);
-        }
+        moe_scatter_dynamic_quant_output_wave_4096<scalar_t, out_t, wave_items, 1>
+            <<<total_workers, kWave, 0, stream>>>(
+                hidden_status, moe_weights, smooth_scale,
+                scatter_tokens, scatter_per_token_scale,
+                packed_route_workspace,
+                experts_token_count, experts_token_start,
+                output_capacity, blocks_per_expert);
         return;
     }
+
     constexpr int max_experts = 256;
     const int total_num = num_tokens * topk;
     const int num_shared_total_tokens = num_shared_experts_per_rank * shared_tokens_per_sp;
 
-    if (num_experts_per_rank == 8) {
-        moe_align_token_offset<8><<<1, 512, 0, stream>>>(
-            selected_experts, scatter_tokens_offset, experts_token_count,
-            experts_token_start, topk, num_tokens, num_experts_per_rank,
-            shared_tokens_per_sp, num_shared_experts_per_rank);
-    } else if (num_experts_per_rank == 16) {
-        moe_align_token_offset<16><<<1, 512, 0, stream>>>(
-            selected_experts, scatter_tokens_offset, experts_token_count,
-            experts_token_start, topk, num_tokens, num_experts_per_rank,
-            shared_tokens_per_sp, num_shared_experts_per_rank);
-    }
+    moe_align_token_offset<max_experts><<<1, 512, 0, stream>>>(
+        selected_experts, scatter_tokens_offset, experts_token_count,
+        experts_token_start, topk, num_tokens, num_experts_per_rank,
+        shared_tokens_per_sp, num_shared_experts_per_rank);
 
     if (total_num < 128)       stable_scatter_offset<64>  <<<num_experts_per_rank,  64,0,stream>>>(scatter_tokens_offset, experts_token_count, experts_token_start, selected_experts, num_tokens, topk, shared_tokens_per_sp, num_shared_experts_per_rank);
     else if (total_num < 512)  stable_scatter_offset<128> <<<num_experts_per_rank, 128,0,stream>>>(scatter_tokens_offset, experts_token_count, experts_token_start, selected_experts, num_tokens, topk, shared_tokens_per_sp, num_shared_experts_per_rank);
@@ -1267,10 +1197,7 @@ void moe_scatter_dynamic_quant(
         const int experts_per_rank,
         const int shared_experts_per_rank,
         const int shared_tokens_per_sp) {
-      DEBUG_TRACE_PARAMS(hidden_status, selected_experts, moe_weights, smooth_scale, scatter_tokens, scatter_per_token_scale, scatter_tokens_offset, experts_token_count, experts_token_start, experts_per_rank, shared_experts_per_rank, shared_tokens_per_sp);
-  DEBUG_DUMP_PARAMS(hidden_status, selected_experts, moe_weights, smooth_scale, scatter_tokens, scatter_per_token_scale, scatter_tokens_offset, experts_token_count, experts_token_start, experts_per_rank, shared_experts_per_rank, shared_tokens_per_sp);
-
-            CHECK_DEVICE(hidden_status);
+    CHECK_DEVICE(hidden_status);
     CHECK_DEVICE(selected_experts);
     CHECK_DEVICE(smooth_scale);
     CHECK_CONTIGUOUS(hidden_status);

@@ -15,7 +15,6 @@ class Transfer_kv_all_layer_direct_lf_pf_runner(OpBenchmarkBase):
         self.num_heads = config.get("num_heads", 8)
         self.total_pages = config.get("total_pages", 4096)
         self.copy_pages = config.get("copy_pages", 128)
-        self.seed = config.get("seed", None)
         self._force_sync = True
         if self.dtype == torch.float32:
              self.dtype = torch.float16
@@ -38,9 +37,6 @@ class Transfer_kv_all_layer_direct_lf_pf_runner(OpBenchmarkBase):
             pass
 
     def _prepare_data(self, dev_id):
-        if self.seed is not None:
-            torch.manual_seed(self.seed)
-            torch.cuda.manual_seed_all(self.seed)
         dev = f'cuda:{dev_id}'
         flat_dim = self.total_pages * self.page_size
         src_layers = []

@@ -333,28 +333,20 @@ def sigmoid_gating_precompute_kernel(
     a,
     dt_bias,
     b,
-    q,
-    k,
     gate_decay,
     gate_values,
     beta_values,
-    q_inv_norm,
-    k_inv_norm,
     softplus_beta,
     softplus_threshold,
     lower_bound,
     stride_a,
     stride_b,
-    stride_q,
-    stride_k,
-    H: tl.constexpr,
     HV: tl.constexpr,
     K: tl.constexpr,
     BK: tl.constexpr,
     IS_KDA: tl.constexpr,
     USE_LOWER_BOUND: tl.constexpr,
     STORE_GATE_VALUES: tl.constexpr,
-    PRECOMPUTE_QK_NORMS: tl.constexpr,
 ):
     """并行预计算每个 token/head 的 exp(g) 与 sigmoid(beta raw)。"""
     i_t = tl.program_id(0)
@@ -404,218 +396,6 @@ def sigmoid_gating_precompute_kernel(
     b_beta = tl.sigmoid(tl.load(b + i_t * stride_b + i_hv).to(tl.float32))
     tl.store(beta_values + i_t * HV + i_hv, b_beta)
 
-    if PRECOMPUTE_QK_NORMS:
-        qk_group_size: tl.constexpr = HV // H
-        if i_hv % qk_group_size == 0:
-            i_h = i_hv // qk_group_size
-            b_q = tl.load(
-                q + i_t * stride_q + i_h * K + o_k,
-                mask=mask_k,
-                other=0.0,
-            ).to(tl.float32)
-            b_k = tl.load(
-                k + i_t * stride_k + i_h * K + o_k,
-                mask=mask_k,
-                other=0.0,
-            ).to(tl.float32)
-            norm_offset = i_t * H + i_h
-            tl.store(
-                q_inv_norm + norm_offset,
-                tl.rsqrt(tl.sum(b_q * b_q) + 1e-6),
-            )
-            tl.store(
-                k_inv_norm + norm_offset,
-                tl.rsqrt(tl.sum(b_k * b_k) + 1e-6),
-            )
-
-
-@triton.jit
-def fused_sigmoid_gating_delta_rule_update_kernel_n1_static6(
-    gate_decay,
-    beta_values,
-    q_inv_norm,
-    k_inv_norm,
-    q,
-    k,
-    v,
-    o,
-    h0_source,
-    h0_indices,
-    stride_h0_source,
-    intermediate_states_buffer,
-    intermediate_state_indices,
-    scale,
-    stride_q,
-    stride_k,
-    stride_v,
-):
-    """Strict N=1/T=6/H=HV=64/K=V=128 target-verify recurrent kernel."""
-    K: tl.constexpr = 128
-    V: tl.constexpr = 128
-    HV: tl.constexpr = 64
-    STEPS: tl.constexpr = 6
-    BV: tl.constexpr = 16
-
-    i_hv = tl.program_id(0)
-    i_v = tl.program_id(1)
-    o_k = tl.arange(0, K)
-    o_v = i_v * BV + tl.arange(0, BV)
-
-    state_idx = tl.load(h0_indices).to(tl.int64)
-    p_h0 = (
-        h0_source
-        + state_idx * stride_h0_source
-        + i_hv * K * V
-        + o_v[:, None] * K
-        + o_k[None, :]
-    )
-    b_h = tl.load(
-        p_h0,
-        mask=state_idx >= 0,
-        other=0.0,
-    ).to(tl.float32)
-
-    cache_idx = tl.load(intermediate_state_indices).to(tl.int64)
-    for step in tl.static_range(0, STEPS):
-        token_head = step * HV + i_hv
-        b_q = tl.load(
-            q + step * stride_q + i_hv * K + o_k
-        ).to(tl.float32)
-        b_k = tl.load(
-            k + step * stride_k + i_hv * K + o_k
-        ).to(tl.float32)
-        b_v = tl.load(
-            v + step * stride_v + i_hv * V + o_v
-        ).to(tl.float32)
-        b_q *= tl.load(q_inv_norm + token_head).to(tl.float32)
-        b_k *= tl.load(k_inv_norm + token_head).to(tl.float32)
-        b_q *= scale
-
-        b_gate_decay = tl.load(
-            gate_decay + token_head * K + o_k
-        ).to(tl.float32)
-        b_beta = tl.load(beta_values + token_head).to(tl.float32)
-
-        b_h *= b_gate_decay[None, :]
-        b_v -= tl.sum(b_h * b_k[None, :], axis=1)
-        b_v *= b_beta
-        b_h += b_v[:, None] * b_k[None, :]
-        b_o = tl.sum(b_h * b_q[None, :], axis=1)
-        tl.store(
-            o + token_head * V + o_v,
-            b_o.to(o.dtype.element_ty),
-        )
-
-        if cache_idx >= 0:
-            cache_ptr = (
-                intermediate_states_buffer
-                + cache_idx * STEPS * HV * K * V
-                + step * HV * K * V
-                + i_hv * K * V
-                + o_v[:, None] * K
-                + o_k[None, :]
-            )
-            tl.store(
-                cache_ptr,
-                b_h.to(cache_ptr.dtype.element_ty),
-            )
-
-
-@triton.jit
-def fused_sigmoid_gating_delta_rule_update_kernel_n2_static6(
-    gate_decay,
-    beta_values,
-    q_inv_norm,
-    k_inv_norm,
-    q,
-    k,
-    v,
-    o,
-    h0_source,
-    h0_indices,
-    cu_seqlens,
-    stride_h0_source,
-    intermediate_states_buffer,
-    intermediate_state_indices,
-    scale,
-    stride_q,
-    stride_k,
-    stride_v,
-):
-    """Strict N=2/T=12/H=HV=64/K=V=128 target-verify recurrent kernel."""
-    K: tl.constexpr = 128
-    V: tl.constexpr = 128
-    HV: tl.constexpr = 64
-    STEPS: tl.constexpr = 6
-    BV: tl.constexpr = 32
-
-    i_nh = tl.program_id(0)
-    i_n, i_hv = i_nh // HV, i_nh % HV
-    i_v = tl.program_id(1)
-    bos = tl.load(cu_seqlens + i_n)
-    o_k = tl.arange(0, K)
-    o_v = i_v * BV + tl.arange(0, BV)
-
-    state_idx = tl.load(h0_indices + i_n).to(tl.int64)
-    p_h0 = (
-        h0_source
-        + state_idx * stride_h0_source
-        + i_hv * K * V
-        + o_v[:, None] * K
-        + o_k[None, :]
-    )
-    b_h = tl.load(
-        p_h0,
-        mask=state_idx >= 0,
-        other=0.0,
-    ).to(tl.float32)
-
-    cache_idx = tl.load(intermediate_state_indices + i_n).to(tl.int64)
-    for step in tl.static_range(0, STEPS):
-        token = bos + step
-        token_head = token * HV + i_hv
-        b_q = tl.load(
-            q + token * stride_q + i_hv * K + o_k
-        ).to(tl.float32)
-        b_k = tl.load(
-            k + token * stride_k + i_hv * K + o_k
-        ).to(tl.float32)
-        b_v = tl.load(
-            v + token * stride_v + i_hv * V + o_v
-        ).to(tl.float32)
-        b_q *= tl.load(q_inv_norm + token_head).to(tl.float32)
-        b_k *= tl.load(k_inv_norm + token_head).to(tl.float32)
-        b_q *= scale
-
-        b_gate_decay = tl.load(
-            gate_decay + token_head * K + o_k
-        ).to(tl.float32)
-        b_beta = tl.load(beta_values + token_head).to(tl.float32)
-
-        b_h *= b_gate_decay[None, :]
-        b_v -= tl.sum(b_h * b_k[None, :], axis=1)
-        b_v *= b_beta
-        b_h += b_v[:, None] * b_k[None, :]
-        b_o = tl.sum(b_h * b_q[None, :], axis=1)
-        tl.store(
-            o + token_head * V + o_v,
-            b_o.to(o.dtype.element_ty),
-        )
-
-        if cache_idx >= 0:
-            cache_ptr = (
-                intermediate_states_buffer
-                + cache_idx * STEPS * HV * K * V
-                + step * HV * K * V
-                + i_hv * K * V
-                + o_v[:, None] * K
-                + o_k[None, :]
-            )
-            tl.store(
-                cache_ptr,
-                b_h.to(cache_ptr.dtype.element_ty),
-            )
-
 
 @triton.jit(do_not_specialize=["T"])
 def fused_sigmoid_gating_delta_rule_update_kernel_opt(
@@ -626,8 +406,6 @@ def fused_sigmoid_gating_delta_rule_update_kernel_opt(
     gate_decay,
     gate_values,
     beta_values,
-    q_inv_norm,
-    k_inv_norm,
     softplus_beta,
     softplus_threshold,
     lower_bound,
@@ -674,15 +452,13 @@ def fused_sigmoid_gating_delta_rule_update_kernel_opt(
     IS_KDA: tl.constexpr,
     USE_LOWER_BOUND: tl.constexpr,
     PRECOMPUTED_GATES: tl.constexpr,
-    PRECOMPUTED_QK_NORMS: tl.constexpr,
     CACHE_RING: tl.constexpr,
-    STATIC_STEPS: tl.constexpr,
     DISABLE_STATE_UPDATE: tl.constexpr = False,
     CACHE_INTERMEDIATE_STATES: tl.constexpr = False,
     HAS_EAGLE_TREE_CUSTOM_ATTN_MASK: tl.constexpr = False,
 ):
 
-    NV: tl.constexpr = (V + BV - 1) // BV
+    NV: tl.constexpr = V // BV
     pid = tl.program_id(0)
     i_nh, i_v = pid // NV, pid % NV
     i_n, i_hv = i_nh // HV, i_nh % HV
@@ -690,12 +466,9 @@ def fused_sigmoid_gating_delta_rule_update_kernel_opt(
 
     if IS_VARLEN:
         bos = tl.load(cu_seqlens + i_n).to(tl.int64)
-        if STATIC_STEPS > 0:
-            T = STATIC_STEPS
-        else:
-            eos = tl.load(cu_seqlens + i_n + 1).to(tl.int64)
-            T = eos - bos
+        eos = tl.load(cu_seqlens + i_n + 1).to(tl.int64)
         all_tokens = T
+        T = eos - bos
     else:
         bos = i_n * T
         all_tokens = B * T
@@ -713,9 +486,6 @@ def fused_sigmoid_gating_delta_rule_update_kernel_opt(
         if CACHE_RING:
             p_gate_values = gate_values + (bos * HV + i_hv) * gate_width
         p_beta_values = beta_values + bos * HV + i_hv
-        if PRECOMPUTED_QK_NORMS:
-            p_q_inv_norm = q_inv_norm + bos * H + i_h
-            p_k_inv_norm = k_inv_norm + bos * H + i_h
     else:
         p_b = b + bos * stride_b + i_hv
         if IS_KDA:
@@ -859,12 +629,8 @@ def fused_sigmoid_gating_delta_rule_update_kernel_opt(
                 )
 
         if USE_QK_L2NORM_IN_KERNEL:
-            if PRECOMPUTED_QK_NORMS:
-                b_q *= tl.load(p_q_inv_norm).to(tl.float32)
-                b_k *= tl.load(p_k_inv_norm).to(tl.float32)
-            else:
-                b_q *= tl.rsqrt(tl.sum(b_q * b_q, axis=0) + 1e-6)
-                b_k *= tl.rsqrt(tl.sum(b_k * b_k, axis=0) + 1e-6)
+            b_q *= tl.rsqrt(tl.sum(b_q * b_q, axis=0) + 1e-6)
+            b_k *= tl.rsqrt(tl.sum(b_k * b_k, axis=0) + 1e-6)
         b_q *= scale
 
         if IS_KDA:
@@ -902,9 +668,6 @@ def fused_sigmoid_gating_delta_rule_update_kernel_opt(
             if CACHE_RING:
                 p_gate_values += HV * gate_width
             p_beta_values += HV
-            if PRECOMPUTED_QK_NORMS:
-                p_q_inv_norm += H
-                p_k_inv_norm += H
         else:
             p_a += stride_a
             p_b += stride_b
@@ -937,15 +700,6 @@ def _select_execution_strategy(
     if num_sequences * value_heads < 104:
         return "single_opt"
     return "dual_opt"
-
-
-def _select_precompute_num_warps(
-    *, token_heads: int, key_dim: int, is_kda: bool, use_static_six: bool
-) -> int:
-    """Choose precompute CTA width from the workload shape."""
-    if not is_kda or use_static_six:
-        return 1
-    return 4
 
 
 def _fused_sigmoid_gating_delta_rule_update_with_strategy(
@@ -1066,19 +820,7 @@ def _fused_sigmoid_gating_delta_rule_update_with_strategy(
         max_cache_len = 0
         stride_rawv_slot = stride_rawk_slot = stride_g_slot = stride_beta_slot = 0
 
-    if strategy not in (
-        "auto",
-        "original",
-        "single_opt",
-        "dual_opt",
-        "dual_opt_norms",
-        "dual_opt_norms_dims",
-        "dual_opt_norms_dims_bv32",
-        "dual_opt_static6_norms",
-        "dual_opt_static6_norms_bv32",
-        "dual_opt_static6_norms_n1",
-        "dual_opt_static6_norms_n2",
-    ):
+    if strategy not in ("auto", "original", "single_opt", "dual_opt"):
         raise ValueError(f"unsupported internal strategy: {strategy!r}")
 
     if strategy == "auto":
@@ -1089,196 +831,14 @@ def _fused_sigmoid_gating_delta_rule_update_with_strategy(
             key_dim=K,
             value_dim=V,
         )
-        # KDA target-verify hierarchy measured on C600-UL.  Precompute the
-        # nonlinear gates and Q/K inverse norms only when enough recurrent work
-        # amortizes the extra launch.  K=256 uses BV=32 below to stay spill-free.
-        norm_precompute_contract = (
-            B == 1
-            and N >= 1
-            and HV == 64
-            and HV % H == 0
-            and K in (64, 128, 256)
-            and V in (64, 128, 256)
-            and 0 < T <= N * cache_stride_steps
-            and cache_stride_steps == 6
-            and is_kda
-            and use_qk_l2norm_in_kernel
-            and lower_bound is not None
-            and disable_state_update
-            and intermediate_states_buffer is not None
-            and cu_seqlens is not None
-            and retrieve_parent_token is None
-            and not cache_ring
-        )
-        dimension_profitable = (
-            K == 256
-            or (K == 128 and V == 64 and T >= 3)
-            or (K == 128 and V in (128, 256) and T > N)
-            or (K == 64 and V == 64 and T >= 6)
-            or (K == 64 and V == 128 and T >= N + 3)
-            or (K == 64 and V == 256 and T >= N + 2)
-        )
-        if norm_precompute_contract:
-            if K == 128 and V == 128 and T == N * 6:
-                if N == 1:
-                    strategy = (
-                        "dual_opt_static6_norms_n1"
-                        if H == HV == 64
-                        else "dual_opt_static6_norms"
-                    )
-                elif N == 2 and H == HV == 64:
-                    strategy = "dual_opt_static6_norms_n2"
-                else:
-                    strategy = "dual_opt_static6_norms_bv32"
-            elif dimension_profitable:
-                if K == 256:
-                    strategy = "dual_opt_norms_dims_bv32"
-                elif K == 128 and V == 128:
-                    strategy = "dual_opt_norms"
-                else:
-                    strategy = "dual_opt_norms_dims"
-    flexible_dims = strategy in (
-        "dual_opt_norms_dims",
-        "dual_opt_norms_dims_bv32",
-    )
-    if strategy != "original" and not flexible_dims and (K != 128 or V != 128):
+    if strategy != "original" and (K != 128 or V != 128):
         raise ValueError("opt strategies require K == V == 128")
-    if flexible_dims and (K not in (64, 128, 256) or V not in (64, 128, 256)):
-        raise ValueError("dual_opt_norms_dims requires K,V in {64,128,256}")
     use_fast_path = strategy != "original"
-    use_two_kernels = strategy in (
-        "dual_opt",
-        "dual_opt_norms",
-        "dual_opt_norms_dims",
-        "dual_opt_norms_dims_bv32",
-        "dual_opt_static6_norms",
-        "dual_opt_static6_norms_n1",
-        "dual_opt_static6_norms_n2",
-        "dual_opt_static6_norms_bv32",
-    )
-    use_static_six = strategy in (
-        "dual_opt_static6_norms",
-        "dual_opt_static6_norms_n1",
-        "dual_opt_static6_norms_n2",
-        "dual_opt_static6_norms_bv32",
-    )
-    precompute_qk_norms = strategy in (
-        "dual_opt_norms",
-        "dual_opt_norms_dims",
-        "dual_opt_norms_dims_bv32",
-        "dual_opt_static6_norms",
-        "dual_opt_static6_norms_n1",
-        "dual_opt_static6_norms_n2",
-        "dual_opt_static6_norms_bv32",
-    )
-    use_n1_static6_recurrent = strategy == "dual_opt_static6_norms_n1"
-    if use_n1_static6_recurrent and not (
-        B == 1
-        and N == 1
-        and T == 6
-        and H == 64
-        and HV == 64
-        and K == 128
-        and V == 128
-        and cache_stride_steps == 6
-        and is_kda
-        and use_qk_l2norm_in_kernel
-        and lower_bound is not None
-        and disable_state_update
-        and initial_state_source is not None
-        and initial_state_indices is not None
-        and intermediate_states_buffer is not None
-        and intermediate_state_indices is not None
-        and cu_seqlens is not None
-        and retrieve_parent_token is None
-        and not cache_ring
-        # Q/K/V may be views into an interleaved packed-QKV allocation.  The
-        # recurrent kernels accept an arbitrary token stride; only the
-        # per-token [head, dim] payload must be dense.
-        and q.stride(-1) == 1
-        and q.stride(-2) == K
-        and k.stride(-1) == 1
-        and k.stride(-2) == K
-        and v.stride(-1) == 1
-        and v.stride(-2) == V
-        and intermediate_states_buffer.is_contiguous()
-        and initial_state_source.stride(-1) == 1
-        and initial_state_source.stride(-2) == K
-        and initial_state_source.stride(-3) == V * K
-    ):
-        raise ValueError(
-            "dual_opt_static6_norms_n1 requires the exact dense-per-token "
-            "N=1/T=6/H=HV=64/K=V=128 target-verify contract"
-        )
-    use_n2_static6_recurrent = strategy == "dual_opt_static6_norms_n2"
-    if use_n2_static6_recurrent and not (
-        B == 1
-        and N == 2
-        and T == 12
-        and H == 64
-        and HV == 64
-        and K == 128
-        and V == 128
-        and cache_stride_steps == 6
-        and is_kda
-        and use_qk_l2norm_in_kernel
-        and lower_bound is not None
-        and disable_state_update
-        and initial_state_source is not None
-        and initial_state_indices is not None
-        and intermediate_states_buffer is not None
-        and intermediate_state_indices is not None
-        and cu_seqlens is not None
-        and retrieve_parent_token is None
-        and not cache_ring
-        # Q/K/V may be views into an interleaved packed-QKV allocation.  The
-        # recurrent kernels accept an arbitrary token stride; only the
-        # per-token [head, dim] payload must be dense.
-        and q.stride(-1) == 1
-        and q.stride(-2) == K
-        and k.stride(-1) == 1
-        and k.stride(-2) == K
-        and v.stride(-1) == 1
-        and v.stride(-2) == V
-        and intermediate_states_buffer.is_contiguous()
-        and initial_state_source.stride(-1) == 1
-        and initial_state_source.stride(-2) == K
-        and initial_state_source.stride(-3) == V * K
-    ):
-        raise ValueError(
-            "dual_opt_static6_norms_n2 requires the exact dense-per-token "
-            "N=2/T=12/H=HV=64/K=V=128 target-verify contract"
-        )
-    if use_static_six and not (
-        cu_seqlens is not None
-        and cache_stride_steps == 6
-        and T == N * 6
-        and intermediate_states_buffer is not None
-    ):
-        raise ValueError(
-            "dual_opt_static6_norms requires six steps for every packed sequence"
-        )
-    if precompute_qk_norms and not (
-        use_qk_l2norm_in_kernel and is_kda and HV % H == 0
-    ):
-        raise ValueError(
-            "Q/K norm precompute requires KDA normalization and HV divisible by H"
-        )
+    use_two_kernels = strategy == "dual_opt"
 
     if use_fast_path:
-        if strategy in (
-            "dual_opt_norms_dims_bv32",
-            "dual_opt_static6_norms_bv32",
-        ):
-            opt_bv = min(V, 32)
-        else:
-            opt_bv = min(V, 128 if N * HV >= 104 else 64)
-        if use_static_six and opt_bv == 32:
-            opt_num_warps = 4
-        else:
-            opt_num_warps = (
-                8 if use_static_six and opt_bv == 128 else (4 if opt_bv == 128 else 2)
-            )
+        opt_bv = 128 if N * HV >= 104 else 64
+        opt_num_warps = 4 if opt_bv == 128 else 2
         # 实测表明 N*HV<104 时额外 kernel launch/中间张量流量得不偿失；
         # 大规模时将非线性门计算移出串行递推更快。
         # Gate/beta are independent across tokens.  Materialize them once so
@@ -1288,125 +848,44 @@ def _fused_sigmoid_gating_delta_rule_update_with_strategy(
         if use_two_kernels:
             gate_width = K if is_kda else 1
             all_tokens = B * T
-            gate_numel = all_tokens * HV * gate_width
-            gate_values_numel = gate_numel if cache_ring else 0
-            beta_numel = all_tokens * HV
-            norm_numel = 2 * all_tokens * H if precompute_qk_norms else 0
-            workspace = torch.empty(
-                gate_numel + gate_values_numel + beta_numel + norm_numel,
+            gate_decay = torch.empty(
+                all_tokens,
+                HV,
+                gate_width,
                 device=q.device,
                 dtype=torch.float32,
             )
-            workspace_offset = 0
-            gate_decay = workspace[
-                workspace_offset : workspace_offset + gate_numel
-            ].view(all_tokens, HV, gate_width)
-            workspace_offset += gate_numel
-            if cache_ring:
-                gate_values = workspace[
-                    workspace_offset : workspace_offset + gate_values_numel
-                ].view(all_tokens, HV, gate_width)
-                workspace_offset += gate_values_numel
-            else:
-                gate_values = None
-            beta_values = workspace[
-                workspace_offset : workspace_offset + beta_numel
-            ].view(all_tokens, HV)
-            workspace_offset += beta_numel
-            if precompute_qk_norms:
-                qk_inv_norm = workspace[
-                    workspace_offset : workspace_offset + norm_numel
-                ].view(2, all_tokens, H)
-                workspace_offset += norm_numel
-                q_inv_norm, k_inv_norm = qk_inv_norm[0], qk_inv_norm[1]
-            else:
-                q_inv_norm = k_inv_norm = None
-            assert workspace_offset == workspace.numel()
+            gate_values = torch.empty_like(gate_decay) if cache_ring else None
+            beta_values = torch.empty(
+                all_tokens,
+                HV,
+                device=q.device,
+                dtype=torch.float32,
+            )
             sigmoid_gating_precompute_kernel[(all_tokens, HV)](
                 A_log=A_log,
                 a=a,
                 dt_bias=dt_bias,
                 b=b,
-                q=q,
-                k=k,
                 gate_decay=gate_decay,
                 gate_values=gate_values,
                 beta_values=beta_values,
-                q_inv_norm=q_inv_norm,
-                k_inv_norm=k_inv_norm,
                 softplus_beta=softplus_beta,
                 softplus_threshold=softplus_threshold,
                 lower_bound=lower_bound if lower_bound is not None else 0.0,
                 stride_a=stride_a,
                 stride_b=stride_b,
-                stride_q=stride_q,
-                stride_k=stride_k,
-                H=H,
                 HV=HV,
                 K=K,
                 BK=BK,
                 IS_KDA=is_kda,
                 USE_LOWER_BOUND=lower_bound is not None,
                 STORE_GATE_VALUES=cache_ring,
-                PRECOMPUTE_QK_NORMS=precompute_qk_norms,
-                num_warps=_select_precompute_num_warps(
-                    token_heads=all_tokens * HV,
-                    key_dim=K,
-                    is_kda=is_kda,
-                    use_static_six=use_static_six,
-                ),
+                num_warps=4 if is_kda else 1,
                 num_stages=1,
             )
         else:
             gate_decay = gate_values = beta_values = None
-            q_inv_norm = k_inv_norm = None
-        if use_n1_static6_recurrent:
-            fused_sigmoid_gating_delta_rule_update_kernel_n1_static6[(64, 8)](
-                gate_decay=gate_decay,
-                beta_values=beta_values,
-                q_inv_norm=q_inv_norm,
-                k_inv_norm=k_inv_norm,
-                q=q,
-                k=k,
-                v=v,
-                o=o,
-                h0_source=initial_state_source,
-                h0_indices=initial_state_indices,
-                stride_h0_source=initial_state_source.stride(0),
-                intermediate_states_buffer=intermediate_states_buffer,
-                intermediate_state_indices=intermediate_state_indices,
-                scale=scale,
-                stride_q=stride_q,
-                stride_k=stride_k,
-                stride_v=stride_v,
-                num_warps=4,
-                num_stages=1,
-            )
-            return o.squeeze(0)
-        if use_n2_static6_recurrent:
-            fused_sigmoid_gating_delta_rule_update_kernel_n2_static6[(128, 4)](
-                gate_decay=gate_decay,
-                beta_values=beta_values,
-                q_inv_norm=q_inv_norm,
-                k_inv_norm=k_inv_norm,
-                q=q,
-                k=k,
-                v=v,
-                o=o,
-                h0_source=initial_state_source,
-                h0_indices=initial_state_indices,
-                cu_seqlens=cu_seqlens,
-                stride_h0_source=initial_state_source.stride(0),
-                intermediate_states_buffer=intermediate_states_buffer,
-                intermediate_state_indices=intermediate_state_indices,
-                scale=scale,
-                stride_q=stride_q,
-                stride_k=stride_k,
-                stride_v=stride_v,
-                num_warps=4,
-                num_stages=1,
-            )
-            return o.squeeze(0)
         fused_sigmoid_gating_delta_rule_update_kernel_opt[
             (N * HV * triton.cdiv(V, opt_bv),)
         ](
@@ -1417,8 +896,6 @@ def _fused_sigmoid_gating_delta_rule_update_with_strategy(
             gate_decay=gate_decay,
             gate_values=gate_values,
             beta_values=beta_values,
-            q_inv_norm=q_inv_norm,
-            k_inv_norm=k_inv_norm,
             softplus_beta=softplus_beta,
             softplus_threshold=softplus_threshold,
             lower_bound=lower_bound if lower_bound is not None else 0.0,
@@ -1469,12 +946,10 @@ def _fused_sigmoid_gating_delta_rule_update_with_strategy(
             IS_KDA=is_kda,
             USE_LOWER_BOUND=lower_bound is not None,
             PRECOMPUTED_GATES=use_two_kernels,
-            PRECOMPUTED_QK_NORMS=precompute_qk_norms,
             DISABLE_STATE_UPDATE=disable_state_update,
             CACHE_INTERMEDIATE_STATES=intermediate_states_buffer is not None,
             HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_parent_token is not None,
             CACHE_RING=cache_ring,
-            STATIC_STEPS=6 if use_static_six else 0,
             num_warps=opt_num_warps,
             num_stages=1,
         )

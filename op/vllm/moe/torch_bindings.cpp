@@ -23,7 +23,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
       "topk_softplus_sqrt(Tensor! topk_weights, Tensor! topk_indices, Tensor! "
       "token_expert_indices, Tensor gating_output, bool renormalize, float "
       "routed_scaling_factor, Tensor? "
-      "bias, Tensor? input_ids, Tensor? tid2eid, Tensor? is_padding, Tensor? bias_vl=None, int image_sentinel_lo=0) -> ()");
+      "bias, Tensor? input_ids, Tensor? tid2eid, Tensor? is_padding) -> ()");
   m.impl("topk_softplus_sqrt", torch::kCUDA, &topk_softplus_sqrt);
 
   // Aligning the number of tokens to be processed by each expert such

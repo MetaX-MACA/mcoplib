@@ -285,7 +285,7 @@ def mhc_pre(
     use_cuda_specialization = (
         _default_op is not None
         and hasattr(_default_op, "mhc_pre_big_fuse_out")
-        and hidden_size in (4096, 7168)
+        and hidden_size == 7168
         and mhc_mult == 4
         and n_splits in (16, 64)
         and rms_eps == 1e-6

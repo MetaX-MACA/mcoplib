@@ -9,8 +9,6 @@
 #include <limits>
 
 #include "../include/qk_rms_norm.h"
-#include "mcoplib_ops_params_info.hpp"
-#include "mcoplib_ops_params_dump.hpp"
 #include "../kernel/utils.h"
 
 #ifndef __shfl_xor_sync_16
@@ -263,8 +261,6 @@ torch::Tensor qk_rms_norm_inplace_cuda(
     int64_t kv_head_num,
     int64_t qk_head_dim,
     double eps) {
-  DEBUG_TRACE_PARAMS(token_data, q_norm_weight, k_norm_weight, q_head_num, kv_head_num, qk_head_dim, eps);
-  DEBUG_DUMP_PARAMS(token_data, q_norm_weight, k_norm_weight, q_head_num, kv_head_num, qk_head_dim, eps);
   TORCH_CHECK(token_data.is_cuda(), "token_data must be a CUDA tensor");
   TORCH_CHECK(q_norm_weight.is_cuda(), "q_norm_weight must be a CUDA tensor");
   TORCH_CHECK(k_norm_weight.is_cuda(), "k_norm_weight must be a CUDA tensor");

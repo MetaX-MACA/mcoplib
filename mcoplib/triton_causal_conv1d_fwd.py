@@ -834,9 +834,16 @@ def causal_conv1d_fwd(
         if has_initial_state is not None:
             assert has_initial_state.shape == (padded_batch,)
 
-    
+    # A small launch needs more token programs.  Once request/channel
+    # parallelism is sufficient, double the channel tile and token chunk to
+    # amortize weight loads and scheduling on C600U.
+    large_launch = dim * len(seq_lens_cpu) >= 4096
+    default_block_m = 32 if large_launch else 16
+    default_block_n = 512 if large_launch else 256
     default_num_warps = 2
 
+    block_m = kwargs.pop("_block_m", default_block_m)
+    block_n = kwargs.pop("_block_n", default_block_n)
     num_warps = kwargs.pop("_num_warps", default_num_warps)
     def grid(meta):
         return (
@@ -871,8 +878,8 @@ def causal_conv1d_fwd(
         HAS_INITIAL_STATES=has_initial_state is not None,
         IS_CONTINUOUS_BATCHING=cache_indices is not None,
         USE_PAD_SLOT=pad_slot_id is not None,
-        BLOCK_M=32,
-        BLOCK_N=512,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
         num_warps=num_warps,
         num_stages=2,
     )

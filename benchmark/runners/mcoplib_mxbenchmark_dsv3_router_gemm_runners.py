@@ -11,7 +11,6 @@ class Dsv3RouterGemmRunner(OpBenchmarkBase):
         super().__init__(name, config)
         self.num_tokens = config.get("num_tokens", 16)
         self.num_experts = config.get("num_experts", 256)
-        self.seed = config.get("seed", None)
         self.hidden_dim = config.get("hidden_dim", 7168)
         self.dtype = torch.bfloat16
         self.out_dtype = torch.float32
@@ -47,9 +46,6 @@ class Dsv3RouterGemmRunner(OpBenchmarkBase):
         state.add_global_memory_writes(write_bytes)
 
     def prepare_and_get_launcher(self, dev_id, tc_s):
-        if self.seed is not None:
-            torch.manual_seed(self.seed)
-            torch.cuda.manual_seed_all(self.seed)
         with torch.cuda.stream(tc_s):
             dev = f"cuda:{dev_id}"
             mat_a = torch.randn(self.num_tokens, self.hidden_dim, dtype=torch.bfloat16, device=dev,).contiguous()
