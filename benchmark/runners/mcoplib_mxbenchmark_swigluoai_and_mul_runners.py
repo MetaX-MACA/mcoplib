@@ -15,6 +15,7 @@ class Swigluoai_and_mul_runner(OpBenchmarkBase):
         self.hidden_dim = config.get("hidden_dim", 4096)
         self.alpha = config.get("alpha", 1.702)
         self.limit = config.get("limit", 7.0)
+        self.seed = config.get("seed", None)
         self.dtype = getattr(torch, config.get("dtype", "bfloat16"))
 
     def define_metrics(self, state):
@@ -30,6 +31,9 @@ class Swigluoai_and_mul_runner(OpBenchmarkBase):
         state.add_global_memory_writes(output_size)
 
     def prepare_and_get_launcher(self, dev_id, tc_s):
+        if self.seed is not None:
+            torch.manual_seed(self.seed)
+            torch.cuda.manual_seed_all(self.seed)
         with torch.cuda.stream(tc_s):
             dev = f'cuda:{dev_id}'
             input_dim = 2 * self.hidden_dim

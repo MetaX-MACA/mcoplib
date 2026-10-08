@@ -6,6 +6,8 @@
 #include <torch/csrc/stable/tensor.h>
 #include <torch/headeronly/util/shim_utils.h>
 
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAException.h>
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 
@@ -73,12 +75,14 @@ inline cudaDeviceProp* get_device_prop() {
 
 // Utility to get the current CUDA stream for a given device using stable APIs.
 // Returns a cudaStream_t for use in kernel launches.
-// inline cudaStream_t get_current_cuda_stream(int32_t device_index = -1) {
-//   StreamHandle stream{};
-//   TORCH_ERROR_CODE_CHECK(
-//       aoti_torch_get_current_stream(device_index, &stream));
-//   return reinterpret_cast<cudaStream_t>(stream);
-// }
+inline cudaStream_t get_current_cuda_stream(int32_t device_index = -1) {
+  if (device_index == -1){
+    return at::cuda::getCurrentCUDAStream();
+  }else{
+    return at::cuda::getCurrentCUDAStream(device_index);
+  }
+  
+}
 
 // Utility to get the current cuBLAS handle using stable APIs.
 // inline cublasHandle_t get_current_cuda_blas_handle() {

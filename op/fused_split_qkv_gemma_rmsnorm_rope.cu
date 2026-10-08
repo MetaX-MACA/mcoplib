@@ -6,6 +6,8 @@
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <cstdint>
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
 
 // ============================================================================
 // Metax C500 极致优化内核 (Zero-Shared-Memory, Multi-Head Block, SREG Caching)
@@ -142,8 +144,11 @@ void gemma_fused_rmsnorm_rope(
     int64_t kv_size,
     int64_t head_dim,
     double eps,
-    at::Tensor const& cos_sin_cache) 
+    at::Tensor const& cos_sin_cache)
 {
+    DEBUG_TRACE_PARAMS(qkv, weight, positions, q_size, kv_size, head_dim, eps, cos_sin_cache);
+    DEBUG_DUMP_PARAMS(qkv, weight, positions, q_size, kv_size, head_dim, eps, cos_sin_cache);
+
     TORCH_CHECK(head_dim % 8 == 0, "head_dim must be a multiple of 8");
     TORCH_CHECK(head_dim <= 256, "head_dim > 256 requires wider warp reduction handling");
 

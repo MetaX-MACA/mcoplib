@@ -32,14 +32,13 @@ SUPPORTED_OPERATORS = [
     "batched_moe_align_block_size",
     "batched_rotary_embedding",
     "build_tree_kernel_efficient",
+    "causal_conv1d_fwd",
     "concat_and_cache_mla",
     "concat_mla_absorb_q",
     "concat_mla_k",
     "concat_mla_q",
-    "convert_fp8",
     "convert_vertical_slash_indexes",
     "convert_vertical_slash_indexes_mergehead",
-    "copy_to_gpu_no_ce",
     "cp_gather_cache",
     "cp_gather_indexer_k_cache",
     "cp_gather_indexer_k_quant_cache",
@@ -50,6 +49,7 @@ SUPPORTED_OPERATORS = [
     "fast_topk",
     "fast_topk_transform_fused",
     "fast_topk_transform_ragged_fused",
+    "stable_topk_gathered",
     "fatrelu_and_mul",
     "fp32_router_gemm",
     "fused_add_rms_norm",
@@ -60,8 +60,8 @@ SUPPORTED_OPERATORS = [
     "fused_moe_gate_deepseek",
     "fused_moe_gate_opt",
     "fused_rope_fwd",
+    "fused_silu_mul_dq_mask_quant",
     "fused_silu_mul_dq_quant_interface",
-    "fused_unpack",
     "gather_and_maybe_dequant_cache",
     "gelu_and_mul",
     "gelu_fast",
@@ -70,28 +70,32 @@ SUPPORTED_OPERATORS = [
     "gelu_tanh_and_mul",
     "get_cuda_view_from_cpu_tensor",
     "gptq_gemm",
-    "gptq_marlin_gemm",
     "gptq_shuffle",
     "grouped_topk",
     "indexer_k_cache",
+    "indexer_norm_rope",
     "init_custom_ar",
-    "mctlass_moe_w4a16_gemm_kernel_mnk",
     "merge_attn_states",
-    "merge_state",
-    "merge_state_v2",
-    "meta_size",
+    "mhc_post",
+    "mhc_pre",
+    "mhc_pre_big_fuse_kernel",
     "moe_align_block_size",
     "moe_fused_gate",
     "moe_lora_align_block_size",
     "moe_sum",
     "moe_sum_reduce",
     "mul_and_silu",
+    "persistent_masked_m_silu_mul_quant_cu",
+    "persistent_masked_m_swiglu_mul_quant_cu",
     "paged_attention_v1",
     "paged_attention_v2",
     "per_token_cast_to_fp8",
     "per_token_group_fp8_quant",
     "persistent_topk",
     "prepare_moe_input",
+    "qk_rms_norm",
+    "quantize_k_cache",
+    "region_topk_ids",
     "reshape_and_cache",
     "reshape_and_cache_flash",
     "rms_norm",
@@ -106,9 +110,9 @@ SUPPORTED_OPERATORS = [
     "sgl_rotary_embedding",
     "silu_and_mul",
     "silu_and_mul_quant",
+    "silu_mul_quant_varlen",
     "static_scaled_fp8_quant",
     "static_scaled_int8_quant",
-    "swap_blocks",
     "swigluoai_and_mul",
     "top_k_per_row_decode",
     "topk_sigmoid",
@@ -128,7 +132,6 @@ SUPPORTED_OPERATORS = [
     "transfer_kv_per_layer_pf_lf",
     "transfer_kv_per_layer_ph_lf",
     "tree_speculative_sampling_target_only",
-    "verify_tree_greedy",
     "reconstruct_indices_from_tree_mask",
     "vllm_rotary_embedding",
     "mx_awq_dequantize",
@@ -138,7 +141,36 @@ SUPPORTED_OPERATORS = [
     "silu_and_mul_with_clamp",
     "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert",
     "fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert",
-    "fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert"
+    "fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert",
+    "dsv3_router_gemm",
+    "moe_permute",
+    "moe_unpermute",
+    "persistent_masked_m_silu_mul_quant",
+    "persistent_masked_m_swiglu_mul_quant",
+    "kimi_k3_attn_res",
+    "fused_kda_decode",
+    "fused_sigmoid_gating_delta_rule_update",
+    "situ_and_mul",
+    "triton_situ_and_mul",
+    "triton_sglang_chunk_delta_h",
+    "triton_sglang_per_token_quant_int8",
+    "masked_situ_and_mul",
+    "concat_and_cache_mla_grouped",
+    "fused_kimi_k3_mla_key_concat_kv_cache_insert",
+    "fused_kimi_k3_mla_key_concat_ds_mla_insert",
+    "fused_kimi_k3_mla_decode_q_concat_kv_cache_insert",
+    "fused_kimi_k3_mla_qkv_quant_kv_cache_fp8_insert",
+    "fused_kimi_k3_mla_decode_q_concat_ds_mla_insert",
+    "fused_kimi_k3_mla_decode_q_concat_kv_cache_fp8_insert",
+    "topk_softplus_sqrt",
+    "ngram_compute_n_gram_ids",
+    "relu_squared",
+    "fused_kimi_k3_mla_kv_concat_quant_fp8",
+    "fused_kimi_k3_mla_kv_concat",
+    "fused_gdn_decode_post_conv_mtp",
+    "cp_gather_and_upconvert_fp8_kv_cache",
+    "dsv3_fused_a_gemm",
+    "fused_deepseek_v4_qnorm_rope_kv_rope_int8_insert"
 ]
 # =============================================================================
 #  Global Config: Ignored Operators
@@ -147,7 +179,9 @@ SUPPORTED_OPERATORS = [
 # The script prints the ignored op name and exits with code 0.
 # Use exact op names (must match SUPPORTED_OPERATORS entries or the --op arg).
 IGNORED_OPERATORS = [
-    # "gptq_shuffle",   # example: uncomment to skip a slow/flaky op
+    "gptq_marlin_gemm",
+    "fused_unpack",
+    "convert_fp8",
 ]
 
 # =============================================================================
@@ -406,7 +440,15 @@ def load_csv_data(filepath):
         reader = csv.reader(f)
         try: header = [h.strip() for h in next(reader)]
         except StopIteration: return [], []
-        data = [dict(zip(header, row)) for row in reader if len(row) >= len(header)]
+        data = []
+        for row in reader:
+            if not row:
+                continue
+            if len(row) < len(header):
+                row = row + [""] * (len(header) - len(row))
+            elif len(row) > len(header):
+                row = row[:len(header)]
+            data.append(dict(zip(header, row)))
         return header, data
 
 def preprocess_data(header, rows):
@@ -443,8 +485,22 @@ def format_duration(seconds):
     if seconds is None: return "N/A"
     return f"{seconds * 1e6:.3f} us"
 
+# Stable identity of a benchmark row for baseline matching. Only these columns
+# define "the same test case"; everything else (timings, bandwidth, noise) and
+# every nvbench axis column emitted dynamically (e.g. "Bits", a mask ratio, a
+# mode name) must NOT gate the match -- otherwise a fresh run that populates such
+# an axis fails to match a fixed-schema baseline row where the cell is empty,
+# yielding a spurious "no perf ratio". See patch_row_key_identity.py.
+_ROW_KEY_IDENTITY_COLS = ("op_name", "Device", "Device Name", "Op", "dtype", "Shape")
+
+
 def get_row_key(row_dict, header):
-    exclude = ["Samples", "CPU Time", "GPU Time", "Noise", "Elem/s", "GlobalMem", "BWUtil", "Acc_Pass", "Max_Diff", "Cos_Dist","Batch GPU"]
+    # Preferred: match on the fixed identity columns that are present in the CSV.
+    id_cols = [c for c in _ROW_KEY_IDENTITY_COLS if c in header]
+    if id_cols:
+        return tuple(row_dict.get(k, "") for k in id_cols)
+    # Fallback for foreign schemas lacking the identity columns: old blacklist.
+    exclude = ["Samples", "CPU Time", "GPU Time", "Noise", "Elem/s", "GlobalMem", "BWUtil", "Acc_Pass", "Max_Diff", "Cos_Dist","Batch GPU", "Bits"]
     key_cols = [h for h in header if not any(x in h for x in exclude) and h != "Skipped"]
     return tuple(row_dict.get(k, "") for k in key_cols)
 
@@ -466,12 +522,26 @@ def get_effective_gpu_time(row):
         
     return None
 
+# Columns emitted by a few op runners via add_summary() that must NOT appear in
+# the unified baseline CSV (keeps C600ul.csv identical to C500.csv's schema).
+_CSV_DROP_COLS = ("tile_size", "Routes", "Path", "situ_beta",
+                  "situ_linear_beta", "Kernel")
+
+
 def _write_csv(path, header, rows):
     try:
+        # Enforce a fixed schema: drop the blacklisted extra columns from the
+        # header and from every row so the file matches the C500 reference.
+        header = [h for h in header if h not in _CSV_DROP_COLS]
+        cleaned_rows = []
+        for r in rows:
+            cleaned_rows.append({k: v for k, v in r.items()
+                                 if k not in _CSV_DROP_COLS})
+        rows = cleaned_rows
         target_dir = os.path.dirname(path)
         if target_dir and not os.path.exists(target_dir): os.makedirs(target_dir)
         with open(path, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.DictWriter(f, fieldnames=header)
+            writer = csv.DictWriter(f, fieldnames=header, extrasaction='ignore')
             writer.writeheader()
             writer.writerows(rows)
     except Exception as e:
@@ -660,6 +730,23 @@ def perform_comparison(cur_raw, hist_raw, output_csv=None):
             if get_row_key(h_row, dummy_header) == key:
                 matches.append((idx, h_row))
 
+        if not matches:
+            print(f" [DEBUG] No baseline match for op={op_name} shape={row.get('Shape','')} dtype={d_type}")
+            print(f"         current_key={key!r}")
+            shown = 0
+            for idx, h_row in enumerate(hist_rows):
+                if h_row.get("op_name") != op_name:
+                    continue
+                hkey = get_row_key(h_row, dummy_header)
+                if hkey != key:
+                    diffs = [(i, c, h) for i, (c, h) in enumerate(zip(key, hkey)) if c != h]
+                    print(f"         hist[{idx}] key={hkey!r} diffs={diffs[:3]}")
+                    shown += 1
+                    if shown >= 2:
+                        break
+            if shown == 0:
+                print(f"         (no historical row found with op_name={op_name!r})")
+
         perf_ratio_str = "None"
         perf_ratio_pct = None
         h_gpu = None
@@ -680,6 +767,10 @@ def perform_comparison(cur_raw, hist_raw, output_csv=None):
             print(row_fmt.format("Base", format_duration(h_gpu), gr, format_duration(h_cpu), cr, ""))
         else:
             print(f"{'Base':<15} | {'N/A':<15} | {'N/A':<10} | {'N/A':<15} | {'N/A':<15} |")
+            cur_dev = row.get("Device Name") or row.get("Device")
+            print(f" [INFO] No historical row matched. Likely cause: device mismatch "
+                  f"(current={cur_dev!r}, baseline was for another device) "
+                  f"or different (Op/Shape/dtype) combination.")
 
         print("Result:")
         print(f"Acc verify:{acc_status}")
@@ -736,6 +827,18 @@ def perform_comparison(cur_raw, hist_raw, output_csv=None):
         print("="*95 + "\n")
 
 # =============================================================================
+def resolve_default_csv_filename(device_name):
+    """Pick the default result-CSV filename from the actual GPU device name.
+    NOTE: test 'C600-UL' BEFORE 'C600-U' because the former contains the latter
+    as a substring."""
+    upper = (device_name or "").upper()
+    if "C600-UL" in upper:
+        return "mcoplib_ops_performance_C600ul.csv"
+    if "C600-U" in upper:
+        return "mcoplib_ops_performance_C600u.csv"
+    return "mcoplib_ops_performance_C500.csv"
+
+
 #  Main Execution Block
 # =============================================================================
 if __name__ == "__main__":
@@ -783,6 +886,30 @@ if __name__ == "__main__":
 
     # 3. Load Operator (get config + runner class, then expand)
     canonical_name, runner_cls, base_config = load_operator_runner_components(op_name)
+
+    # 3.5. Device Name Check: verify config device_name matches actual GPU.
+    #      On mismatch we WARN and CONTINUE (no longer FATAL) so one config set
+    #      can run across MetaX C500 / C600-U / C600-UL.
+    try:
+        actual_device_name = torch.cuda.get_device_name(0)
+    except Exception as e:
+        print(f"[ERROR] Failed to get actual GPU device name: {e}")
+        actual_device_name = ""
+    config_device_name = base_config.get("device_name")
+    if config_device_name and actual_device_name:
+        # Support both string and array forms of device_name
+        if isinstance(config_device_name, list):
+            matched = actual_device_name in config_device_name
+        else:
+            matched = config_device_name == actual_device_name
+        if not matched:
+            print(f"\n[WARN] Device name mismatch (continuing anyway)!")
+            print(f"       Config file device_name : {config_device_name}")
+            print(f"       Actual GPU device name  : '{actual_device_name}'")
+            print(f"       Operator: {canonical_name}")
+            print(f"       Benchmark will still run and record results for the "
+                  f"actual GPU.\n")
+
     expanded_configs = expand_config(base_config)
 
     if len(expanded_configs) > 1:
@@ -792,8 +919,9 @@ if __name__ == "__main__":
             print(f"  [{i+1}/{len(expanded_configs)}] {shape_info}")
         print()
 
-    # 4. Handle CSV Default Logic
-    default_csv_path = "statistics/mcoplib_ops_performance_C500.csv"
+    # 4. Handle CSV Default Logic (device-aware)
+    default_csv_path = os.path.join(
+        "statistics", resolve_default_csv_filename(actual_device_name))
     if args.csv is None:
         print(f"[WARN] --csv not specified, using default path: {default_csv_path}")
         args.csv = default_csv_path

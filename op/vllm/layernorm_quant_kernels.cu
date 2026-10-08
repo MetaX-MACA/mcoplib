@@ -8,7 +8,7 @@
 #include "type_convert.cuh"
 #include "quantization/w8a8/fp8/common.cuh"
 #include "dispatch_utils.h"
-
+#include "core/batch_invariant.hpp"
 #include <torch/cuda.h>
 #include <c10/cuda/CUDAGuard.h>
 
@@ -176,7 +176,10 @@ void rms_norm_static_fp8_quant(torch::Tensor& out,     // [..., hidden_size]
   int num_tokens = input.numel() / hidden_size;
 
   dim3 grid(num_tokens);
-  dim3 block(std::min(hidden_size, 1024));
+  const bool batch_invariant_launch = vllm::vllm_is_batch_invariant();
+  const int max_block_size =
+      batch_invariant_launch ? 1024 : ((num_tokens < 256) ? 1024 : 256);
+  dim3 block(std::min(hidden_size, max_block_size));
   const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   VLLM_DISPATCH_FLOATING_TYPES(
@@ -225,7 +228,9 @@ void fused_add_rms_norm_static_fp8_quant(
      When num_tokens is large, a smaller block size allows
      for increased block occupancy on CUs and better latency
      hiding on global mem ops. */
-  const int max_block_size = (num_tokens < 256) ? 1024 : 256;
+  const bool batch_invariant_launch = vllm::vllm_is_batch_invariant();
+  const int max_block_size =
+      batch_invariant_launch ? 1024 : ((num_tokens < 256) ? 1024 : 256);
   dim3 block(std::min(hidden_size, max_block_size));
   const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();

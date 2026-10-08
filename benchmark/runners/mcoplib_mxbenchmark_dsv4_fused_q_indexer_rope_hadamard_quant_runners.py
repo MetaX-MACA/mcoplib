@@ -16,6 +16,7 @@ class Dsv4_fused_q_indexer_rope_hadamard_quant_runner(OpBenchmarkBase):
         self.rope_dim = config.get("rope_dim", 64)
         self.max_pos = config.get("max_pos", 256)
         self.weight_scale = config.get("weight_scale", 0.5)
+        self.seed = config.get("seed", None)
 
     def define_metrics(self, state):
         state.add_summary("Op", self.name)
@@ -35,6 +36,9 @@ class Dsv4_fused_q_indexer_rope_hadamard_quant_runner(OpBenchmarkBase):
         state.add_global_memory_writes(writes)
 
     def prepare_and_get_launcher(self, dev_id, tc_s):
+        if self.seed is not None:
+            torch.manual_seed(self.seed)
+            torch.cuda.manual_seed_all(self.seed)
         with torch.cuda.stream(tc_s):
             dev = f'cuda:{dev_id}'
             q_input = torch.randn(

@@ -1,7 +1,7 @@
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
-
+#include "../../core/batch_invariant.hpp"
 #include "../../dispatch_utils.h"
 #include "layernorm_utils.cuh"
 #include "quant_conversions.cuh"
@@ -221,7 +221,9 @@ void rms_norm_per_block_quant_dispatch(
   auto num_tokens = input.numel() / hidden_size;
 
   dim3 grid(num_tokens);
-  const int max_block_size = (num_tokens <= 256) ? 512 : 256;
+  const bool batch_invariant_launch = vllm::vllm_is_batch_invariant();
+  const int max_block_size =
+      batch_invariant_launch ? 512 : ((num_tokens <= 256) ? 512 : 256);
   dim3 block(std::min(hidden_size, max_block_size));
   const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();

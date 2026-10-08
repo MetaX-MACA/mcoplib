@@ -8,32 +8,77 @@
 #include <iostream>
 #include <type_traits>
 #include <vector>
+#include <mutex>
+#include <unordered_map>
 #include <cstring>
 #include <cstdlib>  // for std::getenv
 #include <optional> // 必须包含这个头文件
+#include <chrono>
+#include <ctime>
+#include <atomic>
+#include <cstdio>      // for snprintf
+#include <sys/stat.h>  // for mkdir
+#include <unistd.h>    // for getpid
 namespace mcop {
 namespace debug {
 
 // 运行期环境变量检查 - 完全通过环境变量控制，无需编译期宏
 // 使用 static 变量缓存，确保只检查一次环境变量，性能开销极小
+// 第一层开关（默认关）：只有显式设为 1/ON/on 才 dump
 inline bool is_debug_enabled() {
     static const bool enabled = []() {
         const char* env = std::getenv("MCOP_DEBUG_PARAMS_DUMP");
-        return env != nullptr && std::string(env) != "0";
+        if (env == nullptr) return false;  // 默认关
+        std::string v(env);
+        return (v == "1" || v == "ON" || v == "on");
     }();
     return enabled;
+}
+
+// 第二层过滤开关：MCOP_DEBUG_FILTER 未设置 -> 全关（不打印、不 dump）；
+// 设 "all" -> 全部算子；否则按逗号分隔的函数名子串匹配
+inline bool name_matches(const char* func_name) {
+    static const char* filter_p = std::getenv("MCOP_DEBUG_FILTER");
+    if (filter_p == nullptr || filter_p[0] == '\0') return false;
+    const std::string name(func_name ? func_name : "");
+    const std::string filter(filter_p);
+    if (filter == "all") return true;
+    size_t start = 0;
+    while (start <= filter.size()) {
+        size_t comma = filter.find(',', start);
+        std::string token = filter.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+        // 去掉首尾空白，支持 "op1, op2" 带空格的写法
+        size_t b = token.find_first_not_of(" \t\r\n");
+        if (b == std::string::npos) {
+            token.clear();
+        } else {
+            size_t e = token.find_last_not_of(" \t\r\n");
+            token = token.substr(b, e - b + 1);
+        }
+        if (!token.empty() && name.find(token) != std::string::npos) return true;
+        if (comma == std::string::npos) break;
+        start = comma + 1;
+    }
+    return false;
+}
+
+// 是否该对这个算子 dump：第一层开关(默认关) && 第二层过滤 FILTER
+inline bool should_dump(const char* func_name) {
+    if (!is_debug_enabled()) return false;
+    if (!name_matches(func_name)) return false;
+    return true;
 }
 
 // 获取 tensor 数据采样数量（通过环境变量配置）
 inline size_t get_tensor_dump_sample_size() {
     static const size_t sample_size = []() -> size_t {  // 显式指定返回类型
         const char* env = std::getenv("MCOP_TENSOR_DUMP_SAMPLE_SIZE");
-        if (!env) return 10;  // 默认采样前10个和后10个
+        if (!env) return 20;  // 默认采样前20个和后20个（共40个）
         try {
             size_t size = std::stoul(env);
-            return size > 0 ? size : 10;
+            return size > 0 ? size : 20;
         } catch (...) {
-            return 10;
+            return 20;
         }
     }();
     return sample_size;
@@ -147,17 +192,25 @@ public:
         if (total_elements == 0) {
             value_ss << "[]";
         } else {
-            // 关键修复：先将 tensor 复制到 CPU，避免访问 GPU 内存导致崩溃
-            // 检查 tensor 是否在 CPU 上，如果不在则需要复制
-            at::Tensor cpu_tensor = tensor.device().is_cpu() ? tensor : tensor.to(torch::kCPU);
-
             if (dump_full_tensor()) {
-                // Dump 所有数据
+                // Dump 所有数据：整块拷回 CPU（要全量，不可避免）
+                at::Tensor cpu_tensor = tensor.device().is_cpu() ? tensor : tensor.to(torch::kCPU);
                 value_ss << dump_tensor_full(cpu_tensor);
             } else {
-                // Dump 采样数据（前N个和后N个）
+                // Dump 采样数据（前N个和后N个）：只拷被采样的少量元素回 CPU，
+                // 避免把整个 tensor 从显存搬回内存（这是之前 dump 开销的大头）
                 size_t sample_size = get_tensor_dump_sample_size();
-                value_ss << dump_tensor_sample(cpu_tensor, sample_size);
+                if (total_elements <= 2 * sample_size) {
+                    // 元素太少，直接全量拷（本身就没多大）
+                    at::Tensor cpu_tensor = tensor.device().is_cpu() ? tensor : tensor.to(torch::kCPU);
+                    value_ss << dump_tensor_full(cpu_tensor);
+                } else {
+                    at::Tensor flat = tensor.flatten();
+                    at::Tensor head = flat.slice(0, 0, static_cast<int64_t>(sample_size)).to(torch::kCPU);
+                    at::Tensor tail = flat.slice(0, static_cast<int64_t>(total_elements - sample_size),
+                                                  static_cast<int64_t>(total_elements)).to(torch::kCPU);
+                    value_ss << dump_tensor_sample(head, tail);
+                }
                 value_ss << " (showing " << std::min(2 * sample_size, total_elements)
                           << " of " << total_elements << " elements, set MCOP_TENSOR_DUMP_FULL=1 for all)";
             }
@@ -170,140 +223,66 @@ public:
         return info;
     }
 
-    // Helper: Dump tensor 全部数据
-    static std::string dump_tensor_full(const at::Tensor& tensor) {
-        std::ostringstream ss;
-        ss << "[";
-        size_t total = tensor.numel();
-
-        // 根据数据类型访问数据
+    // Helper: 按 dtype 把 [start, start+count) 的元素打印进 ss（仅限 CPU 连续 tensor）
+    static void dump_tensor_range(const at::Tensor& tensor, size_t start, size_t count, std::ostringstream& ss) {
+        const size_t end = start + count;
         if (tensor.dtype() == at::ScalarType::BFloat16) {
             const at::BFloat16* data = tensor.data_ptr<at::BFloat16>();
-            for (size_t i = 0; i < total; ++i) {
-                if (i > 0) ss << ", ";
+            for (size_t i = start; i < end; ++i) {
+                if (i > start) ss << ", ";
                 ss << static_cast<float>(data[i]);
             }
         } else if (tensor.dtype() == at::ScalarType::Float) {
             const float* data = tensor.data_ptr<float>();
-            for (size_t i = 0; i < total; ++i) {
-                if (i > 0) ss << ", ";
+            for (size_t i = start; i < end; ++i) {
+                if (i > start) ss << ", ";
                 ss << data[i];
             }
         } else if (tensor.dtype() == at::ScalarType::Half) {
             const at::Half* data = tensor.data_ptr<at::Half>();
-            for (size_t i = 0; i < total; ++i) {
-                if (i > 0) ss << ", ";
+            for (size_t i = start; i < end; ++i) {
+                if (i > start) ss << ", ";
                 ss << static_cast<float>(data[i]);
             }
         } else if (tensor.dtype() == at::ScalarType::Double) {
             const double* data = tensor.data_ptr<double>();
-            for (size_t i = 0; i < total; ++i) {
-                if (i > 0) ss << ", ";
+            for (size_t i = start; i < end; ++i) {
+                if (i > start) ss << ", ";
                 ss << data[i];
             }
         } else if (tensor.dtype() == at::ScalarType::Int) {
             const int* data = tensor.data_ptr<int>();
-            for (size_t i = 0; i < total; ++i) {
-                if (i > 0) ss << ", ";
+            for (size_t i = start; i < end; ++i) {
+                if (i > start) ss << ", ";
                 ss << data[i];
             }
         } else if (tensor.dtype() == at::ScalarType::Long) {
             const int64_t* data = tensor.data_ptr<int64_t>();
-            for (size_t i = 0; i < total; ++i) {
-                if (i > 0) ss << ", ";
+            for (size_t i = start; i < end; ++i) {
+                if (i > start) ss << ", ";
                 ss << data[i];
             }
         } else {
             ss << "... (unsupported dtype: " << toString(tensor.scalar_type()) << ")";
         }
+    }
 
+    // Helper: Dump tensor 全部数据
+    static std::string dump_tensor_full(const at::Tensor& tensor) {
+        std::ostringstream ss;
+        ss << "[";
+        dump_tensor_range(tensor, 0, tensor.numel(), ss);
         ss << "]";
         return ss.str();
     }
 
-    // Helper: Dump tensor 采样数据（前N个和后N个）
-    static std::string dump_tensor_sample(const at::Tensor& tensor, size_t sample_size) {
+    // Helper: Dump tensor 采样数据（前 N + 后 N，head/tail 已是拷回 CPU 的小 tensor）
+    static std::string dump_tensor_sample(const at::Tensor& head, const at::Tensor& tail) {
         std::ostringstream ss;
-        size_t total = tensor.numel();
-
         ss << "[";
-
-        if (total <= 2 * sample_size) {
-            // 元素太少，dump 全部
-            ss << dump_tensor_full(tensor);
-        } else {
-            // Dump 前 N 个
-            if (tensor.dtype() == at::ScalarType::BFloat16) {
-                const at::BFloat16* data = tensor.data_ptr<at::BFloat16>();
-                for (size_t i = 0; i < sample_size; ++i) {
-                    if (i > 0) ss << ", ";
-                    ss << static_cast<float>(data[i]);
-                }
-                ss << ", ..., ";
-                for (size_t i = total - sample_size; i < total; ++i) {
-                    if (i > total - sample_size) ss << ", ";
-                    ss << static_cast<float>(data[i]);
-                }
-            } else if (tensor.dtype() == at::ScalarType::Float) {
-                const float* data = tensor.data_ptr<float>();
-                for (size_t i = 0; i < sample_size; ++i) {
-                    if (i > 0) ss << ", ";
-                    ss << data[i];
-                }
-                ss << ", ..., ";
-                for (size_t i = total - sample_size; i < total; ++i) {
-                    if (i > total - sample_size) ss << ", ";
-                    ss << data[i];
-                }
-            } else if (tensor.dtype() == at::ScalarType::Half) {
-                const at::Half* data = tensor.data_ptr<at::Half>();
-                for (size_t i = 0; i < sample_size; ++i) {
-                    if (i > 0) ss << ", ";
-                    ss << static_cast<float>(data[i]);
-                }
-                ss << ", ..., ";
-                for (size_t i = total - sample_size; i < total; ++i) {
-                    if (i > total - sample_size) ss << ", ";
-                    ss << static_cast<float>(data[i]);
-                }
-            } else if (tensor.dtype() == at::ScalarType::Double) {
-                const double* data = tensor.data_ptr<double>();
-                for (size_t i = 0; i < sample_size; ++i) {
-                    if (i > 0) ss << ", ";
-                    ss << data[i];
-                }
-                ss << ", ..., ";
-                for (size_t i = total - sample_size; i < total; ++i) {
-                    if (i > total - sample_size) ss << ", ";
-                    ss << data[i];
-                }
-            } else if (tensor.dtype() == at::ScalarType::Int) {
-                const int* data = tensor.data_ptr<int>();
-                for (size_t i = 0; i < sample_size; ++i) {
-                    if (i > 0) ss << ", ";
-                    ss << data[i];
-                }
-                ss << ", ..., ";
-                for (size_t i = total - sample_size; i < total; ++i) {
-                    if (i > total - sample_size) ss << ", ";
-                    ss << data[i];
-                }
-            } else if (tensor.dtype() == at::ScalarType::Long) {
-                const int64_t* data = tensor.data_ptr<int64_t>();
-                for (size_t i = 0; i < sample_size; ++i) {
-                    if (i > 0) ss << ", ";
-                    ss << data[i];
-                }
-                ss << ", ..., ";
-                for (size_t i = total - sample_size; i < total; ++i) {
-                    if (i > total - sample_size) ss << ", ";
-                    ss << data[i];
-                }
-            } else {
-                ss << "... (unsupported dtype)";
-            }
-        }
-
+        dump_tensor_range(head, 0, head.numel(), ss);
+        ss << ", ..., ";
+        dump_tensor_range(tail, 0, tail.numel(), ss);
         ss << "]";
         return ss.str();
     }
@@ -422,9 +401,66 @@ public:
     }
 };
 
-// 文件写入器
-inline void write_to_file(const std::string& content, const std::string& filename) {
-    std::ofstream file(filename, std::ios::out | std::ios::trunc);
+// 获取当前时间戳字符串（秒级）: YYYYMMDD_HHMMSS
+inline std::string get_timestamp() {
+    std::time_t t = std::time(nullptr);
+    std::tm tm_buf;
+    ::localtime_r(&t, &tm_buf);
+    char buf[32];
+    std::strftime(buf, sizeof(buf), "%Y%m%d_%H%M%S", &tm_buf);
+    return std::string(buf);
+}
+
+// 批次目录名：进程内只生成一次，一次运行 = 一个文件夹。
+// 用 inline 函数内 static，保证整个进程（跨所有 .cu 编译单元）共享同一个目录。
+inline const std::string& batch_dir() {
+    static const std::string dir = []() {
+        // 若显式指定 MCOP_DEBUG_DUMP_DIR，则所有进程共用该目录（父进程如 testall.py 会带上时间戳）
+        std::string d;
+        const char* env = std::getenv("MCOP_DEBUG_DUMP_DIR");
+        if (env && env[0]) {
+            d = env;
+        } else {
+            d = "mcoplib_op_params_dump_" + get_timestamp();
+        }
+        ::mkdir(d.c_str(), 0755);
+        return d + "/";
+    }();
+    return dir;
+}
+
+// 每个算子最多记录多少次调用（默认 20，第 21 次起不再写）。可通过 MCOP_DEBUG_DUMP_MAX_CALLS 覆盖。
+inline size_t get_max_dump_calls() {
+    static const size_t limit = []() {
+        const char* env = std::getenv("MCOP_DEBUG_DUMP_MAX_CALLS");
+        if (!env) return size_t(20);
+        try { size_t v = std::stoul(env); return v > 0 ? v : size_t(20); }
+        catch (...) { return size_t(20); }
+    }();
+    return limit;
+}
+
+// 每个算子一个计数器，限制最多记录 N 次调用。
+// inline 函数内 static 保证跨编译单元共享；mutex 保证多线程调用线程安全。
+// 返回本次是第几次（从 1 起），返回 0 表示已超上限、应跳过。
+inline size_t record_dump_call(const char* function_name) {
+    static std::mutex mtx;
+    static std::unordered_map<std::string, size_t> counts;
+    std::lock_guard<std::mutex> lock(mtx);
+    size_t& c = counts[function_name];
+    if (c >= get_max_dump_calls()) return 0;
+    return ++c;
+}
+
+// 一个算子一个固定文件名（不带序号/时间戳），放在批次目录下
+inline std::string make_dump_filename(const char* function_name) {
+    return batch_dir() + function_name + ".json";
+}
+
+// 文件写入器：append=true 追加，否则 trunc 新建
+inline void write_to_file(const std::string& content, const std::string& filename, bool append) {
+    std::ofstream file(filename, append ? (std::ios::out | std::ios::app)
+                                        : (std::ios::out | std::ios::trunc));
     if (file.is_open()) {
         file << content;
         file.close();
@@ -657,17 +693,21 @@ inline void dump_params(const char* function_name,
     }
 
     try {
+        // 每个算子最多记录 N 次调用，超限直接跳过（不序列化、零开销）
+        size_t call_no = record_dump_call(function_name);
+        if (call_no == 0) return;
+
         // 收集参数信息
         auto params = collect_params_with_names(param_names, args...);
 
         // 生成JSON
         std::string json = JsonGenerator::generate(params, function_name);
 
-        // 生成文件名
-        std::string filename = std::string(function_name) + ".json";
+        // 生成文件名（一个算子一个固定文件）
+        std::string filename = make_dump_filename(function_name);
 
-        // 写入文件
-        write_to_file(json, filename);
+        // 写入文件：第 1 次 trunc 新建，之后 append，记录之间留空行
+        write_to_file(json + "\n", filename, /*append=*/ call_no > 1);
     } catch (const std::exception& e) {
         // 静默失败，不影响kernel执行
         (void)e;
@@ -682,6 +722,10 @@ inline void dump_params_simple(const char* function_name, const Args&... args) {
     }
  
     try {
+        // 每个算子最多记录 N 次调用，超限直接跳过（不序列化、零开销）
+        size_t call_no = record_dump_call(function_name);
+        if (call_no == 0) return;
+
         // 收集参数信息（不带参数名）
         auto params = collect_params(args...);
         // 自动生成参数名 arg0, arg1, ...
@@ -694,11 +738,10 @@ inline void dump_params_simple(const char* function_name, const Args&... args) {
         // 生成JSON
         std::string json = JsonGenerator::generate(params, function_name);
         // 生成文件名
-        std::string filename = std::string(function_name) + ".json";
-     
+        std::string filename = make_dump_filename(function_name);
 
-        // 写入文件
-        write_to_file(json, filename);
+        // 写入文件：第 1 次 trunc 新建，之后 append，记录之间留空行
+        write_to_file(json + "\n", filename, /*append=*/ call_no > 1);
     } catch (const std::exception& e) {
         // 静默失败，不影响kernel执行
         (void)e;
@@ -739,7 +782,7 @@ inline void dump_params_simple(const char* function_name, const Args&... args) {
 // 1-20 个参数的实现 - 使用字符串化操作符捕获实际变量名
 #define DEBUG_DUMP_PARAMS_IMPL_1(x1) \
     do { \
-        if (::mcop::debug::is_debug_enabled()) { \
+        if (::mcop::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
             constexpr const char* _names[] = {#x1}; \
             std::vector<const char*> _names_vec(_names, _names + 1); \
             ::mcop::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1); \
@@ -748,7 +791,7 @@ inline void dump_params_simple(const char* function_name, const Args&... args) {
 
 #define DEBUG_DUMP_PARAMS_IMPL_2(x1, x2) \
     do { \
-        if (::mcop::debug::is_debug_enabled()) { \
+        if (::mcop::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
             constexpr const char* _names[] = {#x1, #x2}; \
             std::vector<const char*> _names_vec(_names, _names + 2); \
             ::mcop::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2); \
@@ -757,7 +800,7 @@ inline void dump_params_simple(const char* function_name, const Args&... args) {
 
 #define DEBUG_DUMP_PARAMS_IMPL_3(x1, x2, x3) \
     do { \
-        if (::mcop::debug::is_debug_enabled()) { \
+        if (::mcop::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
             constexpr const char* _names[] = {#x1, #x2, #x3}; \
             std::vector<const char*> _names_vec(_names, _names + 3); \
             ::mcop::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3); \
@@ -766,7 +809,7 @@ inline void dump_params_simple(const char* function_name, const Args&... args) {
 
 #define DEBUG_DUMP_PARAMS_IMPL_4(x1, x2, x3, x4) \
     do { \
-        if (::mcop::debug::is_debug_enabled()) { \
+        if (::mcop::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
             constexpr const char* _names[] = {#x1, #x2, #x3, #x4}; \
             std::vector<const char*> _names_vec(_names, _names + 4); \
             ::mcop::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4); \
@@ -775,7 +818,7 @@ inline void dump_params_simple(const char* function_name, const Args&... args) {
 
 #define DEBUG_DUMP_PARAMS_IMPL_5(x1, x2, x3, x4, x5) \
     do { \
-        if (::mcop::debug::is_debug_enabled()) { \
+        if (::mcop::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
             constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5}; \
             std::vector<const char*> _names_vec(_names, _names + 5); \
             ::mcop::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5); \
@@ -784,7 +827,7 @@ inline void dump_params_simple(const char* function_name, const Args&... args) {
 
 #define DEBUG_DUMP_PARAMS_IMPL_6(x1, x2, x3, x4, x5, x6) \
     do { \
-        if (::mcop::debug::is_debug_enabled()) { \
+        if (::mcop::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
             constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6}; \
             std::vector<const char*> _names_vec(_names, _names + 6); \
             ::mcop::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6); \
@@ -793,7 +836,7 @@ inline void dump_params_simple(const char* function_name, const Args&... args) {
 
 #define DEBUG_DUMP_PARAMS_IMPL_7(x1, x2, x3, x4, x5, x6, x7) \
     do { \
-        if (::mcop::debug::is_debug_enabled()) { \
+        if (::mcop::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
             constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7}; \
             std::vector<const char*> _names_vec(_names, _names + 7); \
             ::mcop::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7); \
@@ -802,7 +845,7 @@ inline void dump_params_simple(const char* function_name, const Args&... args) {
 
 #define DEBUG_DUMP_PARAMS_IMPL_8(x1, x2, x3, x4, x5, x6, x7, x8) \
     do { \
-        if (::mcop::debug::is_debug_enabled()) { \
+        if (::mcop::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
             constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8}; \
             std::vector<const char*> _names_vec(_names, _names + 8); \
             ::mcop::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8); \
@@ -811,7 +854,7 @@ inline void dump_params_simple(const char* function_name, const Args&... args) {
 
 #define DEBUG_DUMP_PARAMS_IMPL_9(x1, x2, x3, x4, x5, x6, x7, x8, x9) \
     do { \
-        if (::mcop::debug::is_debug_enabled()) { \
+        if (::mcop::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
             constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9}; \
             std::vector<const char*> _names_vec(_names, _names + 9); \
             ::mcop::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9); \
@@ -820,7 +863,7 @@ inline void dump_params_simple(const char* function_name, const Args&... args) {
 
 #define DEBUG_DUMP_PARAMS_IMPL_10(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10) \
     do { \
-        if (::mcop::debug::is_debug_enabled()) { \
+        if (::mcop::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
             constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10}; \
             std::vector<const char*> _names_vec(_names, _names + 10); \
             ::mcop::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10); \
@@ -830,7 +873,7 @@ inline void dump_params_simple(const char* function_name, const Args&... args) {
 // 为了节省空间，11-20 个参数的实现 - 使用字符串化操作符捕获实际变量名
 #define DEBUG_DUMP_PARAMS_IMPL_11(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11) \
     do { \
-        if (::mcop::debug::is_debug_enabled()) { \
+        if (::mcop::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
             constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10, #x11}; \
             std::vector<const char*> _names_vec(_names, _names + 11); \
             ::mcop::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11); \
@@ -839,7 +882,7 @@ inline void dump_params_simple(const char* function_name, const Args&... args) {
 
 #define DEBUG_DUMP_PARAMS_IMPL_12(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12) \
     do { \
-        if (::mcop::debug::is_debug_enabled()) { \
+        if (::mcop::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
             constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10, #x11, #x12}; \
             std::vector<const char*> _names_vec(_names, _names + 12); \
             ::mcop::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12); \
@@ -848,7 +891,7 @@ inline void dump_params_simple(const char* function_name, const Args&... args) {
 
 #define DEBUG_DUMP_PARAMS_IMPL_13(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13) \
     do { \
-        if (::mcop::debug::is_debug_enabled()) { \
+        if (::mcop::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
             constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10, #x11, #x12, #x13}; \
             std::vector<const char*> _names_vec(_names, _names + 13); \
             ::mcop::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13); \
@@ -857,7 +900,7 @@ inline void dump_params_simple(const char* function_name, const Args&... args) {
 
 #define DEBUG_DUMP_PARAMS_IMPL_14(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14) \
     do { \
-        if (::mcop::debug::is_debug_enabled()) { \
+        if (::mcop::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
             constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10, #x11, #x12, #x13, #x14}; \
             std::vector<const char*> _names_vec(_names, _names + 14); \
             ::mcop::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14); \
@@ -866,7 +909,7 @@ inline void dump_params_simple(const char* function_name, const Args&... args) {
 
 #define DEBUG_DUMP_PARAMS_IMPL_15(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15) \
     do { \
-        if (::mcop::debug::is_debug_enabled()) { \
+        if (::mcop::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
             constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10, #x11, #x12, #x13, #x14, #x15}; \
             std::vector<const char*> _names_vec(_names, _names + 15); \
             ::mcop::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15); \
@@ -875,7 +918,7 @@ inline void dump_params_simple(const char* function_name, const Args&... args) {
 
 #define DEBUG_DUMP_PARAMS_IMPL_16(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16) \
     do { \
-        if (::mcop::debug::is_debug_enabled()) { \
+        if (::mcop::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
             constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10, #x11, #x12, #x13, #x14, #x15, #x16}; \
             std::vector<const char*> _names_vec(_names, _names + 16); \
             ::mcop::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16); \
@@ -884,7 +927,7 @@ inline void dump_params_simple(const char* function_name, const Args&... args) {
 
 #define DEBUG_DUMP_PARAMS_IMPL_17(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17) \
     do { \
-        if (::mcop::debug::is_debug_enabled()) { \
+        if (::mcop::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
             constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10, #x11, #x12, #x13, #x14, #x15, #x16, #x17}; \
             std::vector<const char*> _names_vec(_names, _names + 17); \
             ::mcop::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17); \
@@ -893,7 +936,7 @@ inline void dump_params_simple(const char* function_name, const Args&... args) {
 
 #define DEBUG_DUMP_PARAMS_IMPL_18(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18) \
     do { \
-        if (::mcop::debug::is_debug_enabled()) { \
+        if (::mcop::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
             constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10, #x11, #x12, #x13, #x14, #x15, #x16, #x17, #x18}; \
             std::vector<const char*> _names_vec(_names, _names + 18); \
             ::mcop::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18); \
@@ -902,7 +945,7 @@ inline void dump_params_simple(const char* function_name, const Args&... args) {
 
 #define DEBUG_DUMP_PARAMS_IMPL_19(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19) \
     do { \
-        if (::mcop::debug::is_debug_enabled()) { \
+        if (::mcop::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
             constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10, #x11, #x12, #x13, #x14, #x15, #x16, #x17, #x18, #x19}; \
             std::vector<const char*> _names_vec(_names, _names + 19); \
             ::mcop::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19); \
@@ -911,7 +954,7 @@ inline void dump_params_simple(const char* function_name, const Args&... args) {
 
 #define DEBUG_DUMP_PARAMS_IMPL_20(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20) \
     do { \
-        if (::mcop::debug::is_debug_enabled()) { \
+        if (::mcop::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
             constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10, #x11, #x12, #x13, #x14, #x15, #x16, #x17, #x18, #x19, #x20}; \
             std::vector<const char*> _names_vec(_names, _names + 20); \
             ::mcop::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20); \

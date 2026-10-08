@@ -9,6 +9,8 @@
 #include "../kernel/utils.h"
 #include "../kernel/rms_norm_vllm.cuh"
 #include "../kernel/utils.cuh"
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
 
 namespace vllm {
 
@@ -416,6 +418,8 @@ void add_gemma_rms_norm_dynamic_per_token_quant_padding_output(
     const int pad_size,
     const float epsilon,
     const bool bneed_pack){
+    DEBUG_TRACE_PARAMS(output, output_rms, output_quant_int8, out_scales, input, residual, weight, pad_size, epsilon, bneed_pack);
+    DEBUG_DUMP_PARAMS(output, output_rms, output_quant_int8, out_scales, input, residual, weight, pad_size, epsilon, bneed_pack);
 
     // Input validation
     TORCH_CHECK(input.dtype() == at::ScalarType::BFloat16, "Input must be BFloat16");

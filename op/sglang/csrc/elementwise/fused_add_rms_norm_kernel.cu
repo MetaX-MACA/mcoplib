@@ -14,12 +14,8 @@ limitations under the License.
 ==============================================================================*/
 
 #include <ATen/cuda/CUDAContext.h>
-
-#include <flashinfer/norm.cuh>
-
 #include "utils.h"
-
-using namespace flashinfer;
+#include "norm.cuh"
 
 template<typename T>
 static __device__ __forceinline__ T float_to_dstT(float value) {
@@ -81,8 +77,9 @@ __device__ __forceinline__ void copy<1>(void* src, void* dst) {
     *ptr_dst = *ptr_src;
 }
 
-template<uint32_t VEC_SIZE, uint32_t NUM_REG, typename T, int NUM_THREADS>
-__global__ void FusedAddRMSNormKernelOpt(T* __restrict__ input, T* __restrict__ residual,
+template<uint32_t VEC_SIZE, uint32_t NUM_REG, typename T, int NUM_THREADS, int MIN_BLOCKS = 8>
+__global__ void __launch_bounds__(NUM_THREADS, MIN_BLOCKS)
+FusedAddRMSNormKernelOpt(T* __restrict__ input, T* __restrict__ residual,
                                     T* __restrict__ weight, const uint32_t d,
                                     const uint32_t stride_input, const uint32_t stride_residual,
                                     float weight_bias, float eps) {
@@ -114,102 +111,28 @@ __global__ void FusedAddRMSNormKernelOpt(T* __restrict__ input, T* __restrict__ 
     k++;
   }
 
+    // Single-barrier reduction: each 16-lane group reduces via native shuffle,
+    // lane 0 writes its partial, then ONE __syncthreads, then every thread sums
+    // the (NUM_THREADS/16) partials itself and computes rms locally. This removes
+    // the second-level shared reduce AND the s_rms broadcast barrier (3 -> 1 barrier).
     constexpr int sm_size = NUM_THREADS >> 4;
-    constexpr int sm_size2 = sm_size / 2;
     __shared__ float sm_sum[sm_size];
-    if constexpr (sm_size == 32) {
-        for(int i = 8; i > 0; i >>= 1) {
-            ss += __shfl_down_sync_16(0xffffffffffffffff, ss, i);
-        }
-        int lane_id = threadIdx.x & 15;
-        int group_id = threadIdx.x >> 4;
-        if(lane_id == 0) {
-            sm_sum[group_id] = ss;
-        }
-        __syncthreads();
-        __shared__ float sm_sum2[sm_size>>4];
-        if(threadIdx.x < sm_size) {
-        float data = sm_sum[threadIdx.x];
-        for(int i = 8; i >= 1; i >>= 1) {
-            data += __shfl_down_sync_16(0xffffffffffffffff, data, i);
-        }
-
-        if(lane_id == 0) {
-            sm_sum2[group_id] = data;
-        }
-        }
-        __syncthreads();
-        ss = sm_sum2[0] + sm_sum2[1];
-    } else if constexpr(sm_size == 16) {
-        for(int i = 8; i > 0; i >>=1 ) {
+    #pragma unroll
+    for(int i = 8; i > 0; i >>= 1) {
         ss += __shfl_down_sync_16(0xffffffffffffffff, ss, i);
-        }
-        int lane_id = threadIdx.x & 15;
-        int group_id = threadIdx.x >> 4;
-        if(lane_id == 0) {
-        sm_sum[group_id] = ss;
-        }
-        __syncthreads();
-        if(threadIdx.x < sm_size) {
-        float data = sm_sum[threadIdx.x];
-        for(int i = 8; i >= 1; i >>= 1) {
-            data += __shfl_down_sync_16(0xffffffffffffffff, data, i);
-        }
-        if(threadIdx.x == 0) {
-            sm_sum[0] = data;
-        }
-        }
-        __syncthreads();
-        ss = sm_sum[0];
-    } else if constexpr(sm_size == 8) {
-        for(int i = 8; i > 0; i >>=1 ) {
-        ss += __shfl_down_sync_16(0xffffffffffffffff, ss, i);
-        }
-        int lane_id = threadIdx.x & 15;
-        int group_id = threadIdx.x >> 4;
-        if(lane_id == 0) {
-        sm_sum[group_id] = ss;
-        }
-        __syncthreads();
-        if(threadIdx.x < sm_size) {
-        float data = sm_sum[threadIdx.x];
-        for(int i = 4; i >= 1; i >>= 1) {
-            data += __shfl_down_sync_16(0xffffffffffffffff, data, i);
-        }
-        if(threadIdx.x == 0) {
-            sm_sum[0] = data;
-        }
-        }
-        __syncthreads();
-        ss = sm_sum[0];
-    } else if constexpr(sm_size == 4) {
-        for(int i = 8; i > 0; i >>=1 ) {
-        ss += __shfl_down_sync_16(0xffffffffffffffff, ss, i);
-        }
-        int lane_id = threadIdx.x & 15;
-        int group_id = threadIdx.x >> 4;
-        if(lane_id == 0) {
-        sm_sum[group_id] = ss;
-        }
-        __syncthreads();
-        if(threadIdx.x < sm_size) {
-        float data = sm_sum[threadIdx.x];
-        for(int i = 2; i >= 1; i >>= 1) {
-            data += __shfl_down_sync_16(0xffffffffffffffff, data, i);
-        }
-        if(threadIdx.x == 0) {
-            sm_sum[0] = data;
-        }
-        }
-        __syncthreads();
-        ss = sm_sum[0];
     }
-  __shared__ float s_rms;
-  if(threadIdx.x == 0) {
-    s_rms = rsqrtf(ss / (float)d + eps);
-  }
-  __syncthreads();
-  rms = s_rms;
+    int lane_id = threadIdx.x & 15;
+    int group_id = threadIdx.x >> 4;
+    if(lane_id == 0) {
+        sm_sum[group_id] = ss;
+    }
+    __syncthreads();
+    float tot = 0.0f;
+    #pragma unroll
+    for(int g = 0; g < sm_size; g++) {
+        tot += sm_sum[g];
+    }
+    rms = __builtin_mxc_rcpf(sqrtf(tot / (float)d + eps));
   T const* ptr_weight = weight;
   k = 0;
   for(uint32_t i = tid; i < d; i += block_stride) {
@@ -227,14 +150,45 @@ __global__ void FusedAddRMSNormKernelOpt(T* __restrict__ input, T* __restrict__ 
 
 template<typename T>
 int launch_fused_add_rmsnorm(T* input, T* residual, T* weight, uint32_t batch_size, uint32_t d,
-                            uint32_t stride_input, uint32_t stride_residual, float eps = 1e-5,
+                            uint32_t stride_input, uint32_t stride_residual, int num_ap, float eps = 1e-5,
                             bool enable_pdl = false, cudaStream_t stream = 0)
 {
   dim3 nblks(batch_size);
   constexpr int N = 16 / sizeof(T);
+  int num_peu = num_ap  * 4;
+  int num1 = 1;
+  if(batch_size < num_peu) {
+    num1 = (num_peu + batch_size - 1) / batch_size;
+  }
+
   if((d & (N - 1)) == 0) {
     int blocksize = 64;
     float weight_bias = 0.0f;
+    // C600-U tuned path: hidden=4096, bf16 (N=8). 128 threads x 4 regs = 32 elems/thread;
+    // small blocks -> many resident blocks per AP so the reduction barrier of one block
+    // is hidden by the streaming loads/stores of others (barrier-bubble hiding).
+    if(d == 4096 && N == 8) {
+        if(num1 >= 2) {
+          constexpr int NUM_THREADS = 1024;
+          FusedAddRMSNormKernelOpt<N/2, 1, T, NUM_THREADS><<<nblks, NUM_THREADS, 0, stream>>>(input, residual, weight, d, stride_input, stride_residual, weight_bias, eps);
+        } else {
+          constexpr int NUM_THREADS = 128;
+          FusedAddRMSNormKernelOpt<N, 4, T, NUM_THREADS><<<nblks, NUM_THREADS, 0, stream>>>(input, residual, weight, d, stride_input, stride_residual, weight_bias, eps);
+        }
+        return 0;
+    }
+    
+    if(d == 5120 && N == 8) {
+      if(num1 >= 2) {
+          constexpr int NUM_THREADS = 1024;
+          FusedAddRMSNormKernelOpt<N/2, 2, T, NUM_THREADS><<<nblks, NUM_THREADS, 0, stream>>>(input, residual, weight, d, stride_input, stride_residual, weight_bias, eps);
+      } else {
+        constexpr int NUM_THREADS = 256;
+        FusedAddRMSNormKernelOpt<N, 3, T, NUM_THREADS><<<nblks, NUM_THREADS, 0, stream>>>(input, residual, weight, d, stride_input, stride_residual, weight_bias, eps);
+      }
+      return 0;
+    }
+
     if(d <= blocksize * N) {
         constexpr int NUM_THREADS = 64;
         FusedAddRMSNormKernelOpt<N, 1, T, NUM_THREADS><<<nblks, NUM_THREADS, 0, stream>>>(input, residual, weight, d, stride_input, stride_residual, weight_bias, eps);
@@ -278,6 +232,10 @@ void sgl_fused_add_rmsnorm(
   unsigned int batch_size = input.size(0);
   unsigned int hidden_size = input.size(1);
 
+  cudaDeviceProp prop;
+  int devId = device.index();
+  cudaError_t err = cudaGetDeviceProperties(&prop, devId);
+  int num_ap = prop.multiProcessorCount;
   cudaStream_t torch_current_stream = at::cuda::getCurrentCUDAStream();
   int status = -1;
   if((hidden_size & 7) == 0 && (input.stride(0)& 7) == 0 && (residual.stride(0) & 7) == 0) {
@@ -289,6 +247,7 @@ void sgl_fused_add_rmsnorm(
         hidden_size,
         input.stride(0),
         residual.stride(0),
+        num_ap,
         eps,
         enable_pdl,
         torch_current_stream);
@@ -300,6 +259,7 @@ void sgl_fused_add_rmsnorm(
         hidden_size,
         input.stride(0),
         residual.stride(0),
+        num_ap,
         eps,
         enable_pdl,
         torch_current_stream);
@@ -308,7 +268,7 @@ void sgl_fused_add_rmsnorm(
   if(status == 0) return;
   // support float16, bfloat16 and float32
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FLOAT_FP16(input.scalar_type(), c_type, [&] {
-    cudaError_t status = norm::FusedAddRMSNorm(
+    cudaError_t status = mcoplib::norm::FusedAddRMSNorm(
         static_cast<c_type*>(input.data_ptr()),
         static_cast<c_type*>(residual.data_ptr()),
         static_cast<c_type*>(weight.data_ptr()),

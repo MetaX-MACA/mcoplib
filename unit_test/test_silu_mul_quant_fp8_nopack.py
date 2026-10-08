@@ -6,12 +6,13 @@ import triton
 import triton.language as tl
 from torch.profiler import profile, ProfilerActivity
 from mcoplib.op import fused_silu_mul_dq_mask_quant_fp8_nopack
-from sglang.jit_kernel.utils import (
-    cache_once,
-    is_arch_support_pdl,
-    load_jit,
-    make_cpp_args,
-)
+from mcoplib.profiler import profiler
+# from sglang.jit_kernel.utils import (
+#     cache_once,
+#     is_arch_support_pdl,
+#     load_jit,
+#     make_cpp_args,
+# )
 
 @triton.jit
 def _silu_and_mul_post_quant_kernel(
@@ -174,6 +175,81 @@ def calc_diff(x, y):
     cos_sim = (x * y).sum() / (x.norm() * y.norm())
     return 1 - cos_sim  # 余弦距离
 
+@profiler(output_dir="./profiles", warmup=2, repeat=3)
+def _varlen_deep_gemm_silu_mul_quant_transpose(
+    gateup_output: torch.Tensor,
+    masked_m: Optional[torch.Tensor],
+    topk: int,
+    swiglu_limit: Optional[float] = None,
+    swizzle: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    
+    group_size = 128
+
+    assert masked_m is not None
+    hidden_states_device = gateup_output.device
+    E, N, D_2 = gateup_output.shape
+    D = D_2 // 2
+    del D_2
+    G = D // group_size
+    gateup_output_clone = gateup_output.clone()
+    down_input = torch.empty(
+        (E, N, D),
+        device=hidden_states_device,
+        dtype=torch.float8_e4m3fn,
+    )
+    down_input_clone = down_input.clone()
+    down_input_scale = torch.empty(
+        (E, N, G),
+        device=hidden_states_device,
+        dtype=torch.float32,
+    )
+    value=0.0
+    if swiglu_limit!=None:
+        value=swiglu_limit
+    
+    down_input_scale_tmp = torch.empty(
+        (E, G, N),                       # 真·连续列主序 buffer
+        device=hidden_states_device,
+        dtype=torch.float32,
+    ).transpose(-1,-2)
+
+    silu_and_mul_masked_post_quant_fwd(
+        gateup_output,
+        down_input,
+        down_input_scale,
+        group_size,
+        masked_m,
+        scale_ue8m0=False,
+        swiglu_limit=value,
+    )
+    fused_silu_mul_dq_mask_quant_fp8_nopack(
+        down_input_clone, 
+        down_input_scale_tmp, 
+        gateup_output_clone, 
+        masked_m, 
+        group_size,
+        swiglu_limit,
+        True
+    )
+    
+    down_input_scale_clone = down_input_scale_tmp.contiguous()
+    for j in range(num_groups):
+        diff = calc_diff(
+            down_input[j, :masked_m[j].item()], 
+            down_input_clone[j, :masked_m[j].item()]
+        )
+        assert diff < 0.05, f'fp8 {m=}, {n=}, {j=}, masked_m={masked_m[j]}, {num_groups=}, {diff:.5f}'
+
+        diff = calc_diff(
+            down_input_scale[j, :masked_m[j].item()], 
+            down_input_scale_clone[j, :masked_m[j].item()]
+        )
+
+        assert diff < 0.05, f'scale {m=}, {n=}, {j=}, masked_m={masked_m[j]}, {num_groups=}, {diff:.5f}'
+        print("check successfuly")
+    
+@profiler(output_dir="./profiles", warmup=2, repeat=3)
 def _varlen_deep_gemm_silu_mul_quant(
     gateup_output: torch.Tensor,
     masked_m: Optional[torch.Tensor],
@@ -206,6 +282,7 @@ def _varlen_deep_gemm_silu_mul_quant(
     if swiglu_limit!=None:
         value=swiglu_limit
     down_input_scale_clone = down_input_scale.clone()
+
     silu_and_mul_masked_post_quant_fwd(
         gateup_output,
         down_input,
@@ -215,7 +292,6 @@ def _varlen_deep_gemm_silu_mul_quant(
         scale_ue8m0=False,
         swiglu_limit=value,
     )
-
     fused_silu_mul_dq_mask_quant_fp8_nopack(
         down_input_clone, 
         down_input_scale_clone, 
@@ -224,55 +300,22 @@ def _varlen_deep_gemm_silu_mul_quant(
         group_size,
         swiglu_limit
     )
+
     for j in range(num_groups):
         diff = calc_diff(
             down_input[j, :masked_m[j].item()], 
             down_input_clone[j, :masked_m[j].item()]
         )
         assert diff < 0.05, f'fp8 {m=}, {n=}, {j=}, masked_m={masked_m[j]}, {num_groups=}, {diff:.5f}'
+
         diff = calc_diff(
             down_input_scale[j, :masked_m[j].item()], 
             down_input_scale_clone[j, :masked_m[j].item()]
         )
+
         assert diff < 0.05, f'scale {m=}, {n=}, {j=}, masked_m={masked_m[j]}, {num_groups=}, {diff:.5f}'
         print("check successfuly")
-    # with profile(
-    #     activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-    # ) as prof:
-    #     for _ in range(1000):
-    #         silu_and_mul_masked_post_quant(
-    #             gateup_output,
-    #             down_input,
-    #             down_input_scale,
-    #             group_size,
-    #             masked_m,
-    #             scale_ue8m0=False,
-    #             topk=topk,
-    #             transposed=False,
-    #             swiglu_limit=swiglu_limit,
-    #             swizzle=swizzle,
-    #         )
-    # torch.cuda.synchronize()
 
-    # print("\nperf result: ")
-    # print(f"iterations: 1000")
-
-    # table = prof.key_averages().table(sort_by="device_time_total", row_limit=20)
-    # print(table)
-
-    # with profile(
-    #     activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-    # ) as prof:
-    #     for _ in range(1000):
-    #         fused_silu_mul_dq_mask_quant_fp8_nopack(down_input, down_input_scale, gateup_output, masked_m, swiglu_limit)
-    # torch.cuda.synchronize()
-
-    # print("\nperf result: ")
-    # print(f"iterations: 1000")
-
-    # table = prof.key_averages().table(sort_by="device_time_total", row_limit=20)
-    # print(table)
-    
 
 # @pytest.mark.parametrize("num_groups", [8,16])
 # @pytest.mark.parametrize("m", [4096,2048])
@@ -300,9 +343,10 @@ if __name__ == "__main__":
     m = 4096
     n = 7168
     topk = 8
-    
+    torch.manual_seed(10)
     for swiglu_limit in (10.0, None):
         for mask_id in [32,64,128,256]:
             masked_m = torch.full((num_groups,), mask_id, dtype=torch.int32, device='cuda')
             gateup_output = torch.randn((num_groups, m, n), device='cuda', dtype=torch.bfloat16)
             _varlen_deep_gemm_silu_mul_quant(gateup_output, masked_m, topk, swiglu_limit, False)
+            _varlen_deep_gemm_silu_mul_quant_transpose(gateup_output, masked_m, topk, swiglu_limit, False)

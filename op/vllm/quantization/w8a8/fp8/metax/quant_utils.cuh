@@ -2,6 +2,7 @@
 
 #include "../../../../attention/attention_dtypes.h"
 #include <torch/headeronly/core/ScalarType.h>
+#include <common/maca_fp8.h>
 #include <assert.h>
 #include <float.h>
 #include <stdint.h>
@@ -66,6 +67,47 @@ __inline__ __device__ Tout scaled_convert(const Tin& x, const float scale) {
     } else {                                                                   \
       STD_TORCH_CHECK(false, "Unsupported data type of kv cache: ", KV_DTYPE); \
     }
+
+template <typename Tout, typename Tin>
+__inline__ __device__ Tout scaled_vec_conversion(const Tin& x, const float scale) {
+  return x;
+}
+
+template <>
+__inline__ __device__ __nv_bfloat16 scaled_vec_conversion<__nv_bfloat16, uint8_t>(const uint8_t& a, const float scale) {
+  __half_raw res = __maca_cvt_fp8_to_halfraw(a, __MACA_E4M3);
+  float tmp = half_to_float(res.x);
+  return __float2bfloat16(tmp * scale);
+}
+
+template <>
+__inline__ __device__ __nv_bfloat162 scaled_vec_conversion<__nv_bfloat162, uint16_t>(const uint16_t& a, const float scale) {
+  __nv_bfloat162 res;
+  res.x = scaled_vec_conversion<__nv_bfloat16, uint8_t>((uint8_t)a, scale);
+  res.y = scaled_vec_conversion<__nv_bfloat16, uint8_t>((uint8_t)(a >> 8U), scale);
+  return res;
+}
+
+template <>
+__inline__ __device__ bf16_4_t scaled_vec_conversion<bf16_4_t, uint32_t>(const uint32_t& a, const float scale) {
+  bf16_4_t res;
+  res.x = scaled_vec_conversion<__nv_bfloat162, uint16_t>((uint16_t)a, scale);
+  res.y = scaled_vec_conversion<__nv_bfloat162, uint16_t>((uint16_t)(a >> 16U), scale);
+  return res;
+}
+
+template <>
+__inline__ __device__ bf16_8_t scaled_vec_conversion<bf16_8_t, uint2>(const uint2& a, const float scale) {
+  bf16_4_t tmp1, tmp2;
+  tmp1 = scaled_vec_conversion<bf16_4_t, uint32_t>(a.x, scale);
+  tmp2 = scaled_vec_conversion<bf16_4_t, uint32_t>(a.y, scale);
+  bf16_8_t res;
+  res.x = tmp1.x;
+  res.y = tmp1.y;
+  res.z = tmp2.x;
+  res.w = tmp2.y;
+  return res;
+}
 
 }  // namespace fp8
 }  // namespace vllm

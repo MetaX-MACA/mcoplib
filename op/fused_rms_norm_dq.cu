@@ -6,6 +6,12 @@
 #include "../kernel/utils.h"
 #include "../kernel/dispatch_utils.h"
 #include "../kernel/utils.cuh"
+#include <maca_fp8.h>
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
+
+
+typedef __NATIVE_VECTOR__(4, _Float16) v4f16;
 
 template<typename T>
 static __device__ __forceinline__ float convert_to_float(T value) {
@@ -311,6 +317,213 @@ __global__ void rms_norm_dynamic_per_token_quant_kernel(
   }
 }
 
+// ===========================================================================
+// C600-U optimized fused RMSNorm + dynamic per-token quant kernel.
+//
+// Design (see op/vllm/layernorm_kernels.cu::FusedAddRMSNormKernelOpt and the
+// c600u-optimization-guide skill):
+//   * one block per token, register-cache the whole row (float reg_x[NUM_REG][N])
+//   * 128-bit vectorized loads/stores (float4) for input/weight/smooth/output
+//   * read input / weight / smooth ONCE each; write after_res / after_norm / out
+//     ONCE each -> minimal HBM traffic (the original re-read after_res + weight +
+//     smooth twice with scalar access)
+//   * two reductions (sum-of-squares, then abs-max) done with native 16-lane
+//     __shfl_down_sync_16 intra-group reduce + tiny SMEM cross-group combine,
+//     NO cub::BlockReduce
+//
+// VEC     : elements per 128-bit vector for scalar_t (8 for bf16/half)
+// NUM_REG : number of vectors cached per thread (row = NUM_REG*NUM_THREADS*VEC)
+// scalar_t: input/after_res/after_norm dtype (bf16 / half)
+// out_t   : int8_t (dynamic per-token int8 quant)
+// wt_t    : weight/smooth dtype (bf16 or float)
+// ===========================================================================
+template <int VEC, int NUM_REG, int NUM_THREADS, typename scalar_t,
+          typename out_t, typename wt_t, bool has_residual, int MIN_BLOCKS = 1>
+__global__ __launch_bounds__(NUM_THREADS, MIN_BLOCKS) void
+rms_norm_dq_opt_kernel(out_t* __restrict__ out,
+                       float* __restrict__ scales,
+                       scalar_t* __restrict__ after_res,
+                       scalar_t* __restrict__ after_norm,
+                       scalar_t const* __restrict__ input,
+                       wt_t const* __restrict__ weight,
+                       wt_t const* __restrict__ smooth,
+                       scalar_t const* __restrict__ residual,
+                       float const eps, int32_t const hidden_size) {
+  int64_t const token_off = blockIdx.x * static_cast<int64_t>(hidden_size);
+  scalar_t const* ptr_in = input + token_off;
+  scalar_t const* ptr_res = has_residual ? residual + token_off : nullptr;
+  scalar_t* ptr_ares = after_res + token_off;
+  scalar_t* ptr_anorm = after_norm + token_off;
+  out_t* ptr_out = out + token_off;
+
+  float reg_x[NUM_REG][VEC];    // cached normalized-input value (x + residual)
+  float ss = 0.0f;
+
+  int const tid = threadIdx.x * VEC;
+  int const block_stride = NUM_THREADS * VEC;
+
+  // ---- Pass A: load input (+residual), write after_res, accumulate sum(x^2)
+  //  compile-time unroll over k so reg_x stays in true registers (no local spill)
+  {
+#pragma unroll
+    for (int k = 0; k < NUM_REG; k++) {
+      int const i = tid + k * block_stride;
+      if (i >= hidden_size) break;
+      scalar_t vin[VEC];
+      *reinterpret_cast<float4*>(vin) = *reinterpret_cast<float4 const*>(ptr_in + i);
+      scalar_t vres[VEC];
+      if constexpr (has_residual) {
+        *reinterpret_cast<float4*>(vres) = *reinterpret_cast<float4 const*>(ptr_res + i);
+      }
+#pragma unroll
+      for (int j = 0; j < VEC; j++) {
+        float x = static_cast<float>(vin[j]);
+        if constexpr (has_residual) {
+          x += static_cast<float>(vres[j]);
+          vin[j] = float_to_dstT<scalar_t>(x);
+        }
+        reg_x[k][j] = x;
+        ss += x * x;
+      }
+      // after_res = x (post-residual-add input); matches original semantics
+      *reinterpret_cast<float4*>(ptr_ares + i) = *reinterpret_cast<float4 const*>(vin);
+    }
+  }
+
+  // ---- reduce sum-of-squares across the block (16-lane shuffle + SMEM combine)
+  constexpr int sm_size = NUM_THREADS >> 4;   // number of 16-lane groups
+  __shared__ float sm[sm_size > 0 ? sm_size : 1];
+  {
+#pragma unroll
+    for (int i = 8; i > 0; i >>= 1)
+      ss += __shfl_down_sync_16(0xffffffffffffffffULL, ss, i);
+    int const lane = threadIdx.x & 15;
+    int const grp = threadIdx.x >> 4;
+    if constexpr (sm_size == 1) {
+      if (lane == 0) sm[0] = ss;
+    } else {
+      if (lane == 0) sm[grp] = ss;
+      __syncthreads();
+      if (threadIdx.x < sm_size) {
+        float d = sm[threadIdx.x];
+#pragma unroll
+        for (int i = sm_size >> 1; i >= 1; i >>= 1)
+          d += __shfl_down_sync_16(0xffffffffffffffffULL, d, i);
+        if (threadIdx.x == 0) sm[0] = d;
+      }
+    }
+    __syncthreads();
+  }
+  __shared__ float s_rms;
+  if (threadIdx.x == 0) s_rms = sqrtf(sm[0] / hidden_size + eps);
+  __syncthreads();
+  // x / rms == x * (1/rms). Compute the reciprocal once (per-block constant) so
+  // Pass B uses a multiply instead of a per-element float divide (critical-path
+  // compute is the real limiter here, not HBM bandwidth).
+  float const rms_mul = s_rms;
+
+  // ---- Pass B: normed = x/rms*weight -> after_norm; val = normed*smooth
+  //      cache val back into reg_x, track abs-max
+  float absmax = 0.0f;
+  {
+#pragma unroll
+    for (int k = 0; k < NUM_REG; k++) {
+      int const i = tid + k * block_stride;
+      if (i >= hidden_size) break;
+      wt_t vw[VEC];
+      wt_t vs[VEC];
+      if constexpr (sizeof(wt_t) == 2) {          // bf16 weight/smooth: 128-bit
+        *reinterpret_cast<float4*>(vw) = *reinterpret_cast<float4 const*>(weight + i);
+        *reinterpret_cast<float4*>(vs) = *reinterpret_cast<float4 const*>(smooth + i);
+      } else {                                     // fp32 weight/smooth: 2x float4
+        *reinterpret_cast<float4*>(vw)     = *reinterpret_cast<float4 const*>(weight + i);
+        *reinterpret_cast<float4*>(vw + 4) = *reinterpret_cast<float4 const*>(weight + i + 4);
+        *reinterpret_cast<float4*>(vs)     = *reinterpret_cast<float4 const*>(smooth + i);
+        *reinterpret_cast<float4*>(vs + 4) = *reinterpret_cast<float4 const*>(smooth + i + 4);
+      }
+      scalar_t vnorm[VEC];
+#pragma unroll
+      for (int j = 0; j < VEC; j++) {
+        float normed = reg_x[k][j] * rms_mul * static_cast<float>(vw[j]);
+        vnorm[j] = float_to_dstT<scalar_t>(normed);
+        float val = normed * static_cast<float>(vs[j]);
+        reg_x[k][j] = val;
+        absmax = fmaxf(absmax, fabsf(val));
+      }
+      *reinterpret_cast<float4*>(ptr_anorm + i) = *reinterpret_cast<float4 const*>(vnorm);
+    }
+  }
+
+  // ---- reduce abs-max across the block
+  {
+#pragma unroll
+    for (int i = 8; i > 0; i >>= 1)
+      absmax = fmaxf(absmax, __shfl_down_sync_16(0xffffffffffffffffULL, absmax, i));
+    int const lane = threadIdx.x & 15;
+    int const grp = threadIdx.x >> 4;
+    if constexpr (sm_size == 1) {
+      if (lane == 0) sm[0] = absmax;
+    } else {
+      if (lane == 0) sm[grp] = absmax;
+      __syncthreads();
+      if (threadIdx.x < sm_size) {
+        float d = sm[threadIdx.x];
+#pragma unroll
+        for (int i = sm_size >> 1; i >= 1; i >>= 1)
+          d = fmaxf(d, __shfl_down_sync_16(0xffffffffffffffffULL, d, i));
+        if (threadIdx.x == 0) sm[0] = d;
+      }
+    }
+    __syncthreads();
+  }
+    // int8 -> [-127,127]; fp8-e4m3 -> [-448,448]
+  constexpr float QMAX = std::is_same_v<out_t, int8_t> ? 127.0f : 448.0f;
+
+  __shared__ float s_scale;
+  if (threadIdx.x == 0) {
+    float scale = sm[0] / QMAX;
+    s_scale = scale;
+    scales[blockIdx.x] = scale;
+  }
+  __syncthreads();
+  float const inv_scale = QMAX * __builtin_mxc_rcpf(sm[0]);  // = 1/scale
+
+  // ---- Pass C: quant val (cached in reg_x) -> out (int8 or fp8-e4m3)
+  {
+#pragma unroll
+    for (int k = 0; k < NUM_REG; k++) {
+      int const i = tid + k * block_stride;
+      if (i >= hidden_size) break;
+      if constexpr (std::is_same_v<out_t, int8_t>) {
+        out_t vo[VEC];
+#pragma unroll
+        for (int j = 0; j < VEC; j++)
+          vo[j] = float_to_int8_rn(reg_x[k][j] * inv_scale);
+        // int8 VEC=8 -> 8 bytes -> float2 store
+        *reinterpret_cast<float2*>(ptr_out + i) =
+            *reinterpret_cast<float2 const*>(vo);
+      } else {
+        // fp8-e4m3: pack 4 lanes at a time with the native builtin (same path
+        // as silu_and_mul_mask_quant). VEC=8 -> 2 packs -> 8 bytes.
+        uint32_t packed[VEC / 4];
+#pragma unroll
+        for (int j = 0; j < VEC; j += 4) {
+          v4f16 pk;
+#pragma unroll
+          for (int t = 0; t < 4; t++) {
+            float r = reg_x[k][j + t] * inv_scale;
+            r = fminf(fmaxf(r, -QMAX), QMAX);   // clamp to fp8-e4m3 range
+            pk[t] = static_cast<_Float16>(r);
+          }
+          packed[j / 4] = __builtin_mxc_cvt_pk4_f16tof8(pk);
+        }
+        *reinterpret_cast<float2*>(ptr_out + i) =
+            *reinterpret_cast<float2 const*>(packed);
+      }
+    }
+  }
+}
+
 template<typename scalar_t, typename scalar_weight_t, typename VT, int N, int NUM_REG, typename VWT, int NUM_THREADS, bool has_residual = false>
 __global__ void rms_norm_kernel_align(
   scalar_t* __restrict__ out,
@@ -586,6 +799,106 @@ __global__ void head_rms_norm_kernel(
 }
 
 // Residual add + RMS norm + dynamic per token
+// Fast-path launcher for the C600-U optimized kernel. Returns true if it
+// handled the launch. Requires int8 output, bf16/half input (VEC=8), and
+// hidden_size % 8 == 0. Block capped at 256 threads so the 16-lane shuffle
+// cross-group combine stays correct (sm_size <= 16); NUM_REG covers the row.
+template <typename scalar_in_t, typename wt_t, typename out_t, bool has_residual, int NT>
+static bool launch_rms_dq_opt(
+    out_t* out, float* scales, scalar_in_t* after_res, scalar_in_t* after_norm,
+    scalar_in_t const* input, wt_t const* weight, wt_t const* smooth,
+    scalar_in_t const* residual, float eps, int32_t hidden_size,
+    int32_t num_tokens, cudaStream_t stream) {
+  constexpr int VEC = 16 / sizeof(scalar_in_t);   // 8 for bf16/half
+  if ((hidden_size % VEC) != 0) return false;
+  int const vecs = hidden_size / VEC;
+  // constexpr int NT = 128;
+  int const num_reg = (vecs + NT - 1) / NT;       // ceil
+  dim3 grid(num_tokens);
+
+#define LAUNCH_RMS_DQ_OPT(NREG)                                              \
+  rms_norm_dq_opt_kernel<VEC, NREG, NT, scalar_in_t, out_t, wt_t,           \
+                         has_residual, 8><<<grid, NT, 0, stream>>>(         \
+      out, scales, after_res, after_norm, input, weight, smooth, residual,  \
+      eps, hidden_size);                                                     \
+  return true;
+
+  switch (num_reg) {
+    case 1: LAUNCH_RMS_DQ_OPT(1);
+    case 2: LAUNCH_RMS_DQ_OPT(2);
+    case 3: LAUNCH_RMS_DQ_OPT(3);
+    case 4: LAUNCH_RMS_DQ_OPT(4);
+    case 5: LAUNCH_RMS_DQ_OPT(5);
+    case 6: LAUNCH_RMS_DQ_OPT(6);
+    case 7: LAUNCH_RMS_DQ_OPT(7);
+    case 8: LAUNCH_RMS_DQ_OPT(8);
+    default: return false;   // extremely large hidden -> fall back
+  }
+#undef LAUNCH_RMS_DQ_OPT
+}
+
+// Dispatch the C600-U fast path over weight dtype (bf16/fp32) and residual
+// presence for a given output element type (int8_t or __maca_fp8_e4m3).
+template <typename scalar_in_t, typename out_t>
+static bool try_launch_rms_dq_opt(
+    out_t* out, float* scales, scalar_in_t* after_res, scalar_in_t* after_norm,
+    scalar_in_t const* input, torch::Tensor const& weight,
+    torch::Tensor const& smooth_scale, scalar_in_t const* residual,
+    bool has_residual, float eps, int32_t hidden_size, int32_t num_tokens,
+    cudaStream_t stream) {
+  if (weight.dtype() == torch::kBFloat16) {
+    auto* w = reinterpret_cast<bfloat16*>(weight.data_ptr<at::BFloat16>());
+    auto* s = reinterpret_cast<bfloat16*>(smooth_scale.data_ptr<at::BFloat16>());
+    if (has_residual) {
+      if(num_tokens <= 64) {
+        return launch_rms_dq_opt<scalar_in_t, bfloat16, out_t, true, 256>(
+            out, scales, after_res, after_norm, input, w, s, residual, eps,
+            hidden_size, num_tokens, stream);
+      } else {
+        return launch_rms_dq_opt<scalar_in_t, bfloat16, out_t, true, 128>(
+            out, scales, after_res, after_norm, input, w, s, residual, eps,
+            hidden_size, num_tokens, stream);
+        }
+    } else {
+        if(num_tokens <= 64) {
+        return launch_rms_dq_opt<scalar_in_t, bfloat16, out_t, false, 256>(
+            out, scales, after_res, after_norm, input, w, s, residual, eps,
+            hidden_size, num_tokens, stream);
+      } else {
+        return launch_rms_dq_opt<scalar_in_t, bfloat16, out_t, false, 128>(
+            out, scales, after_res, after_norm, input, w, s, residual, eps,
+            hidden_size, num_tokens, stream);
+        }
+    }
+  } else if (weight.dtype() == torch::kFloat32) {
+    auto* w = weight.data_ptr<float>();
+    auto* s = smooth_scale.data_ptr<float>();
+    if (has_residual) {
+      if(num_tokens <= 64) {
+        return launch_rms_dq_opt<scalar_in_t, float, out_t, true, 256>(
+            out, scales, after_res, after_norm, input, w, s, residual, eps,
+            hidden_size, num_tokens, stream);
+      } else {
+        return launch_rms_dq_opt<scalar_in_t, float, out_t, true, 128>(
+            out, scales, after_res, after_norm, input, w, s, residual, eps,
+            hidden_size, num_tokens, stream);
+      }
+    } else {
+        if(num_tokens <= 64) {
+        return launch_rms_dq_opt<scalar_in_t, float, out_t, false, 256>(
+            out, scales, after_res, after_norm, input, w, s, residual, eps,
+            hidden_size, num_tokens, stream);
+      } else {
+        return launch_rms_dq_opt<scalar_in_t, float, out_t, false, 128>(
+            out, scales, after_res, after_norm, input, w, s, residual, eps,
+            hidden_size, num_tokens, stream);
+      }
+    }
+      
+  }
+  return false;
+}
+
 template <typename scalar_in_t>
 void rms_norm_dynamic_per_token_quant_dispatch(
     torch::Tensor& out,           // [..., hidden_size]
@@ -603,7 +916,33 @@ void rms_norm_dynamic_per_token_quant_dispatch(
   dim3 grid(num_tokens);
   dim3 block(std::min(hidden_size, 1024));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  
+
+  // ---- C600-U fast path: int8 output, register-cached single-pass kernel ----
+    // ---- C600-U fast path: register-cached single-pass kernel (int8 / fp8) ----
+  if (out.scalar_type() == at::ScalarType::Char ||
+      out.scalar_type() == at::ScalarType::Float8_e4m3fn) {
+    float const eps_f = static_cast<float>(var_epsilon);
+    scalar_in_t const* res_ptr =
+        residual.has_value() ? residual->data_ptr<scalar_in_t>() : nullptr;
+    bool const has_res = residual.has_value();
+    bool handled = false;
+    if (out.scalar_type() == at::ScalarType::Char) {
+      handled = try_launch_rms_dq_opt<scalar_in_t, int8_t>(
+          out.data_ptr<int8_t>(), scales.data_ptr<float>(),
+          after_res.data_ptr<scalar_in_t>(), after_norm.data_ptr<scalar_in_t>(),
+          input.data_ptr<scalar_in_t>(), weight, smooth_scale, res_ptr, has_res,
+          eps_f, hidden_size, num_tokens, stream);
+    } else {  // Float8_e4m3fn
+      handled = try_launch_rms_dq_opt<scalar_in_t, __maca_fp8_e4m3>(
+          reinterpret_cast<__maca_fp8_e4m3*>(out.data_ptr()),
+          scales.data_ptr<float>(), after_res.data_ptr<scalar_in_t>(),
+          after_norm.data_ptr<scalar_in_t>(), input.data_ptr<scalar_in_t>(),
+          weight, smooth_scale, res_ptr, has_res, eps_f, hidden_size,
+          num_tokens, stream);
+    }
+    if (handled) return;
+  }
+
   if(weight.dtype() == torch::kBFloat16) {
     if (residual.has_value()) {
       MOE_DISPATCH_QUANT_TYPES(
@@ -662,8 +1001,12 @@ void rms_norm_dynamic_per_token_quant(
     torch::Tensor& after_res,
     torch::Tensor& after_norm,
     std::optional<at::Tensor> residual) {
-  
-  TORCH_CHECK(out.dtype() == torch::kInt8);
+      DEBUG_TRACE_PARAMS(out, input, weight, smooth_scale, scales, var_epsilon, after_res, after_norm, residual);
+      DEBUG_DUMP_PARAMS(out, input, weight, smooth_scale, scales, var_epsilon, after_res, after_norm, residual);
+
+    TORCH_CHECK(out.dtype() == torch::kInt8 ||
+                  out.dtype() == torch::kFloat8_e4m3fn,
+              "rms_norm_dynamic_per_token_quant: out must be int8 or fp8-e4m3");
   TORCH_CHECK(out.is_contiguous() && input.is_contiguous());
   TORCH_CHECK(scales.dtype() == torch::kFloat32);
 
@@ -811,6 +1154,8 @@ void head_rms_norm_dispatch(
 
 void head_rms_norm(torch::Tensor& out, torch::Tensor const& hidden_states, torch::Tensor const &weight, double const var_epsilon, int head_offset, int head_norm)
 {
+    DEBUG_TRACE_PARAMS(out, hidden_states, weight, var_epsilon, head_offset, head_norm);
+    DEBUG_DUMP_PARAMS(out, hidden_states, weight, var_epsilon, head_offset, head_norm);
     TORCH_CHECK(out.is_contiguous() && weight.is_contiguous() && hidden_states.is_contiguous());
     MOE_DISPATCH_FLOATING_TYPES(hidden_states.scalar_type(), "head_rms_norm_dispatch", [&]{
       head_rms_norm_dispatch<scalar_t>(out, hidden_states, weight, var_epsilon, head_offset, head_norm);
@@ -993,6 +1338,8 @@ void rms_norm(
     bool rms_div
 )
 {
+  DEBUG_TRACE_PARAMS(out, input, weight, var_epsilon, after_res, residual, rms_div);
+  DEBUG_DUMP_PARAMS(out, input, weight, var_epsilon, after_res, residual, rms_div);
   TORCH_CHECK(out.is_contiguous() && input.is_contiguous());
   TORCH_CHECK(weight.is_contiguous());
   MOE_DISPATCH_FLOATING_TYPES(

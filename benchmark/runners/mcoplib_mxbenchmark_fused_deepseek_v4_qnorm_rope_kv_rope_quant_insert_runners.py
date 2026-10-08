@@ -54,7 +54,7 @@ class Fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_runner(OpBenchmarkBase):
 
         self.num_heads = config.get("num_heads", 32)
         self.num_kv_heads = config.get("num_kv_heads", 8)
-
+        self.seed = config.get("seed", None)
         self.q_head_padded = config.get(
             "q_head_padded",
             self.num_heads,
@@ -131,7 +131,9 @@ class Fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_runner(OpBenchmarkBase):
 
 
     def prepare_and_get_launcher(self, dev_id, tc_s):
-
+        if self.seed is not None:
+            torch.manual_seed(self.seed)
+            torch.cuda.manual_seed_all(self.seed)
         dev = f"cuda:{dev_id}"
 
         num_tokens = self.num_tokens

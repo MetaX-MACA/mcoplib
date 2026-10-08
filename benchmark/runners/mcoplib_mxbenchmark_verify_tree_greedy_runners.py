@@ -13,6 +13,7 @@ class Verify_tree_greedy_runner(OpBenchmarkBase):
         self.num_spec_step = config.get("num_spec_step", 8)
         self.num_draft_tokens = config.get("num_draft_tokens", 16)
         self.vocab_size = config.get("vocab_size", 32000)
+        self.seed = config.get("seed", None)
         self.tot_num_draft_tokens = self.bs * self.num_draft_tokens
 
     def define_metrics(self, state):
@@ -39,6 +40,9 @@ class Verify_tree_greedy_runner(OpBenchmarkBase):
         state.add_global_memory_writes(write_bytes)
 
     def _generate_inputs(self, dev):
+        if self.seed is not None:
+            torch.manual_seed(self.seed)
+            torch.cuda.manual_seed_all(self.seed)
         predicts = torch.zeros(self.tot_num_draft_tokens, dtype=torch.int32, device=dev)
         accept_index = torch.zeros((self.bs, self.num_spec_step), dtype=torch.int32, device=dev)
         accept_token_num = torch.zeros(self.bs, dtype=torch.int32, device=dev)

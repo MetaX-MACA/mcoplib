@@ -67,6 +67,11 @@ if (USE_MACA)
     MACA_VERSION_MINOR=${MACA_VERSION_MINOR}
     MACA_VERSION_PATCH=${MACA_VERSION_PATCH}
     MACA_VERSION_BUILD=${MACA_VERSION_BUILD}
+
+    # add vLLM ops macro
+    VLLM_ENABLE_KIMI_K3_ATTN_RES
+    VLLM_ENABLE_FUSED_KDA_DECODE
+    VLLM_ENABLE_FUSED_GDN_DECODE
   )
   message(STATUS "MACA version: ${MACA_VERSION_MAJOR}.${MACA_VERSION_MINOR}.${MACA_VERSION_PATCH}.${MACA_VERSION_BUILD}")
 
@@ -81,7 +86,6 @@ if (USE_MACA)
 endif()
 
 
-# Prevent installation of dependencies (cutlass) by default.
 install(CODE "set(CMAKE_INSTALL_LOCAL_ONLY TRUE)" ALL_COMPONENTS)
 
 #
@@ -90,7 +94,7 @@ install(CODE "set(CMAKE_INSTALL_LOCAL_ONLY TRUE)" ALL_COMPONENTS)
 #
 set(PYTHON_SUPPORTED_VERSIONS "3.9" "3.10" "3.11" "3.12")
 
-set(TORCH_SUPPORTED_VERSION_CUDA "2.6.0")
+set(TORCH_SUPPORTED_VERSION_CUDA "2.10.0")
 
 find_python_from_executable(${VLLM_PYTHON_EXECUTABLE} "${PYTHON_SUPPORTED_VERSIONS}")
 
@@ -98,9 +102,9 @@ find_python_from_executable(${VLLM_PYTHON_EXECUTABLE} "${PYTHON_SUPPORTED_VERSIO
 # This check must happen after find_package(Torch) because that's when CMAKE_CUDA_COMPILER_VERSION gets defined
 if(DEFINED CMAKE_CUDA_COMPILER_VERSION AND
    CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.8)
-  set(CUDA_SUPPORTED_ARCHS "7.0;7.2;7.5;8.0;8.6;8.7;8.9;9.0;10.0;10.1;12.0")
+  set(CUDA_SUPPORTED_ARCHS "8.0;8.6;8.7;8.9;9.0;10.0;10.1;12.0")
 else()
-  set(CUDA_SUPPORTED_ARCHS "7.0;7.2;7.5;8.0;8.6;8.7;8.9;9.0")
+  set(CUDA_SUPPORTED_ARCHS "8.0;8.6;8.7;8.9;9.0")
 endif()
 
 set(MCOPLIB_GPU_LANG "CUDA")
@@ -173,24 +177,6 @@ if(DEFINED ENV{DEBUG_LINE_INFO})
     $<$<COMPILE_LANGUAGE:CUDA>:--generate-line-info> 
   )
 endif()
-##############cutlass build option#########################
-
-option(GLOBAL_ENABLE_BUILD_CUTLASS_OP "Build the default op kernels subproject" ON)
-# 如果存在环境变量，则覆盖默认设置
-if(DEFINED ENV{ENABLE_BUILD_CUTLASS_OP})
-    message(STATUS "mcoplib build option ENV ENABLE_BUILD_CUTLASS_OP:$ENV{ENABLE_BUILD_CUTLASS_OP}")
-    string(TOLOWER "$ENV{ENABLE_BUILD_CUTLASS_OP}" _val)
-    if (_val STREQUAL "1" OR _val STREQUAL "on" OR _val STREQUAL "true")
-        set(GLOBAL_ENABLE_BUILD_CUTLASS_OP ON)
-    else()
-        set(GLOBAL_ENABLE_BUILD_CUTLASS_OP OFF)
-    endif()
-endif()
-
-if (GLOBAL_ENABLE_BUILD_CUTLASS_OP)
-  add_definitions(-DENABLE_CUTALASS_OP)
-endif()
-
 ##################gptq marlin build switch#######################
 option(GLOBAL_ENABLE_BUILD_GPTQ_MARLIN "Default not build the gptq marlin op kernels " OFF)
 # 如果存在环境变量，则覆盖默认设置
@@ -213,10 +199,6 @@ endif()
 # Each dependency that produces build artifacts should override its BINARY_DIR to avoid
 # conflicts between build types. It should instead be set to ${CMAKE_BINARY_DIR}/<dependency>.
 #
-include(FetchContent)
-file(MAKE_DIRECTORY ${FETCHCONTENT_BASE_DIR}) # Ensure the directory exists
-message(STATUS "FetchContent base directory: ${FETCHCONTENT_BASE_DIR}")
-
 set(VLLM_SRC_DIR ${CMAKE_SOURCE_DIR}/op/vllm)
 
 if (BUILD_VLLM_SUBMODULE) 
@@ -242,8 +224,10 @@ if (BUILD_VLLM_SUBMODULE)
     "${VLLM_SRC_DIR}/fused_deepseek_v4_qnorm_rope_kv_insert_kernel.cu"
     "${VLLM_SRC_DIR}/fused_deepseek_v4_qnorm_rope_kv_insert_kernel_bf16.cu"
     "${VLLM_SRC_DIR}/fused_minimax_m3_qknorm_rope_kv_insert_kernel.cu"
+    "${VLLM_SRC_DIR}/fused_kimi_k3_mla_key_concat_kv_cache_kernel.cu"
     "${VLLM_SRC_DIR}/sampler.cu"
     "${VLLM_SRC_DIR}/topk.cu"
+    "${VLLM_SRC_DIR}/region_topk_ids.cu"
     "${VLLM_SRC_DIR}/dsv3_fused_a_gemm.cu"
     "${VLLM_SRC_DIR}/cuda_view.cu"
     "${VLLM_SRC_DIR}/quantization/gptq/q_gemm.cu"
@@ -253,93 +237,31 @@ if (BUILD_VLLM_SUBMODULE)
     "${VLLM_SRC_DIR}/quantization/w8a8/int8/per_token_group_quant.cu"
     "${VLLM_SRC_DIR}/quantization/fused_kernels/fused_layernorm_dynamic_per_token_quant.cu"
     "${VLLM_SRC_DIR}/quantization/fused_kernels/fused_silu_mul_block_quant.cu"
+    "${VLLM_SRC_DIR}/custom_all_gather_reduce_scatter.cu"
+    "${VLLM_SRC_DIR}/custom_all_gather_reduce_scatter_ops.cpp"
+    "${VLLM_SRC_DIR}/custom_all_reduce.cu"
     "${VLLM_SRC_DIR}/quantization/gguf/gguf_kernel.cu"
     "${VLLM_SRC_DIR}/quantization/activation_kernels.cu"
+    "${VLLM_SRC_DIR}/quantization/awq/gemm_kernels.cu"
+    "${VLLM_SRC_DIR}/permute_cols.cu"
+    "${VLLM_SRC_DIR}/kimi_k3/fused_kda_decode_kernel.cu"
+    "${VLLM_SRC_DIR}/kimi_k3/attn_res_kernel.cu"
     "${VLLM_SRC_DIR}/cuda_utils_kernels.cu" 
     "${VLLM_SRC_DIR}/fused_unpack.cu"
     "${VLLM_SRC_DIR}/fp32_router_gemm_entry.cu"
     "${VLLM_SRC_DIR}/fp32_router_gemm.cu"
+    "${VLLM_SRC_DIR}/ngram_embedding_kernels.cu"
+    "${VLLM_SRC_DIR}/gdn/fused_gdn_decode_kernel.cu"
+    "${VLLM_SRC_DIR}/attention/dcp_utils/dcp_direct_a2a_lse_reduce.cu"
+    "${VLLM_SRC_DIR}/attention/dcp_utils/dcp_direct_kv_gather.cu"
+    "${VLLM_SRC_DIR}/attention/dcp_utils/dcp_direct_q_gather.cu"
     "${VLLM_SRC_DIR}/torch_bindings.cpp")
     
-  if(MCOPLIB_GPU_LANG STREQUAL "CUDA")
-    SET(CUTLASS_ENABLE_HEADERS_ONLY ON CACHE BOOL "Enable only the header library")
 
-    # Set CUTLASS_REVISION. Used for FetchContent. Also fixes some bogus messages when building.
-    set(CUTLASS_REVISION "v4.0.0" CACHE STRING "CUTLASS revision to use")
-
-    # Use the specified CUTLASS source directory for compilation if VLLM_CUTLASS_SRC_DIR is provided
-    if (DEFINED ENV{VLLM_CUTLASS_SRC_DIR})
-      set(VLLM_CUTLASS_SRC_DIR $ENV{VLLM_CUTLASS_SRC_DIR})
-    endif()
-
-    # Substitue CUTLASS with MATLASS 
-    if (USE_MACA)
-      message(WARNING "Use MACA, Overwrite VLLM_CUTLASS_SRC_DIR.")
-      set(VLLM_CUTLASS_SRC_DIR $ENV{MACA_PATH}/include)
-    endif()
-
-    if(VLLM_CUTLASS_SRC_DIR)
-      if(NOT IS_ABSOLUTE VLLM_CUTLASS_SRC_DIR)
-        get_filename_component(VLLM_CUTLASS_SRC_DIR "${VLLM_CUTLASS_SRC_DIR}" ABSOLUTE)
-      endif()
-      message(STATUS "The VLLM_CUTLASS_SRC_DIR is set, using ${VLLM_CUTLASS_SRC_DIR} for compilation")
-      FetchContent_Declare(cutlass SOURCE_DIR ${VLLM_CUTLASS_SRC_DIR})
-    else()
-      message(FATAL_ERROR "Error: Unable to download cutlass automatically. Please download cutlass manually and set the 'VLLM_CUTLASS_SRC_DIR' environment variable.")
-    endif()
-    FetchContent_MakeAvailable(cutlass)
-
-    list(APPEND VLLM_EXT_SRC
-      "${VLLM_SRC_DIR}/quantization/awq/gemm_kernels.cu"
-      "${VLLM_SRC_DIR}/permute_cols.cu"
-      "${VLLM_SRC_DIR}/quantization/fp4/nvfp4_quant_entry.cu"
-      "${VLLM_SRC_DIR}/cutlass_extensions/common.cpp")
-
-    if (GLOBAL_ENABLE_BUILD_CUTLASS_OP)
-      list(APPEND VLLM_EXT_SRC
-        "${VLLM_SRC_DIR}/quantization/cutlass_w8a8/scaled_mm_entry.cu"
-        "${VLLM_SRC_DIR}/quantization/fp4/nvfp4_scaled_mm_entry.cu"
-        "${VLLM_SRC_DIR}/sparse/cutlass/sparse_scaled_mm_entry.cu"
-        "${VLLM_SRC_DIR}/attention/mla/cutlass_mla_entry.cu")
-    endif()
 
     set_gencode_flags_for_srcs(
       SRCS "${VLLM_EXT_SRC}"
       CUDA_ARCHS "${CUDA_ARCHS}")
-
-    # support opt of cutlass w8a8 scale mm
-    set_source_files_properties(
-      "${VLLM_SRC_DIR}/quantization/cutlass_w8a8/scaled_mm_entry.cu"
-      PROPERTIES
-      COMPILE_FLAGS " -mllvm -metaxgpu-igroup=true -mllvm -misched-postra=true"
-    )  
-
-
-    # For the cutlass_scaled_mm kernels we want to build the c2x (CUTLASS 2.x)
-    # kernels for the remaining archs that are not already built for 3x.
-    # (Build 8.9 for FP8)
-    cuda_archs_loose_intersection(SCALED_MM_2X_ARCHS
-      "7.5;8.0;8.7;8.9+PTX" "${CUDA_ARCHS}")
-    # subtract out the archs that are already built for 3x
-    list(REMOVE_ITEM SCALED_MM_2X_ARCHS ${SCALED_MM_3X_ARCHS})
-    if (SCALED_MM_2X_ARCHS AND GLOBAL_ENABLE_BUILD_CUTLASS_OP)
-      set(SRCS "${VLLM_SRC_DIR}/quantization/cutlass_w8a8/scaled_mm_c2x.cu")
-      set_gencode_flags_for_srcs(
-        SRCS "${SRCS}"
-        CUDA_ARCHS "${SCALED_MM_2X_ARCHS}")
-      list(APPEND VLLM_EXT_SRC "${SRCS}")
-      list(APPEND MCOPLIB_GPU_FLAGS "-DENABLE_SCALED_MM_C2X=1")
-
-      # support opt of cutlass w8a8 scale mm
-      set_source_files_properties(
-        "${VLLM_SRC_DIR}/quantization/cutlass_w8a8/scaled_mm_c2x.cu"
-        PROPERTIES
-        COMPILE_FLAGS " -mllvm -metaxgpu-igroup=true -mllvm -misched-postra=true"
-      )
-      message(STATUS "Building scaled_mm_c2x for archs: ${SCALED_MM_2X_ARCHS}")
-    endif()
-  # if CUDA endif
-  endif()
 
 
   message(STATUS "Enabling C extension.")
@@ -350,17 +272,9 @@ if (BUILD_VLLM_SUBMODULE)
     SOURCES ${VLLM_EXT_SRC}
     COMPILE_FLAGS ${MCOPLIB_GPU_FLAGS}
     ARCHITECTURES ${VLLM_GPU_ARCHES}
-    INCLUDE_DIRECTORIES ${CUTLASS_INCLUDE_DIR} 
-    INCLUDE_DIRECTORIES ${CUTLASS_TOOLS_UTIL_INCLUDE_DIR}
     INCLUDE_DIRECTORIES ${VLLM_SRC_DIR}
     USE_SABI 3
     WITH_SOABI)
-
-  # If CUTLASS is compiled on NVCC >= 12.5, it by default uses
-  # cudaGetDriverEntryPointByVersion as a wrapper to avoid directly calling the
-  # driver API. This causes problems when linking with earlier versions of CUDA.
-  # Setting this variable sidesteps the issue by calling the driver directly.
-  target_compile_definitions(_C PRIVATE CUTLASS_ENABLE_DIRECT_CUDA_DRIVER_CALL=1)
 
   #添加编译参数
   target_compile_options(_C PRIVATE 
@@ -370,7 +284,7 @@ if (BUILD_VLLM_SUBMODULE)
   --Wno-macro-redefined
   --Wno-pass-failed
   --Wno-maca-compat
-  --offload-arch=xcore1000 --offload-arch=xcore1500 --offload-arch=xcore1600
+  --offload-arch=xcore1000  --offload-arch=xcore1008 --offload-arch=xcore1500 --offload-arch=xcore1600
   >)
 
   #
@@ -383,7 +297,11 @@ if (BUILD_VLLM_SUBMODULE)
     #"${VLLM_SRC_DIR}/moe/moe_lora_align_sum_kernels.cu"
     "${VLLM_SRC_DIR}/moe/topk_softmax_kernels.cu"
     "${VLLM_SRC_DIR}/moe/topk_softplus_sqrt_kernels.cu"
-    "${VLLM_SRC_DIR}/moe/grouped_topk_kernels.cu")
+    "${VLLM_SRC_DIR}/moe/grouped_topk_kernels.cu"
+    "${VLLM_SRC_DIR}/moe/dsv3_router_gemm_bf16_out.cu"
+    "${VLLM_SRC_DIR}/moe/dsv3_router_gemm_entry.cu"
+    "${VLLM_SRC_DIR}/moe/dsv3_router_gemm_float_out.cu"
+    "${VLLM_SRC_DIR}/moe/permute_unpermute_kernels/moe_permute_unpermute_kernel.cu")
 
   if (USE_MACA AND ENABLE_BLAS_API)
     #list(APPEND VLLM_MOE_EXT_SRC "${VLLM_SRC_DIR}/moe/moe_ops.cpp")
@@ -440,8 +358,6 @@ if (BUILD_VLLM_SUBMODULE)
     SOURCES ${VLLM_MOE_EXT_SRC}
     COMPILE_FLAGS ${MCOPLIB_GPU_FLAGS}
     ARCHITECTURES ${VLLM_GPU_ARCHES}
-    INCLUDE_DIRECTORIES ${CUTLASS_INCLUDE_DIR}
-    INCLUDE_DIRECTORIES ${CUTLASS_TOOLS_UTIL_INCLUDE_DIR}
     INCLUDE_DIRECTORIES ${VLLM_SRC_DIR}
     ${BLAS_API_ARGS}
     USE_SABI 3
@@ -453,7 +369,7 @@ if (BUILD_VLLM_SUBMODULE)
   --Wno-macro-redefined
   --Wno-pass-failed
   --Wno-maca-compat
-  --offload-arch=xcore1000 --offload-arch=xcore1500 --offload-arch=xcore1600>)
+  --offload-arch=xcore1000  --offload-arch=xcore1008 --offload-arch=xcore1500 --offload-arch=xcore1600>)
 endif()
 
 
@@ -494,7 +410,7 @@ if (BUILD_LMDEPLOY_SUBMODULE)
     --Wno-macro-redefined
     --Wno-pass-failed
     --Wno-maca-compat
-    --offload-arch=xcore1000 --offload-arch=xcore1500 --offload-arch=xcore1600>)
+    --offload-arch=xcore1000  --offload-arch=xcore1008 --offload-arch=xcore1500 --offload-arch=xcore1600>)
   set_target_properties(lmdeploy PROPERTIES PREFIX "" SUFFIX "${EXT_SUFFIX}")
 
   #############lmdeploy ops end ###############
@@ -513,9 +429,12 @@ if (BUILD_DEFAULT_OP_SUBMODULE)
       "${MCOPLIB_SRCS_DIR}/fused_repeat_kv.cu"
       "${MCOPLIB_SRCS_DIR}/fused_bias_gelu.cu"
       "${MCOPLIB_SRCS_DIR}/fused_rms_norm_dq.cu"
+      "${MCOPLIB_SRCS_DIR}/qk_rms_norm.cu"
+      "${MCOPLIB_SRCS_DIR}/indexer_norm_rope.cu"
       "${MCOPLIB_SRCS_DIR}/fused_softplus_sqrt.cu"
       "${MCOPLIB_SRCS_DIR}/moe_swiglu_dq.cu"
       "${MCOPLIB_SRCS_DIR}/moe_softmax_topk.cu"
+      "${MCOPLIB_SRCS_DIR}/chunk_gated_delta_rule_fwd_h_native.cu"
       "${MCOPLIB_SRCS_DIR}/all_reduce.cu"
       "${MCOPLIB_SRCS_DIR}/rotary_embedding.cu"
       "${MCOPLIB_SRCS_DIR}/moe_gather.cu"
@@ -535,7 +454,16 @@ if (BUILD_DEFAULT_OP_SUBMODULE)
       "${MCOPLIB_SRCS_DIR}/glm_attention_prepare.cu"
       "${MCOPLIB_SRCS_DIR}/fused_deepseekv4_qkv_rms_norm_rope.cu"
       "${MCOPLIB_SRCS_DIR}/fused_split_qkv_gemma_rmsnorm_rope.cu"
-      "${MCOPLIB_SRCS_DIR}/fused_split_qkv_gemma_rmsnorm_rope_no_pack.cu")
+      "${MCOPLIB_SRCS_DIR}/fused_rmsnorm_rope_quant_reshape_and_cache.cu"
+      "${MCOPLIB_SRCS_DIR}/fused_split_qkv_gemma_rmsnorm_rope_no_pack.cu"
+      "${MCOPLIB_SRCS_DIR}/moe_step4_weighted_topk_gather.cu"
+      "${MCOPLIB_SRCS_DIR}/fused_masked_situ_quant_int8_pack.cu"
+      "${MCOPLIB_SRCS_DIR}/per_token_quant_int8.cu"
+      "${MCOPLIB_SRCS_DIR}/router_bias_topk.cu"
+      "${MCOPLIB_SRCS_DIR}/silu_mul_clamp_dsv4.cu")
+  list(APPEND MCOPLIB_EXT_SRC
+      "${MCOPLIB_SRCS_DIR}/mhc_pre_big_fuse.cu"
+      "${MCOPLIB_SRCS_DIR}/mhc_post_cuda.cu")
 
   if (GLOBAL_ENABLE_BUILD_GPTQ_MARLIN)
       list(APPEND MCOPLIB_EXT_SRC
@@ -565,7 +493,7 @@ if (BUILD_DEFAULT_OP_SUBMODULE)
     --Wno-macro-redefined
     --Wno-pass-failed
     --Wno-maca-compat
-    --offload-arch=xcore1000 --offload-arch=xcore1500 --offload-arch=xcore1600>)
+    --offload-arch=xcore1000  --offload-arch=xcore1008 --offload-arch=xcore1500 --offload-arch=xcore1600>)
 endif()
 
 
@@ -575,15 +503,22 @@ if (BUILD_SGLANG_SUBMODULE)
   set(SGLANG_KERNELS_SRCS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/op/sglang)
   set(MCOPLIB_SGLANG_KERNEL_SRC
       "${SGLANG_KERNELS_SRCS_DIR}/csrc/allreduce/custom_all_reduce.cu"
-      "${SGLANG_KERNELS_SRCS_DIR}/csrc/attention/cascade.cu"
+      #"${SGLANG_KERNELS_SRCS_DIR}/csrc/attention/cascade.cu"
       "${SGLANG_KERNELS_SRCS_DIR}/csrc/attention/merge_attn_states.cu"
+      "${SGLANG_KERNELS_SRCS_DIR}/csrc/attention/chunk_kda_fwd_intra_token_parallel.cu"
       "${SGLANG_KERNELS_SRCS_DIR}/csrc/attention/vertical_slash_index.cu"
       "${SGLANG_KERNELS_SRCS_DIR}/csrc/attention/fused_mla.cu"
+      "${SGLANG_KERNELS_SRCS_DIR}/csrc/attention/sparse_attention.cu"
       "${SGLANG_KERNELS_SRCS_DIR}/csrc/elementwise/activation.cu"
       "${SGLANG_KERNELS_SRCS_DIR}/csrc/elementwise/fused_add_rms_norm_kernel.cu"
+      "${SGLANG_KERNELS_SRCS_DIR}/csrc/elementwise/fused_hc_head.cu"
       "${SGLANG_KERNELS_SRCS_DIR}/csrc/elementwise/rope.cu"
       "${SGLANG_KERNELS_SRCS_DIR}/csrc/elementwise/pos_enc.cu"
       "${SGLANG_KERNELS_SRCS_DIR}/csrc/elementwise/topk.cu"
+      "${SGLANG_KERNELS_SRCS_DIR}/csrc/elementwise/topk_decode.cu"
+      "${SGLANG_KERNELS_SRCS_DIR}/jit_kernels/fused_gemma_qknorm_rope.cu"
+      "${SGLANG_KERNELS_SRCS_DIR}/jit_kernels/topk_v1.cu"
+      "${SGLANG_KERNELS_SRCS_DIR}/jit_kernels/kpool_topk_transform.cu"
       "${SGLANG_KERNELS_SRCS_DIR}/csrc/elementwise/copy.cu"
       "${SGLANG_KERNELS_SRCS_DIR}/csrc/elementwise/dsv4_norm_rope.cu"
       "${SGLANG_KERNELS_SRCS_DIR}/csrc/elementwise/concat_mla.cu"
@@ -607,6 +542,7 @@ if (BUILD_SGLANG_SUBMODULE)
       "${SGLANG_KERNELS_SRCS_DIR}/csrc/quantization/int8_quant_kernels.cu"
       "${SGLANG_KERNELS_SRCS_DIR}/csrc/quantization/quantize_kernel.cu"
       "${SGLANG_KERNELS_SRCS_DIR}/csrc/quantization/fused_silu_mul_per_group_quant.cu"
+      "${SGLANG_KERNELS_SRCS_DIR}/csrc/quantization/silu_mul_quant_varlen.cu"
       "${SGLANG_KERNELS_SRCS_DIR}/csrc/sgl_diffusion/elementwise/timestep_embedding.cu"
       "${SGLANG_KERNELS_SRCS_DIR}/csrc/quantization/fp8_quantize_kernel.cu"
       "${SGLANG_KERNELS_SRCS_DIR}/csrc/elementwise/fused_layernorm_dynamic_per_token_quant_custom.cu"
@@ -617,24 +553,10 @@ if (BUILD_SGLANG_SUBMODULE)
       "${SGLANG_KERNELS_SRCS_DIR}/csrc/moe/moe_topk_sigmoid_kernels.cu"
       "${SGLANG_KERNELS_SRCS_DIR}/csrc/mamba/causal_conv1d.cu")
 
-  if (GLOBAL_ENABLE_BUILD_CUTLASS_OP)
-    list(APPEND MCOPLIB_SGLANG_KERNEL_SRC
-      "${SGLANG_KERNELS_SRCS_DIR}/csrc/moe/cutlass_moe/scaled_mm_c2x.cu"
-      "${SGLANG_KERNELS_SRCS_DIR}/csrc/cutlass_w8a8/scaled_mm_entry.cu")
-  endif()
-
   set_gencode_flags_for_srcs(
     SRCS "${MCOPLIB_SGLANG_KERNEL_SRC}"
     CUDA_ARCHS "${CUDA_ARCHS}")
-  message(STATUS "Enabling mcoplib  sgl_kernel extension.")
 
-  #flashinfer 
-  set(FLASHINFER_INCLUDE 
-          ${PYTHON_PACKAGE}/flashinfer/data/include
-          ${PYTHON_PACKAGE}/flashinfer/data/gemm
-          ${PYTHON_PACKAGE}/flashinfer/data/include
-          ${PYTHON_PACKAGE}/flashinfer/data/csrc
-          cublas)
   define_gpu_extension_target(
     sgl_kernel
     DESTINATION mcoplib
@@ -644,18 +566,15 @@ if (BUILD_SGLANG_SUBMODULE)
     ARCHITECTURES ${VLLM_GPU_ARCHES}
     INCLUDE_DIRECTORIES ${SGLANG_KERNELS_SRCS_DIR}/include
     INCLUDE_DIRECTORIES ${SGLANG_KERNELS_SRCS_DIR}/csrc
-    INCLUDE_DIRECTORIES ${FLASHINFER_INCLUDE}
     INCLUDE_DIRECTORIES $ENV{MACA_PATH}/include
     INCLUDE_DIRECTORIES ${SGLANG_KERNELS_SRCS_DIR}/csrc/fast_hadamard_transform)
 
   set_target_properties(sgl_kernel PROPERTIES PREFIX "" SUFFIX "${EXT_SUFFIX}")
-  #target_link_libraries(sgl_kernel PRIVATE mctlassEx)
   #添加编译参数
   target_compile_options(sgl_kernel PRIVATE
       $<$<COMPILE_LANGUAGE:CUDA>:-O3 -std=c++17 -Xcompiler -fPIC -gencode=arch=compute_75,code=sm_75 -gencode=arch=compute_80,code=sm_80 -gencode=arch=compute_89,code=sm_89 -gencode=arch=compute_90,code=sm_90>
-      $<$<COMPILE_LANGUAGE:CUDA>:-DCUTLASS_ENABLE_TENSOR_CORE_MMA=1 -DCUTLASS_VERSIONS_GENERATED -DCUTE_USE_PACKED_TUPLE=1 -DCUTLASS_TEST_LEVEL=0 -DCUTLASS_TEST_ENABLE_CACHED_RESULTS=1 -DCUTLASS_DEBUG_TRACE_LEVEL=0 >
       $<$<COMPILE_LANGUAGE:CUDA>:--ptxas-options=-v --expt-relaxed-constexpr  -use-fast-math  -DTORCH_API_INCLUDE_EXTENSION_H >
-      $<$<COMPILE_LANGUAGE:CUDA>:-DFLASHINFER_ENABLE_BF16 -U__CUDA_NO_HALF2_OPERATORS__ -U__CUDA_NO_HALF_OPERATORS__ --offload-arch=xcore1000 --offload-arch=xcore1500 --offload-arch=xcore1600>
+      $<$<COMPILE_LANGUAGE:CUDA>: -DMCOPLIB_ENABLE_BF16 -DMCOPLIB_ENABLE_F16 -U__CUDA_NO_HALF2_OPERATORS__ -U__CUDA_NO_HALF_OPERATORS__ --offload-arch=xcore1000  --offload-arch=xcore1008 --offload-arch=xcore1500 --offload-arch=xcore1600>
   )
 
 
@@ -684,71 +603,10 @@ if (BUILD_SGLANG_SUBMODULE)
 
 
   target_compile_options(sgl_grouped_gemm_cuda PRIVATE
-    $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math --offload-arch=xcore1000 --offload-arch=xcore1500 --offload-arch=xcore1600>
+    $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math --offload-arch=xcore1000  --offload-arch=xcore1008 --offload-arch=xcore1500 --offload-arch=xcore1600>
     $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
     $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>
     $<$<COMPILE_LANGUAGE:CUDA>:-U__MACA_NO_HALF_OPERATORS__ -U__CUDA_NO_HALF2_OPERATORS__ -U__CUDA_NO_HALF_OPERATORS__ >
   )
 
-  ############sglang moe_fused_w4a16##############
-  set(MCOPLIB_SGLANG_MOE_FUSED_SRC
-      "${SGLANG_KERNELS_SRCS_DIR}/csrc/moe/moe_fused_w4a16.cpp"
-      "${SGLANG_KERNELS_SRCS_DIR}/csrc/moe/moe_fused_w4a16_cuda.cu"
-  )
-
-  set_gencode_flags_for_srcs(
-    SRCS "${MCOPLIB_SGLANG_MOE_FUSED_SRC}"
-    CUDA_ARCHS "${CUDA_ARCHS}")
-  message(STATUS "Enabling mcoplib  grouped_gemm_cuda extension.")
-
-  define_gpu_extension_target(
-    sgl_moe_fused_w4a16
-    DESTINATION mcoplib
-    LANGUAGE ${MCOPLIB_GPU_LANG}
-    SOURCES ${MCOPLIB_SGLANG_MOE_FUSED_SRC}
-    COMPILE_FLAGS ${MCOPLIB_GPU_FLAGS}
-    ARCHITECTURES ${VLLM_GPU_ARCHES}
-    INCLUDE_DIRECTORIES ${SGLANG_KERNELS_SRCS_DIR}/include
-    INCLUDE_DIRECTORIES ${SGLANG_KERNELS_SRCS_DIR}/csrc)
-  set_target_properties(sgl_moe_fused_w4a16 PROPERTIES PREFIX "" SUFFIX "${EXT_SUFFIX}")
-
-
-  #添加编译参数
-  target_compile_options(sgl_moe_fused_w4a16 PRIVATE
-      $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math --offload-arch=xcore1000 --offload-arch=xcore1500 --offload-arch=xcore1600>
-      $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
-      $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>
-      $<$<COMPILE_LANGUAGE:CUDA>:-U__MACA_NO_HALF_OPERATORS__ -U__CUDA_NO_HALF2_OPERATORS__ -U__CUDA_NO_HALF_OPERATORS__ >
-  )
-
-
-  ############sglang grouped_gemm_mctlass_int8##############
-  set(MCOPLIB_SGLANG_GROUPED_GEMM_MCTLASS_SRC
-      "${SGLANG_KERNELS_SRCS_DIR}/csrc/moe/grouped_gemm_mctlass_int8.cpp"
-      "${SGLANG_KERNELS_SRCS_DIR}/csrc/moe/grouped_gemm_mctlass_int8_cuda.cu"
-  )
-
-  set_gencode_flags_for_srcs(
-    SRCS "${MCOPLIB_SGLANG_GROUPED_GEMM_MCTLASS_SRC}"
-    CUDA_ARCHS "${CUDA_ARCHS}")
-  message(STATUS "Enabling mcoplib  grouped_gemm_cuda extension.")
-
-  define_gpu_extension_target(
-    sgl_grouped_gemm_mctlass_int8
-    DESTINATION mcoplib
-    LANGUAGE ${MCOPLIB_GPU_LANG}
-    SOURCES ${MCOPLIB_SGLANG_GROUPED_GEMM_MCTLASS_SRC}
-    COMPILE_FLAGS ${MCOPLIB_GPU_FLAGS}
-    ARCHITECTURES ${VLLM_GPU_ARCHES}
-    INCLUDE_DIRECTORIES ${SGLANG_KERNELS_SRCS_DIR}/include
-    INCLUDE_DIRECTORIES ${SGLANG_KERNELS_SRCS_DIR}/csrc)
-  set_target_properties(sgl_grouped_gemm_mctlass_int8 PROPERTIES PREFIX "" SUFFIX "${EXT_SUFFIX}")
-
-  #添加编译参数
-  target_compile_options(sgl_grouped_gemm_mctlass_int8 PRIVATE
-      $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math --offload-arch=xcore1000 --offload-arch=xcore1500 --offload-arch=xcore1600>
-      $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
-      $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>
-      $<$<COMPILE_LANGUAGE:CUDA>:-U__MACA_NO_HALF_OPERATORS__ -U__CUDA_NO_HALF2_OPERATORS__ -U__CUDA_NO_HALF_OPERATORS__ > 
-  )
 endif()

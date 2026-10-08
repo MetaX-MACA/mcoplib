@@ -1,9 +1,10 @@
 {
     "device_id": 0,
-    "device_name": "MetaX C500",
-    "batch_size": 32,
+    "device_name": ["MetaX C500", "MetaX C600-UL", "Metax C600-U"],
+    "batch_size": 128,
     "vocab_size": 64000,
     "prefill_bs": 32,
     "dtype": "float32",
+    "seed": 42,
     "samples": 1000
 }

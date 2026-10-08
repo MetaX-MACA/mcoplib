@@ -11,6 +11,8 @@
 #include <cub/cub.cuh>
 #include <cstdint>
 
+#include "topk_histogram_4096.cuh"
+
 namespace vllm {
 namespace persistent {
 
@@ -29,8 +31,7 @@ constexpr size_t kMediumScalarsBytes = 5 * sizeof(int);               // 20
 constexpr size_t kMediumHeaderSize =
     (kMediumHistBytes + kMediumScalarsBytes + 127) & ~size_t(127);  // 3200
 constexpr int MAX_BUFFERED_ITEMS = 4096;
-constexpr size_t kSmemMedium =
-    kMediumHeaderSize + 2 * MAX_BUFFERED_ITEMS * sizeof(int);  // 35968
+constexpr size_t kSmemMedium = 64 * 1024;
 constexpr uint32_t RADIX_THRESHOLD = 32768;
 
 // Decode path constants
@@ -246,30 +247,31 @@ __device__ __noinline__ void histogram_2048_topk(
         const bool is_valid_elem = (elem_idx < seq_len);
         const bool is_above = is_valid_elem && (bin > uthr);
         const bool is_equal = is_valid_elem && (bin == uthr);
+        constexpr uint64_t kWarpMask = 0xffffffffffffffffULL;
 
-        const uint32_t above_mask = __ballot_sync(0xffffffffffffffffULL, is_above);
+        const uint64_t above_mask = __ballot_sync(kWarpMask, is_above);
         if (above_mask) {
-          const int above_count = __popc(above_mask);
-          const int above_rank = __popc(above_mask & ((1ULL << lane) - 1));
+          const int above_count = __popcll(above_mask);
+          const int above_rank = __popcll(above_mask & ((1ULL << lane) - 1ULL));
           int above_base;
           if (lane == 0) {
             above_base = atomicAdd(&decode_smem[sOUT_abs], above_count);
           }
-          above_base = __shfl_sync(0xffffffffffffffffULL, above_base, 0);
+          above_base = __shfl_sync(kWarpMask, above_base, 0);
           if (is_above) {
             output_indices[above_base + above_rank] = elem_idx;
           }
         }
 
-        const uint32_t equal_mask = __ballot_sync(0xffffffffffffffffULL, is_equal);
+        const uint64_t equal_mask = __ballot_sync(kWarpMask, is_equal);
         if (equal_mask) {
-          const int equal_count = __popc(equal_mask);
-          const int equal_rank = __popc(equal_mask & ((1ULL << lane) - 1));
+          const int equal_count = __popcll(equal_mask);
+          const int equal_rank = __popcll(equal_mask & ((1ULL << lane) - 1ULL));
           int equal_base;
           if (lane == 0) {
             equal_base = atomicAdd(&decode_smem[sBUF0_abs], equal_count);
           }
-          equal_base = __shfl_sync(0xffffffffffffffffULL, equal_base, 0);
+          equal_base = __shfl_sync(kWarpMask, equal_base, 0);
           if (is_equal && __builtin_expect(equal_base + equal_rank < DBUF, 1)) {
             bufs[0][equal_base + equal_rank] = elem_idx;
           }
@@ -625,7 +627,6 @@ __device__ __forceinline__ void wait_ge(int* ptr, int target_val,
 
 // ============================================================================
 // Multi-CTA cooperative RadixTopK for a single large row.
-// Adapted from https://github.com/flashinfer-ai/flashinfer/pull/2215
 // ============================================================================
 
 template <int TopK, uint32_t VEC_SIZE>
@@ -868,6 +869,7 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 2)
   RadixRowState* state = &params.row_states[group_id];
 
   int barrier_phase = 0;
+  uint32_t radix_iter = 0;
   const uint32_t total_iters = (params.num_rows + num_groups - 1) / num_groups;
 
   for (uint32_t iter = 0; iter < total_iters; iter++) {
@@ -875,7 +877,26 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 2)
     uint32_t row_idx = group_id + iter * num_groups;
     if (row_idx >= params.num_rows) break;
 
-    const uint32_t seq_len = params.lengths[row_idx];
+    // Clamp the row length before any decision is made on it.
+    //
+    // `lengths` is int32 and is consumed here as uint32, so a negative value
+    // (e.g. a padded decode slot whose per-token context length underflowed)
+    // would reinterpret as ~4e9 and sail past every threshold below. Any
+    // value beyond the row width would also read into the next row.
+    //
+    // Clamping to max_seq_len additionally keeps this per-row decision
+    // consistent with the `cta_in_group != 0` early exit above, which is
+    // taken from the host-side scalar: when max_seq_len <= RADIX_THRESHOLD
+    // the non-leader CTAs return immediately, so a leader that reached the
+    // cooperative radix path would wait on the inter-CTA barrier for peers
+    // that no longer exist and spin until the kernel is killed.
+    const int32_t raw_len = params.lengths[row_idx];
+    const uint32_t row_bound =
+        params.stride < params.max_seq_len ? params.stride : params.max_seq_len;
+    const uint32_t non_negative_len =
+        raw_len > 0 ? static_cast<uint32_t>(raw_len) : 0u;
+    const uint32_t seq_len =
+        non_negative_len < row_bound ? non_negative_len : row_bound;
     int32_t* row_output = params.output + row_idx * params.top_k;
     const float* row_input = params.input + row_idx * params.stride;
 
@@ -900,16 +921,24 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 2)
     radix_topk<TopK, VEC_SIZE>(
         row_input, row_output, seq_len, my_chunk_start, chunk_size,
         local_histogram, suffix_sum, shared_scalars, shared_ordered, state,
-        cta_in_group, ctas_per_group, barrier_phase, iter, tx);
+        cta_in_group, ctas_per_group, barrier_phase, radix_iter, tx);
+    radix_iter++;
   }
 }
 
 }  // namespace persistent
 
 // ============================================================================
-// FlashInfer FilteredTopK (BS>32 dispatch) — float32 only.
-// Extracted from flashinfer_topk.cuh. Lives in namespace vllm (not persistent).
-// Adapted from https://github.com/flashinfer-ai/flashinfer/pull/2215
+// ============================================================================
+// Optimized FilteredTopK — single CTA per row for bs > 32.
+// Kept with persistent_topk so the portable fallback owns the non-cluster path.
+// ============================================================================
+namespace filtered_topk {
+
+namespace hist4096 = topk_histogram_4096;
+
+// ============================================================================
+// FilteredTopK — single CTA per row for bs > 32
 // ============================================================================
 
 #define FLASHINFER_CUDA_CALL(func, ...) \
@@ -933,13 +962,6 @@ struct vec_t {
 #pragma unroll
     for (size_t i = 0; i < N; ++i) {
       data[i] = ptr[i];
-    }
-  }
-
-  FLASHINFER_INLINE void cast_store(T* ptr) const {
-#pragma unroll
-    for (size_t i = 0; i < N; ++i) {
-      ptr[i] = data[i];
     }
   }
 };
@@ -985,7 +1007,8 @@ constexpr size_t FILTERED_TOPK_SMEM_DYNAMIC =
  * \tparam IdType Index type (int32_t)
  * \tparam VEC_SIZE Vector size for input loads (1, 2, 4, or 8)
  */
-template <typename DType, typename IdType, int VEC_SIZE, uint32_t MAX_K = 2048>
+template <typename DType, typename IdType, int VEC_SIZE, uint32_t MAX_K = 2048,
+          bool UsePredicatedShortLoads = false>
 __global__ void __launch_bounds__(FILTERED_TOPK_BLOCK_THREADS)
     FilteredTopKUnifiedKernel(const DType* __restrict__ input,
                               IdType* __restrict__ output,
@@ -1003,6 +1026,7 @@ __global__ void __launch_bounds__(FILTERED_TOPK_BLOCK_THREADS)
 
   const int length =
       (lengths != nullptr) ? lengths[bid] : static_cast<int>(max_len);
+
   const DType* score = input + bid * max_len;
   IdType* dst = output + bid * top_k;
 
@@ -1010,6 +1034,19 @@ __global__ void __launch_bounds__(FILTERED_TOPK_BLOCK_THREADS)
   if (length <= static_cast<int>(top_k)) {
     for (int i = tx; i < static_cast<int>(top_k); i += BLOCK_SIZE) {
       dst[i] = (i < length) ? static_cast<IdType>(i) : static_cast<IdType>(-1);
+    }
+    return;
+  }
+
+  // Short path
+  if (length <= 32768) {
+    extern __shared__ uint8_t _smem_reg[];
+    if constexpr (UsePredicatedShortLoads) {
+      hist4096::histogram_4096_topk_predicated<MAX_K, 12, 8>(score, dst, length,
+                                                             _smem_reg);
+    } else {
+      hist4096::histogram_4096_topk<MAX_K, 12, 8>(score, dst, length,
+                                                  _smem_reg);
     }
     return;
   }
@@ -1241,8 +1278,8 @@ constexpr int ComputeFilteredTopKVecSize(uint32_t max_len) {
 }
 
 template <typename DType, typename IdType, uint32_t MAX_K = 2048>
-cudaError_t FilteredTopKRaggedTransform(DType* input, IdType* output_indices,
-                                        IdType* lengths, uint32_t num_rows,
+cudaError_t FilteredTopKRaggedTransform(const DType* input, IdType* output_indices,
+                                        const IdType* lengths, uint32_t num_rows,
                                         uint32_t top_k_val, uint32_t max_len,
                                         cudaStream_t stream = 0) {
   constexpr size_t smem_size = FILTERED_TOPK_SMEM_DYNAMIC;
@@ -1255,14 +1292,15 @@ cudaError_t FilteredTopKRaggedTransform(DType* input, IdType* output_indices,
 
   const int vec_size = ComputeFilteredTopKVecSize<DType>(max_len);
 
-#define DISPATCH_VEC_SIZE(VS)                                               \
-  if (vec_size == VS) {                                                     \
-    auto kernel = FilteredTopKUnifiedKernel<DType, IdType, VS, MAX_K>;      \
-    FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(                              \
-        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));   \
-    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, grid, block, args, \
-                                          smem_size, stream));              \
-    return cudaSuccess;                                                     \
+#define DISPATCH_VEC_SIZE(VS)                                                 \
+  if (vec_size == VS) {                                                       \
+    auto kernel =                                                             \
+        FilteredTopKUnifiedKernel<DType, IdType, VS, MAX_K, (VS != MAX_VEC)>; \
+    FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(                                \
+        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));     \
+    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, grid, block, args,   \
+                                          smem_size, stream));                \
+    return cudaSuccess;                                                       \
   }
 
   DISPATCH_VEC_SIZE(1)
@@ -1275,6 +1313,325 @@ cudaError_t FilteredTopKRaggedTransform(DType* input, IdType* output_indices,
 
   return cudaSuccess;
 }
+
+}  // namespace filtered_topk
+
+template <typename DType, typename IdType, uint32_t MAX_K = 2048>
+cudaError_t FilteredTopKRaggedTransform(const DType* input,
+                                        IdType* output_indices,
+                                        const IdType* lengths,
+                                        uint32_t num_rows, uint32_t top_k_val,
+                                        uint32_t max_len,
+                                        cudaStream_t stream = 0) {
+  return filtered_topk::FilteredTopKRaggedTransform<DType, IdType, MAX_K>(
+      input, output_indices, lengths, num_rows, top_k_val, max_len, stream);
+}
+
+namespace stable_topk_gathered {
+
+constexpr int BLOCK_SIZE  = 1024;
+constexpr int WARP_SIZE   = 64;
+constexpr int RADIX_BITS  = 10;                               // 1024 bins
+constexpr int HIST_BINS   = 1 << RADIX_BITS;
+constexpr int KEY_BITS    = 64;
+constexpr int RADIX_PASSES =
+    (KEY_BITS + RADIX_BITS - 1) / RADIX_BITS;                // 7
+constexpr int FINAL_RADIX_BITS =
+    KEY_BITS - RADIX_BITS * (RADIX_PASSES - 1);              // 4
+constexpr int WARPS_PER_BLOCK = BLOCK_SIZE / WARP_SIZE;       // 16
+constexpr int HIST_CHUNKS = HIST_BINS / BLOCK_SIZE;           // 1
+constexpr int MAX_SMEM_CANDIDATES = (65536 - 5000) / 8;      // ≈7567
+
+// ── Key helpers ──────────────────────────────────────────────────
+
+// Build a 64-bit stable sort key from (score, token_id).
+// High 32 bits = sortable score, low 32 bits = ~token_id.
+// Descending key order == score desc, then smallest token_id.
+// token_id < 0 → key = 0 (invalid candidates sort last).
+__device__ __forceinline__ uint64_t stable_key(float score,
+                                               int32_t token_id) {
+  uint64_t score_key =
+      (uint64_t)persistent::convert_to_uint32_v2(score) << 32u;
+  uint64_t id_key = (uint64_t)(uint32_t)(~token_id);
+  uint64_t key = score_key | id_key;
+  if (token_id < 0) key = 0ull;
+  return key;
+}
+
+// Recover token_id from a stable key (the ~id in the low 32 bits).
+__device__ __forceinline__ int32_t key_to_output_value(uint64_t key) {
+  return (int32_t)~((uint32_t)key);
+}
+
+// True when `key` shares the current running prefix region.
+__device__ __forceinline__ bool matches_prefix(
+    uint64_t key, uint64_t prefix, int prefix_bits) {
+  if (prefix_bits == 0) return true;
+  int shift = KEY_BITS - prefix_bits;
+  return (key >> shift) == (prefix >> shift);
+}
+
+// ── Scan helpers ─────────────────────────────────────────────────
+
+// Inclusive scan within a 64-lane warp.
+__device__ __forceinline__ uint32_t warp_scan_inclusive(uint32_t value,
+                                                        int lane) {
+  for (int offset = 1; offset < WARP_SIZE; offset <<= 1) {
+    uint32_t neighbour = __shfl_up_sync(
+        0xFFFFFFFFFFFFFFFFull, value, offset);
+    if (lane >= offset) value += neighbour;
+  }
+  return value;
+}
+
+__device__ __forceinline__ uint32_t warp_scan_exclusive(uint32_t value,
+                                                        int lane) {
+  return warp_scan_inclusive(value, lane) - value;
+}
+
+// Block-wide exclusive prefix sum over 512 per-thread values.
+__device__ __forceinline__ uint32_t block_exclusive_scan(
+    uint32_t value, int tid, int lane, int warp_id,
+    uint32_t* warp_totals) {
+  uint32_t in_warp = warp_scan_inclusive(value, lane);
+  if (lane == WARP_SIZE - 1) warp_totals[warp_id] = in_warp;
+  __syncthreads();
+  if (warp_id == 0) {
+    uint32_t v = (lane < WARPS_PER_BLOCK) ? warp_totals[lane] : 0u;
+    uint32_t s = warp_scan_inclusive(v, lane);
+    if (lane < WARPS_PER_BLOCK) warp_totals[lane] = s - v;
+  }
+  __syncthreads();
+  return (in_warp - value) + warp_totals[warp_id];
+}
+
+// ── Kernel ───────────────────────────────────────────────────────
+
+// MSB-first radix-select: one block per row over 64-bit stable keys.
+// keys_a==nullptr → smem keys (num_candidates ≤ MAX_SMEM_CANDIDATES);
+// otherwise       → global-memory double-buffered keys (unlimited world).
+__global__ void stable_topk_gathered_kernel(
+    const float*    __restrict__ gathered,
+          int*      __restrict__ out,
+          int       num_rows,
+          int       num_candidates,
+          int       topk,
+          uint64_t* __restrict__ keys_a,
+          uint64_t* __restrict__ keys_b) {
+
+  extern __shared__ uint64_t smem[];
+  const bool use_global = (keys_a != nullptr);
+
+  // Shared memory layout (smem path):
+  //   keys[num_candidates] | prefix | committed | warp_totals[8] | hist[512]
+  // Global-memory path omits keys from smem.
+  uint64_t* prefix;
+  uint32_t* committed;
+  uint32_t* warp_totals;
+  uint32_t* hist;
+
+  if (use_global) {
+    prefix      = smem;
+    committed   = (uint32_t*)(prefix + 1);
+    warp_totals = committed + 1;
+    hist        = warp_totals + WARPS_PER_BLOCK;
+  } else {
+    prefix      = smem + num_candidates;
+    committed   = (uint32_t*)(prefix + 1);
+    warp_totals = committed + 1;
+    hist        = warp_totals + WARPS_PER_BLOCK;
+  }
+
+  __shared__ int  s_threshold, s_include;
+  __shared__ uint32_t warp_sum[WARPS_PER_BLOCK], compact_total;
+
+  const int row        = blockIdx.x;
+  const int tid        = threadIdx.x;
+  const int lane       = tid % WARP_SIZE;
+  const int warp_id    = tid / WARP_SIZE;
+  const int row_stride = num_candidates * 2;
+
+  // Pointers to per-row key storage (smem or global double-buffer)
+  uint64_t* keys_in;
+  uint64_t* keys_out;
+  if (use_global) {
+    keys_in  = keys_a + (unsigned long long)row * num_candidates;
+    keys_out = keys_b + (unsigned long long)row * num_candidates;
+  } else {
+    keys_in  = (uint64_t*)smem;
+    keys_out = nullptr;
+  }
+
+  // Pre-fill output with -1 (invalid sentinel)
+  for (int i = tid; i < topk; i += blockDim.x) {
+    out[row * topk + i] = -1;
+  }
+
+  // Build stable keys from (score, token_id)
+  for (int c = tid; c < num_candidates; c += blockDim.x) {
+    float   score    = gathered[row * row_stride + c * 2];
+    int32_t token_id = (int32_t)gathered[row * row_stride + c * 2 + 1];
+    keys_in[c] = stable_key(score, token_id);
+  }
+
+  if (tid == 0) {
+    *committed = 0u;
+    *prefix    = 0ull;
+  }
+  __syncthreads();
+
+  int remaining = num_candidates;
+
+  // ── Radix passes ──────────────────────────────────────────────
+  for (int pass = 0; pass < RADIX_PASSES; ++pass) {
+    const int bits = (pass == RADIX_PASSES - 1)
+                         ? FINAL_RADIX_BITS : RADIX_BITS;
+    const int prefix_bits = pass * RADIX_BITS;
+    const int shift       = KEY_BITS - prefix_bits - bits;
+    const uint32_t bin_mask  = (1u << bits) - 1u;
+
+    // 1) Clear histogram
+    for (int chunk = 0; chunk < HIST_CHUNKS; ++chunk) {
+      hist[tid + chunk * BLOCK_SIZE] = 0u;
+    }
+    __syncthreads();
+
+    // 2) Histogram
+    for (int c = tid; c < remaining; c += blockDim.x) {
+      uint32_t bin = (uint32_t)((keys_in[c] >> shift) & bin_mask);
+      atomicAdd(&hist[bin], 1u);
+    }
+    __syncthreads();
+
+    // 3) Find threshold bin (single-chunk scan for 1024 bins)
+    const uint32_t target  = (uint32_t)topk - *committed;
+    const uint32_t count   = hist[HIST_BINS - 1 - tid];
+    const uint32_t excl    = block_exclusive_scan(count, tid, lane,
+                                                   warp_id, warp_totals);
+
+    int  threshold = -1;  // 负责记录本线程对应bin是否碰到topk选取阈值，以及阈值是多少（bin编号）
+    bool include   = false;  // 本线程对应bin的候选是否能全被选入topk
+
+    // 高于本bin的所有bin的累加量（excl）<当前pass的topk选择余量（target）<=excl + 本bin的个数
+    // 说明本线程找到了当前pass的阈值
+    if (count > 0u && excl < target && target <= excl + count) {
+      threshold = HIST_BINS - 1 - tid;
+
+      // 情况1：本线程对应bin的候选刚好够全部选入topk，不多不少（count < target - excl 不可能发生）
+      // 情况2：最后一个pass，后续无法再细分，必须把bin内的全部候选选完
+      include = (count <= target - excl) || (pass == RADIX_PASSES - 1);
+    }
+    
+    // 重置全局的阈值、include标志
+    if (tid == 0) {s_threshold = -1; s_include = 0;}
+    __syncthreads();
+
+    // 找到阈值所在的线程 负责更新 全局阈值、include标志
+    if (threshold >= 0) {s_threshold = threshold; s_include = include ? 1 : 0;}
+    __syncthreads();
+
+    // 全局阈值、include标志 广播到各线程
+    threshold = s_threshold; include   = s_include != 0;
+
+    // 如果广播了-1阈值，说明本次pass没有找到阈值，全部bin的全部候选都被选入topk
+    if (threshold < 0) include = true;
+
+    // 4) Scatter selected keys to output
+    for (int c = tid; c < remaining; c += blockDim.x) {
+      uint32_t bin = (uint32_t)((keys_in[c] >> shift) & bin_mask);
+      if ((int)bin > threshold ||
+          (include && (int)bin == threshold)) {
+        uint32_t dst = atomicAdd(committed, 1u);
+        if ((int)dst < topk) {
+          out[row * topk + (int)dst] = key_to_output_value(keys_in[c]);
+        }
+      }
+    }
+    __syncthreads();
+
+    // 5) Narrow prefix
+    if (!include) {  // 如果本次pass没有全选，说明找到了阈值（bin编号）
+      if (tid == 0) {
+        // 保留前几轮pass所固定下来的高位prefix，再填充上本轮pass所找到的bin编号
+        *prefix |= (uint64_t)(uint32_t)threshold << shift;
+      }
+      __syncthreads();
+    }
+    // 如果本次pass全选，相当于阈值（bin编号）为0，prefix的当前段填充全0
+
+    // Compact survivors for next pass (atomics-free prefix sum)
+    if (!include && pass < RADIX_PASSES - 1) {
+      const int      new_prefix_bits = prefix_bits + bits;
+      const uint64_t new_prefix      = *prefix;
+
+      // Count how many of my candidates survive
+      uint32_t my_count = 0;
+      for (int c = tid; c < remaining; c += blockDim.x) {
+        if (matches_prefix(keys_in[c], new_prefix, new_prefix_bits)) {
+          my_count++;
+        }
+      }
+
+      // Warp-level exclusive prefix
+      uint32_t warp_excl = warp_scan_exclusive(my_count, lane);
+      uint32_t warp_total = warp_excl + my_count;
+      if (lane == WARP_SIZE - 1) warp_sum[warp_id] = warp_total;
+      __syncthreads();
+
+      // Block-level total
+      if (tid == 0) {
+        uint32_t total = 0;
+        for (int w = 0; w < WARPS_PER_BLOCK; ++w) total += warp_sum[w];
+        compact_total = total;
+      }
+      __syncthreads();
+
+      // Block-level per-warp prefix
+      if (warp_id == 0) {
+        uint32_t v = (lane < WARPS_PER_BLOCK) ? warp_sum[lane] : 0u;
+        uint32_t s = warp_scan_inclusive(v, lane);
+        if (lane < WARPS_PER_BLOCK) warp_sum[lane] = s - v;
+      }
+      __syncthreads();
+
+      uint32_t warp_base  = (warp_id < WARPS_PER_BLOCK)
+                                ? warp_sum[warp_id] : 0u;
+      uint32_t global_off = warp_base + warp_excl;
+
+      // Scatter survivors to keys_out (global) or in-place (smem)
+      uint32_t local_idx = 0;
+      if (use_global) {
+        for (int c = tid; c < remaining; c += blockDim.x) {
+          if (matches_prefix(keys_in[c], new_prefix, new_prefix_bits)) {
+            keys_out[global_off + local_idx] = keys_in[c];
+            local_idx++;
+          }
+        }
+      } else {
+        for (int c = tid; c < remaining; c += blockDim.x) {
+          if (matches_prefix(keys_in[c], new_prefix, new_prefix_bits)) {
+            keys_in[global_off + local_idx] = keys_in[c];
+            local_idx++;
+          }
+        }
+      }
+      __syncthreads();
+
+      remaining = compact_total;
+
+      // Swap buffers for next pass (global path only; smem is in-place)
+      if (use_global) {
+        uint64_t* tmp = keys_in;
+        keys_in  = keys_out;
+        keys_out = tmp;
+      }
+    }
+
+    if (*committed >= (uint32_t)topk || include) break;
+  }
+}
+
+}  // namespace stable_topk_gathered
 
 }  // namespace vllm
 

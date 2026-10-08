@@ -30,6 +30,7 @@ class Convert_vertical_slash_indexes_mergehead_runner(OpBenchmarkBase):
         self.causal = config.get("causal", True)
         self.dtype = getattr(torch, config.get("dtype", "int32"))
         self.num_rows = (self.context_size + self.block_size_m - 1) // self.block_size_m
+        self.seed = config.get("seed", None)
 
     def define_metrics(self, state):
         state.add_summary("Op", self.name)
@@ -45,7 +46,9 @@ class Convert_vertical_slash_indexes_mergehead_runner(OpBenchmarkBase):
         state.add_global_memory_reads(size_in * element_size)
         state.add_global_memory_writes(size_out * element_size)
 
-    def _prepare_args(self, device, seed=42):
+    def _prepare_args(self, device, seed=None):
+        if seed is None:
+            seed = self.seed if self.seed is not None else 42
         gen = torch.Generator(device=device).manual_seed(seed)
         q_seqlens = torch.full((self.batch_size,), self.context_size, dtype=self.dtype, device=device)
         kv_seqlens = torch.full((self.batch_size,), self.context_size, dtype=self.dtype, device=device)

@@ -1,0 +1,11 @@
+{
+    "device_id": 0,
+    "device_name": ["MetaX C500", "MetaX C600-UL", "Metax C600-U"],
+    "ne_n": [4],
+    "ne_k": [2],
+    "batch_size": [3],
+    "max_context_len": [16],
+    "req_lens": [[5, 4, 6]],
+    "dtype": ["int32"],
+    "samples": 1000
+    }

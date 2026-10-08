@@ -250,8 +250,7 @@ __global__ void fusedQKNormRopeKernel(
     *outputPtr = vec;
   }
 }
-// Borrowed from
-// https://github.com/flashinfer-ai/flashinfer/blob/8125d079a43e9a0ba463a4ed1b639cefd084cec9/include/flashinfer/pos_enc.cuh#L568
+
 #define DISPATCH_INTERLEAVE(interleave, INTERLEAVE, ...) \
   if (interleave) {                                      \
     const bool INTERLEAVE = true;                        \

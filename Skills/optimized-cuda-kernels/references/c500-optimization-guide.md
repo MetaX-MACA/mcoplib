@@ -569,6 +569,14 @@ sparse_weight = to_sparse_semi_structured(dense_weight)
 8. avoid using `ldg.u8`/`ldg.i8`，using `ldg.b32`/`ldg.b64`
 9. Each thread must read or write at least 32 bytes (assembled into large bytes for loading).
 10. warpreduce, blokcreduce
+11. double buffer
+12. Maintain sufficient occupancy
+13. Avoid branching within warp
+14. Ensure global memory access merging
+15. Use warp shuffle instead of shared memory for warp communication
+16. Reorder instructions, break dependency chains, and increase ILP
+17. Use asynchronous operations to overlap computation and memory access
+18. Verify the effect of each optimization with Nsight Compute/compiler reports
 
 ## Working Example
 
@@ -601,3 +609,341 @@ cucc -std=c++17 ./cuda_op_name.cu -o cuda_op_name -lcudart #cuda_op_name.cu实�
 #然后是否出现优化没有达到性能目标， 如果没有达到则需要ReAct模型继续进行算子优化
 #最后直到cuda kernel算子优化达到了性能目标， 则完成任务，向openclaw 网页端输出汇总后的结果，并告知最终的代码路径
 
+## Case Study: fused_silu_mul_per_group_quant (SwiGLU + Per-Group Dynamic Quantization)
+
+This kernel is a fused FFN pre-quantization op in the SGLang inference path. It merges three logically sequential steps — SwiGLU activation, per-group absmax reduction, and dynamic int8/fp8 quantization — into a single kernel launch, eliminating one full `[tokens, hidden]` global-memory round-trip.
+
+**Source:** `op/sglang/csrc/quantization/fused_silu_mul_per_group_quant.cu`
+
+### What it does
+
+```
+input: [tokens, hidden*2]   (gate | up concatenated along last dim)
+  |
+  +- y = SiLU(gate) * up          <-- SwiGLU: silu(x) = x / (1 + exp(-x))
+  +- [optional] y = clamp(y, -L, +L)   <-- swiglu_limit bounds outliers
+  |
+  +- per-group absmax (group = 128 contiguous elements)
+  |   scale = absmax / qmax
+  |
+  +- q(y) = round(y * inv_scale)   <-- int8: qmax=127, clamp[-127,127]
+                                     fp8_e4m3fn: qmax=448, cast
+
+out:    [tokens, hidden]    int8 or fp8_e4m3fn
+scales: [tokens, hidden/128] float32
+```
+
+The `swiglu_limit` clamp is applied **after** SiLU*up, **before** absmax. Bounding outliers before absmax prevents one extreme value from blowing up the group's scale and destroying quantization resolution for the other ~127 elements.
+
+#### vec kernel (hidden > 128, pointer-aligned)
+
+Replaces shared-memory reduction with **warp-shuffle subgroup reduction**. Each warp processes `GROUPS_PER_WARP` groups in parallel (VEC=8 -> 4 groups/warp, VEC=4 -> 2, VEC=2 -> 1).
+
+```c
+template <typename input_t, typename quant_t, int VEC, bool kHasLimit>
+__global__ void fused_silu_mul_per_group_quant_vec_kernel(
+    quant_t* __restrict__ out, float* __restrict__ scales,
+    const input_t* __restrict__ input, int64_t hidden, int64_t groups,
+    float swiglu_limit) {
+  constexpr int GROUP = 128;
+  constexpr int SUBGROUP_LANES = GROUP / VEC;        // VEC=8 -> 16 lanes
+  constexpr int GROUPS_PER_WARP = 64 / SUBGROUP_LANES; // VEC=8 -> 4 groups/warp
+
+  const int lane = threadIdx.x & 63;
+  const int subgroup_id = lane / SUBGROUP_LANES;
+  const int subgroup_lane = lane & (SUBGROUP_LANES - 1);
+  const int group_id = (blockIdx.x * (blockDim.x/64) + (threadIdx.x/64))
+                       * GROUPS_PER_WARP + subgroup_id;
+  if (group_id >= groups) return;
+  const int token_id = blockIdx.y;
+  const int64_t col = group_id * GROUP + subgroup_lane * VEC;
+
+  const input_t* gate = input + token_id * hidden * 2;
+  const input_t* up   = gate + hidden;
+
+  // (1) Vectorized load: one instruction reads VEC elements.
+  using InVec = AlignedArray<input_t, VEC>;
+  const InVec gate_vec = *reinterpret_cast<const InVec*>(gate + col);
+  const InVec up_vec   = *reinterpret_cast<const InVec*>(up + col);
+
+  // (2) Compute VEC SiLU*up values, track local absmax. All in registers.
+  float vals[VEC];
+  float local_absmax = 0.0f;
+  #pragma unroll
+  for (int i = 0; i < VEC; ++i) {
+    float gate_v = static_cast<float>(gate_vec.data[i]);
+    float up_v   = static_cast<float>(up_vec.data[i]);
+    float silu   = gate_v * __builtin_mxc_rcpf(1.0f + __builtin_expf(-gate_v));
+    float v = silu * up_v;
+    if constexpr (kHasLimit) v = fmaxf(-swiglu_limit, fminf(v, swiglu_limit));
+    vals[i] = v;
+    local_absmax = fmaxf(local_absmax, fabsf(v));
+  }
+
+  // (3) Warp-shuffle subgroup reduction - no shared memory, no __syncthreads.
+  #pragma unroll
+  for (int offset = SUBGROUP_LANES >> 1; offset > 0; offset >>= 1) {
+    float other = __shfl_xor_sync(0xffffffffffffffffULL, local_absmax,
+                                  offset, SUBGROUP_LANES);
+    local_absmax = fmaxf(local_absmax, other);
+  }
+
+  const float qmax = quant_qmax<quant_t>();
+  const float absmax = fmaxf(local_absmax, quant_min_absmax<quant_t>());
+  const float scale = absmax / qmax;
+  const float inv_scale = qmax * __builtin_mxc_rcpf(absmax);
+
+  if (subgroup_lane == 0) scales[token_id * groups + group_id] = scale;
+
+  // (4) Vectorized quantize + store: one instruction writes VEC elements.
+  using OutVec = AlignedArray<quant_t, VEC>;
+  OutVec out_vec;
+  #pragma unroll
+  for (int i = 0; i < VEC; ++i) out_vec.data[i] = do_quant<quant_t>(vals[i], inv_scale);
+  *reinterpret_cast<OutVec*>(out + token_id * hidden + col) = out_vec;
+}
+```
+
+### High-performance techniques used
+
+| # | Technique | Where | Why it matters on C500 |
+| - | --------- | ----- | ---------------------- |
+| 1 | **`__builtin_mxc_rcpf` reciprocal intrinsic** | `silu_mul_value`, `inv_scale` computation | Replaces FP division with SFU-backed reciprocal+multiply. Division is ~3-4x slower on C500. Used both for `1/(1+exp(-x))` inside SiLU and for `qmax/absmax` (inverted scale). |
+| 2 | **`__builtin_expf` intrinsic** | `silu_mul_value` | Metax hardware exp, faster than standard `expf`. |
+| 3 | **`if constexpr` compile-time branching** | `kHasLimit`, `quant_t` dispatch | Zero runtime cost. `kHasLimit=false` instantiations have no clamp code at all; the compiler sees a straight-line kernel. |
+| 4 | **Vectorized load/store via `AlignedArray<T,N>`** | vec kernel `*reinterpret_cast<const InVec*>(...)` | One instruction reads/writes VEC elements. fp16+VEC=8 = 16 bytes = full 128-bit transaction. Satisfies the "each thread >=32 bytes, use ldg.b128" rule. |
+| 5 | **Warp-shuffle subgroup reduction (`__shfl_xor_sync` with `SUBGROUP_LANES`)** | vec kernel absmax reduction | Register-to-register communication. No shared memory, no `__syncthreads()`. 2-3x faster than smem tree reduction. The 3rd arg `SUBGROUP_LANES` confines shuffle to the subgroup so one warp processes multiple independent groups. |
+| 6 | **One warp, multiple groups (`GROUPS_PER_WARP`)** | vec kernel topology | VEC=8 -> 4 groups/warp. Block-level parallelism scales 4x with zero smem cost. The 4 subgroups reduce independently via masked shuffle. |
+| 7 | **Shared-memory tree reduction (fallback path)** | default kernel absmax | `log2(128)=7` steps with `#pragma unroll`. Used only when hidden==128 (single group), where shuffle's multi-group advantage doesn't apply. |
+| 8 | **`#pragma unroll` on all fixed-trip loops** | reduction loops, VEC loops | Removes loop overhead, exposes ILP to the compiler. |
+| 9 | **Register-resident intermediate values** | `val` (default) / `vals[VEC]` (vec) | SiLU*up result stays in registers from computation through quantization. **Never written to global memory until after quant.** This is the core fusion benefit — saves one full `[tokens,hidden]` write+read. |
+| 10 | **Multiply by inverted scale (`x * inv_scale`)** | `ScaledQuant<quant_t, true>` | Quantization does `x * (qmax/absmax)` instead of `x / (absmax/qmax)`. Multiplication is faster than division. |
+| 11 | **`__float2int_rn` hardware rounding** | `float_to_int8_rn` | Single-instruction round-to-nearest-even + saturate via `min/max`. No software `round()` call. |
+| 12 | **`__restrict__` pointer qualifiers** | all kernel params | Tells the compiler input/output/scales don't alias, enabling aggressive load/store reordering. |
+| 13 | **Adaptive block-thread count** | dispatch picks `64/128/256/512` by hidden bucket | Keeps warps-per-block proportional to groups-per-token so no warp sits idle. |
+| 14 | **Alignment-gated vectorization** | host computes `can_vec8/4/2` | Automatically picks the widest legal vector width for the given tensor layout. Falls back gracefully when alignment is poor. |
+| 15 | **`swiglu_limit` as `bool kHasLimit` template** | clamp logic | When the caller doesn't need the clamp, a separate `kHasLimit=false` kernel instantiation is dispatched — zero branch, zero extra instructions. When enabled, it's just two `fmaxf/fminf` instructions in registers (essentially free). |
+
+### Best-practice takeaways
+
+1. **Fuse the producer into the consumer when the intermediate is large.** SiLU*up writes `[tokens, hidden]`; quant reads it back. Fusing saves 2x that tensor's bandwidth — the single biggest win here.
+2. **Prefer warp shuffle over shared memory for reductions**, *unless* the reduction spans exactly one group and the block is dedicated to it (the hidden==128 case). Shuffle avoids smem allocation and `__syncthreads`.
+3. **Use `__builtin_mxc_rcpf` everywhere a divide would appear** — both `1/(1+exp(-x))` and `qmax/absmax`. This is the highest-leverage C500-specific intrinsic for FP-heavy kernels.
+4. **Template on boolean flags (`kHasLimit`), don't branch at runtime.** The compiler elides the dead path; runtime `if` would cost a branch in every iteration.
+5. **Vectorize at the widest legal width.** Probe pointer alignment and `hidden % VEC` at host side, dispatch the widest kernel that fits. A single 128-bit load beats four 32-bit loads by ~3x on C500.
+6. **Keep the value in registers from compute through quant.** `val`/`vals[VEC]` is computed once, used twice (absmax + quant). No global re-read. This is the SREG pattern applied at thread scope.
+
+## Double Buffer & Async Pipeline Optimization
+
+Hiding global-memory latency by overlapping the next data load with the current compute is the single most impactful technique for memory-bound GEMM/quantization kernels. The pattern: split shared memory into N stage buffers; issue async loads ahead of the compute; wait only on the stage you actually need. While the MMA pipeline chews on stage k, the load pipeline fills stage k+1, k+2, ... . Three kernels in this tree implement this pattern; each uses a different C500 async primitive.
+
+### Primitive toolkit
+
+| Primitive | What it does | Where declared |
+| --------- | ------------ | -------------- |
+| `cp.async.cg.shared.global [smem], [gmem], 16` (PTX) | Async copy global -> shared, 16-byte chunk, L2-cached. Bypasses register file, goes straight to smem. | inline asm in marlin.cuh, dsv3_fused_a_gemm.cu |
+| `cp.async.commit_group` | Commit all pending cp.async into a group (a "stage"). | marlin.cuh `cp_async_fence()` |
+| `cp.async.wait_group N` | Wait until at most N groups remain pending. Lets you keep N stages in flight. | marlin.cuh `cp_async_wait<N>()` |
+| `__pipeline_commit()` / `__pipeline_wait_prior(K)` | CUDA C++ wrapper for the same cp.async commit/wait, from `<cuda_pipeline_primitives.h>`. | qserve_w4a8 |
+| `mbarrier.init.shared::cta` / `mbarrier.arrive` / `mbarrier.try_wait.parity` | Hopper-style async barrier in shared memory. Used with cp.async + `ldgsts_arrive` to signal load completion without a fence. | dsv3_fused_a_gemm.cu |
+| `ldgsts_128` / `cp.async.mbarrier.arrive.noinc` | Issue async gmem->smem load AND signal an mbarrier in one shot (no separate commit). | dsv3_fused_a_gemm.cu |
+| `ldmatrix.sync.aligned.x4.m8n8.shared.b16` | Async shared->register fragment load (feeds MMA). Paired with the wait on the stage's mbarrier. | dsv3_fused_a_gemm.cu |
+| Double-buffered registers `A_shared_warp_[iter_k % 2]` | While MMA reads buffer[0], share_to_reg fills buffer[1]. Register-level ping-pong. | qserve_w4a8 |
+
+### Case 1: dsv3_fused_a_gemm (Hopper-style mbarrier pipeline)
+
+**File:** `op/vllm/dsv3_fused_a_gemm.cu` and `op/sglang/csrc/gemm/dsv3_fused_a_gemm.cu` (the sgl copy is a 1-line-divergent fork).
+
+**Topology.** The kernel splits its 256-thread block into:
+- **4 "loader" warps** (`GmemLoaderA`, `GmemLoaderB`) — issue `cp.async.cg.shared.global` into a multi-stage smem ring buffer.
+- **4 "compute" warps** (`MmaComputer`) — wait on the mbarrier for a stage, then `ldmatrix` + `hmma` on that stage's data.
+
+Loader and compute warps run concurrently in the same block. They synchronize only via mbarrier signals — no `__syncthreads()` in the hot loop.
+
+**Stage count** is dynamic, computed at compile time from smem budget:
+
+```c
+constexpr int max_stage_cnt =
+    1024 * 192 / ((tile_m + tile_n) * tile_k * sizeof(bf16_t));   // ~2-4 typically
+constexpr int stage_cnt =
+    k_iter_cnt > max_stage_cnt ? max_stage_cnt : k_iter_cnt;
+```
+
+**Per-stage smem layout.** Each stage owns a slice of `smem_a` and `smem_b` plus a pair of mbarriers (one for "load done", one for "compute done"), forming a ring:
+
+```c
+bf16_t* smem_a = reinterpret_cast<bf16_t*>(smem + (stage_cnt * 8 * 2 + 1024) / 1024 * 1024);
+bf16_t* smem_b = smem_a + tile_m * tile_k * stage_cnt;
+// barriers live at the front of smem; 16 bytes per stage (load-arrive + compute-arrive pair)
+```
+
+**Loader main loop** (GmemLoaderA::issue_mainloop, simplified):
+
+```c
+for (int loop_idx = 0; loop_idx < k_iter_cnt; loop_idx++) {
+  if (need_wait) {
+    wait_barrier(smem_barrier + 1 + stage_idx * 2, phase_bit);   // compute done with this stage?
+  }
+  int next_stage_idx = (stage_idx + 1) == stage_cnt ? 0 : stage_idx + 1;
+  if (loop_idx != k_iter_cnt - 1) {
+    // Try non-blocking wait on NEXT stage's load-done barrier.
+    // If it returns "ready", we skip the blocking wait next iteration.
+    need_wait = !try_wait_barrier(smem_barrier + 1 + next_stage_idx * 2,
+                                  next_phase_bit);
+  }
+  // cp.async into THIS stage's smem slot
+  for (int i = 0; i < a_inst_cnt_per_iter; i++) {
+    ldgsts_128(gmem_ptr_this_iter,
+               smem_a + stage_idx * tile_m * tile_k + smem_offset, true);
+  }
+  ldgsts_arrive(smem_barrier + stage_idx * 2);   // signal: load for stage done
+  stage_idx = next_stage_idx;
+}
+```
+
+Key idea: `ldgsts_128` issues a global->smem load AND, via `cp.async.mbarrier.arrive.noinc`, signals the load-done mbarrier — the compute warps can `wait_barrier` on that same mbarrier and know exactly when the data is consumable.
+
+**Compute main loop** (MmaComputer::issue_mainloop, simplified):
+
+```c
+for (int loop_idx = 0; loop_idx < k_iter_cnt; loop_idx++) {
+  wait_barrier(smem_barrier + 0 + stage_idx * 2, phase_bit);   // wait for LOAD done on this stage
+  // ldmatrix from smem_a/b at this stage
+  for (i ...) ldsm_x4(smem_a + stage_idx * tile_m * tile_k + offset, a_reg[i]);
+  for (n ...) ldsm_x4(smem_b + stage_idx * tile_n * tile_k + offset, b_reg[n][i]);
+  // hmma on the fragments just loaded
+  for (k ...) for (n ...) hmma_16_8_16_f32acc_bf16ab(acc, a_reg, b_reg, acc);
+  arrive_barrier(smem_barrier + 1 + stage_idx * 2);  // signal: COMPUTE done with this stage
+  stage_idx = (stage_idx + 1) == stage_cnt ? 0 : stage_idx;
+}
+```
+
+**What overlaps with what.** While `MmaComputer` runs `hmma` on stage k's fragments, `GmemLoaderA/B` are issuing `cp.async` for stage k+1 (or k+2, depending on `stage_cnt`). The mbarrier pair per stage is the only synchronization. Phase bit flips each cycle through the ring so `try_wait` can poll without blocking.
+
+### Case 2: marlin W4A16 GEMM (cp.async.commit_group / wait_group pipeline)
+
+**File:** `op/sglang/csrc/gemm/marlin/marlin.cuh` (primitives) + `op/sglang/csrc/gemm/marlin/marlin_template.h` (kernel).
+
+**Stage count** is a compile-time constant:
+
+```c
+static constexpr int pipe_stages = 4;   // 4 pipeline stages fit into shared memory
+```
+
+**Per-stage smem layout** (from `marlin_template.h`):
+
+```c
+// Shared memory storage for global fetch pipelines.
+int4* sh_a = ...;                          // stages * a_sh_stage elements
+int4* sh_b = sh_a + stages * a_sh_stage;  // stages * b_sh_stage
+int4* sh_g_idx = sh_b + stages * b_sh_stage;
+int4* sh_zp  = sh_g_idx + stages * g_idx_stage;
+int4* sh_s   = sh_zp  + stages * zp_sh_stage;
+```
+
+**Stage-advance primitive** (`fetch_to_shared` lambda):
+
+```c
+auto fetch_to_shared = [&](int pipe, int a_off, bool pred = true) {
+  int4* sh_a_stage = sh_a + a_sh_stage * pipe;       // <-- ring index = pipe % stages
+  // ... cp_async4_pred(&sh_a_stage[...], gmem_ptr, pred) ...
+  int4* sh_b_stage = sh_b + b_sh_stage * pipe;
+  // ... cp_async4(&sh_b_stage[...], B_ptr[i] + j) ...
+  if (has_act_order) {
+    int4* sh_s_stage = sh_s + s_sh_stage * pipe;
+    // ... cp_async4 for scales ...
+  }
+  cp_async_fence();   // == cp.async.commit_group
+};
+```
+
+**Wait discipline** in the main loop:
+
+```c
+// after issuing 'stages' worth of fetches in the prologue
+cp_async_wait<stages - 2>();   // wait until at most stages-2 groups pending -> at least 2 ready
+// main loop: fetch next, compute current
+while (...) {
+  fetch_to_shared(pipe % stages, a_off, ...);   // issue load for stage (pipe+stages) % stages
+  cp_async_wait<stages - 2>();                  // make sure THIS stage's load is done
+  // ... compute on sh_a/b at (pipe % stages) ...
+  pipe++;
+}
+// drain
+cp_async_wait<0>();
+```
+
+The invariant: keep `stages - 1` loads in flight at all times. `wait_group N` blocks only if fewer than (max_inflight - N) groups are ready — so `wait_group<stages - 2>` lets the kernel wait on stage k while stages k+1 and k+2 are still loading.
+
+### Case 3: qserve W4A8 per-group GEMM (cuda_pipeline_primitives + register ping-pong)
+
+**File:** `op/sglang/csrc/gemm/qserve_w4a8_per_group_gemm.cu`.
+
+Uses the high-level `<cuda_pipeline_primitives.h>` API instead of raw PTX, plus a **register-level double buffer** for the loaded fragments — two levels of overlap.
+
+**Two levels of overlap:**
+
+**Level 1 — smem stages.** `STAGES` smem buffers rotate (`STAGES` is a template param, typically 2-4). Each stage holds A, B, zeros, scales for one K-tile.
+
+```c
+#include <cuda_pipeline_primitives.h>
+
+// prologue: pre-issue STAGES-1 loads before any compute
+for (k_0_0_ld = 0; k_0_0_ld < prologue_stages; ++k_0_0_ld) {
+  global_to_share_one_stage_A<...>(A_shared + ld_stage * kSmemSizeAPerStage, ...);
+  global_to_share_one_stage_B<...>(B_shared + ld_stage * kSmemSizeBPerStage, ...);
+  global_to_share_one_stage_zeros<...>(zeros_shared + ld_stage * CTA_N, ...);
+  if constexpr (STAGES > 1) __pipeline_commit();
+}
+if constexpr (STAGES > 1) __pipeline_wait_prior(STAGES - 2);
+```
+
+**Level 2 — register ping-pong.** Even within one smem stage, two register buffers rotate so that `share_to_reg` (smem -> fragment) for the next iter overlaps with `mma` on the current iter's fragments:
+
+```c
+int8_t* A_shared_warp_[2];   // double-buffered register fragments
+int8_t* B_shared_warp_[2];
+
+for (int iter_k = 0; iter_k < SHARED_K_ITERS; ++iter_k) {
+  // Load NEXT iter's fragments into the OTHER register buffer.
+  share_to_reg_one_stage_A<...>(A_shared_this_compute_stage,
+                                 A_shared_warp_[(iter_k + 1) % 2], ...);
+  share_to_reg_one_stage_B<...>(B_shared_this_compute_stage,
+                                 B_shared_warp_[(iter_k + 1) % 2], ...);
+
+  // MMA on THIS iter's fragments (already in registers from last iter's share_to_reg).
+  int8_t* A_shared_warp = A_shared_warp_[iter_k % 2];
+  int8_t* B_shared_warp = B_shared_warp_[iter_k % 2];
+  for (j ...) for (i ...) mma_m16n8k32(C_warp + ..., A_shared_warp + ..., B_shared_warp + ...);
+
+  // Issue load for the NEXT smem stage (goes into ld_stage slot).
+  if (iter_k < SHARED_K_ITERS - 1) {
+    if constexpr (STAGES == 1) __syncthreads();
+    global_to_share_one_stage_A<...>(A_shared + ld_stage * kSmemSizeAPerStage, ...);
+    // ... B, zeros ...
+    if constexpr (STAGES > 1) __pipeline_commit();
+    if constexpr (STAGES > 1) __pipeline_wait_prior(STAGES - 2);
+  }
+}
+```
+
+So at any instant the kernel is doing **three things in parallel**: MMA on fragments in register bank 0, smem->register fill of register bank 1, and gmem->smem fill of the next smem stage. Three-stage overlap from a two-level buffer scheme.
+
+### Pattern summary
+
+| Kernel | Async primitive | Stage count | Buffer level | Compute overlapped |
+| ------ | --------------- | ----------- | ------------ | ------------------ |
+| dsv3_fused_a_gemm | cp.async + mbarrier (raw PTX) | dynamic (2-4, smem-budgeted) | smem ring + registers | Hopper `hmma` 16x8x16 bf16 MMA |
+| marlin (W4A16) | cp.async.commit_group / wait_group (raw PTX) | 4 (compile-time) | smem ring | `mma.sync.aligned.m16n8k8` on int4-unpacked fragments |
+| qserve W4A8 | `__pipeline_*` high-level API | STAGES (template, 2-4) | smem ring + register ping-pong | `mma_m16n8k32` int8 |
+
+### When to apply this pattern
+
+- **GEMM where K is large** (so there are many K-tiles to pipeline). If K-tile count is less than the stage count, the prologue's `STAGES - 1` prefetches don't amortize.
+- **Memory-bound inner loop where each tile needs a fresh global load.** If the tile fits in L2 and is reused, plain synchronous load is fine.
+- **You have spare smem.** Each stage costs `tile_a + tile_b (+ scales/zeros)` bytes. Marlin's 4-stage budget is tight; dsv3 computes it dynamically to use the whole smem.
+- **You can decouple producers from consumers.** dsv3 uses separate loader warps + compute warps; marlin/qserve use a single warp that interleaves issue and wait. Both work; the split-warp variant has lower register pressure per warp but needs mbarrier for cross-warp sync.
+
+### Anti-pattern: trying to pipeline a single-group reduction
+
+Do **not** attempt this pattern for kernels like `fused_silu_mul_per_group_quant` (the previous case study). Each "stage" there computes its own absmax across the whole group — there's no K-dimension to walk through, and the absmax reduction is a barrier you cannot start the next tile past. The SREG pattern (single read, register-resident value reused for both reduce and quant) is the right tool for that shape. Multi-stage pipelines only pay off when there is an **independent sequence of data tiles** to prefetch.

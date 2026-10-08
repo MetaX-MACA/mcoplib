@@ -15,6 +15,7 @@ class Per_token_group_fp8_quant_runner(OpBenchmarkBase):
         self.group_size = config.get("group_size", 128)
         self.fp8_min = -448.0
         self.fp8_max = 448.0
+        self.seed = config.get("seed", None)
         self.eps = 1e-10
 
     def define_metrics(self, state):
@@ -35,6 +36,9 @@ class Per_token_group_fp8_quant_runner(OpBenchmarkBase):
         state.add_global_memory_writes(writes)
 
     def prepare_and_get_launcher(self, dev_id, tc_s):
+        if self.seed is not None:
+            torch.manual_seed(self.seed)
+            torch.cuda.manual_seed_all(self.seed)
         with torch.cuda.stream(tc_s):
             dev = f'cuda:{dev_id}'
             x = torch.randn(self.m, self.n, dtype=self.dtype, device=dev)

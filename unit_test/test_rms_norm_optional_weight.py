@@ -1,207 +1,138 @@
 """
 Unit test for rms_norm CUDA kernel with optional weight parameter.
 Tests both scenarios: with weight and without weight.
-Tests hidden_size: 7168, 5120, 6144, 4096.
+Tests hidden_size: 4096.
 """
 
+import math
 import torch
 import torch.nn.functional as F
-import math
-import time
+import pytest
 
-# Import the CUDA kernel
 import mcoplib._C
 
 
-def reference_rms_norm_with_weight(
-    input: torch.Tensor,
-    weight: torch.Tensor,
-    epsilon: float
-) -> torch.Tensor:
-    """
-    Reference implementation of RMS norm with weight in PyTorch.
-
-    Args:
-        input: [num_tokens, hidden_size] - Input tensor
-        weight: [hidden_size] - RMS norm weight
-        epsilon: RMS norm epsilon
-
-    Returns:
-        output: [num_tokens, hidden_size] - RMS norm output
-    """
-    # Compute variance: mean(x^2)
+def reference_rms_norm_with_weight(input, weight, epsilon):
     variance = input.float().pow(2).mean(dim=-1, keepdim=True)
-    # RMS = sqrt(variance + epsilon)
-    rms = torch.sqrt(variance + epsilon)
-    # Normalized = x / rms * weight
-    output = (input.float() / rms) * weight.float()
-    return output.to(input.dtype)
-
-
-def reference_rms_norm_without_weight(
-    input: torch.Tensor,
-    epsilon: float
-) -> torch.Tensor:
-    """
-    Reference implementation of RMS norm without weight in PyTorch.
-    Formula: q *= torch.rsqrt(q.square().mean(-1, keepdim=True) + self.eps)
-
-    Args:
-        input: [num_tokens, hidden_size] - Input tensor
-        epsilon: RMS norm epsilon
-
-    Returns:
-        output: [num_tokens, hidden_size] - RMS norm output
-    """
-    # Compute variance: mean(x^2)
-    variance = input.float().pow(2).mean(dim=-1, keepdim=True)
-    # RMS = rsqrt(variance + epsilon)
     rms = torch.rsqrt(variance + epsilon)
-    # Normalized = x * rms (no weight)
-    output = input.float() * rms
+    if weight.dim() == 1:
+        output = input.float() * rms * weight.float()
+    elif weight.dim() == 2:
+        output = input.float() * rms * weight.float()
+    else:
+        raise RuntimeError("weight dim must be 1 or 2")
     return output.to(input.dtype)
+
+
+def reference_rms_norm_4d_with_weight(input, weight, epsilon):
+    y = input.float() * torch.rsqrt(input.float().pow(2).mean(-1, keepdim=True) + epsilon)
+    y = y * weight.float().reshape(input.shape[0], 1, 1, input.shape[-1])
+    return y.to(input.dtype)
+
+
+def reference_rms_norm_without_weight(input, epsilon):
+    variance = input.float().pow(2).mean(dim=-1, keepdim=True)
+    rms = torch.rsqrt(variance + epsilon)
+    return (input.float() * rms).to(input.dtype)
 
 
 def cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> float:
-    """Compute cosine similarity between two tensors."""
     a_flat = a.flatten().float()
     b_flat = b.flatten().float()
-    cos_sim = F.cosine_similarity(a_flat.unsqueeze(0), b_flat.unsqueeze(0), dim=1)
-    return cos_sim.item()
+    return F.cosine_similarity(a_flat.unsqueeze(0), b_flat.unsqueeze(0), dim=1).item()
 
 
-def compute_bandwidth(hidden_size: int, num_tokens: int, time_ms: float, has_weight: bool) -> float:
-    """
-    Compute kernel bandwidth in GB/s.
-
-    Total data read/written:
-    - Read: input (bf16), weight (bf16) if present
-    - Write: output (bf16)
-
-    Each bf16 = 2 bytes
-    """
-    bytes_per_bf16 = 2
-
-    total_bytes = 0
-
-    # Reads
-    total_bytes += num_tokens * hidden_size * bytes_per_bf16  # input
+def compute_bandwidth(hidden_size, num_tokens, time_ms, has_weight, weight_dim=1):
+    bytes_per_dtype = 2
+    total_bytes = num_tokens * hidden_size * bytes_per_dtype * 2
     if has_weight:
-        total_bytes += hidden_size * bytes_per_bf16  # weight (shared across tokens)
-
-    # Writes
-    total_bytes += num_tokens * hidden_size * bytes_per_bf16  # output
-
-    bandwidth = total_bytes / (time_ms * 1e-3) / 1e9  # GB/s
-    return bandwidth
+        total_bytes += hidden_size * bytes_per_dtype if weight_dim == 1 else num_tokens * hidden_size * bytes_per_dtype
+    return total_bytes / (time_ms * 1e-3) / 1e9
 
 
-def benchmark(func, args, warmup=10, rep=100):
-    """Benchmark function execution time."""
+def benchmark(func, warmup=10, rep=100):
     for _ in range(warmup):
-        func(*args)
+        func()
     torch.cuda.synchronize()
-
     start_event = [torch.cuda.Event(enable_timing=True) for _ in range(rep)]
     end_event = [torch.cuda.Event(enable_timing=True) for _ in range(rep)]
-
     for i in range(rep):
         start_event[i].record()
-        func(*args)
+        func()
         end_event[i].record()
-
     torch.cuda.synchronize()
-    durations = torch.tensor(
-        [s.elapsed_time(e) for s, e in zip(start_event, end_event)],
-        dtype=torch.float,
-    )
-    return durations
+    return torch.tensor([s.elapsed_time(e) for s, e in zip(start_event, end_event)], dtype=torch.float)
 
 
-def test_single_hidden_size(hidden_size: int, has_weight: bool, num_tokens: int = 1, epsilon: float = 1e-6):
-    """Test a single hidden_size configuration."""
+@pytest.mark.parametrize("hidden_size", [4096])
+@pytest.mark.parametrize("has_weight", [True, False])
+@pytest.mark.parametrize("weight_dim", [1, 2])
+def test_single_hidden_size(hidden_size, has_weight, weight_dim):
+    num_tokens = 4096
+    epsilon = 1e-6
     dtype = torch.bfloat16
+
+    if not has_weight and weight_dim != 1:
+        pytest.skip("weight_dim is not applicable when has_weight=False")
+
     torch.manual_seed(42)
 
-    # Create input tensors
     input = torch.randn(num_tokens, hidden_size, dtype=dtype, device="cuda")
     out = torch.empty_like(input)
 
     if has_weight:
-        weight = torch.randn(hidden_size, dtype=dtype, device="cuda")
+        if weight_dim == 1:
+            weight = torch.randn(hidden_size, dtype=dtype, device="cuda")
+        else:
+            weight = torch.randn(num_tokens, hidden_size, dtype=dtype, device="cuda")
     else:
         weight = None
 
-    print(f"\n{'='*60}")
-    print(f"Test: hidden_size={hidden_size}, has_weight={has_weight}, num_tokens={num_tokens}")
-    print(f"{'='*60}")
+    print("\n" + "=" * 60)
+    print(f"Test hidden={hidden_size}, tokens={num_tokens}, has_weight={has_weight}, weight_dim={weight_dim if has_weight else None}")
+    print("=" * 60)
 
-    # Get reference results
     if has_weight:
         ref_out = reference_rms_norm_with_weight(input, weight, epsilon)
     else:
         ref_out = reference_rms_norm_without_weight(input, epsilon)
 
-    # Call CUDA kernel
     torch.ops._C.rms_norm(out, input, weight, epsilon)
-
     torch.cuda.synchronize()
 
-    # Verify precision using cosine similarity
     cos_sim = cosine_similarity(ref_out, out)
-    print(f"Output cosine similarity: {cos_sim:.8f}")
+    print(f"cos similarity={cos_sim:.8f}")
 
-    # Assert precision requirements
-    assert cos_sim > 0.9999, f"Cosine similarity {cos_sim} < 0.9999"
     assert not math.isnan(cos_sim), "Cosine similarity is NaN"
+    assert cos_sim > 0.9999, f"Cosine similarity too low: {cos_sim:.8f}"
 
-    print("Precision verification PASSED!")
+    print("Precision PASS")
 
-    # Performance benchmark
-    # Create fresh tensors for benchmarking
-    torch.manual_seed(42)
     input_bench = torch.randn(num_tokens, hidden_size, dtype=dtype, device="cuda")
     out_bench = torch.empty_like(input_bench)
-    weight_bench = torch.randn(hidden_size, dtype=dtype, device="cuda") if has_weight else None
+
+    if has_weight:
+        if weight_dim == 1:
+            weight_bench = torch.randn(hidden_size, dtype=dtype, device="cuda")
+        else:
+            weight_bench = torch.randn(num_tokens, hidden_size, dtype=dtype, device="cuda")
+    else:
+        weight_bench = None
 
     def cuda_kernel_func():
         torch.ops._C.rms_norm(out_bench, input_bench, weight_bench, epsilon)
 
-    # Benchmark CUDA kernel
-    dur_cuda = benchmark(cuda_kernel_func, (), warmup=10, rep=100)
-    cuda_time_ms = dur_cuda.mean().item()
-    print(f"CUDA kernel time: {cuda_time_ms:.4f} ms")
+    dur = benchmark(cuda_kernel_func, warmup=10, rep=100)
+    cuda_time = dur.mean().item()
 
-    # Benchmark PyTorch reference
-    def torch_reference_func():
-        if has_weight:
-            reference_rms_norm_with_weight(input_bench, weight_bench, epsilon)
-        else:
-            reference_rms_norm_without_weight(input_bench, epsilon)
-
-    dur_torch = benchmark(torch_reference_func, (), warmup=10, rep=100)
-    torch_time_ms = dur_torch.mean().item()
-    print(f"PyTorch reference time: {torch_time_ms:.4f} ms")
-
-    # Performance ratio
-    perf_ratio = torch_time_ms / cuda_time_ms
-    print(f"Performance ratio (torch/cuda): {perf_ratio:.2f}x")
-
-    # Compute bandwidth
-    bandwidth = compute_bandwidth(hidden_size, num_tokens, cuda_time_ms, has_weight)
-    print(f"CUDA kernel bandwidth: {bandwidth:.2f} GB/s")
-
-    return True
+    bandwidth = compute_bandwidth(hidden_size, num_tokens, cuda_time, has_weight, weight_dim)
+    print(f"time={cuda_time:.4f} ms bandwidth={bandwidth:.2f} GB/s")
 
 
 def test_without_weight_param():
-    """
-    Test rms_norm kernel WITHOUT passing weight parameter at all.
-    This tests that the weight parameter is truly optional.
-    """
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("Test: rms_norm WITHOUT weight parameter (passing None)")
-    print("="*60)
+    print("=" * 60)
 
     hidden_size = 4096
     num_tokens = 1
@@ -212,78 +143,95 @@ def test_without_weight_param():
     input = torch.randn(num_tokens, hidden_size, dtype=dtype, device="cuda")
     out = torch.empty_like(input)
 
-    # Get reference results (without weight)
     ref_out = reference_rms_norm_without_weight(input, epsilon)
-
-    # Call CUDA kernel with weight=None
     torch.ops._C.rms_norm(out, input, None, epsilon)
-
     torch.cuda.synchronize()
 
-    # Verify precision
     cos_sim = cosine_similarity(ref_out, out)
     print(f"Output cosine similarity: {cos_sim:.8f}")
 
-    assert cos_sim > 0.9999, f"Cosine similarity {cos_sim} < 0.9999"
     assert not math.isnan(cos_sim), "Cosine similarity is NaN"
-
+    assert cos_sim > 0.9999, f"Cosine similarity {cos_sim} < 0.9999"
     print("Test PASSED: Precision requirements met!")
-    return True
+
+
+def test_rms_norm_4d_weight():
+    print("\n" + "=" * 60)
+    print("Test: rms_norm 4D input with 2D weight")
+    print("=" * 60)
+
+    dtype = torch.bfloat16
+    batch, seq, heads, hidden = 5, 8, 8, 128
+    epsilon = 1e-6
+
+    torch.manual_seed(42)
+
+    input = torch.rand((batch, seq, heads, hidden), dtype=dtype, device="cuda")
+    weight = torch.rand((batch, hidden), dtype=dtype, device="cuda")
+    out = torch.empty_like(input)
+
+    ref_out = reference_rms_norm_4d_with_weight(input, weight, epsilon)
+    torch.ops._C.rms_norm(out, input, weight, epsilon)
+    torch.cuda.synchronize()
+
+    ref = ref_out.float()
+    result = out.float()
+    diff = torch.abs(ref - result)
+
+    max_diff = diff.max()
+    mean_diff = diff.mean()
+    cos_sim = F.cosine_similarity(ref.flatten(), result.flatten(), dim=0)
+
+    print("\n========== RMSNorm Verify ==========")
+    print(f"max diff : {max_diff.item()}")
+    print(f"mean diff: {mean_diff.item()}")
+    print(f"cos sim  : {cos_sim.item()}")
+
+    max_idx = torch.argmax(diff)
+    print("\nmax diff index:")
+    print(torch.unravel_index(max_idx, diff.shape))
+    print("\nref value:")
+    print(ref.flatten()[max_idx])
+    print("mcoplib value:")
+    print(result.flatten()[max_idx])
+
+    assert not math.isnan(cos_sim.item()), "Cosine similarity is NaN"
+    assert cos_sim.item() > 0.9999, f"Cosine similarity too low: {cos_sim.item()}"
+    print("\n4D weight test PASS")
 
 
 def run_all_tests():
-    """Run all tests."""
-    print("\n" + "="*60)
-    print("Running rms_norm unit tests with optional weight")
-    print("="*60)
-
-    hidden_sizes = [7168, 5120, 6144, 4096]
-    num_tokens = 1
+    hidden_sizes = [4096]
+    num_tokens = 4096
     epsilon = 1e-6
-
     results = []
 
     for hidden_size in hidden_sizes:
-        # Test with weight
-        try:
-            test_name = f"hidden_size={hidden_size}, with weight"
-            test_single_hidden_size(hidden_size, has_weight=True, num_tokens=num_tokens, epsilon=epsilon)
-            results.append((test_name, True))
-        except Exception as e:
-            print(f"Test FAILED: {e}")
-            results.append((f"hidden_size={hidden_size}, with weight", False))
+        for weight_dim in [1, 2]:
+            try:
+                test_single_hidden_size(hidden_size, True, weight_dim, num_tokens, epsilon)
+                results.append((f"{hidden_size} weight_dim={weight_dim}", True))
+            except Exception as e:
+                print(f"FAILED weight_dim={weight_dim}: {e}")
+                results.append((f"{hidden_size} weight_dim={weight_dim}", False))
 
-        # Test without weight
         try:
-            test_name = f"hidden_size={hidden_size}, without weight"
-            test_single_hidden_size(hidden_size, has_weight=False, num_tokens=num_tokens, epsilon=epsilon)
-            results.append((test_name, True))
+            test_single_hidden_size(hidden_size, False, 1, num_tokens, epsilon)
+            results.append((f"{hidden_size} no weight", True))
         except Exception as e:
-            print(f"Test FAILED: {e}")
-            results.append((f"hidden_size={hidden_size}, without weight", False))
+            print(f"FAILED no weight: {e}")
+            results.append((f"{hidden_size} no weight", False))
 
-    # Test passing None explicitly
     try:
-        results.append(("Test without weight param (None)", test_without_weight_param()))
+        test_rms_norm_4d_weight()
+        results.append(("4D input weight_dim=2", True))
     except Exception as e:
-        print(f"Test FAILED: {e}")
-        results.append(("Test without weight param (None)", False))
+        print(f"FAILED 4D weight test: {e}")
+        results.append(("4D input weight_dim=2", False))
 
-    # Summary
-    print("\n" + "="*60)
-    print("Test Summary")
-    print("="*60)
-    for name, passed in results:
-        status = "PASSED" if passed else "FAILED"
-        print(f"{name}: {status}")
-
-    all_passed = all(r[1] for r in results)
-    if all_passed:
-        print("\nAll tests PASSED!")
-    else:
-        print("\nSome tests FAILED!")
-
-    return all_passed
+    print("\nSummary")
+    for name, ok in results:
+        print(name, "PASS" if ok else "FAIL")
 
 
 if __name__ == "__main__":

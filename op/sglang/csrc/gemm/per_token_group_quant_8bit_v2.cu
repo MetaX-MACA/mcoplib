@@ -2,7 +2,7 @@
 #include <c10/util/Float8_e4m3fn.h>
 
 #include <cmath>
-#include <flashinfer/vec_dtypes.cuh>
+#include "vec_dtypes.cuh"
 
 #include "utils.h"
 

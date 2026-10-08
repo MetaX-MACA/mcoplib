@@ -11,6 +11,7 @@ class Gelu_new_runner(OpBenchmarkBase):
         super().__init__(name, config)
         self.batch_size = config.get("batch_size", 1024)
         self.hidden_size = config.get("hidden_size", 512)
+        self.seed = config.get("seed", None)
 
     def define_metrics(self, state):
         state.add_summary("Op", self.name)
@@ -23,6 +24,9 @@ class Gelu_new_runner(OpBenchmarkBase):
         state.add_global_memory_writes(total * element_size)
 
     def prepare_and_get_launcher(self, dev_id, tc_s):
+        if self.seed is not None:
+            torch.manual_seed(self.seed)
+            torch.cuda.manual_seed_all(self.seed)
         with torch.cuda.stream(tc_s):
             dev = f'cuda:{dev_id}'
             shape = (self.batch_size, self.hidden_size)

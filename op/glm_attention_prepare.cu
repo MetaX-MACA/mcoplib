@@ -9,6 +9,8 @@
 #include "../kernel/utils.h"
 #include "../kernel/utils.cuh"
 #include <cooperative_groups.h>
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
 
 namespace cg = cooperative_groups;
 
@@ -312,6 +314,9 @@ void FusedAttentionPrepare(torch::Tensor qkv,
                             const int max_position_embeddings,
                             const float rms_norm_eps,
                             const float partial_rotary_factor){
+    DEBUG_TRACE_PARAMS(qkv, weight, positions, out_q, out_kv, num_heads, num_kv_heads, head_dim, base, max_position_embeddings, rms_norm_eps, partial_rotary_factor);
+    DEBUG_DUMP_PARAMS(qkv, weight, positions, out_q, out_kv, num_heads, num_kv_heads, head_dim, base, max_position_embeddings, rms_norm_eps, partial_rotary_factor);
+
     TORCH_CHECK(qkv.dtype() == torch::kBFloat16);
     TORCH_CHECK(positions.dtype() == torch::kInt64);
     int positions_ndim = positions.dim();

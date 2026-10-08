@@ -19,6 +19,7 @@ class Gptq_gemm_runner(OpBenchmarkBase):
         self.k_packed = self.k // self.pack_factor
         self.num_groups = (self.k + self.groupsize - 1) // self.groupsize
         self.use_exllama = False
+        self.seed = config.get("seed", None)
 
     def define_metrics(self, state):
         state.add_summary("Op", self.name)
@@ -37,6 +38,9 @@ class Gptq_gemm_runner(OpBenchmarkBase):
         state.add_global_memory_writes(write_vol)
 
     def prepare_and_get_launcher(self, dev_id, tc_s):
+        if self.seed is not None:
+            torch.manual_seed(self.seed)
+            torch.cuda.manual_seed_all(self.seed)
         with torch.cuda.stream(tc_s):
             dev = f'cuda:{dev_id}'
             a = torch.randn(self.m, self.k, dtype=self.dtype, device=dev)

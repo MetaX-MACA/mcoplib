@@ -4,8 +4,12 @@
 #include <torch/torch.h>
 
 #include "../kernel/fused_repeat_kv_kernel.h"
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
 
 at::Tensor fused_repeat_kv_fwd(at::Tensor input, int q_num_head, int kv_num_head, int head_dim) {
+    DEBUG_TRACE_PARAMS(input, q_num_head, kv_num_head, head_dim);
+    DEBUG_DUMP_PARAMS(input, q_num_head, kv_num_head, head_dim);
 
     // mixed_x_layer seq, bs, partition, (q_num_head + kv_num_head * 2) * head_dim
     // output        seq, bs, 3, q_num_head, head_dim
@@ -77,6 +81,8 @@ at::Tensor fused_repeat_kv_fwd(at::Tensor input, int q_num_head, int kv_num_head
 
 
 at::Tensor fused_repeat_kv_bwd(at::Tensor input, int q_num_head, int kv_num_head, int partition) {
+    DEBUG_TRACE_PARAMS(input, q_num_head, kv_num_head, partition);
+    DEBUG_DUMP_PARAMS(input, q_num_head, kv_num_head, partition);
 
     // input    seq, bs, partition, (q_num_head + kv_num_head * 2) * head_dim
     // output   seq, bs, 3, q_num_head, head_dim

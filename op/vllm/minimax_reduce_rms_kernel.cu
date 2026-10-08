@@ -136,15 +136,9 @@ __device__ __forceinline__ float4 ld_global_volatile(float4* addr) {
 }
 
 __device__ __forceinline__ float ld_global_volatile(float *addr) {
-  float val;
-
-  // >>>> PTX2CPP Success <<<<
-  {
-    __threadfence();
-    (val) = ((volatile int *)(addr))[0];
-  }
-
-  return val;
+  // NOTE: must be a bit-preserving float load -- the ptx2cpp `volatile
+  // int` + int->float conversion mangled the -0.0 sentinel bits.
+  return *reinterpret_cast<float volatile*>(addr);
 }
 // __device__ __forceinline__ float ld_global_volatile(float* addr) {
 //   float val;
@@ -257,17 +251,15 @@ rsqrt(variance + eps)) in this case, max hidden_dim is 6144 (float data), for
 each token, we only need 6144 / 4 / tp_size = (1536 / tp_size) threads so we can
 assume cluster size is 1 (tp_size >= 2)
  */
-template <typename DType, int NRanks>
+// kAcc = float4 accesses per thread per token (kAcc=3 is the measured
+// optimum; anything else falls back to kAcc=1, one block per token).
+template <typename DType, int NRanks, int kAcc = 1>
 __global__ void __launch_bounds__(1024)
     minimax_reduce_rms_kernel_lamport(MiniMaxReduceRMSParams params) {
   IndexHelper<DType> index_helper(params);
-  int token_id = index_helper.token_id;
-  int access_id_in_token = index_helper.access_id_in_token;
-  int token_stride = index_helper.token_stride;
-  int access_id = index_helper.access_id;
-  int access_stride = index_helper.access_stride;
-  int tot_access = index_helper.tot_access;
   int tot_tokens = params.size_q / params.hidden_dim;
+  int accesses_per_token = params.hidden_dim / kElemsPerAccess<DType>;
+  int access_in_token = index_helper.access_id_in_token * kAcc;
   float4 clear_vec = get_neg_zero();
 
   LamportComm<NRanks> comm(params.workspace, params.rank);
@@ -275,15 +267,20 @@ __global__ void __launch_bounds__(1024)
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   asm volatile("griddepcontrol.wait;");
 #endif
-  for (int idx = access_id; idx < tot_access;
-       idx += access_stride, token_id += token_stride) {
-    alignas(16) DType vals[kElemsPerAccess<DType>];
+  for (int token_id = index_helper.token_id; token_id < tot_tokens;
+       token_id += index_helper.token_stride) {
+    alignas(16) DType vals[kAcc][kElemsPerAccess<DType>];
     float sum_variance = 0.F;
-    *reinterpret_cast<float4*>(vals) =
-        reinterpret_cast<float4*>(params.allreduce_in)[idx];
+    int base = token_id * accesses_per_token + access_in_token;
 #pragma unroll
-    for (int i = 0; i < kElemsPerAccess<DType>; ++i) {
-      sum_variance += static_cast<float>(vals[i]) * static_cast<float>(vals[i]);
+    for (int a = 0; a < kAcc; ++a) {
+      *reinterpret_cast<float4*>(vals[a]) =
+          reinterpret_cast<float4*>(params.allreduce_in)[base + a];
+#pragma unroll
+      for (int i = 0; i < kElemsPerAccess<DType>; ++i) {
+        sum_variance +=
+            static_cast<float>(vals[a][i]) * static_cast<float>(vals[a][i]);
+      }
     }
     blockReduceSumV2<float, 1>(&sum_variance);
     if (is_neg_zero(sum_variance)) {
@@ -314,28 +311,48 @@ __global__ void __launch_bounds__(1024)
       sum_variance += vars_all_ranks[r];
     }
 
-    DType norm_weight[kElemsPerAccess<DType>];
-    *reinterpret_cast<typename ElemsPerAccess<DType>::vec_type*>(norm_weight) =
-        reinterpret_cast<typename ElemsPerAccess<DType>::vec_type*>(
-            params.rms_gamma)[access_id_in_token];
-
+    // alignas(16): float4 access traps on misaligned scratch (MACA)
+    alignas(16) DType norm_weight[kAcc][kElemsPerAccess<DType>];
 #pragma unroll
-    for (int i = 0; i < kElemsPerAccess<DType>; ++i) {
-      vals[i] = static_cast<DType>(
-          static_cast<float>(vals[i]) *
-          rsqrtf(
-              (sum_variance / static_cast<float>(params.hidden_dim) / NRanks) +
-              params.rms_eps) *
-          static_cast<float>(norm_weight[i]));
+    for (int a = 0; a < kAcc; ++a) {
+      *reinterpret_cast<typename ElemsPerAccess<DType>::vec_type*>(
+          norm_weight[a]) =
+          reinterpret_cast<typename ElemsPerAccess<DType>::vec_type*>(
+              params.rms_gamma)[access_in_token + a];
     }
 
-    reinterpret_cast<float4*>(params.rms_norm_out)[idx] =
-        *reinterpret_cast<float4*>(vals);
+#pragma unroll
+    for (int a = 0; a < kAcc; ++a) {
+#pragma unroll
+      for (int i = 0; i < kElemsPerAccess<DType>; ++i) {
+        vals[a][i] = static_cast<DType>(
+            static_cast<float>(vals[a][i]) *
+            rsqrtf(
+                (sum_variance / static_cast<float>(params.hidden_dim) /
+                 NRanks) +
+                params.rms_eps) *
+            static_cast<float>(norm_weight[a][i]));
+      }
+      reinterpret_cast<float4*>(params.rms_norm_out)[base + a] =
+          *reinterpret_cast<float4*>(vals[a]);
+    }
   }
-  for (int idx = access_id; idx < clear_access; idx += access_stride) {
+  // contiguous float4 clear: every float4 of the stale slot must return
+  // to -0.0, or a leftover value fakes a "done" next round
+  for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < clear_access;
+       idx += blockDim.x * gridDim.x) {
     reinterpret_cast<float4*>(comm.clear_buf)[idx] = clear_vec;
   }
-  comm.update(params.size_q * NRanks);
+  // clear exactly this round's N*tot_tokens floats (in DType units, rounded
+  // up to a whole float4); the original size_q*NRanks overshot the slot and
+  // faulted the ATU at large T
+  int64_t clear_elems =
+      (static_cast<int64_t>(NRanks) * tot_tokens * 4 + sizeof(DType) - 1) /
+      sizeof(DType);
+  clear_elems =
+      (clear_elems + kElemsPerAccess<DType> - 1) / kElemsPerAccess<DType> *
+      kElemsPerAccess<DType>;
+  comm.update(clear_elems);
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   asm volatile("griddepcontrol.launch_dependents;");
 #endif
@@ -671,25 +688,40 @@ int get_max_active_blocks(KernelFunc kernel, int block_size,
   return std::max(max_active, 1);
 }
 
+template <typename DType, int NRanks, int kAcc>
+void minimax_rms_launch(MiniMaxReduceRMSParams const& params, int token_num,
+                        int sm_count, int block_size) {
+  int max_blocks_per_sm = get_max_active_blocks(
+      minimax_reduce_rms_kernel_lamport<DType, NRanks, kAcc>, block_size);
+  int max_grid = max_blocks_per_sm * sm_count;
+  int grid_size = std::min(max_grid, token_num);
+  minimax_reduce_rms_kernel_lamport<DType, NRanks, kAcc>
+      <<<grid_size, block_size, 0, params.stream>>>(params);
+  CUDA_CHECK(cudaGetLastError());
+}
+
 template <typename DType, int NRanks>
 void minimax_reduce_rms_kernel_launcher(MiniMaxReduceRMSParams const& params) {
   static int SM = getSMVersion();
   int token_num = params.size_q / params.hidden_dim;
   int sm_count = get_sm_count();
-  int cluster_size = 1;
-  int cluster_num = token_num;
   int threads_per_token = params.hidden_dim / kElemsPerAccess<DType>;
-  int block_size = threads_per_token;
-
-  int max_blocks_per_sm = get_max_active_blocks(
-      minimax_reduce_rms_kernel_lamport<DType, NRanks>, block_size);
-  int max_grid = max_blocks_per_sm * sm_count;
-
-  int grid_size =
-      (std::min(max_grid, cluster_num * cluster_size) / cluster_size) *
-      cluster_size;
-  minimax_reduce_rms_kernel_lamport<DType, NRanks><<<grid_size, block_size, 0, params.stream>>>(params);
-  CUDA_CHECK(cudaGetLastError());
+  // Verified optima (C500, hidden_full=6144): ws=2 -> 16-bit block 128 /
+  // fp32 256, ws=4 -> 16-bit 64 / fp32 128 -- all kAcc=3 (kAcc = float4
+  // accesses per thread, i.e. block = threads_per_token/3). Any other
+  // world size or shape keeps the original one-token-per-block launch.
+  constexpr int kTargetBlock =
+      (NRanks == 2)   ? (sizeof(DType) == 4 ? 256 : 128)
+      : (NRanks == 4) ? (sizeof(DType) == 4 ? 128 : 64)
+                      : 0;
+  if (kTargetBlock != 0 && params.hidden_dim * NRanks == 6144 &&
+      threads_per_token == kTargetBlock * 3) {
+    minimax_rms_launch<DType, NRanks, 3>(params, token_num, sm_count,
+                                         kTargetBlock);
+  } else {
+    minimax_rms_launch<DType, NRanks, 1>(params, token_num, sm_count,
+                                         threads_per_token);
+  }
 }
 
 template <typename DType, int NRanks, int OriginQDim, int OriginKDim>

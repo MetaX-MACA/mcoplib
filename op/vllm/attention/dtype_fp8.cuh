@@ -15,6 +15,7 @@ enum class Fp8KVCacheDataType {
   kAuto = 0,
   kFp8E4M3 = 1,
   kFp8E5M2 = 2,
+  kInt8 = 3,
 };
 
 inline Fp8KVCacheDataType get_fp8_kv_cache_data_type(
@@ -29,9 +30,12 @@ inline Fp8KVCacheDataType get_fp8_kv_cache_data_type(
     return Fp8KVCacheDataType::kFp8E4M3;
   } else if (dtype_str == "fp8_e5m2") {
     return Fp8KVCacheDataType::kFp8E5M2;
+  } else if (dtype_str == "int8") {
+    return Fp8KVCacheDataType::kInt8;
   }
   TORCH_CHECK(false, "Unsupported fp8 kv cache data type: ", dtype_str);
 }
+
 
 // fp8 vector types for quantization of kv cache
 template <>

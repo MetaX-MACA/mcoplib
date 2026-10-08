@@ -1,18 +1,21 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime.h>
-#include <mctlass/array.h>
-#include <mctlass/mctlass.h>
-#include <mctlass/numeric_types.h>
 #include <stdio.h>
 #include <torch/all.h>
 
 #include <cfloat>
 #include <type_traits>
+
 template <typename T, int N>
-using AlignedArray = mctlass::AlignedArray<T, N>;
-using bfloat16_t   = mctlass::bfloat16_t;
-using float16_t    = mctlass::half_t;
-using float32_t    = float;
+struct alignas(16) AlignedArray {
+  T data[N];
+  __device__ T& operator[](int index) { return data[index]; }
+  __device__ const T& operator[](int index) const { return data[index]; }
+};
+
+using bfloat16_t = at::BFloat16;
+using float16_t = at::Half;
+using float32_t = float;
 
 // QQ NOTE: to handle the case for at::Half, error: more than one operator ">" matches these operands: built-in operator
 // "arithmetic > arithmetic" function "operator>(const __half &, const __half &)"
@@ -22,7 +25,7 @@ __device__ inline bool cmp_gt(const T& a, const T& b) {
     // at::Half (or float16_t in our native case) causes ambiguity, so we cast to float.
     return static_cast<float>(a) > static_cast<float>(b);
   } else {
-    // For types like float, at::BFloat16, or cutlass::half_t / cutlass::bfloat16_t, assume operator> works as expected.
+    // at::Half or at::BFloat16 values are converted explicitly where needed.
     return a > b;
   }
 }

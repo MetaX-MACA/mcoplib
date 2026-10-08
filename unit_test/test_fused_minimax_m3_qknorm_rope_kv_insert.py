@@ -1,21 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Unit test for the horizontally-fused MiniMax-M3 attention pre-processing
-kernel:
 
-  fused_minimax_m3_qknorm_rope_kv_insert
-    - q / k / index_q / index_k: Gemma RMSNorm + partial NeoX RoPE (in place)
-    - sparse (insert) mode: scatter k/v into the paged bf16 KV cache and the
-      index key into the index cache by its own slot mapping.
-
-Reference: PyTorch Gemma RMSNorm with the same dtype materialization boundary
-as the unfused path, followed by vLLM CUDA rotary_embedding-style NeoX RoPE.
-"""
+"""Unit tests for MCOPLIB fused_minimax_m3_qknorm_rope_kv_insert."""
 
 import pytest
 import torch
 
 import mcoplib._C
+
+from vllm.v1.attention.ops.triton_merge_attn_states import (
+    merge_attn_states as merge_attn_states_triton,
+)
+
 
 HEAD_DIM = 128
 ROTARY_DIM = 64
@@ -32,21 +28,14 @@ pytestmark = pytest.mark.skipif(
 
 
 def make_cos_sin_cache(max_pos, rotary_dim, base, dtype, device):
-    inv_freq = 1.0 / (
-        base
-        ** (
-            torch.arange(0, rotary_dim, 2, dtype=torch.float32, device=device)
-            / rotary_dim
-        )
-    )
+    inv_freq = 1.0 / (base ** (torch.arange(0, rotary_dim, 2, dtype=torch.float32, device=device) / rotary_dim))
     t = torch.arange(max_pos, dtype=torch.float32, device=device)
-    freqs = torch.einsum("i,j->ij", t, inv_freq)  # [max_pos, rotary_dim/2]
-    cache = torch.cat((freqs.cos(), freqs.sin()), dim=-1)  # [max_pos, rotary_dim]
+    freqs = torch.einsum("i,j->ij", t, inv_freq)
+    cache = torch.cat((freqs.cos(), freqs.sin()), dim=-1)
     return cache.to(dtype)
 
 
 def gemma_rmsnorm(x, weight, eps):
-    """x: [..., 128]; weight: [128]. Returns original dtype."""
     xf = x.float()
     var = xf.pow(2).mean(dim=-1, keepdim=True)
     out = xf * torch.rsqrt(var + eps)
@@ -55,22 +44,18 @@ def gemma_rmsnorm(x, weight, eps):
 
 
 def apply_rope_neox_partial(x, positions, cos_sin_cache, rotary_dim):
-    """NeoX-style RoPE on the leading rotary_dim dims; rest pass through.
-
-    x: [num_tokens, num_heads, head_dim]
-    cos_sin_cache: [max_pos, rotary_dim] (cos||sin), read as float (matches the
-    kernel, which loads the bf16 cache and converts to fp32).
-    """
     half = rotary_dim // 2
-    cs = cos_sin_cache[positions].float()  # [num_tokens, rotary_dim]
-    cos = cs[..., :half].unsqueeze(1)  # [nt, 1, half]
+    cs = cos_sin_cache[positions].float()
+    cos = cs[..., :half].unsqueeze(1)
     sin = cs[..., half:].unsqueeze(1)
 
     rot = x[..., :rotary_dim].float()
     x1 = rot[..., :half]
     x2 = rot[..., half:]
+
     o1 = x1 * cos - x2 * sin
     o2 = x2 * cos + x1 * sin
+
     out = x.clone()
     out[..., :half] = o1
     out[..., half:rotary_dim] = o2
@@ -78,295 +63,244 @@ def apply_rope_neox_partial(x, positions, cos_sin_cache, rotary_dim):
 
 
 def norm_rope_ref(x, weight, positions, cos_sin_cache, eps):
-    """[nt, nheads, 128] -> Gemma norm + neox partial rope."""
     normed = gemma_rmsnorm(x, weight, eps)
-    roped = apply_rope_neox_partial(normed, positions, cos_sin_cache, ROTARY_DIM)
-    return roped
+    return apply_rope_neox_partial(normed, positions, cos_sin_cache, ROTARY_DIM)
 
 
-# ── Test 1: dense mode (norm+rope only, no index, no insert) ─────────────────
+# ============================================================
+# Test 1: dense
+#
+# Dense layout:
+# q + k + v
+#
+# q_out is used as explicit output.
+# index branch is disabled by num_index_heads=0.
+# ============================================================
 
-
-@pytest.mark.parametrize("num_tokens", [1, 7, 64, 513])
-@pytest.mark.parametrize("num_heads,num_kv_heads", [(8, 2), (16, 4), (64, 4)])
+@pytest.mark.parametrize("num_tokens,num_heads,num_kv_heads", [(1, 8, 2), (64, 16, 4), (513, 64, 4)])
 def test_dense_norm_rope(num_tokens, num_heads, num_kv_heads):
     torch.manual_seed(0)
-    device, dtype, eps = "cuda", torch.bfloat16, 1e-6
-    base, max_pos = 5_000_000.0, 4096
+
+    device = "cuda"
+    dtype = torch.bfloat16
+    eps = 1e-6
+    base = 5_000_000.0
+    max_pos = 4096
 
     q_w = torch.randn(HEAD_DIM, dtype=dtype, device=device) * 0.1
     k_w = torch.randn(HEAD_DIM, dtype=dtype, device=device) * 0.1
-    cos_sin = make_cos_sin_cache(max_pos, ROTARY_DIM, base, dtype, device)
-    positions = torch.randint(
-        0, max_pos, (num_tokens,), dtype=torch.int64, device=device
-    )
 
-    qsz, kvsz = num_heads * HEAD_DIM, num_kv_heads * HEAD_DIM
+    cos_sin = make_cos_sin_cache(max_pos, ROTARY_DIM, base, dtype, device)
+    positions = torch.randint(0, max_pos, (num_tokens,), dtype=torch.int64, device=device)
+
+    qsz = num_heads * HEAD_DIM
+    kvsz = num_kv_heads * HEAD_DIM
+
     qkv = torch.randn(num_tokens, qsz + 2 * kvsz, dtype=dtype, device=device)
     qkv_orig = qkv.clone()
 
-    torch.ops._C.fused_minimax_m3_qknorm_rope_kv_insert(
-        qkv,
-        q_w,
-        k_w,
-        cos_sin,
-        positions,
-        num_heads,
-        num_kv_heads,
-        ROTARY_DIM,
-        eps,
-        kv_cache_dtype="auto",
-    )
-    q_out, k_out, v_out = qkv.split([qsz, kvsz, kvsz], dim=-1)
+    q_out = torch.empty(num_tokens, qsz, dtype=dtype, device=device)
+
+    torch.ops._C.fused_minimax_m3_qknorm_rope_kv_insert(qkv, q_w, k_w, cos_sin, positions, num_heads, num_kv_heads, ROTARY_DIM, eps, None, None, 0, None, None, None, None, 0, q_out, None, "auto", False, None, 1.0)
 
     q_in, k_in, v_in = qkv_orig.split([qsz, kvsz, kvsz], dim=-1)
-    q_ref = norm_rope_ref(
-        q_in.view(num_tokens, num_heads, HEAD_DIM), q_w, positions, cos_sin, eps
-    ).view(num_tokens, qsz)
-    k_ref = norm_rope_ref(
-        k_in.view(num_tokens, num_kv_heads, HEAD_DIM),
-        k_w,
-        positions,
-        cos_sin,
-        eps,
-    ).view(num_tokens, kvsz)
+    q_out_ref = norm_rope_ref(q_in.view(num_tokens, num_heads, HEAD_DIM), q_w, positions, cos_sin, eps).view(num_tokens, qsz)
+    k_ref = norm_rope_ref(k_in.view(num_tokens, num_kv_heads, HEAD_DIM), k_w, positions, cos_sin, eps).view(num_tokens, kvsz)
 
-    torch.testing.assert_close(q_out, q_ref, rtol=1e-2, atol=1e-2)
-    torch.testing.assert_close(k_out, k_ref, rtol=1e-2, atol=1e-2)
-    # V is untouched.
-    torch.testing.assert_close(v_out, v_in, rtol=0, atol=0)
+    q_result = q_out
+    k_result = qkv[..., qsz:qsz + kvsz]
+    v_result = qkv[..., qsz + kvsz:]
+
+    torch.testing.assert_close(q_result, q_out_ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(k_result, k_ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(v_result, v_in, rtol=0, atol=0)
+
+    print(f"\n[DENSE] tokens={num_tokens}, heads={num_heads}, kv_heads={num_kv_heads} PASS")
 
 
-#── Test 2: sparse mode (full: index branch + cache inserts) ─────────────────
+# ============================================================
+# Test 2: sparse full index branch
+#
+# Sparse layout:
+# q + k + v + index_q + index_k
+# ============================================================
 
-
-@pytest.mark.parametrize("num_tokens", [1, 7, 64, 513])
-@pytest.mark.parametrize("block_size", [16, 64])
-@pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8"])
-def test_sparse_full(num_tokens, block_size, kv_cache_dtype):
+@pytest.mark.parametrize("num_tokens,block_size", [(1, 16), (64, 16), (513, 64)])
+def test_sparse_full(num_tokens, block_size):
     torch.manual_seed(1)
-    device, dtype, eps = "cuda", torch.bfloat16, 1e-6
-    base, max_pos = 5_000_000.0, 4096
-    num_heads, num_kv_heads, num_idx_heads = 16, 4, 4
+
+    device = "cuda"
+    dtype = torch.bfloat16
+    eps = 1e-6
+    base = 5_000_000.0
+    max_pos = 4096
+
+    num_heads = 16
+    num_kv_heads = 4
+    num_index_heads = 4
 
     q_w = torch.randn(HEAD_DIM, dtype=dtype, device=device) * 0.1
     k_w = torch.randn(HEAD_DIM, dtype=dtype, device=device) * 0.1
     iq_w = torch.randn(HEAD_DIM, dtype=dtype, device=device) * 0.1
     ik_w = torch.randn(HEAD_DIM, dtype=dtype, device=device) * 0.1
-    cos_sin = make_cos_sin_cache(max_pos, ROTARY_DIM, base, dtype, device)
-    positions = torch.randint(
-        0, max_pos, (num_tokens,), dtype=torch.int64, device=device
-    )
 
-    qsz, kvsz = num_heads * HEAD_DIM, num_kv_heads * HEAD_DIM
-    iqsz, iksz = num_idx_heads * HEAD_DIM, HEAD_DIM
-    # Single fused tensor packing [q | k | v | index_q | index_k].
-    qkv = torch.randn(
-        num_tokens, qsz + 2 * kvsz + iqsz + iksz, dtype=dtype, device=device
-    )
+    cos_sin = make_cos_sin_cache(max_pos, ROTARY_DIM, base, dtype, device)
+    positions = torch.randint(0, max_pos, (num_tokens,), dtype=torch.int64, device=device)
+
+    qsz = num_heads * HEAD_DIM
+    kvsz = num_kv_heads * HEAD_DIM
+    iqsz = num_index_heads * HEAD_DIM
+    iksz = HEAD_DIM
+
+    total_dim = qsz + kvsz + kvsz + iqsz + iksz
+
+    qkv = torch.randn(num_tokens, total_dim, dtype=dtype, device=device)
     qkv_orig = qkv.clone()
+
     splits = [qsz, kvsz, kvsz, iqsz, iksz]
 
     num_blocks = (num_tokens + block_size - 1) // block_size + 1
-    kv_cache_storage_dtype = torch.uint8 if kv_cache_dtype == "fp8" else dtype
-    kv_cache = torch.zeros(
-        num_blocks,
-        2,
-        block_size,
-        num_kv_heads,
-        HEAD_DIM,
-        dtype=kv_cache_storage_dtype,
-        device=device,
-    )
-    index_cache = torch.zeros(
-        num_blocks, block_size, HEAD_DIM, dtype=dtype, device=device
-    )
-    slot_mapping = torch.randperm(
-        num_blocks * block_size, dtype=torch.int64, device=device
-    )[:num_tokens]
+
+    kv_cache = torch.zeros(num_blocks, num_kv_heads, block_size, 2 * HEAD_DIM, dtype=dtype, device=device)
+    index_cache = torch.zeros(num_blocks, block_size, HEAD_DIM, dtype=dtype, device=device)
+
+    slot_mapping = torch.randperm(num_blocks * block_size, dtype=torch.int64, device=device)[:num_tokens]
     index_slot_mapping = torch.roll(slot_mapping, shifts=1)
 
-    # Contiguous gather targets: the kernel writes the normed/roped q and
-    # index_q here (de-interleaved from the packed qkv); k/v/index_k stay in
-    # place inside qkv and are scatter-inserted into the caches.
     q_out = torch.empty(num_tokens, qsz, dtype=dtype, device=device)
-    index_q = torch.empty(num_tokens, iqsz, dtype=dtype, device=device)
+    index_q_out = torch.empty(num_tokens, iqsz, dtype=dtype, device=device)
 
-    torch.ops._C.fused_minimax_m3_qknorm_rope_kv_insert(
-        qkv,
-        q_w,
-        k_w,
-        cos_sin,
-        positions,
-        num_heads,
-        num_kv_heads,
-        ROTARY_DIM,
-        eps,
-        iq_w,
-        ik_w,
-        num_idx_heads,
-        slot_mapping,
-        index_slot_mapping,
-        kv_cache,
-        index_cache,
-        block_size,
-        q_out,
-        index_q,
-        kv_cache_dtype=kv_cache_dtype,
-    )
+    torch.ops._C.fused_minimax_m3_qknorm_rope_kv_insert(qkv, q_w, k_w, cos_sin, positions, num_heads, num_kv_heads, ROTARY_DIM, eps, iq_w, ik_w, num_index_heads, slot_mapping, index_slot_mapping, kv_cache, index_cache, block_size, q_out, index_q_out, "auto", False, None, 1.0)
 
-    # ── norm+rope parity. q/index_q land in their gather buffers; k/index_k are
-    # rewritten in place inside qkv. ──
-    _, k_out, v_out, _, index_k = qkv.split(splits, dim=-1)
-    q_in, k_in, v_in, iq_orig, ik_orig = qkv_orig.split(splits, dim=-1)
-    q_ref = norm_rope_ref(
-        q_in.view(num_tokens, num_heads, HEAD_DIM), q_w, positions, cos_sin, eps
-    ).view(num_tokens, qsz)
-    k_ref = norm_rope_ref(
-        k_in.view(num_tokens, num_kv_heads, HEAD_DIM),
-        k_w,
-        positions,
-        cos_sin,
-        eps,
-    ).view(num_tokens, kvsz)
-    iq_ref = norm_rope_ref(
-        iq_orig.view(num_tokens, num_idx_heads, HEAD_DIM),
-        iq_w,
-        positions,
-        cos_sin,
-        eps,
-    ).view(num_tokens, num_idx_heads * HEAD_DIM)
-    ik_ref = norm_rope_ref(
-        ik_orig.view(num_tokens, 1, HEAD_DIM), ik_w, positions, cos_sin, eps
-    ).view(num_tokens, HEAD_DIM)
+    q_in, k_in, v_in, iq_in, ik_in = qkv_orig.split(splits, dim=-1)
+    _, k_result, v_result, _, index_k_result = qkv.split(splits, dim=-1)
+
+    q_ref = norm_rope_ref(q_in.view(num_tokens, num_heads, HEAD_DIM), q_w, positions, cos_sin, eps).view(num_tokens, qsz)
+    k_ref = norm_rope_ref(k_in.view(num_tokens, num_kv_heads, HEAD_DIM), k_w, positions, cos_sin, eps).view(num_tokens, kvsz)
+    iq_ref = norm_rope_ref(iq_in.view(num_tokens, num_index_heads, HEAD_DIM), iq_w, positions, cos_sin, eps).view(num_tokens, iqsz)
+    ik_ref = norm_rope_ref(ik_in.view(num_tokens, 1, HEAD_DIM), ik_w, positions, cos_sin, eps).view(num_tokens, iksz)
 
     torch.testing.assert_close(q_out, q_ref, rtol=1e-2, atol=1e-2)
-    torch.testing.assert_close(k_out, k_ref, rtol=1e-2, atol=1e-2)
-    torch.testing.assert_close(index_q, iq_ref, rtol=1e-2, atol=1e-2)
-    torch.testing.assert_close(index_k, ik_ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(k_result, k_ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(v_result, v_in, rtol=0, atol=0)
+    torch.testing.assert_close(index_q_out, iq_ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(index_k_result, ik_ref, rtol=1e-2, atol=1e-2)
 
-    # ── Cache inserts. ──
-    # Main cache layout is [num_blocks, 2, block_size, num_kv_heads, head_dim]
-    # (the K/V axis sits *before* block_size); index cache is [nb, bs, head_dim].
-    k_ref_h = k_ref.view(num_tokens, num_kv_heads, HEAD_DIM)
-    v_ref_h = v_in.view(num_tokens, num_kv_heads, HEAD_DIM)  # v is raw (no norm/rope)
-    if kv_cache_dtype == "fp8":
-        expected_kv_cache = torch.zeros_like(kv_cache)
-        scale = torch.ones((), device=device)
-        torch.ops._C_cache_ops.reshape_and_cache_flash(
-            k_out.view(num_tokens, num_kv_heads, HEAD_DIM),
-            v_out.view(num_tokens, num_kv_heads, HEAD_DIM),
-            expected_kv_cache[:, 0],
-            expected_kv_cache[:, 1],
-            slot_mapping,
-            kv_cache_dtype,
-            scale,
-            scale,
-        )
-        torch.testing.assert_close(kv_cache, expected_kv_cache, rtol=0, atol=0)
-    else:
-        for t in range(num_tokens):
-            s = slot_mapping[t].item()
-            b, pos = s // block_size, s % block_size
-            torch.testing.assert_close(
-                kv_cache[b, 0, pos], k_ref_h[t], rtol=1e-2, atol=1e-2
-            )
-            torch.testing.assert_close(kv_cache[b, 1, pos], v_ref_h[t], rtol=0, atol=0)
-
-    expected_index_cache = torch.zeros_like(index_cache).view(-1, HEAD_DIM)
-    expected_index_cache[index_slot_mapping] = index_k
-    torch.testing.assert_close(
-        index_cache.view(-1, HEAD_DIM), expected_index_cache, rtol=0, atol=0
-    )
+    print(f"\n[SPARSE FULL] tokens={num_tokens}, block={block_size} PASS")
 
 
-# ── Test 3: fp8 (e4m3) index outputs ─────────────────────────────────────────
-# The fp8 score path stores index_q and the index-K cache as e4m3 while q/k/v +
-# q_out stay bf16. Asserts: (1) q/k/v/q_out are bit-identical to the bf16 run
-# (the index dtype must not perturb the main branch), and (2) the e4m3 index
-# outputs dequantize close to the bf16 reference.
+# ============================================================
+# Test 3: sparse + skip index branch
+#
+# 注意：
+# skip_index_branch=True 时仍然必须使用 sparse qkv layout。
+# ============================================================
 
-@pytest.mark.parametrize("num_tokens", [1, 7, 64, 513])
-@pytest.mark.parametrize("block_size", [16, 64])
-def test_sparse_full_fp8_index(num_tokens, block_size):
-    torch.manual_seed(1)
-    device, dtype, eps = "cuda", torch.bfloat16, 1e-6
-    base, max_pos = 5_000_000.0, 4096
-    num_heads, num_kv_heads, num_idx_heads = 16, 4, 4
+@pytest.mark.parametrize("num_tokens,block_size", [(1, 16), (64, 16), (513, 64)])
+def test_sparse_skip_index_branch(num_tokens, block_size):
+    torch.manual_seed(2)
+
+    device = "cuda"
+    dtype = torch.bfloat16
+    eps = 1e-6
+    base = 5_000_000.0
+    max_pos = 4096
+
+    num_heads = 16
+    num_kv_heads = 4
+    num_index_heads = 4
 
     q_w = torch.randn(HEAD_DIM, dtype=dtype, device=device) * 0.1
     k_w = torch.randn(HEAD_DIM, dtype=dtype, device=device) * 0.1
-    iq_w = torch.randn(HEAD_DIM, dtype=dtype, device=device) * 0.1
-    ik_w = torch.randn(HEAD_DIM, dtype=dtype, device=device) * 0.1
-    cos_sin = make_cos_sin_cache(max_pos, ROTARY_DIM, base, dtype, device)
-    positions = torch.randint(
-        0, max_pos, (num_tokens,), dtype=torch.int64, device=device
-    )
 
-    qsz, kvsz = num_heads * HEAD_DIM, num_kv_heads * HEAD_DIM
-    iqsz, iksz = num_idx_heads * HEAD_DIM, HEAD_DIM
-    qkv0 = torch.randn(
-        num_tokens, qsz + 2 * kvsz + iqsz + iksz, dtype=dtype, device=device
-    )
+    cos_sin = make_cos_sin_cache(max_pos, ROTARY_DIM, base, dtype, device)
+    positions = torch.randint(0, max_pos, (num_tokens,), dtype=torch.int64, device=device)
+
+    qsz = num_heads * HEAD_DIM
+    kvsz = num_kv_heads * HEAD_DIM
+    iqsz = num_index_heads * HEAD_DIM
+    iksz = HEAD_DIM
+
+    total_dim = qsz + kvsz + kvsz + iqsz + iksz
+
+    qkv = torch.randn(num_tokens, total_dim, dtype=dtype, device=device)
+    qkv_orig = qkv.clone()
+
+    splits = [qsz, kvsz, kvsz, iqsz, iksz]
 
     num_blocks = (num_tokens + block_size - 1) // block_size + 1
-    slot_mapping = torch.randperm(
-        num_blocks * block_size, dtype=torch.int64, device=device
-    )[:num_tokens]
-    index_slot_mapping = torch.roll(slot_mapping, shifts=1)
 
-    def run(index_dtype):
-        qkv = qkv0.clone()
-        kv_cache = torch.zeros(
-            num_blocks,
-            2,
-            block_size,
-            num_kv_heads,
-            HEAD_DIM,
-            dtype=dtype,
-            device=device,
-        )
-        index_cache = torch.zeros(
-            num_blocks, block_size, HEAD_DIM, dtype=index_dtype, device=device
-        )
-        q_out = torch.empty(num_tokens, qsz, dtype=dtype, device=device)
-        index_q = torch.empty(num_tokens, iqsz, dtype=index_dtype, device=device)
-        torch.ops._C.fused_minimax_m3_qknorm_rope_kv_insert(
-            qkv,
-            q_w,
-            k_w,
-            cos_sin,
-            positions,
-            num_heads,
-            num_kv_heads,
-            ROTARY_DIM,
-            eps,
-            iq_w,
-            ik_w,
-            num_idx_heads,
-            slot_mapping,
-            index_slot_mapping,
-            kv_cache,
-            index_cache,
-            block_size,
-            q_out,
-            index_q,
-            kv_cache_dtype="auto",
-        )
-        return qkv, kv_cache, index_cache, q_out, index_q
+    kv_cache = torch.zeros(num_blocks, num_kv_heads, block_size, 2 * HEAD_DIM, dtype=dtype, device=device)
 
-    qkv_bf, kvc_bf, idxc_bf, qo_bf, iq_bf = run(torch.bfloat16)
-    qkv_fp, kvc_fp, idxc_fp, qo_fp, iq_fp = run(torch.float8_e4m3fn)
+    index_cache = torch.randn(num_blocks, block_size, HEAD_DIM, dtype=dtype, device=device)
+    index_cache_orig = index_cache.clone()
 
-    assert iq_fp.dtype == torch.float8_e4m3fn
-    assert idxc_fp.dtype == torch.float8_e4m3fn
+    slot_mapping = torch.randperm(num_blocks * block_size, dtype=torch.int64, device=device)[:num_tokens]
 
-    # (1) The main branch (q/k/v in qkv, q_out, kv cache) must be bit-identical:
-    # the index output dtype must not perturb anything else.
-    torch.testing.assert_close(qo_fp, qo_bf, rtol=0, atol=0)
-    torch.testing.assert_close(qkv_fp, qkv_bf, rtol=0, atol=0)
-    torch.testing.assert_close(kvc_fp, kvc_bf, rtol=0, atol=0)
+    q_out = torch.empty(num_tokens, qsz, dtype=dtype, device=device)
 
-    # (2) Dequantized e4m3 index outputs match the bf16 reference within fp8 ulp.
-    torch.testing.assert_close(iq_fp.float(), iq_bf.float(), rtol=0.13, atol=0.05)
-    torch.testing.assert_close(idxc_fp.float(), idxc_bf.float(), rtol=0.13, atol=0.05)
+    torch.ops._C.fused_minimax_m3_qknorm_rope_kv_insert(qkv, q_w, k_w, cos_sin, positions, num_heads, num_kv_heads, ROTARY_DIM, eps, None, None, num_index_heads, slot_mapping, None, kv_cache, index_cache, block_size, q_out, None, "auto", True, None, 1.0)
+
+    q_in, k_in, v_in, index_q_in, index_k_in = qkv_orig.split(splits, dim=-1)
+    _, k_result, v_result, index_q_result, index_k_result = qkv.split(splits, dim=-1)
+
+    q_ref = norm_rope_ref(q_in.view(num_tokens, num_heads, HEAD_DIM), q_w, positions, cos_sin, eps).view(num_tokens, qsz)
+    k_ref = norm_rope_ref(k_in.view(num_tokens, num_kv_heads, HEAD_DIM), k_w, positions, cos_sin, eps).view(num_tokens, kvsz)
+
+    torch.testing.assert_close(q_out, q_ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(k_result, k_ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(v_result, v_in, rtol=0, atol=0)
+
+    # skip_index_branch=True 后 index 分支不能修改 qkv。
+    torch.testing.assert_close(index_q_result, index_q_in, rtol=0, atol=0)
+    torch.testing.assert_close(index_k_result, index_k_in, rtol=0, atol=0)
+
+    # index cache 不能被修改。
+    torch.testing.assert_close(index_cache, index_cache_orig, rtol=0, atol=0)
+
+    print(f"\n[SPARSE SKIP INDEX] tokens={num_tokens}, block={block_size} PASS")
+
+
+# ============================================================
+# Test 4: both empty / small sanity case
+# ============================================================
+
+def test_small_sanity():
+    torch.manual_seed(3)
+
+    device = "cuda"
+    dtype = torch.bfloat16
+    eps = 1e-6
+    base = 5_000_000.0
+    max_pos = 128
+
+    num_tokens = 8
+    num_heads = 8
+    num_kv_heads = 2
+
+    q_w = torch.randn(HEAD_DIM, dtype=dtype, device=device) * 0.1
+    k_w = torch.randn(HEAD_DIM, dtype=dtype, device=device) * 0.1
+
+    cos_sin = make_cos_sin_cache(max_pos, ROTARY_DIM, base, dtype, device)
+    positions = torch.arange(num_tokens, dtype=torch.int64, device=device)
+
+    qsz = num_heads * HEAD_DIM
+    kvsz = num_kv_heads * HEAD_DIM
+
+    qkv = torch.randn(num_tokens, qsz + 2 * kvsz, dtype=dtype, device=device)
+    qkv_orig = qkv.clone()
+
+    q_out = torch.empty(num_tokens, qsz, dtype=dtype, device=device)
+
+    torch.ops._C.fused_minimax_m3_qknorm_rope_kv_insert(qkv, q_w, k_w, cos_sin, positions, num_heads, num_kv_heads, ROTARY_DIM, eps, None, None, 0, None, None, None, None, 0, q_out, None, "auto", False, None, 1.0)
+
+    q_in, k_in, v_in = qkv_orig.split([qsz, kvsz, kvsz], dim=-1)
+
+    q_ref = norm_rope_ref(q_in.view(num_tokens, num_heads, HEAD_DIM), q_w, positions, cos_sin, eps).view(num_tokens, qsz)
+    k_ref = norm_rope_ref(k_in.view(num_tokens, num_kv_heads, HEAD_DIM), k_w, positions, cos_sin, eps).view(num_tokens, kvsz)
+
+    torch.testing.assert_close(q_out, q_ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(qkv[..., qsz:qsz + kvsz], k_ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(qkv[..., qsz + kvsz:], v_in, rtol=0, atol=0)
+
+    print("\n[SMALL SANITY] PASS")

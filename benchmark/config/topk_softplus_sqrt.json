@@ -1,0 +1,11 @@
+{
+    "device_id": 0,
+    "device_name": ["MetaX C500", "MetaX C600-UL", "Metax C600-U"],
+    "scenario_id": 5,
+    "num_tokens": 4096,
+    "renormalize": true,
+    "dtype": "bfloat16",
+    "routed_scaling_factor": 1.0,
+    "use_correction_bias": true,
+    "samples": 1000
+}

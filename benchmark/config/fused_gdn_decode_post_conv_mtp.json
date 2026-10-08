@@ -1,0 +1,14 @@
+{
+    "device_id": 0,
+    "device_name": ["MetaX C500", "MetaX C600-UL", "Metax C600-U"],
+    "num_tokens": [8],
+    "tp_size": 16,
+    "state_width": 8,
+    "state_dtype": "float32",
+    "norm_dtype": "bfloat16",
+    "dt_bias_dtype": "float16",
+    "seed": 0,
+    "scale": 0.08838834764831843,
+    "norm_eps": 1e-6,
+    "samples": 1000
+}

@@ -18,6 +18,7 @@ class Awq_dequantize_runner(OpBenchmarkBase):
         self.split_k_iters = config.get("split_k_iters", 0)
         self.thx = config.get("thx", 0)
         self.thy = config.get("thy", 0)
+        self.seed = config.get("seed", None)
         
         assert self.out_c % 8 == 0, "out_c must be divisible by 8"
         assert self.in_c % self.group_size == 0, "in_c must be divisible by group_size"
@@ -43,6 +44,9 @@ class Awq_dequantize_runner(OpBenchmarkBase):
         state.add_global_memory_writes(int(write_bytes))
 
     def prepare_and_get_launcher(self, dev_id, tc_s):
+        if self.seed is not None:
+            torch.manual_seed(self.seed)
+            torch.cuda.manual_seed_all(self.seed)
         with torch.cuda.stream(tc_s):
             dev = f'cuda:{dev_id}'
             kernel = torch.randint(-2**31, 2**31-1, (self.in_c, self.qout_c), dtype=torch.int32, device=dev)

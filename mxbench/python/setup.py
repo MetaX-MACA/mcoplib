@@ -85,9 +85,17 @@ def get_maca_version():
 
 
 def get_maca_version_list():
-    """Parse MACA version into list of integers"""
-    version_str = get_maca_version()
-    version_list = list(map(int, (version_str or "0.0.0.0").split('.')))
+    """Parse the four numeric CMake components of a MACA SDK version.
+
+    Version.txt may append a target suffix, for example 3.8.2.11.c600u.
+    The suffix belongs to the package version string, but is not a numeric
+    CMake version component.
+    """
+    parts = (get_maca_version() or "0.0.0.0").split('.')[:4]
+    version_list = []
+    for part in parts:
+        digits = part.split('-', 1)[0]
+        version_list.append(int(digits) if digits.isdigit() else 0)
     version_list.extend([0] * (4 - len(version_list)))
     return version_list
 

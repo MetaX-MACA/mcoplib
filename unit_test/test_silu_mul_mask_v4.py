@@ -1,13 +1,13 @@
 import torch
 import os
-# from mcoplid.profiler import profiler
-import mcoplid.op as op
-# import mcoplid.sgl_kernel
-from mcoplid.op import silu_mul_mask
+# from mcoplib.profiler import profiler
+import mcoplib.op as op
+# import mcoplibd.sgl_kernel
+from mcoplib.op import silu_mul_mask
 import triton
 import triton.language as tl
 from typing import Optional, Tuple, Union
-from mcoplid.profiler import profiler
+from mcoplib.profiler import profiler
 
 FP8_DTYPE = 1
 
@@ -47,7 +47,7 @@ def _silu_and_mul_masked_kernel(
     output_ptr_offs = output_ptr + expert_id * stride_output_0 + offs_in_d
 
     # Main processing loop
-    for token_index in tl.range(token_num_cur_expert, block_num_per_expert, num_stages=NUM_STAGE):
+    for token_index in tl.range(0, token_num_cur_expert, num_stages=NUM_STAGE):
         token_id, token_num_cur_expert
         # Load gate and up values
         gate = tl.load(

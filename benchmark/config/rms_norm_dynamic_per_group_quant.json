@@ -1,9 +1,9 @@
 {
-    "num_tokens": 32,
+    "num_tokens": 2048,
     "hidden_size": 7168,
     "group_size": 128,
     "eps": 1e-06,
     "dtype": "float16",
-    "device_name": "MetaX C500",
+    "device_name": ["MetaX C500", "MetaX C600-UL", "Metax C600-U"],
     "samples": 1000
 }

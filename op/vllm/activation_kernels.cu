@@ -18,16 +18,23 @@ __device__ __forceinline__ scalar_t compute(const scalar_t& x,
                                             const scalar_t& y,
                                             const float limit,
                                             const float alpha,
-                                            const float beta) {
+                                            const float beta,
+                                            const bool step4) {
   if constexpr (act_first) {
     scalar_t gate = x;
     scalar_t up = y;
     if constexpr (HAS_CLAMP) {
-      gate = (scalar_t)fminf((float)gate, limit);
-      up = (scalar_t)fmaxf(fminf((float)up, limit), -limit);
+      if (step4) {
+        up = (scalar_t)fmaxf(fminf((float)up, limit), -limit);
+      } else {
+        gate = (scalar_t)fminf((float)gate, limit);
+        up = (scalar_t)fmaxf(fminf((float)up, limit), -limit);
+      }
     }
-    
-    return (scalar_t)(ACT_FN(gate, alpha) * ((float)up + beta));
+
+    const float activated = (float)ACT_FN(gate, alpha);
+    return (scalar_t)((step4 ? fminf(activated, limit) : activated) *
+                      ((float)up + beta));
   } else {
     scalar_t gate = x;
     scalar_t up = y;
@@ -49,22 +56,32 @@ __device__ __forceinline__ packed_t packed_compute(
     const packed_t& y,
     const float limit,
     const float alpha,
-    const float beta) {
+    const float beta,
+    const bool step4) {
   if constexpr (act_first) {
     packed_t gate = x;
     packed_t up = y;
     float2 u = cast_to_float2(up);
 
     if constexpr (HAS_CLAMP) {
-      float2 g = cast_to_float2(gate);
-      g.x = fminf(g.x, limit);
-      g.y = fminf(g.y, limit);
-      u.x = fmaxf(fminf(u.x, limit), -limit);
-      u.y = fmaxf(fminf(u.y, limit), -limit);
-      gate = cast_to_packed<packed_t>(g);
+      if (step4) {
+        u.x = fmaxf(fminf(u.x, limit), -limit);
+        u.y = fmaxf(fminf(u.y, limit), -limit);
+      } else {
+        float2 g = cast_to_float2(gate);
+        g.x = fminf(g.x, limit);
+        g.y = fminf(g.y, limit);
+        gate = cast_to_packed<packed_t>(g);
+        u.x = fmaxf(fminf(u.x, limit), -limit);
+        u.y = fmaxf(fminf(u.y, limit), -limit);
+      }
     }
 
     float2 activated = cast_to_float2(PACKED_ACT_FN(gate, alpha));
+    if (step4) {
+      activated.x = fminf(activated.x, limit);
+      activated.y = fminf(activated.y, limit);
+    }
     activated.x *= (u.x + beta);
     activated.y *= (u.y + beta);
 
@@ -106,7 +123,8 @@ __global__ void act_and_mul_kernel(
     const int d,
     const float limit,
     const float alpha,
-    const float beta) {
+    const float beta,
+    const bool step4) {
   const scalar_t* x_ptr = input + blockIdx.x * 2 * d;
   const scalar_t* y_ptr = x_ptr + d;
   scalar_t* out_ptr = out + blockIdx.x * d;
@@ -143,7 +161,8 @@ __global__ void act_and_mul_kernel(
                 y.elts[j],
                 limit,
                 alpha,
-                beta);
+                beta,
+                step4);
       }
 
       if constexpr (use_256b) {
@@ -166,7 +185,8 @@ __global__ void act_and_mul_kernel(
               y,
               limit,
               alpha,
-              beta);
+              beta,
+              step4);
     }
   }
 }
@@ -251,7 +271,7 @@ packed_gelu_tanh_kernel(const packed_t& val, const float /*alpha*/) {
 // clamped (max only) and up input is clamped (both sides) before the
 // activation function is applied.
 #define LAUNCH_ACTIVATION_GATE_KERNEL(KERNEL, PACKED_KERNEL, ACT_FIRST, \
-                                      HAS_CLAMP, LIMIT, ALPHA, BETA)     \
+                                      HAS_CLAMP, LIMIT, ALPHA, BETA, STEP4)     \
 auto dtype = input.scalar_type();                                        \
 int d = input.size(-1) / 2;                                              \
 int64_t num_tokens = input.numel() / input.size(-1);                     \
@@ -282,7 +302,8 @@ if (use_vec) {                                                           \
           d,                                                             \
           LIMIT,                                                         \
           ALPHA,                                                         \
-          BETA);                                                         \
+          BETA,                                                          \
+          STEP4);                                                         \
     });                                                                  \
   } else {                                                               \
     VLLM_DISPATCH_FLOATING_TYPES(dtype, "act_and_mul_kernel", [&] {      \
@@ -296,7 +317,7 @@ if (use_vec) {                                                           \
           d,                                                             \
           LIMIT,                                                         \
           ALPHA,                                                         \
-          BETA);                                                         \
+          BETA, STEP4);                                                         \
     });                                                                  \
   }                                                                      \
 } else {                                                                 \
@@ -312,29 +333,443 @@ if (use_vec) {                                                           \
         d,                                                               \
         LIMIT,                                                           \
         ALPHA,                                                           \
-        BETA);                                                           \
+        BETA, STEP4);                                                           \
   });                                                                    \
 }
+
+namespace vllm {
+
+template <typename T>
+__device__ __forceinline__ float silu_mul_scalar(float g, float u) {
+  // silu(g) * u = g * sigmoid(g) * u = (g / (1 + e^{-g})) * u
+  float sig = __builtin_mxc_rcpf(1.0f + __builtin_expf(-g));
+  return g * sig * u;
+}
+
+template <typename scalar_t, typename cuda_t, int VEC>
+__global__ void silu_and_mul_fast_kernel(
+    scalar_t* __restrict__ out,          // [num_tokens, d]
+    const scalar_t* __restrict__ input,  // [num_tokens, 2*d]
+    const int d,
+    const int num_vecs) {                // d / VEC (whole 128-bit vectors)
+  using vec_t = int4;  // 16 bytes = VEC elements (VEC = 16/sizeof(scalar_t))
+
+  const int64_t row = blockIdx.y;
+  const cuda_t* __restrict__ gate_ptr =
+      reinterpret_cast<const cuda_t*>(input) + row * 2 * (int64_t)d;
+  const cuda_t* __restrict__ up_ptr = gate_ptr + d;
+  cuda_t* __restrict__ out_ptr =
+      reinterpret_cast<cuda_t*>(out) + row * (int64_t)d;
+
+  const vec_t* __restrict__ gate_v = reinterpret_cast<const vec_t*>(gate_ptr);
+  const vec_t* __restrict__ up_v = reinterpret_cast<const vec_t*>(up_ptr);
+  vec_t* __restrict__ out_v = reinterpret_cast<vec_t*>(out_ptr);
+
+  // Coalesced block-strided loop over the row's whole vectors. grid.x blocks
+  // cooperate on one row, so the stride is (blocks-per-row * threads).
+  const int stride = gridDim.x * blockDim.x;
+  for (int vidx = blockIdx.x * blockDim.x + threadIdx.x; vidx < num_vecs;
+       vidx += stride) {
+    vec_t vg = __ldg(&gate_v[vidx]);
+    vec_t vu = __ldg(&up_v[vidx]);
+    cuda_t* g = reinterpret_cast<cuda_t*>(&vg);
+    cuda_t* u = reinterpret_cast<cuda_t*>(&vu);
+    vec_t vo;
+    cuda_t* o = reinterpret_cast<cuda_t*>(&vo);
+    if constexpr (std::is_same_v<cuda_t, half>) {
+      half2* g2 = reinterpret_cast<half2*>(&vg);
+      half2* u2 = reinterpret_cast<half2*>(&vu);
+      half2* o2 = reinterpret_cast<half2*>(&vo);
+      const half2 neg_log2e = __float2half2_rn(-1.4426950408889634f);
+      const half2 one = __float2half2_rn(1.0f);
+#pragma unroll
+      for (int k = 0; k < VEC / 2; ++k) {
+        half2 e = h2exp2(__hmul2(g2[k], neg_log2e));
+        half2 sig = h2rcp(__hadd2(one, e));
+        o2[k] = __hmul2(g2[k], __hmul2(sig, u2[k]));
+      }
+    } else {
+#pragma unroll
+      for (int k = 0; k < VEC; ++k) {
+        o[k] = (cuda_t)silu_mul_scalar<cuda_t>((float)g[k], (float)u[k]);
+      }
+    }
+    out_v[vidx] = vo;
+  }
+}
+
+// Scalar (non-vectorized) variant used when the per-row hidden size `d` is not
+// a multiple of the 128-bit vector width, which would make `up_ptr` /
+// `out_ptr` misaligned for 16-byte loads (e.g. d = 1537, 257). Still uses the
+// 2D (col_tiles, num_tokens) grid so occupancy stays high for small batch.
+template <typename scalar_t, typename cuda_t>
+__global__ void silu_and_mul_scalar_kernel(
+    scalar_t* __restrict__ out,          // [num_tokens, d]
+    const scalar_t* __restrict__ input,  // [num_tokens, 2*d]
+    const int d) {
+  const int64_t row = blockIdx.y;
+  const cuda_t* __restrict__ gate_ptr =
+      reinterpret_cast<const cuda_t*>(input) + row * 2 * (int64_t)d;
+  const cuda_t* __restrict__ up_ptr = gate_ptr + d;
+  cuda_t* __restrict__ out_ptr =
+      reinterpret_cast<cuda_t*>(out) + row * (int64_t)d;
+
+  const int stride = gridDim.x * blockDim.x;
+  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < d; i += stride) {
+    float gf = (float)__ldg(&gate_ptr[i]);
+    float uf = (float)__ldg(&up_ptr[i]);
+    out_ptr[i] = (cuda_t)silu_mul_scalar<cuda_t>(gf, uf);
+  }
+}
+
+// silu_and_mul_with_clamp math, all in fp32:
+//   legacy: out = silu_a(min(g, limit)) * (clamp(u, +-limit) + beta)
+//   step4:  out = min(silu_a(g), limit) * (clamp(u, +-limit) + beta)
+// sigmoid via the native mxcc builtins (mirrors silu_mul_scalar above).
+__device__ __forceinline__ float silu_clamp_mul_scalar(
+    float g, float u, const float limit, const float alpha, const float beta,
+    const bool step4) {
+  u = fmaxf(fminf(u, limit), -limit);
+  if (!step4) {
+    g = fminf(g, limit);
+  }
+  const float sig = __builtin_mxc_rcpf(1.0f + __builtin_expf(-g * alpha));
+  if (step4) {
+    return fminf(g * sig, limit) * (u + beta);
+  }
+  return g * sig * (u + beta);
+}
+
+// Per-128-bit-vector clamp math shared by the 2D and flat kernels.
+// fp16 uses half2 SIMD; bf16/fp32 stay in fp32 scalars (bf16x2 clamps were
+// measured as a net regression on MACA).
+template <typename cuda_t, int VEC>
+__device__ __forceinline__ int4 silu_clamp_mul_vec(
+    const int4& vg, const int4& vu, const float limit, const float alpha,
+    const float beta, const bool step4) {
+  int4 vo;
+  if constexpr (std::is_same_v<cuda_t, half>) {
+    const half2* g2 = reinterpret_cast<const half2*>(&vg);
+    const half2* u2 = reinterpret_cast<const half2*>(&vu);
+    half2* o2 = reinterpret_cast<half2*>(&vo);
+    const half2 lim2 = __float2half2_rn(limit);
+    const half2 nlim2 = __float2half2_rn(-limit);
+    // sigmoid(alpha*g) = rcp(1 + 2^(-alpha*log2(e)*g))
+    const half2 neg_log2e_alpha =
+        __float2half2_rn(-1.4426950408889634f * alpha);
+    const half2 one = __float2half2_rn(1.0f);
+    const half2 beta2 = __float2half2_rn(beta);
+#pragma unroll
+    for (int k = 0; k < VEC / 2; ++k) {
+      half2 g = g2[k];
+      half2 u = __hmax2(__hmin2(u2[k], lim2), nlim2);
+      if (!step4) {
+        g = __hmin2(g, lim2);
+      }
+      half2 sig = h2rcp(__hadd2(one, h2exp2(__hmul2(g, neg_log2e_alpha))));
+      half2 act = __hmul2(g, sig);
+      if (step4) {
+        act = __hmin2(act, lim2);
+      }
+      o2[k] = __hmul2(act, __hadd2(u, beta2));
+    }
+  } else {
+    const cuda_t* g = reinterpret_cast<const cuda_t*>(&vg);
+    const cuda_t* u = reinterpret_cast<const cuda_t*>(&vu);
+    cuda_t* o = reinterpret_cast<cuda_t*>(&vo);
+#pragma unroll
+    for (int k = 0; k < VEC; ++k) {
+      o[k] = (cuda_t)silu_clamp_mul_scalar((float)g[k], (float)u[k], limit,
+                                           alpha, beta, step4);
+    }
+  }
+  return vo;
+}
+
+// Clamped variant of silu_and_mul_fast_kernel: same 2D (col_tiles, rows)
+// grid and 128-bit vector layout.
+template <typename scalar_t, typename cuda_t, int VEC>
+__global__ void silu_and_mul_clamp_fast_kernel(
+    scalar_t* __restrict__ out,          // [num_tokens, d]
+    const scalar_t* __restrict__ input,  // [num_tokens, 2*d]
+    const int d,
+    const int num_vecs,                  // d / VEC (whole 128-bit vectors)
+    const float limit,
+    const float alpha,
+    const float beta,
+    const bool step4) {
+  using vec_t = int4;  // 16 bytes = VEC elements (VEC = 16/sizeof(scalar_t))
+
+  const int64_t row = blockIdx.y;
+  const cuda_t* __restrict__ gate_ptr =
+      reinterpret_cast<const cuda_t*>(input) + row * 2 * (int64_t)d;
+  const cuda_t* __restrict__ up_ptr = gate_ptr + d;
+  cuda_t* __restrict__ out_ptr =
+      reinterpret_cast<cuda_t*>(out) + row * (int64_t)d;
+
+  const vec_t* __restrict__ gate_v = reinterpret_cast<const vec_t*>(gate_ptr);
+  const vec_t* __restrict__ up_v = reinterpret_cast<const vec_t*>(up_ptr);
+  vec_t* __restrict__ out_v = reinterpret_cast<vec_t*>(out_ptr);
+
+  const int stride = gridDim.x * blockDim.x;
+  for (int vidx = blockIdx.x * blockDim.x + threadIdx.x; vidx < num_vecs;
+       vidx += stride) {
+    vec_t vg = __ldg(&gate_v[vidx]);
+    vec_t vu = __ldg(&up_v[vidx]);
+    out_v[vidx] =
+        silu_clamp_mul_vec<cuda_t, VEC>(vg, vu, limit, alpha, beta, step4);
+  }
+}
+
+// Flat cross-row variant for rows whose vec count is not a multiple of the
+// warp width: small d strands whole warps (d=96 -> 12/64 lanes), larger
+// non-aligned d strands the tail tile (d=864 -> 108 = 64+44, 44/64 on the
+// second tile). Linearize [rows x num_vecs] instead and recover the row with
+// one integer division per 128-bit vector -- much cheaper than the idle
+// lanes it reclaims.
+template <typename scalar_t, typename cuda_t, int VEC>
+__global__ void silu_and_mul_clamp_flat_kernel(
+    scalar_t* __restrict__ out,          // [num_tokens, d]
+    const scalar_t* __restrict__ input,  // [num_tokens, 2*d]
+    const int d,
+    const int num_vecs,                  // d / VEC
+    const int total_vecs,                // num_tokens * num_vecs (fits int32)
+    const float limit,
+    const float alpha,
+    const float beta,
+    const bool step4) {
+  using vec_t = int4;
+  const int v = blockIdx.x * blockDim.x + threadIdx.x;
+  if (v >= total_vecs) {
+    return;
+  }
+  const int row = v / num_vecs;
+  const int col = v - row * num_vecs;
+  const cuda_t* __restrict__ gate_ptr =
+      reinterpret_cast<const cuda_t*>(input) + (int64_t)row * 2 * d;
+  const vec_t* __restrict__ gate_v =
+      reinterpret_cast<const vec_t*>(gate_ptr);
+  const vec_t* __restrict__ up_v =
+      reinterpret_cast<const vec_t*>(gate_ptr + d);
+  vec_t* __restrict__ out_v =
+      reinterpret_cast<vec_t*>(reinterpret_cast<cuda_t*>(out) +
+                               (int64_t)row * d);
+  out_v[col] = silu_clamp_mul_vec<cuda_t, VEC>(__ldg(&gate_v[col]),
+                                               __ldg(&up_v[col]), limit,
+                                               alpha, beta, step4);
+}
+
+// Scalar (non-vectorized) clamp variant for d not divisible by the 128-bit
+// vector width; keeps the 2D (col_tiles, rows) grid so occupancy stays high.
+template <typename scalar_t, typename cuda_t>
+__global__ void silu_and_mul_clamp_scalar_kernel(
+    scalar_t* __restrict__ out,          // [num_tokens, d]
+    const scalar_t* __restrict__ input,  // [num_tokens, 2*d]
+    const int d,
+    const float limit,
+    const float alpha,
+    const float beta,
+    const bool step4) {
+  const int64_t row = blockIdx.y;
+  const cuda_t* __restrict__ gate_ptr =
+      reinterpret_cast<const cuda_t*>(input) + row * 2 * (int64_t)d;
+  const cuda_t* __restrict__ up_ptr = gate_ptr + d;
+  cuda_t* __restrict__ out_ptr =
+      reinterpret_cast<cuda_t*>(out) + row * (int64_t)d;
+
+  const int stride = gridDim.x * blockDim.x;
+  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < d; i += stride) {
+    const float gf = (float)__ldg(&gate_ptr[i]);
+    const float uf = (float)__ldg(&up_ptr[i]);
+    out_ptr[i] =
+        (cuda_t)silu_clamp_mul_scalar(gf, uf, limit, alpha, beta, step4);
+  }
+}
+
+}  // namespace vllm
 
 void silu_and_mul(torch::Tensor& out,    // [..., d]
                   torch::Tensor& input)  // [..., 2 * d]
 {
-  LAUNCH_ACTIVATION_GATE_KERNEL(vllm::silu_kernel, vllm::packed_silu_kernel,
-                                true, false, 0.0f, 1.0f, 0.0f);
+  const int d = input.size(-1) / 2;
+  if (d == 1537){ //avoid Performance regression
+    LAUNCH_ACTIVATION_GATE_KERNEL(vllm::silu_kernel, vllm::packed_silu_kernel,
+                                true, false, 0.0f, 1.0f, 0.0f, false);
+
+  } else{
+    const int64_t num_tokens = input.numel() / input.size(-1);
+    if (num_tokens == 0 || d == 0) {
+      return;
+    }
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    const int sm_count = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+
+    // Tunables (overridable via env for autotuning; sensible defaults baked in).
+    static const int ENV_THREADS = [] {
+      const char* e = getenv("SILU_THREADS");
+      int v = e ? atoi(e) : 64;
+      if (v < 64) v = 64;
+      if (v > 1024) v = 1024;
+      return (v / 64) * 64;  // multiple of warp (64)
+    }();
+    static const int ENV_WAVES = [] {
+      const char* e = getenv("SILU_WAVES");
+      int v = e ? atoi(e) : 8;
+      if (v < 1) v = 1;
+      if (v > 64) v = 64;
+      return v;
+    }();
+
+    VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "silu_and_mul_fast", [&] {
+      using cuda_t = typename vllm::CUDATypeConverter<scalar_t>::Type;
+      constexpr int VEC = 16 / sizeof(scalar_t);  // 8 for bf16/fp16
+      // Vector path requires each row's gate/up/out slice to be 16-byte aligned.
+      // Given PyTorch's 256-byte base alignment, that holds iff d % VEC == 0.
+      const bool use_vec = (d % VEC == 0);
+      const int num_vecs = use_vec ? (d / VEC) : 0;
+      const int items = use_vec ? num_vecs : d;
+
+      const int target_blocks = sm_count * ENV_WAVES;
+
+      int threads = ENV_THREADS;
+      if (items > 0 && items < threads) {
+        threads = ((items + 63) / 64) * 64;
+        if (threads < 64) threads = 64;
+      }
+
+      // Full-row tiling: blocks to cover the row once (1 item/thread).
+      int max_tiles = (items + threads - 1) / threads;
+      if (max_tiles < 1) max_tiles = 1;
+      int col_tiles = max_tiles;
+
+      // For small batch, add column tiles so num_tokens*col_tiles fills all SMs.
+      if (num_tokens < (int64_t)target_blocks) {
+        int want = (int)((target_blocks + num_tokens - 1) / num_tokens);
+        if (want < 1) want = 1;
+        if (col_tiles < want) col_tiles = want;
+        if (col_tiles > max_tiles) col_tiles = max_tiles;
+      }
+
+      dim3 grid(col_tiles, num_tokens);
+      dim3 block(threads);
+      if (use_vec) {
+        vllm::silu_and_mul_fast_kernel<scalar_t, cuda_t, VEC>
+            <<<grid, block, 0, stream>>>(out.data_ptr<scalar_t>(),
+                                        input.data_ptr<scalar_t>(), d, num_vecs);
+      } else {
+        vllm::silu_and_mul_scalar_kernel<scalar_t, cuda_t>
+            <<<grid, block, 0, stream>>>(out.data_ptr<scalar_t>(),
+                                        input.data_ptr<scalar_t>(), d);
+      }
+    });
+}
 }
 
 void silu_and_mul_clamp(torch::Tensor& out,
                         torch::Tensor& input,
                         double limit,
                         double alpha /* = 1.0 */,
-                        double beta /* = 0.0 */) {
-  LAUNCH_ACTIVATION_GATE_KERNEL(vllm::silu_kernel,
-                                vllm::packed_silu_kernel,
-                                true,
-                                true,
-                                (float)limit,
-                                (float)alpha,
-                                (float)beta);
+                        double beta /* = 0.0 */,
+                        bool step4 /* = false */) {
+  const int d = input.size(-1) / 2;
+  const int64_t num_tokens = input.numel() / input.size(-1);
+  if (num_tokens == 0 || d == 0) {
+    return;
+  }
+
+
+  const bool over_cap = num_tokens > 65535;
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const int sm_count =
+      at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+
+  // Tunables (overridable via env for autotuning; defaults mirror
+  // silu_and_mul's SILU_THREADS / SILU_WAVES).
+  static const int ENV_THREADS = [] {
+    const char* e = getenv("SILU_CLAMP_THREADS");
+    int v = e ? atoi(e) : 64;
+    if (v < 64) v = 64;
+    if (v > 1024) v = 1024;
+    return (v / 64) * 64;  // multiple of warp (64)
+  }();
+  static const int ENV_WAVES = [] {
+    const char* e = getenv("SILU_CLAMP_WAVES");
+    int v = e ? atoi(e) : 8;
+    if (v < 1) v = 1;
+    if (v > 64) v = 64;
+    return v;
+  }();
+  static const int ENV_FLAT_THREADS = [] {
+    const char* e = getenv("SILU_CLAMP_FLAT_THREADS");
+    int v = e ? atoi(e) : 256;
+    if (v < 64) v = 64;
+    if (v > 1024) v = 1024;
+    return (v / 64) * 64;  // multiple of warp (64)
+  }();
+  VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "silu_and_mul_clamp_fast",
+                               [&] {
+    using cuda_t = typename vllm::CUDATypeConverter<scalar_t>::Type;
+    constexpr int VEC = 16 / sizeof(scalar_t);  // 8 for bf16/fp16
+    // Vector path requires each row's gate/up/out slice to be 16-byte
+    // aligned; with PyTorch's 256-byte base alignment that holds iff
+    // d % VEC == 0.
+    const bool use_vec = (d % VEC == 0);
+    const int num_vecs = use_vec ? (d / VEC) : 0;
+    const int items = use_vec ? num_vecs : d;
+
+    const int target_blocks = sm_count * ENV_WAVES;
+
+    int threads = ENV_THREADS;
+    if (items > 0 && items < threads) {
+      threads = ((items + 63) / 64) * 64;
+      if (threads < 64) threads = 64;
+    }
+
+    // Full-row tiling: blocks to cover the row once (1 item/thread).
+    int max_tiles = (items + threads - 1) / threads;
+    if (max_tiles < 1) max_tiles = 1;
+    int col_tiles = max_tiles;
+
+    // For small batch, add column tiles so num_tokens*col_tiles fills all SMs.
+    if (num_tokens < (int64_t)target_blocks) {
+      int want = (int)((target_blocks + num_tokens - 1) / num_tokens);
+      if (want < 1) want = 1;
+      if (col_tiles < want) col_tiles = want;
+      if (col_tiles > max_tiles) col_tiles = max_tiles;
+    }
+
+    dim3 grid(col_tiles, num_tokens);
+    dim3 block(threads);
+    if (use_vec && (over_cap || num_vecs < 64 || num_vecs % 64 != 0)) {
+      // Rows whose vec count is not warp-aligned (d=96 -> 12; d=864 -> 108 =
+      // 64+44): 2D row-tiling strands the tail tile's lanes (44/64 for
+      // d=864, 84% utilization) while the flat layout packs ~100% of them;
+      // the per-vector int division hides behind memory at bandwidth-bound
+      // sizes (proven at d=96) and small T is launch-bound either way.
+      // num_tokens <= 65535 here (guard above), so total fits int32.
+      const int total_vecs = (int)(num_tokens * num_vecs);
+      const int flat_grid =
+          (total_vecs + ENV_FLAT_THREADS - 1) / ENV_FLAT_THREADS;
+      vllm::silu_and_mul_clamp_flat_kernel<scalar_t, cuda_t, VEC>
+          <<<flat_grid, ENV_FLAT_THREADS, 0, stream>>>(
+              out.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(), d,
+              num_vecs, total_vecs, (float)limit, (float)alpha, (float)beta,
+              step4);
+    } else if (use_vec) {
+      vllm::silu_and_mul_clamp_fast_kernel<scalar_t, cuda_t, VEC>
+          <<<grid, block, 0, stream>>>(
+              out.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(), d,
+              num_vecs, (float)limit, (float)alpha, (float)beta, step4);
+    } else {
+      vllm::silu_and_mul_clamp_scalar_kernel<scalar_t, cuda_t>
+          <<<grid, block, 0, stream>>>(
+              out.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(), d,
+              (float)limit, (float)alpha, (float)beta, step4);
+    }
+  });
 }
 
 void mul_and_silu(torch::Tensor& out,    // [..., d]
@@ -343,21 +778,21 @@ void mul_and_silu(torch::Tensor& out,    // [..., d]
   // The difference between mul_and_silu and silu_and_mul is that mul_and_silu
   // applies the silu to the latter half of the input.
   LAUNCH_ACTIVATION_GATE_KERNEL(vllm::silu_kernel, vllm::packed_silu_kernel,
-                                false, false, 0.0f, 1.0f, 0.0f);
+                                false, false, 0.0f, 1.0f, 0.0f, false);
 }
 
 void gelu_and_mul(torch::Tensor& out,    // [..., d]
                   torch::Tensor& input)  // [..., 2 * d]
 {
   LAUNCH_ACTIVATION_GATE_KERNEL(vllm::gelu_kernel, vllm::packed_gelu_kernel,
-                                true, false, 0.0f, 1.0f, 0.0f);
+                                true, false, 0.0f, 1.0f, 0.0f, false);
 }
 
 void gelu_tanh_and_mul(torch::Tensor& out,    // [..., d]
                        torch::Tensor& input)  // [..., 2 * d]
 {
   LAUNCH_ACTIVATION_GATE_KERNEL(
-      vllm::gelu_tanh_kernel, vllm::packed_gelu_tanh_kernel, true, false, 0.0f, 1.0f, 0.0f);
+      vllm::gelu_tanh_kernel, vllm::packed_gelu_tanh_kernel, true, false, 0.0f, 1.0f, 0.0f, false);
 }
 
 namespace vllm {
@@ -495,6 +930,66 @@ __global__ void swigluoai_and_mul_kernel(
   }
 }
 
+// SITU (Kimi SituGLU) gated activation. Non-interleaved layout:
+// input = [gate(d), up(d)] per token.
+//   gate_out = beta * tanh(gate / beta) * sigmoid(gate)
+//   up_out   = (linear_beta > 0) ? linear_beta * tanh(up / linear_beta) : up
+//   out      = gate_out * up_out
+// Compute is done in fp32 and written straight to `out` -- no intermediate
+// tensors and no full-tensor fp32 upcast (the pure-torch forward_native
+// allocated ~8 fp32 temporaries per call, which blows up MoE profiling).
+template <typename scalar_t>
+__global__ void situ_and_mul_kernel(
+    scalar_t* __restrict__ out,          // [..., d]
+    const scalar_t* __restrict__ input,  // [..., 2, d]
+    const int d, const float beta, const float linear_beta) {
+  const int64_t row = blockIdx.x;
+  const scalar_t* gate_ptr = input + row * 2 * d;
+  const scalar_t* up_ptr = gate_ptr + d;
+  scalar_t* out_ptr = out + row * d;
+  const bool clamp_up = linear_beta > 0.0f;
+  const float inv_beta = 1.0f / beta;
+  const float inv_linear_beta = clamp_up ? 1.0f / linear_beta : 0.0f;
+  for (int64_t idx = threadIdx.x; idx < d; idx += blockDim.x) {
+    const float g = (float)VLLM_LDG(&gate_ptr[idx]);
+    const float u = (float)VLLM_LDG(&up_ptr[idx]);
+    const float gate_out = beta * tanhf(g * inv_beta) / (1.0f + expf(-g));
+    const float up_out =
+        clamp_up ? linear_beta * tanhf(u * inv_linear_beta) : u;
+    out_ptr[idx] = (scalar_t)(gate_out * up_out);
+  }
+}
+
+template <typename scalar_t>
+__global__ void masked_situ_and_mul_kernel(
+    scalar_t* __restrict__ out, const scalar_t* __restrict__ input,
+    const int* __restrict__ expert_num_tokens, const int max_num_tokens,
+    const int d, const float beta, const float linear_beta) {
+  const int expert = blockIdx.y;
+  const int num_tokens = expert_num_tokens[expert];
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= d || num_tokens == 0) {
+    return;
+  }
+
+  const bool clamp_up = linear_beta > 0.0f;
+  const float inv_beta = 1.0f / beta;
+  const float inv_linear_beta = clamp_up ? 1.0f / linear_beta : 0.0f;
+  const int64_t expert_row = static_cast<int64_t>(expert) * max_num_tokens;
+  for (int token = 0; token < num_tokens; ++token) {
+    const int64_t row = expert_row + token;
+    const scalar_t* gate_ptr = input + row * 2 * d;
+    const scalar_t* up_ptr = gate_ptr + d;
+    scalar_t* out_ptr = out + row * d;
+    const float g = (float)VLLM_LDG(&gate_ptr[idx]);
+    const float u = (float)VLLM_LDG(&up_ptr[idx]);
+    const float gate_out = beta * tanhf(g * inv_beta) / (1.0f + expf(-g));
+    const float up_out =
+        clamp_up ? linear_beta * tanhf(u * inv_linear_beta) : u;
+    out_ptr[idx] = (scalar_t)(gate_out * up_out);
+  }
+}
+
 }  // namespace vllm
 
 #define LAUNCH_ACTIVATION_GATE_KERNEL_WITH_PARAM(KERNEL, PACKED_KERNEL, PARAM) \
@@ -578,6 +1073,59 @@ void swigluoai_and_mul(torch::Tensor& out,    // [..., d]
                        torch::Tensor& input,  // [..., 2 * d]
                        double alpha, double limit) {
   LAUNCH_SIGLUOAI_AND_MUL(vllm::swigluoai_and_mul, alpha, limit);
+}
+
+// Kimi SITU gated activation. `linear_beta <= 0` means "unset" (up passed
+// through), matching SituAndMul(linear_beta=None) on the Python side.
+void situ_and_mul(torch::Tensor& out,    // [..., d]
+                  torch::Tensor& input,  // [..., 2 * d]
+                  double beta, double linear_beta) {
+  int d = input.size(-1) / 2;
+  int64_t num_tokens = input.numel() / input.size(-1);
+  if (num_tokens == 0) {
+    return;
+  }
+  dim3 grid(num_tokens);
+  dim3 block(std::min(d, 1024));
+  const at::cuda::CUDAGuard device_guard(input.device());
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  VLLM_DISPATCH_FLOATING_TYPES(
+      input.scalar_type(), "situ_and_mul_kernel", [&] {
+        vllm::situ_and_mul_kernel<scalar_t><<<grid, block, 0, stream>>>(
+            out.mutable_data_ptr<scalar_t>(), input.const_data_ptr<scalar_t>(),
+            d, (float)beta, (float)linear_beta);
+      });
+}
+
+void masked_situ_and_mul(torch::Tensor& out,    // [E, T, d]
+                         torch::Tensor& input,  // [E, T, 2 * d]
+                         const torch::Tensor& expert_num_tokens,
+                         double beta, double linear_beta) {
+  TORCH_CHECK(out.dim() == 3 && input.dim() == 3 &&
+                  out.size(0) == input.size(0) &&
+                  out.size(1) == input.size(1) &&
+                  out.size(2) * 2 == input.size(2),
+              "masked_situ_and_mul: expected out=[E,T,d], input=[E,T,2*d] "
+              "(check argument order), got out size ",
+              out.sizes(), ", input size ", input.sizes());
+  int num_experts = input.size(0);
+  int max_num_tokens = input.size(1);
+  int d = input.size(2) / 2;
+  if (num_experts == 0 || max_num_tokens == 0) {
+    return;
+  }
+  constexpr int block_size = 256;
+  dim3 grid((d + block_size - 1) / block_size, num_experts);
+  dim3 block(block_size);
+  const at::cuda::CUDAGuard device_guard(input.device());
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  VLLM_DISPATCH_FLOATING_TYPES(
+      input.scalar_type(), "masked_situ_and_mul_kernel", [&] {
+        vllm::masked_situ_and_mul_kernel<scalar_t><<<grid, block, 0, stream>>>(
+            out.mutable_data_ptr<scalar_t>(), input.const_data_ptr<scalar_t>(),
+            expert_num_tokens.const_data_ptr<int>(), max_num_tokens, d,
+            (float)beta, (float)linear_beta);
+      });
 }
 namespace vllm {
 
@@ -694,6 +1242,14 @@ __device__ __forceinline__ T gelu_quick_kernel(const T& x) {
   return (T)(((float)x) / (1.0f + expf(-1.702f * (float)x)));
 }
 
+template <typename T>
+__device__ __forceinline__ T relu_squared_kernel(const T& x) {
+  // relu(x)^2 — introduced in https://arxiv.org/abs/2109.08668v2
+  const float f = (float)x;
+  const float val = f > 0.0f ? f : 0.0f;
+  return (T)(val * val);
+}
+
 }  // namespace vllm
 
 void gelu_new(torch::Tensor& out,    // [..., d]
@@ -712,4 +1268,10 @@ void gelu_quick(torch::Tensor& out,    // [..., d]
                 torch::Tensor& input)  // [..., d]
 {
   LAUNCH_ACTIVATION_KERNEL(vllm::gelu_quick_kernel);
+}
+
+void relu_squared(torch::Tensor& out,    // [..., d]
+                  torch::Tensor& input)  // [..., d]
+{
+  LAUNCH_ACTIVATION_KERNEL(vllm::relu_squared_kernel);
 }

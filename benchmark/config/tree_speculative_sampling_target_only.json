@@ -1,14 +1,15 @@
 {
     "device_id": 0,
-    "device_name": "MetaX C500",
-    "batch_size": 256,
+    "device_name": ["MetaX C500", "MetaX C600-UL", "Metax C600-U"],
+    "batch_size": 4096,
     "num_spec_step": 8,
-    "num_draft_tokens": 16,
-    "tot_num_draft_tokens": 4096,
+    "num_draft_tokens": 32,
+    "tot_num_draft_tokens": 131072,
     "vocab_size": 32000,
     "threshold_single": 0.5,
     "threshold_acc": 0.8,
     "deterministic": true,
     "dtype": "float32",
+    "seed": 42,
     "samples": 1000
 }

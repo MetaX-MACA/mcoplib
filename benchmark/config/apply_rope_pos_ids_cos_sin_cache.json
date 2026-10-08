@@ -1,6 +1,6 @@
 {
     "device_id": 0,
-    "device_name": "MetaX C500",
+    "device_name": ["MetaX C500", "MetaX C600-UL", "Metax C600-U"],
     "dtype": "bfloat16",
     "nnz": 81920,
     "num_q_heads": 32,
@@ -10,5 +10,6 @@
     "max_seq_len": 32768,
     "interleave": false,
     "enable_pdl": false,
+    "seed": 42,
     "samples": 1000
 }

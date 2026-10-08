@@ -1,19 +1,21 @@
 #include "core/registration.h"
 #include "moe_ops.h"
 
+#include <torch/csrc/stable/library.h>
+
 TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
   // Apply topk softmax to the gating outputs.
   m.def(
       "topk_softmax(Tensor! topk_weights, Tensor! topk_indices, Tensor! "
       "token_expert_indices, Tensor gating_output, bool renormalize, Tensor? "
-      "bias) -> ()");
+      "bias, Tensor? is_padding) -> ()");
   m.impl("topk_softmax", torch::kCUDA, &topk_softmax);
 
   // Apply topk sigmoid to the gating outputs.
   m.def(
       "topk_sigmoid(Tensor! topk_weights, Tensor! topk_indices, Tensor! "
-      "token_expert_indices, Tensor gating_output, bool renormalize, Tensor? "
-      "bias) -> ()");
+      "token_expert_indices, Tensor gating_output, bool renormalize, "
+      "Tensor? bias, float routed_scaling_factor, Tensor? is_padding) -> ()");
   m.impl("topk_sigmoid", torch::kCUDA, &topk_sigmoid);
 
 
@@ -21,13 +23,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
       "topk_softplus_sqrt(Tensor! topk_weights, Tensor! topk_indices, Tensor! "
       "token_expert_indices, Tensor gating_output, bool renormalize, float "
       "routed_scaling_factor, Tensor? "
-      "bias, Tensor? input_ids, Tensor? tid2eid) -> ()");
+      "bias, Tensor? input_ids, Tensor? tid2eid, Tensor? is_padding, Tensor? bias_vl=None, int image_sentinel_lo=0) -> ()");
   m.impl("topk_softplus_sqrt", torch::kCUDA, &topk_softplus_sqrt);
-
-  // Calculate the result of moe by summing up the partial results
-  // from all selected experts.
-  m.def("moe_sum(Tensor input, Tensor! output) -> ()");
-  m.impl("moe_sum", torch::kCUDA, &moe_sum);
 
   // Aligning the number of tokens to be processed by each expert such
   // that it is divisible by the block size.
@@ -110,6 +107,18 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
       "Tensor)");
   m.impl("grouped_topk", torch::kCUDA, &grouped_topk);
 
+  // DeepSeek V3 optimized router GEMM for SM90+
+  m.def("dsv3_router_gemm(Tensor! output, Tensor mat_a, Tensor mat_b) -> ()");
+  // conditionally compiled so impl registration is in source file
+
+}
+STABLE_TORCH_LIBRARY_FRAGMENT(_moe_C, m) {
+      m.def(
+      "moe_sum(Tensor input, Tensor! output, Tensor? topk_ids=None, "
+      "Tensor? expert_map=None) -> ()");
+}
+STABLE_TORCH_LIBRARY_IMPL(_moe_C, CUDA, m) {
+    m.impl("moe_sum", TORCH_BOX(&moe_sum));
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)

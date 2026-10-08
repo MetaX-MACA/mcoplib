@@ -1,6 +1,6 @@
 {
     "device_id": 0,
-    "device_name": "MetaX C500",
+    "device_name": ["MetaX C500", "MetaX C600-UL", "Metax C600-U"],
     "total_pool_blocks": 65536,
     "num_blocks_to_copy": 16384,
     "elements_per_block": 4096,

@@ -11,6 +11,7 @@ class Copy_to_gpu_no_ce_runner(OpBenchmarkBase):
         super().__init__(name, config)
         self.N = config.get("N", 64)
         self.dtype = torch.int32
+        self.seed = config.get("seed", None)
         if self.N not in [64, 72]:
             print(f"[Warning] copy_to_gpu_no_ce only supports N=64 or N=72. Resetting N={self.N} to 64.")
             self.N = 64
@@ -26,6 +27,8 @@ class Copy_to_gpu_no_ce_runner(OpBenchmarkBase):
         state.add_global_memory_writes(total_elements * element_size)
 
     def prepare_and_get_launcher(self, dev_id, tc_s):
+        if self.seed is not None:
+            torch.manual_seed(self.seed)
         with torch.cuda.stream(tc_s):
             dev = f'cuda:{dev_id}'
             input_cpu = torch.randint(0, 1000, (self.N,), dtype=self.dtype, device='cpu').contiguous()

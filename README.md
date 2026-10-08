@@ -149,113 +149,168 @@ export BUILD_VLLM_SUBMODULE=OFF  BUILD_SGLANG_SUBMODULE=OFF BUILD_LMDEPLOY_SUBMO
 ```
 
 ## 动态控制算子入参信息终端输出或参数dump到本地磁盘
-```shell
-#开启算子入参信息输出到终端（包括数据类型，shape 等信息）
-export MCOP_DEBUG_TRACE=1
-# 启用 dump
-export MCOP_DEBUG_PARAMS_DUMP=1
+### 一、功能概述
 
-# （可选）配置采样数量
-export MCOP_TENSOR_DUMP_SAMPLE_SIZE=20
-# 或 dump 所有 tensor 数据（可选）
-export MCOP_TENSOR_DUMP_FULL=1
+每个算子入口函数里埋了两行宏，运行期可以在不重新编译的情况下，通过环境变量打开，打印或落盘该算子的入参：
+
+- `DEBUG_TRACE_PARAMS(...)` —— 把入参的 shape / dtype / device / 值打印到终端。
+- `DEBUG_DUMP_PARAMS(...)` —— 把入参序列化成 JSON，写到磁盘。
+---
+### 二、运行流程
+
+#1、环境参数
+
+| 变量 | 作用 | 默认 | 取值 |
+|---|---|---|---|
+| `MCOP_DEBUG_TRACE` | 终端打印 把算子输入参数打印在终端 | 关 | `1`/`ON`/`on` |
+| `MCOP_DEBUG_PARAMS_DUMP` | JSON 落盘 把算子输入参数dump到本地磁盘 | 关 | `1`/`ON`/`on` |
+| `MCOP_DEBUG_FILTER` | 指定功能 要调试哪些算子 | 关（未设置=不触发） | `all` / 逗号分隔子串 |
+| `MCOP_TENSOR_DUMP_SAMPLE_SIZE` | 每个 tensor 采样多少个元素（前 N + 后 N，共 2N） | `20` | 正整数 |
+| `MCOP_TENSOR_DUMP_FULL` | 全量 dump 整个 tensor，不采样 | 关 | 非 `0` 即开 |
+| `MCOP_DEBUG_DUMP_MAX_CALLS` | 每个算子最多记录多少次调用（trace/dump 共用） | `20` | 正整数 |
+| `MCOP_DEBUG_DUMP_DIR` | dump 输出目录（配合 sitecustomize.py 一个命令一个文件夹） | 无（自动生成带时间戳目录） | 目录路径 |
+
+#2、打印启动流程
+
+```bash
+export MCOP_DEBUG_TRACE=1               # 打开终端打印 算子输入参数打印在终端
+export MCOP_DEBUG_PARAMS_DUMP=1         # 打开 JSON 落盘 算子输入参数dump到本地磁盘
+export MCOP_DEBUG_FILTER=all            # 指定功能 要调试哪些算子
+
 ```
-### 算子入参Dump本地示例
+- 只设 `MCOP_DEBUG_TRACE=1`、不设 `FILTER` → 什么都不打印（`FILTER` 未设置等于"一个算子都不选"）。
+- 只设 `MCOP_DEBUG_FILTER=all`、不开trace/dump → 什么都不打印（没有指定输出格式）。
+- trace/dump的两个开关彼此独立，可以只开一个
+```
+**取值约定**：
+trace/dump两个开关用 `1` / `ON` / `on` 表示打开
+filter开关 `MCOP_DEBUG_FILTER` 详解
 
+```bash
+export MCOP_DEBUG_FILTER=all                  # 所有算子
+export MCOP_DEBUG_FILTER=fused_rope           # 函数名包含 "fused_rope" 的算子（子串匹配）
+export MCOP_DEBUG_FILTER=fused_rope,rms_norm  # 多个，逗号分隔，前后空格会被去掉
+```
+
+### 三、算子入参Dump本地示例
+#sample 1 ：打印指定算子 `fused_silu_mul_dq_reorder_quant`
+#(1)启动打印
+
+```bash
+export MCOP_DEBUG_TRACE=1
+export MCOP_DEBUG_PARAMS_DUMP=1
+export MCOP_DEBUG_FILTER=fused_silu_mul_dq
+python unit_test/test_fused_silu_mul_dq_reorder_quant.py
+```
+#（2）输出文件 `mcoplib_op_params_dump_时间戳/fused_silu_mul_dq_quant_reordered_topk_interface.json`
 ```json
 {
-  "function": "fused_moe_gate_deepseek",
+  "function": "fused_silu_mul_dq_quant_reordered_topk_interface",
   "parameters": [
     {
-      "name": "gating_outputs",
+      "name": "out",
       "type": "at::Tensor",
-      "dtype": "Half",
-      "shape": "[16, 448]",
-      "value": "[0.480469, 0.894531, 0.0356445, 0.0322266, 0.498047, 0.899902, 0.887207, 0.763672, 0.192871, 0.271484, ..., 0.730469, 0.484375, 0.0517578, 0.4375, 0.507812, 0.979492, 0.42041, 0.184082, 0.825195, 0.395508] (showing 20 of 7168 elements, set MCOP_TENSOR_DUMP_FULL=1 for all) [data_ptr=0x7f43fbc00000]",
-      "bytes": 14336
+      "dtype": "Char",
+      "shape": "[512, 2048]",
+      "value": "[... (unsupported dtype: Char), ..., ... (unsupported dtype: Char)] (showing 40 of 1048576 elements, set MCOP_TENSOR_DUMP_FULL=1 for all) [data_ptr=0x7f56c0200000]",
+      "bytes": 1048576
     },
     {
-      "name": "correction_bias",
-      "type": "at::Tensor",
-      "dtype": "Half",
-      "shape": "[448]",
-      "value": "[0.0732422, 0.508789, 0.522461, 0.0961914, 0.373535, 0.535645, 0.0454102, 0.862305, 0.300781, 0.5625, ..., 0.757324, 0.407227, 0.803711, 0.134766, 0.777344, 0.895996, 0.731445, 0.388184, 0.0571289, 0.395996] (showing 20 of 448 elements, set MCOP_TENSOR_DUMP_FULL=1 for all) [data_ptr=0x7f43fbc03800]",
-      "bytes": 896
-    },
-    {
-      "name": "out_routing_weights",
+      "name": "scale",
       "type": "at::Tensor",
       "dtype": "Float",
-      "shape": "[16, 8]",
-      "value": "[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ..., 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] (showing 20 of 128 elements, set MCOP_TENSOR_DUMP_FULL=1 for all) [data_ptr=0x7f43fbc03c00]",
-      "bytes": 512
+      "shape": "[512, 1]",
+      "value": "[5.19539, 6.94539, 5.13291, 5.88289, 5.0704, 5.50795, 5.75788, 3.9727, 5.7579, 5.13291, 5.47667, 3.55082, 5.85164, 6.16416, 7.16413, 4.50789, 4.75789, 5.25792, 8.26583, 6.60168, ..., 4.59375, 4.3125, 5.8125, 7.28125, 6.5, 4.5625, 4.96875, 5.5625, 5.3125, 6.5625, 4.90625, 7.34375, 8.1875, 5.28125, 6.84375, 6.09375, 7.125, 5.125, 6.625, 6.65625] (showing 40 of 512 elements, set MCOP_TENSOR_DUMP_FULL=1 for all) [data_ptr=0x7f56cb601200]",
+      "bytes": 2048
     },
     {
-      "name": "out_selected_experts",
+      "name": "input",
       "type": "at::Tensor",
-      "dtype": "Int",
-      "shape": "[16, 8]",
-      "value": "[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ..., 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] (showing 20 of 128 elements, set MCOP_TENSOR_DUMP_FULL=1 for all) [data_ptr=0x7f43fbc03e00]",
-      "bytes": 512
+      "dtype": "BFloat16",
+      "shape": "[512, 4096]",
+      "value": "[-0.925781, 0.992188, -0.482422, -0.617188, -0.425781, 1.07031, -0.231445, -2.375, -2.64062, -0.628906, 0.416016, -1.90625, 0.145508, 0.320312, -0.753906, -0.141602, -0.121094, -0.310547, 1.27344, 2.40625, ..., -1.64062, -0.945312, 0.992188, 0.707031, -1.41406, 1.82812, 0.628906, 0.0179443, -0.296875, 0.9375, -1.21094, 1.97656, 0.186523, -0.0610352, 0.209961, 0.3125, 1.51562, 1.14062, -0.816406, -0.170898] (showing 40 of 2097152 elements, set MCOP_TENSOR_DUMP_FULL=1 for all) [data_ptr=0x7f56d2600000]",
+      "bytes": 4194304
     },
     {
-      "name": "topk",
-      "type": "int",
-      "dtype": "int",
-      "shape": "[]",
-      "value": "8",
-      "bytes": 4
+      "name": "reorder_topk_ids",
+      "type": "at::Tensor",
+      "dtype": "Long",
+      "shape": "[512]",
+      "value": "[1, 7, 2, 0, 5, 2, 5, 5, 4, 4, 4, 2, 5, 5, 0, 3, 4, 2, 5, 1, ..., 2, 4, 2, 4, 5, 3, 5, 1, 0, 4, 6, 0, 4, 3, 2, 0, 5, 4, 7, 3] (showing 40 of 512 elements, set MCOP_TENSOR_DUMP_FULL=1 for all) [data_ptr=0x7f56cb600000]",
+      "bytes": 4096
     },
     {
-      "name": "renormalize",
-      "type": "bool",
-      "dtype": "bool",
-      "shape": "[]",
-      "value": "1",
-      "bytes": 1
-    },
-    {
-      "name": "num_expert_group",
-      "type": "int",
-      "dtype": "int",
-      "shape": "[]",
-      "value": "1",
-      "bytes": 4
-    },
-    {
-      "name": "topk_group",
-      "type": "int",
-      "dtype": "int",
-      "shape": "[]",
-      "value": "1",
-      "bytes": 4
-    },
-    {
-      "name": "num_fused_shared_experts",
-      "type": "std::optional<int>",
-      "dtype": "int",
-      "shape": "[]",
-      "value": "nullopt",
+      "name": "w2_scale",
+      "type": "at::Tensor",
+      "dtype": "Float",
+      "shape": "[0]",
+      "value": "[] [data_ptr=0x0]",
       "bytes": 0
     },
     {
-      "name": "routed_scaling_factor",
-      "type": "std::optional<float>",
-      "dtype": "float",
-      "shape": "[]",
-      "value": "5.5",
-      "bytes": 4
-    },
-    {
-      "name": "moegate_type",
-      "type": "std::optional<int>",
-      "dtype": "int",
+      "name": "start_expert_id",
+      "type": "long",
+      "dtype": "long",
       "shape": "[]",
       "value": "0",
-      "bytes": 4
+      "bytes": 8
+    },
+    {
+      "name": "end_expert_id",
+      "type": "long",
+      "dtype": "long",
+      "shape": "[]",
+      "value": "7",
+      "bytes": 8
     }
   ]
 }
+
+
+```
+
+#sample 2 :打印多个算子 
+#（1）启动打印
+```bash
+export MCOP_DEBUG_TRACE=1
+export MCOP_DEBUG_PARAMS_DUMP=1
+export MCOP_DEBUG_FILTER=all
+python unit_test/run_ops.py fused_bias_gelu.py topk_sigmoid.py #把 fused_bias_gelu.py 和 topk_sigmoid.py 塞进同一进程按序跑输出文件
+```
+#(2) 输出文件 `mcoplib_op_params_dump_时间戳/fused_gelu_fwd.json` 和 `fused_gelu_bwd.json`，**每个文件正好 20 个 JSON 对象**（截取 1 个示意）：
+
+```json
+{
+  "function": "fused_gelu_bwd",
+  "parameters": [
+    {
+      "name": "input",
+      "type": "at::Tensor",
+      "dtype": "Float",
+      "shape": "[4096, 1, 14336]",
+      "value": "[-0.0394715, 1.0781, -0.45613, -1.68752, 0.63038, -0.217091, -0.0953174, 1.87518, 0.982992, 0.885668, 0.538419, 0.167188, -0.697348, 0.0247884, -0.195, -0.234183, -0.814877, -0.458664, -0.0596179, 1.20023, ..., 0.927596, -0.750395, -0.806976, 0.240616, -0.108705, 0.712145, 0.580186, 0.145358, -1.6756, -0.12453, 0.522908, -0.248826, 1.78173, 1.15039, -0.316377, 0.299093, -0.243433, 0.942879, -0.809986, -0.489415] (showing 40 of 58720256 elements, set MCOP_TENSOR_DUMP_FULL=1 for all) [data_ptr=0x7f71ad400000]",
+      "bytes": 234881024
+    },
+    {
+      "name": "input1",
+      "type": "at::Tensor",
+      "dtype": "Float",
+      "shape": "[4096, 1, 14336]",
+      "value": "[0.533128, -1.14377, -1.18346, -0.148431, 0.412671, 0.204955, 0.498725, 0.360008, -0.973992, -1.07118, -1.09559, -1.2775, -0.407253, -1.53412, 1.26002, 2.51654, 0.648574, -1.47942, 0.75869, 1.20661, ..., -1.56871, -2.74373, -0.297842, -0.965582, -0.100965, 1.36005, -0.0581853, 1.09586, 1.32505, -0.475635, 0.302815, -0.535586, -1.75935, 0.00314422, -0.26229, -0.484426, 0.560441, 1.48841, 0.414848, 0.968975] (showing 40 of 58720256 elements, set MCOP_TENSOR_DUMP_FULL=1 for all) [data_ptr=0x7f718f200000]",
+      "bytes": 234881024
+    },
+    {
+      "name": "bias",
+      "type": "at::Tensor",
+      "dtype": "Float",
+      "shape": "[14336]",
+      "value": "[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ..., 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] (showing 40 of 14336 elements, set MCOP_TENSOR_DUMP_FULL=1 for all) [data_ptr=0x7f71aac00000]",
+      "bytes": 57344
+    }
+  ]
+}
+
+......
 
 ```
 
@@ -356,13 +411,6 @@ try:
 except ImportError as e:
     print("Failed to import from sgl_grouped_gemm_cuda with %r", e)
 
-try:
-    import mcoplib.sgl_moe_fused_w4a16
-except ImportError as e:
-    print("Failed to import from sgl_moe_fused_w4a16 with %r", e)
-
-
-
 #功能：mla中，对q做rotary_emb，对latent_cache做rms_normal，更新latent_cache和kv_a，之后对latent_cache做rotary_emb。
 #     调用torch的kv_b_proj计算kv，将数据从kv拷贝到k和v，从latent_cache中拷贝数据到k
 #输入：
@@ -413,22 +461,61 @@ Traceback (most recent call last):
 - 当编译及运行出现错误：ERROR: MACA minimum compatibility version mismatch, aborting， 说明不符合最低MACA release 版本要求， 如果因为排查问题， 需要定位版本差异，可通过以下凡是跳过这个错误(切记： 不保证编译运行没有问题)：
     1：运行时， 修改version文件 中Min_Compatibility_Maca_Version = '3.7.0' 字段，即可 
     2：编译时， 修改/opt/maca/Version.txt 对应的MACA版本
-
+- from mcoplib.op import fused_silu_mul_dq_mask_quant_fp8_nopack，ImportError: /opt/conda/lib/python3.10/site-packages/mcoplib/op.cpython-310-x86_64-linux-gnu.so: undefined symbol: _ZN3c104cuda29c10_cuda_check_implementationEiPKcS2_jb
+    解答：这是因为mcoplib 要求torch2.10版本， 安装的包也是torch2.10编译出来的， 如果在torch 2.8上进行安装时，就会报错，请保证安装的环境与编译的环境一致。
 ## Release
-### Release 0.4.9
-- add cv op kernel
-- support sglang  0.5.13 op
-- optimize mcoplib project build
-- support mxbench for auto test op kernel `s perfromance
-- support profiler tools check op kernel `s perfromance
-- support for vllm 0.24.0  op kernels
-- support Project-customized op kernels
-- support k-transformer op kernels
-- support verl op kernels
-- support all of mcopZoo op kernels
-- support auto print and dump op input params by setting env
-- support auto build mxbench running env by shell script
-- support auto test torch/py/c op api by mxbench cmd
+### Release 0.4.13
+- support sglang  0.5.17 op
+- support for vllm 0.28.0  op kernels
+
+#### Op New
+- add region_topk_ids operator
+- add indexer_norm_rope fused operator (indexer RMSNorm + RoPE)
+- add fused_deepseek_v4_qnorm_rope_kv_insert operator
+- add fused_minimax_m3_qknorm_rope_kv_insert operator
+- add jit fused_gemma_qknorm_rope operator on C600U sglang
+- add topk_softplus_sqrt moe routing operator
+- add moe_step4_weighted_topk_gather operator for step-4 model
+- add silu_and_mul_clamp operator for step-4 model
+- add merge_attn_states operator
+- add fused_layernorm_dynamic_per_token_quant kernels
+- add triton_causal_conv1d_fwd operator
+- add fused_sigmoid_gating_delta_rule_update operator
+- add mhc_pre_big_fuse optimized CUDA specialization
+- add rms_norm optional-weight / per-block-quant / static-fp8-quant variants
+- add fused_kimi_k3_mla_kv_concat
+- fused_kimi_k3_mla_kv_concat_quant_fp8
+- fused_gdn_decode_post_conv_mtp
+- direct_dcp_a2a_lse_reduce
+- direct_dcp_kv_gather
+- direct_dcp_q_gather
+
+#### Op Optimization
+- optimize single_grouped_topk kernel for GLM-5.1 prefill
+- optimize kpool_topk_transform for GLM-5 workloads
+- optimize fused Q/K RoPE and add preallocated output API
+- optimize act_and_mul_kernel for JoyAI-llm-flash TP4/TP8
+- optimize silu_and_mul_with_clamp with flat/2D vectorized kernels and rcp/expf fast path
+- optimize per_token_cast_to_fp8 and fix bit-exact accuracy
+- optimize moe_sum_reduce kernel on C600U sglang
+- optimize weighted_topk_gather kernel
+- optimize rms_norm for Gemma4-31B-it model
+- optimize minimax_reduce_rms_kernel q_only path
+- fix fused_silu_mul_per_group_quant accuracy bug
+- fix topk_sigmoid / topk_softmax accuracy error
+
+#### Op Update
+- update kimi_k3_attn_res
+- update moe_lora_align_block_size
+- update cp_gather_and_upconvert_fp8_kv_cache
+- update cp_gather_cache
+- update dsv3_fused_a_gemm
+- update reshape_and_cache_flash
+- update persistent_topk
+
+#### Common
+- update vLLM kernels to v0.28.0 baseline
+- fix custom op torch.compile error under sglang piecewise graph
 
 ## Authors and acknowledgment
 Show your appreciation to those who have contributed to the project.

@@ -83,117 +83,134 @@ def cpu_grouped_topk_reference(
 
 def run_grouped_topk_test():
     # ==========================================
-    # 1. 设定测试参数 (模拟 DeepSeek 配置)
+    # 1. 测试场景配置
+    # (场景名, num_tokens, num_experts, n_group, topk_group, topk, routed_scaling_factor, scoring_func)
+    #   - 多组 DeepSeek: n_group=8, topk_group=4
+    #   - 单组 GLM-5.1 : n_group=1, topk_group=1
     # ==========================================
-    NUM_TOKENS = 64
-    NUM_EXPERTS = 256
-    N_GROUP = 8
-    TOPK_GROUP = 4
-    TOPK = 8
+    _SINGLE_GROUP_SHORT_TOKENS = [8, 2984, 3064, 3072, 3112, 3208, 3312]  # 3k1k nocache
+    _SINGLE_GROUP_LONG_TOKENS = [8, 24, 88, 6552, 6560, 6568, 6576, 6584,
+                                 6592, 6600, 6608, 6616, 6624, 6632, 6640,
+                                 6648, 6656, 6664, 6672, 8192]  # 63k1k prefixcache
+
+    scenarios = [("多组 DeepSeek", 64, 256, 8, 4, 8, 2.0, 1)]
+    for nt in _SINGLE_GROUP_SHORT_TOKENS + _SINGLE_GROUP_LONG_TOKENS:
+        scenarios.append(("单组 GLM-5.1", nt, 256, 1, 1, 8, 1.0, 1))
     RENORMALIZE = True
-    ROUTED_SCALING_FACTOR = 2.0
-    SCORING_FUNC = 1  # 1 代表 Sigmoid
-    
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    
-    print(f"=== 开始测试 Grouped TopK ===")
-    print(f"配置: Tokens={NUM_TOKENS}, Experts={NUM_EXPERTS}, Groups={N_GROUP}, TopK={TOPK}")
 
-    # 构造随机输入
-    torch.manual_seed(42)
-    scores = torch.randn((NUM_TOKENS, NUM_EXPERTS), dtype=torch.bfloat16, device=device)
-    bias = torch.randn((NUM_EXPERTS,), dtype=torch.float32, device=device)
+    for (name, num_tokens, num_experts, n_group, topk_group,
+         topk, routed_scaling_factor, scoring_func) in scenarios:
+        print(f"=== 开始测试 Grouped TopK ({name}) ===")
+        print(f"配置: Tokens={num_tokens}, Experts={num_experts}, "
+              f"Groups={n_group}, TopK={topk}")
 
-    # ==========================================
-    # 2. 运行 Torch 基准实现
-    # ==========================================
-    ref_weights, ref_indices = cpu_grouped_topk_reference(
-        scores, N_GROUP, TOPK_GROUP, TOPK, RENORMALIZE, ROUTED_SCALING_FACTOR, bias, SCORING_FUNC
-    )
+        # 构造随机输入
+        torch.manual_seed(42)
+        scores = torch.randn((num_tokens, num_experts), dtype=torch.bfloat16, device=device)
+        bias = torch.randn((num_experts,), dtype=torch.float32, device=device)
 
-    # ==========================================
-    # 3. 运行 CUDA 算子实现
-    # ==========================================
-    try:
-        # 调用对外声明的 C++ 接口
-        cuda_weights, cuda_indices = torch.ops._moe_C.grouped_topk(
-            scores, N_GROUP, TOPK_GROUP, TOPK, RENORMALIZE, ROUTED_SCALING_FACTOR, bias, SCORING_FUNC
+        # ==========================================
+        # 2. 运行 Torch 基准实现
+        # ==========================================
+        ref_weights, ref_indices = cpu_grouped_topk_reference(
+            scores, n_group, topk_group, topk, RENORMALIZE,
+            routed_scaling_factor, bias, scoring_func
         )
-    except Exception as e:
-        print(f"❌ 调用 CUDA 算子失败: {e}")
-        return
 
-    # ==========================================
-    # 4. 精度对比 (Cosine Similarity)
-    # ==========================================
-    print("\n[1/2] 正在进行精度校验...")
-    
-    # (a) 检查索引是否完全一致
-    indices_match = torch.equal(ref_indices, cuda_indices)
-    if indices_match:
-        print("✅ 专家索引 (Indices) 完全匹配")
-    else:
-        print("❌ 错误: 专家索引 (Indices) 不一致!")
-        mismatch_count = (ref_indices != cuda_indices).sum().item()
-        print(f"   => 共有 {mismatch_count} 个索引不匹配。")
+        # ==========================================
+        # 3. 运行 CUDA 算子实现
+        # ==========================================
+        try:
+            # 调用对外声明的 C++ 接口
+            cuda_weights, cuda_indices = torch.ops._moe_C.grouped_topk(
+                scores, n_group, topk_group, topk, RENORMALIZE,
+                routed_scaling_factor, bias, scoring_func
+            )
+        except Exception as e:
+            print(f"❌ 调用 CUDA 算子失败: {e}")
+            continue
 
-    # (b) 使用余弦相似度检查权重精度
-    # flatten 后计算一维张量的余弦相似度
-    cos_sim = F.cosine_similarity(ref_weights.flatten().float(), cuda_weights.flatten().float(), dim=0).item()
-    precision_error = 1.0 - cos_sim
-    max_diff = torch.max(torch.abs(ref_weights - cuda_weights)).item()
+        # ==========================================
+        # 4. 精度对比 (Cosine Similarity)
+        # ==========================================
+        print("\n[1/2] 正在进行精度校验...")
+        
+        # (a) 检查索引是否完全一致
+        indices_match = torch.equal(ref_indices, cuda_indices)
+        if indices_match:
+            print("✅ 专家索引 (Indices) 完全匹配")
+        else:
+            print("❌ 错误: 专家索引 (Indices) 不一致!")
+            mismatch_count = (ref_indices != cuda_indices).sum().item()
+            print(f"   => 共有 {mismatch_count} 个索引不匹配。")
 
-    print(f"📊 权重余弦相似度: {cos_sim:.8f}")
-    print(f"📊 余弦相似度误差 (1 - cos_sim): {precision_error:.8e}")
-    print(f"📊 最大绝对误差 (Max Diff): {max_diff:.8e}")
+        # (b) 使用余弦相似度检查权重精度
+        # flatten 后计算一维张量的余弦相似度
+        cos_sim = F.cosine_similarity(ref_weights.flatten().float(), cuda_weights.flatten().float(), dim=0).item()
+        precision_error = 1.0 - cos_sim
+        max_diff = torch.max(torch.abs(ref_weights - cuda_weights)).item()
 
-    # 判断精度是否达标 (阈值设为 1e-5)
-    if precision_error < 1e-5 and not math.isnan(precision_error):
-        print("✅ 权重精度校验通过 (误差 < 1e-5)。")
-    else:
-        print(f"❌ 错误: 权重精度不达标！请检查 CUDA 核函数内部的精度溢出或隐式转换问题。")
+        print(f"📊 权重余弦相似度: {cos_sim:.8f}")
+        print(f"📊 余弦相似度误差 (1 - cos_sim): {precision_error:.8e}")
+        print(f"📊 最大绝对误差 (Max Diff): {max_diff:.8e}")
 
-    # ==========================================
-    # 5. 耗时统计 (Torch vs CUDA)
-    # ==========================================
-    print("\n[2/2] 正在进行耗时统计分析...")
-    WARMUP_ITERS = 10
-    TEST_ITERS = 100
+        # 判断精度是否达标 (阈值设为 1e-5)
+        if precision_error < 1e-5 and not math.isnan(precision_error):
+            print("✅ 权重精度校验通过 (误差 < 1e-5)。")
+        else:
+            print(f"❌ 错误: 权重精度不达标！请检查 CUDA 核函数内部的精度溢出或隐式转换问题。")
 
-    # 声明 CUDA 事件计时器
-    start_evt = torch.cuda.Event(enable_timing=True)
-    end_evt = torch.cuda.Event(enable_timing=True)
+        # ==========================================
+        # 5. 耗时统计 (Torch vs CUDA)
+        # ==========================================
+        print("\n[2/2] 正在进行耗时统计分析...")
+        WARMUP_ITERS = 10
+        TEST_ITERS = 100
 
-    # (a) Profile Torch 实现
-    for _ in range(WARMUP_ITERS):
-        _ = cpu_grouped_topk_reference(scores, N_GROUP, TOPK_GROUP, TOPK, RENORMALIZE, ROUTED_SCALING_FACTOR, bias, SCORING_FUNC)
-    torch.cuda.synchronize()
+        # 声明 CUDA 事件计时器
+        start_evt = torch.cuda.Event(enable_timing=True)
+        end_evt = torch.cuda.Event(enable_timing=True)
 
-    start_evt.record()
-    for _ in range(TEST_ITERS):
-        _ = cpu_grouped_topk_reference(scores, N_GROUP, TOPK_GROUP, TOPK, RENORMALIZE, ROUTED_SCALING_FACTOR, bias, SCORING_FUNC)
-    end_evt.record()
-    torch.cuda.synchronize()
-    torch_avg_time = start_evt.elapsed_time(end_evt) / TEST_ITERS
+        # (a) Profile Torch 实现
+        for _ in range(WARMUP_ITERS):
+            _ = cpu_grouped_topk_reference(scores, n_group, topk_group, topk,
+                                           RENORMALIZE, routed_scaling_factor,
+                                           bias, scoring_func)
+        torch.cuda.synchronize()
 
-    # (b) Profile CUDA 算子
-    for _ in range(WARMUP_ITERS):
-        _ = torch.ops._moe_C.grouped_topk(scores, N_GROUP, TOPK_GROUP, TOPK, RENORMALIZE, ROUTED_SCALING_FACTOR, bias, SCORING_FUNC)
-    torch.cuda.synchronize()
+        start_evt.record()
+        for _ in range(TEST_ITERS):
+            _ = cpu_grouped_topk_reference(scores, n_group, topk_group, topk,
+                                           RENORMALIZE, routed_scaling_factor,
+                                           bias, scoring_func)
+        end_evt.record()
+        torch.cuda.synchronize()
+        torch_avg_time = start_evt.elapsed_time(end_evt) / TEST_ITERS
 
-    start_evt.record()
-    for _ in range(TEST_ITERS):
-        _ = torch.ops._moe_C.grouped_topk(scores, N_GROUP, TOPK_GROUP, TOPK, RENORMALIZE, ROUTED_SCALING_FACTOR, bias, SCORING_FUNC)
-    end_evt.record()
-    torch.cuda.synchronize()
-    cuda_avg_time = start_evt.elapsed_time(end_evt) / TEST_ITERS
+        # (b) Profile CUDA 算子
+        for _ in range(WARMUP_ITERS):
+            _ = torch.ops._moe_C.grouped_topk(scores, n_group, topk_group, topk,
+                                              RENORMALIZE, routed_scaling_factor,
+                                              bias, scoring_func)
+        torch.cuda.synchronize()
 
-    print(f"⏱️  Torch 基准平均耗时: {torch_avg_time:.4f} ms")
-    print(f"⏱️  CUDA 算子平均耗时 : {cuda_avg_time:.4f} ms")
-    if cuda_avg_time > 0:
-        print(f"🚀 CUDA 算子加速比  : {torch_avg_time / cuda_avg_time:.2f}x")
-    
-    print("\n=== 测试圆满结束 ===")
+        start_evt.record()
+        for _ in range(TEST_ITERS):
+            _ = torch.ops._moe_C.grouped_topk(scores, n_group, topk_group, topk,
+                                              RENORMALIZE, routed_scaling_factor,
+                                              bias, scoring_func)
+        end_evt.record()
+        torch.cuda.synchronize()
+        cuda_avg_time = start_evt.elapsed_time(end_evt) / TEST_ITERS
+
+        print(f"⏱️  Torch 基准平均耗时: {torch_avg_time:.4f} ms")
+        print(f"⏱️  CUDA 算子平均耗时 : {cuda_avg_time:.4f} ms")
+        if cuda_avg_time > 0:
+            print(f"🚀 CUDA 算子加速比  : {torch_avg_time / cuda_avg_time:.2f}x")
+        
+        print("\n=== 测试圆满结束 ===\n")
 
 if __name__ == "__main__":
     run_grouped_topk_test()

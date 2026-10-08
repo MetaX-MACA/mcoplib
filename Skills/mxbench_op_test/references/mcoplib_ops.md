@@ -4,18 +4,27 @@
 
 ## 目录
 
-- [OpBenchmarkBase 基类 API](#opbenchmarkbase-基类-api)
-- [精度验证 gating 机制](#精度验证-gating-机制)
-- [已接入算子的关键点](#已接入算子的关键点)
-  - [rotary_embedding (default/sgl/vllm)](#rotary_embedding)
-  - [fused_moe_gate_deepseek](#fused_moe_gate_deepseek)
-  - [gptq_shuffle](#gptq_shuffle)
-  - [paged_attention_v1 / v2](#paged_attention)
-  - [sgl_topk_softmax / vllm_topk_softmax](#topk_softmax)
-  - [top_k_per_row_decode](#top_k_per_row_decode)
-  - [indexer_k_cache / cp_gather_indexer_k_cache](#indexer_k_cache)
-- [常见 layout 陷阱](#常见-layout-陷阱)
-- [阈值选择指南](#阈值选择指南)
+- [mcoplib 算子 nvbench 性能测试参考](#mcoplib-算子-nvbench-性能测试参考)
+  - [目录](#目录)
+  - [OpBenchmarkBase 基类 API](#opbenchmarkbase-基类-api)
+  - [精度验证 gating 机制](#精度验证-gating-机制)
+  - [已接入算子的关键点](#已接入算子的关键点)
+    - [rotary\_embedding](#rotary_embedding)
+    - [fused\_moe\_gate\_deepseek](#fused_moe_gate_deepseek)
+    - [gptq\_shuffle](#gptq_shuffle)
+    - [paged\_attention](#paged_attention)
+    - [topk\_softmax](#topk_softmax)
+    - [top\_k\_per\_row\_decode](#top_k_per_row_decode)
+    - [indexer\_k\_cache / cp\_gather\_indexer\_k\_cache](#indexer_k_cache--cp_gather_indexer_k_cache)
+  - [常见 layout 陷阱](#常见-layout-陷阱)
+    - [1. value\_cache 顺序（paged\_attention）](#1-value_cache-顺序paged_attention)
+    - [2. cos\_sin\_cache dtype（rotary\_embedding）](#2-cos_sin_cache-dtyperotary_embedding)
+    - [3. q\_perm 空张量（gptq\_shuffle benchmark）](#3-q_perm-空张量gptq_shuffle-benchmark)
+    - [4. top-k 无序输出](#4-top-k-无序输出)
+    - [5. samples 过大导致超时](#5-samples-过大导致超时)
+    - [6. set\_blocking\_kernel\_timeout(-1)](#6-set_blocking_kernel_timeout-1)
+    - [7. Shape 字符串含裸逗号 → CSV 列错位](#7-shape-字符串含裸逗号--csv-列错位)
+  - [阈值选择指南](#阈值选择指南)
 
 ---
 
@@ -257,6 +266,27 @@ verification 路径：传真实 `q_perm`，两遍都跑
 ### 6. set_blocking_kernel_timeout(-1)
 
 禁止使用——会让 nvbench 无限等待。除非确认每次调用都在 15s 内，否则不要调用此方法。
+
+### 7. Shape 字符串含裸逗号 → CSV 列错位
+
+`define_metrics` 里 `state.add_summary("Shape", ...)` 拼出的字符串**绝对不能含英文逗号 `,`**。
+
+**原因**：CSV 用逗号作列分隔符。若 `Shape` 字段本身含逗号（且未加引号），写入 CSV 时该字段会被拆成多列，导致**整行后续所有列整体右移错位**。
+
+**后果（非常隐蔽）**：
+- CSV 里该 op 的行从 `Shape` 列起全部错位（例如 `Shape` 变成 `layers=8,8209541176.58, dim=576`）；
+- `get_row_key` 用 `"Shape"` 作为身份列之一来匹配 baseline（`_ROW_KEY_IDENTITY_COLS`），错位后拿到的身份残缺/不唯一；
+- `--compare` 时 `perform_comparison` 取**错误配置的 baseline 行**相除，算出荒谬的 `perf`（如 27%、37%、48% = "慢 3~4 倍"），**并非真实性能退化**。
+
+**错误写法**：
+```python
+state.add_summary("Shape", f"layers={self.num_layers}, tokens={self.num_tokens}, dim={self.dim}")
+```
+
+**正确写法**（用空格分隔）：
+```python
+state.add_summary("Shape", f"layers={self.num_layers} tokens={self.num_tokens} dim={self.dim}")
+```
 
 ---
 

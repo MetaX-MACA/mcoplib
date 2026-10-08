@@ -333,20 +333,21 @@ def silu_and_mul_masked_fwd_fp8(
     a_bytes[:,:, :hidden_size] = b_bytes
     a_bytes[:,:, hidden_size:hidden_size+4] = c_bytes
     out_stride = (input.shape[-1] // 4 + 257) // 256 * 256
-    dst = torch.empty((output.shape[0], output.shape[1], out_stride), device='cuda', dtype=output.dtype)
+    dst = torch.empty((output.shape[0], output.shape[1], output.shape[-1]), device='cuda', dtype=output.dtype)
     op.fused_silu_mul_dq_mask_fp8_quant(dst, input, masked_m)
     
     int8_ref = combine_tensor.view(torch.float8_e4m3fn)
     int8_dst = dst.view(torch.float8_e4m3fn)
     float32_ref = int8_ref.view(torch.float32)
     float32_dst = int8_dst.view(torch.float32)
+    float32_dst_flat = float32_dst.reshape(-1)
     ref=torch.zeros(int8_ref.shape[0], mask_value,1,dtype=torch.float32)
     dst = torch.zeros(int8_dst.shape[0], mask_value,1,dtype=torch.float32)
     # print(hidden_size)
     for i  in range(float32_ref.shape[0]):
         for j in range(mask_value):
             ref[i][j][0] = float32_ref[i][j][(hidden_size)//4]
-            dst[i][j][0] = float32_dst[i][j][(hidden_size)//4]  
+            dst[i][j][0] = float32_dst_flat[(i * output.shape[1] + j) * out_stride // 2 + hidden_size // 4]
     assert(torch.allclose(ref, dst, rtol=1e-04, atol=1e-03, equal_nan=True))
     print("done")
 

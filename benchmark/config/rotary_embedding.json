@@ -1,11 +1,11 @@
 {
     "device_id": 0,
-    "device_name": "MetaX C500",
-    "batch_size_list": [128, 64, 256, 32],
-    "q_head_num": [32, 8],
-    "kv_head_num": [8, 1],
-    "head_size": [128, 256],
-    "max_seq_len": [2048, 8192],
+    "device_name": ["MetaX C500", "MetaX C600-UL", "Metax C600-U"],
+    "batch_size_list": [512],
+    "q_head_num": [32],
+    "kv_head_num": [8],
+    "head_size": [128],
+    "max_seq_len": [8192],
     "rope_offset": [0],
     "dtype": ["bfloat16"],
     "samples": 1000

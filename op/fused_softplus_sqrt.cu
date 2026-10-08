@@ -5,6 +5,8 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <torch/extension.h>
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
 
 #define THRESH_HOLD 15.0f
 
@@ -71,6 +73,8 @@ __global__ void softplus_sqrt_f16_kernel(
 }
 
 torch::Tensor softplus_sqrt_cuda(torch::Tensor input) {
+     DEBUG_TRACE_PARAMS(input);
+  DEBUG_DUMP_PARAMS(input);
     int64_t numel = input.numel();
 
     if (numel <= 1024 * 1024) {

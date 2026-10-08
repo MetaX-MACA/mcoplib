@@ -7,6 +7,8 @@
 #include "../kernel/utils.h"
 #include "../kernel/utils.cuh"
 #include "../kernel/rms_norm_vllm.cuh"
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
 
 namespace vllm {
 
@@ -267,6 +269,9 @@ void rms_norm_dynamic_per_token_quant_custom(
     at::Tensor& scales,        // [num_tokens]
     double const var_epsilon,     // Variance epsilon used in norm calculation
     c10::optional<at::Tensor> scale_ub, c10::optional<at::Tensor> residual) {
+  DEBUG_TRACE_PARAMS(out, input, weight, scales, var_epsilon, scale_ub, residual);
+  DEBUG_DUMP_PARAMS(out, input, weight, scales, var_epsilon, scale_ub, residual);
+
   TORCH_CHECK(out.dtype() == torch::kInt8 || out.dtype() == torch::kFloat8_e4m3fn);
   TORCH_CHECK(out.is_contiguous() && input.is_contiguous());
 

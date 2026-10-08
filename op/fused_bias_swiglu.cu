@@ -4,9 +4,13 @@
 #include <torch/torch.h>
 
 #include "../kernel/fused_bias_swiglu_kernel.h"
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
 
 
 at::Tensor fused_bias_swiglu_fwd(at::Tensor input) {
+    DEBUG_TRACE_PARAMS(input);
+    DEBUG_DUMP_PARAMS(input);
 
     CHECK_DEVICE(input);
     CHECK_DIMS(input, 3);
@@ -51,6 +55,8 @@ at::Tensor fused_bias_swiglu_fwd(at::Tensor input) {
 }
 
 at::Tensor fused_bias_swiglu_bwd(at::Tensor input, at::Tensor grad_output) {
+    DEBUG_TRACE_PARAMS(input, grad_output);
+    DEBUG_DUMP_PARAMS(input, grad_output);
 
     const int stride_in = input.size(-1);
     const int stride_out = grad_output.size(-1);

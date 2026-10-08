@@ -136,7 +136,6 @@ void all_reduce_max(at::Tensor input,
                 at::Tensor output)               // [num_tokens, hidden_size]
 {
     DEBUG_TRACE_PARAMS(input, output);
-    DEBUG_DUMP_PARAMS(input, output);
     const int hidden_size = input.size(-1);
     const int num_tokens = input.numel() / hidden_size;
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -146,13 +145,16 @@ void all_reduce_max(at::Tensor input,
     }else {
         TORCH_CHECK(false, "Only bfloat16 are supported");
     }
+    if (::mcop::debug::should_dump(__FUNCTION__)) {
+        cudaDeviceSynchronize();
+    }
+    DEBUG_DUMP_PARAMS(input, output);
 }
 
 void all_reduce_sum(at::Tensor input,
                 at::Tensor output)               // [num_tokens, hidden_size]
 {
     DEBUG_TRACE_PARAMS(input, output);
-    DEBUG_DUMP_PARAMS(input, output);
     const int hidden_size = input.size(-1);
     const int num_tokens = input.numel() / hidden_size;
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -162,4 +164,8 @@ void all_reduce_sum(at::Tensor input,
     }else {
         TORCH_CHECK(false, "Only bfloat16 are supported");
     }
+    if (::mcop::debug::should_dump(__FUNCTION__)) {
+        cudaDeviceSynchronize();
+    }
+    DEBUG_DUMP_PARAMS(input, output);
 }

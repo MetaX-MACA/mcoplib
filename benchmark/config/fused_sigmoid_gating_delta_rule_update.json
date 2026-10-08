@@ -1,0 +1,15 @@
+{
+    "device_id": 0,
+    "device_name": "MetaX C500",
+    "batch_size": [256],
+    "num_heads": [48],
+    "num_steps": [256],
+    "head_dim": 128,
+    "mode": "verify",
+    "dtype": "bfloat16",
+    "lower_bound": -5.0,
+    "seed": 42,
+    "atol": 0.02,
+    "rtol": 0.01,
+    "samples": 100
+}

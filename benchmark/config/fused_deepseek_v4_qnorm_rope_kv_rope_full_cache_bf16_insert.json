@@ -1,5 +1,6 @@
 {
     "device_id": 0,
+    "device_name": ["MetaX C500", "MetaX C600-UL", "Metax C600-U"],
     "batch_size": 17,
     "num_heads": 17,
     "num_kv_heads": 1,
@@ -14,5 +15,6 @@
     "positions_dtype": "int64",
     "fp8_scale": 1.0,
     "q_fp8_scale_inv": 1.0,
+    "seed": 42,
     "samples": 1000
 }

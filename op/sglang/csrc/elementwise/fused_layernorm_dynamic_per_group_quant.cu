@@ -80,7 +80,7 @@ __device__ __forceinline__ float finalize_scale(float amax, float rms,
 // Default fallback. One thread owns scalar elements. Two adjacent warps write
 // their local amax to shared memory and one thread combines them per group.
 template <typename scalar_t, typename scalar_out_t, int32_t VPT,
-          int32_t BLOCK_DIM, bool has_residual>
+          int32_t BLOCK_DIM, bool has_residual, bool TRANS_SCATTER>
 __global__ void rms_group_quant_default_kernel(
     scalar_out_t *__restrict__ out, scalar_t *__restrict__ out_norm,
     float *__restrict__ scales, const scalar_t *__restrict__ input,
@@ -95,7 +95,6 @@ __global__ void rms_group_quant_default_kernel(
 
   const int32_t token = blockIdx.x;
   const int64_t row = static_cast<int64_t>(token) * hidden_size;
-  const int64_t scale_row = static_cast<int64_t>(token) * groups_per_token;
   float values[VPT];
   float ss = 0.0f;
 
@@ -143,7 +142,11 @@ __global__ void rms_group_quant_default_kernel(
                              warp_amax[k * kWarps + first_warp + 1]);
     const float scale = finalize_scale(amax, rms, qmax, min_scale, scale_ub);
     group_scales[group] = scale;
-    scales[scale_row + group] = scale;
+    if constexpr (TRANS_SCATTER) {
+      scales[static_cast<int64_t>(group) * gridDim.x + token] = scale;
+    } else {
+      scales[static_cast<int64_t>(token) * groups_per_token + group] = scale;
+    }
   }
   __syncthreads();
 
@@ -163,7 +166,8 @@ __global__ void rms_group_quant_default_kernel(
 // VEC=2/4/8 maps a 128-element group to a 64/32/16-lane subgroup. The group
 // amax and scale remain inside one warp, so this path uses no global atomic.
 template <typename scalar_t, typename scalar_out_t, int32_t VEC,
-          int32_t TILES_PER_WARP, int32_t BLOCK_DIM, bool has_residual>
+          int32_t TILES_PER_WARP, int32_t BLOCK_DIM, bool has_residual,
+          bool TRANS_SCATTER>
 __global__ void rms_group_quant_vector_kernel(
     scalar_out_t *__restrict__ out, scalar_t *__restrict__ out_norm,
     float *__restrict__ scales, const scalar_t *__restrict__ input,
@@ -185,7 +189,6 @@ __global__ void rms_group_quant_vector_kernel(
   const int32_t subgroup_lane = lane % kSubgroupWidth;
   const int32_t subgroup = lane / kSubgroupWidth;
   const int64_t row = static_cast<int64_t>(token) * hidden_size;
-  const int64_t scale_row = static_cast<int64_t>(token) * groups_per_token;
   float values[TILES_PER_WARP][VEC];
   float ss = 0.0f;
 
@@ -251,7 +254,11 @@ __global__ void rms_group_quant_vector_kernel(
     float scale = 0.0f;
     if (subgroup_lane == 0 && group < groups_per_token) {
       scale = finalize_scale(amax, rms, qmax, min_scale, scale_ub);
-      scales[scale_row + group] = scale;
+      if constexpr (TRANS_SCATTER) {
+        scales[static_cast<int64_t>(group) * gridDim.x + token] = scale;
+      } else {
+        scales[static_cast<int64_t>(token) * groups_per_token + group] = scale;
+      }
     }
     scale = __shfl_sync(kFullWarpMask, scale, 0, kSubgroupWidth);
 
@@ -278,12 +285,21 @@ void launch_default(scalar_out_t *out, scalar_t *out_norm, float *scales,
                     const scalar_t *input, const scalar_t *weight,
                     const float *scale_ub, float epsilon, int32_t hidden,
                     int32_t groups, int32_t tokens, float min_scale,
-                    scalar_t *residual, cudaStream_t stream) {
-  rms_group_quant_default_kernel<scalar_t, scalar_out_t, VPT, BLOCK_DIM,
-                                 has_residual>
-      <<<tokens, BLOCK_DIM, 0, stream>>>(out, out_norm, scales, input, weight,
-                                         scale_ub, epsilon, hidden, groups,
-                                         min_scale, residual);
+                    scalar_t *residual, bool trans_scatter,
+                    cudaStream_t stream) {
+  if (trans_scatter) {
+    rms_group_quant_default_kernel<scalar_t, scalar_out_t, VPT, BLOCK_DIM,
+                                   has_residual, true>
+        <<<tokens, BLOCK_DIM, 0, stream>>>(out, out_norm, scales, input, weight,
+                                           scale_ub, epsilon, hidden, groups,
+                                           min_scale, residual);
+  } else {
+    rms_group_quant_default_kernel<scalar_t, scalar_out_t, VPT, BLOCK_DIM,
+                                   has_residual, false>
+        <<<tokens, BLOCK_DIM, 0, stream>>>(out, out_norm, scales, input, weight,
+                                           scale_ub, epsilon, hidden, groups,
+                                           min_scale, residual);
+  }
 }
 
 template <typename scalar_t, typename scalar_out_t, bool has_residual>
@@ -291,11 +307,12 @@ void dispatch_default(scalar_out_t *out, scalar_t *out_norm, float *scales,
                       const scalar_t *input, const scalar_t *weight,
                       const float *scale_ub, float epsilon, int32_t hidden,
                       int32_t groups, int32_t tokens, float min_scale,
-                      scalar_t *residual, cudaStream_t stream) {
+                      scalar_t *residual, bool trans_scatter,
+                      cudaStream_t stream) {
 #define LAUNCH_DEFAULT(VPT, BLOCK)                                             \
   launch_default<scalar_t, scalar_out_t, VPT, BLOCK, has_residual>(            \
       out, out_norm, scales, input, weight, scale_ub, epsilon, hidden, groups, \
-      tokens, min_scale, residual, stream)
+      tokens, min_scale, residual, trans_scatter, stream)
 
   if (hidden <= 1024) {
     LAUNCH_DEFAULT(4, 256);
@@ -317,11 +334,21 @@ void launch_vector(scalar_out_t *out, scalar_t *out_norm, float *scales,
                    const scalar_t *input, const scalar_t *weight,
                    const float *scale_ub, float epsilon, int32_t hidden,
                    int32_t groups, int32_t tokens, float min_scale,
-                   scalar_t *residual, cudaStream_t stream) {
-  rms_group_quant_vector_kernel<scalar_t, scalar_out_t, VEC, TILES, BLOCK,
-                                has_residual><<<tokens, BLOCK, 0, stream>>>(
-      out, out_norm, scales, input, weight, scale_ub, epsilon, hidden, groups,
-      min_scale, residual);
+                   scalar_t *residual, bool trans_scatter,
+                   cudaStream_t stream) {
+  if (trans_scatter) {
+    rms_group_quant_vector_kernel<scalar_t, scalar_out_t, VEC, TILES, BLOCK,
+                                  has_residual, true>
+        <<<tokens, BLOCK, 0, stream>>>(out, out_norm, scales, input, weight,
+                                       scale_ub, epsilon, hidden, groups,
+                                       min_scale, residual);
+  } else {
+    rms_group_quant_vector_kernel<scalar_t, scalar_out_t, VEC, TILES, BLOCK,
+                                  has_residual, false>
+        <<<tokens, BLOCK, 0, stream>>>(out, out_norm, scales, input, weight,
+                                       scale_ub, epsilon, hidden, groups,
+                                       min_scale, residual);
+  }
 }
 
 template <typename scalar_t, typename scalar_out_t, int32_t VEC,
@@ -330,11 +357,12 @@ void dispatch_vector(scalar_out_t *out, scalar_t *out_norm, float *scales,
                      const scalar_t *input, const scalar_t *weight,
                      const float *scale_ub, float epsilon, int32_t hidden,
                      int32_t groups, int32_t tokens, float min_scale,
-                     scalar_t *residual, cudaStream_t stream) {
+                     scalar_t *residual, bool trans_scatter,
+                     cudaStream_t stream) {
 #define LAUNCH_VECTOR(TILES, BLOCK)                                            \
   launch_vector<scalar_t, scalar_out_t, VEC, TILES, BLOCK, has_residual>(      \
       out, out_norm, scales, input, weight, scale_ub, epsilon, hidden, groups, \
-      tokens, min_scale, residual, stream)
+      tokens, min_scale, residual, trans_scatter, stream)
 
   if constexpr (VEC == 8) {
     if (hidden <= 512) {
@@ -433,39 +461,40 @@ void dispatch_selected_kernel(scalar_out_t *out, scalar_t *out_norm,
                               const scalar_t *weight, const float *scale_ub,
                               float epsilon, int32_t hidden, int32_t groups,
                               int32_t tokens, float min_scale,
-                              scalar_t *residual, cudaStream_t stream) {
+                              scalar_t *residual, bool trans_scatter,
+                              cudaStream_t stream) {
   if (can_vectorize<scalar_t, scalar_out_t, 8>(
           out, out_norm, input, weight, residual, hidden, has_residual)) {
     dispatch_vector<scalar_t, scalar_out_t, 8, has_residual>(
         out, out_norm, scales, input, weight, scale_ub, epsilon, hidden, groups,
-        tokens, min_scale, residual, stream);
+        tokens, min_scale, residual, trans_scatter, stream);
   } else if (can_vectorize<scalar_t, scalar_out_t, 4>(out, out_norm, input,
                                                       weight, residual, hidden,
                                                       has_residual)) {
     dispatch_vector<scalar_t, scalar_out_t, 4, has_residual>(
         out, out_norm, scales, input, weight, scale_ub, epsilon, hidden, groups,
-        tokens, min_scale, residual, stream);
+        tokens, min_scale, residual, trans_scatter, stream);
   } else if (can_vectorize<scalar_t, scalar_out_t, 2>(out, out_norm, input,
                                                       weight, residual, hidden,
                                                       has_residual)) {
     dispatch_vector<scalar_t, scalar_out_t, 2, has_residual>(
         out, out_norm, scales, input, weight, scale_ub, epsilon, hidden, groups,
-        tokens, min_scale, residual, stream);
+        tokens, min_scale, residual, trans_scatter, stream);
   } else {
     dispatch_default<scalar_t, scalar_out_t, has_residual>(
         out, out_norm, scales, input, weight, scale_ub, epsilon, hidden, groups,
-        tokens, min_scale, residual, stream);
+        tokens, min_scale, residual, trans_scatter, stream);
   }
 }
 
 template <typename scalar_in_t, bool has_residual>
 void dispatch_output_type(torch::Tensor &out, torch::Tensor &out_norm,
-                          torch::Tensor &scales, const torch::Tensor &input,
+                          float *scales_ptr, const torch::Tensor &input,
                           const torch::Tensor &weight,
                           const std::optional<at::Tensor> &scale_ub,
                           const std::optional<at::Tensor> &residual,
                           float epsilon, int32_t hidden, int32_t groups,
-                          int32_t tokens, float min_scale,
+                          int32_t tokens, float min_scale, bool trans_scatter,
                           cudaStream_t stream) {
   scalar_in_t *residual_ptr =
       has_residual ? residual->data_ptr<scalar_in_t>() : nullptr;
@@ -476,32 +505,53 @@ void dispatch_output_type(torch::Tensor &out, torch::Tensor &out_norm,
       out.scalar_type(), "rms_norm_dynamic_per_group_quant", [&] {
         dispatch_selected_kernel<scalar_in_t, scalar_t, has_residual>(
             out.data_ptr<scalar_t>(), out_norm.data_ptr<scalar_in_t>(),
-            scales.data_ptr<float>(), input.data_ptr<scalar_in_t>(),
+            scales_ptr, input.data_ptr<scalar_in_t>(),
             weight.data_ptr<scalar_in_t>(), scale_ub_ptr, epsilon, hidden,
-            groups, tokens, min_scale, residual_ptr, stream);
+            groups, tokens, min_scale, residual_ptr, trans_scatter, stream);
       });
 }
 
 template <typename scalar_in_t>
 void dispatch_input_type(torch::Tensor &out, torch::Tensor &out_norm,
-                         torch::Tensor &scales, const torch::Tensor &input,
+                         float *scales_ptr, const torch::Tensor &input,
                          const torch::Tensor &weight,
                          const std::optional<at::Tensor> &scale_ub,
                          const std::optional<at::Tensor> &residual,
                          float epsilon, int32_t hidden, int32_t groups,
-                         int32_t tokens, float min_scale, cudaStream_t stream) {
+                         int32_t tokens, float min_scale, bool trans_scatter,
+                         cudaStream_t stream) {
   if (residual.has_value()) {
     dispatch_output_type<scalar_in_t, true>(
-        out, out_norm, scales, input, weight, scale_ub, residual, epsilon,
-        hidden, groups, tokens, min_scale, stream);
+        out, out_norm, scales_ptr, input, weight, scale_ub, residual, epsilon,
+        hidden, groups, tokens, min_scale, trans_scatter, stream);
   } else {
     dispatch_output_type<scalar_in_t, false>(
-        out, out_norm, scales, input, weight, scale_ub, residual, epsilon,
-        hidden, groups, tokens, min_scale, stream);
+        out, out_norm, scales_ptr, input, weight, scale_ub, residual, epsilon,
+        hidden, groups, tokens, min_scale, trans_scatter, stream);
   }
 }
 
 } // namespace vllm
+
+namespace {
+__global__ __launch_bounds__(256)
+void transpose_scale_kernel(const float* __restrict__ src, float* __restrict__ dst, int m, int G)
+{
+    __shared__ float tile[32][33];
+    const int bx = blockIdx.x * 32, by = blockIdx.y * 32;
+    #pragma unroll
+    for (int j = 0; j < 32; j += 8) {
+        int r = by + threadIdx.y + j, c = bx + threadIdx.x;
+        if (r < m && c < G) tile[threadIdx.y + j][threadIdx.x] = src[(long)r * G + c];
+    }
+    __syncthreads();
+    #pragma unroll
+    for (int j = 0; j < 32; j += 8) {
+        int r = bx + threadIdx.y + j, c = by + threadIdx.x;
+        if (r < G && c < m) dst[(long)r * m + c] = tile[threadIdx.x][threadIdx.y + j];
+    }
+}
+}
 
 // Note: only support group 128
 void rms_norm_dynamic_per_group_quant(
@@ -509,7 +559,8 @@ void rms_norm_dynamic_per_group_quant(
     const torch::Tensor &weight, torch::Tensor &scales,
     int64_t quant_group_size, double variance_epsilon,
     const std::optional<at::Tensor> &scale_ub,
-    const std::optional<at::Tensor> &residual) {
+    const std::optional<at::Tensor> &residual,
+    bool trans_scale) {
   const auto fp8_type = is_fp8_ocp()
       ? c10::ScalarType::Float8_e4m3fn
       : c10::ScalarType::Float8_e4m3fnuz;
@@ -567,7 +618,6 @@ void rms_norm_dynamic_per_group_quant(
   TORCH_CHECK(out.is_contiguous(), "out must be contiguous");
   TORCH_CHECK(out_norm.is_contiguous(), "out_norm must be contiguous");
   TORCH_CHECK(weight.is_contiguous(), "weight must be contiguous");
-  TORCH_CHECK(scales.is_contiguous(), "scales must be contiguous");
 
   TORCH_CHECK(out.sizes() == input.sizes(),
               "out shape must match input shape, got out=", out.sizes(),
@@ -578,6 +628,7 @@ void rms_norm_dynamic_per_group_quant(
   TORCH_CHECK(weight.dim() == 1 && weight.size(0) == hidden,
               "weight shape must be [hidden_size], got ", weight.sizes(),
               ", hidden_size=", hidden);
+
   TORCH_CHECK(scales.dim() == 2 && scales.size(0) == tokens &&
                   scales.size(1) == groups,
               "scales shape must be [num_tokens, ceil(hidden_size / 128)], got ",
@@ -622,12 +673,29 @@ void rms_norm_dynamic_per_group_quant(
   const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
+  const bool use_ws = trans_scale && tokens >= 512 && groups >= 8;
+  torch::Tensor ws;
+  float *scales_ptr = scales.data_ptr<float>();
+  if (use_ws) {
+    ws = torch::empty({tokens, groups},
+                      input.options().dtype(torch::kFloat32));
+    scales_ptr = ws.data_ptr<float>();
+  }
+  const bool trans_scatter = trans_scale && !use_ws;
+
   VLLM_DISPATCH_FLOATING_TYPES(
       input.scalar_type(), "rms_norm_dynamic_per_group_quant_dispatch", [&] {
         vllm::dispatch_input_type<scalar_t>(
-            out, out_norm, scales, input, weight, scale_ub, residual,
+            out, out_norm, scales_ptr, input, weight, scale_ub, residual,
             static_cast<float>(variance_epsilon), static_cast<int32_t>(hidden),
             static_cast<int32_t>(groups), static_cast<int32_t>(tokens),
-            min_scale, stream);
+            min_scale, trans_scatter, stream);
       });
+
+  if (use_ws) {
+    transpose_scale_kernel<<<
+        dim3((groups + 31) / 32, (tokens + 31) / 32), dim3(32, 8), 0, stream>>>(
+        scales_ptr, scales.data_ptr<float>(), static_cast<int32_t>(tokens),
+        static_cast<int32_t>(groups));
+  }
 }

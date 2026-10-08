@@ -1,11 +1,12 @@
 {
-    "batch_size": 16,
+    "batch_size": 8192,
     "num_heads": 8,
     "head_dim": 192,
     "rope_dim": 64,
     "max_pos": 512,
     "eps": 1e-06,
     "dtype": "bfloat16",
-    "device_name": "MetaX C500",
+    "device_name": ["MetaX C500", "MetaX C600-UL", "Metax C600-U"],
+    "seed": 42,
     "samples": 1000
 }

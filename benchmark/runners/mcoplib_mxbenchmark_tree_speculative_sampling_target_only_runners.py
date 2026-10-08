@@ -18,6 +18,7 @@ class Tree_speculative_sampling_target_only_runner(OpBenchmarkBase):
         self.threshold_single = config.get("threshold_single", 0.5)
         self.threshold_acc = config.get("threshold_acc", 0.8)
         self.deterministic = config.get("deterministic", True)
+        self.seed = config.get("seed", None)
 
     def define_metrics(self, state):
         state.add_summary("Op", self.name)
@@ -46,6 +47,9 @@ class Tree_speculative_sampling_target_only_runner(OpBenchmarkBase):
         state.add_global_memory_writes(write_bytes)
 
     def _generate_inputs(self, dev):
+        if self.seed is not None:
+            torch.manual_seed(self.seed)
+            torch.cuda.manual_seed_all(self.seed)
         predicts = torch.zeros(self.tot_num_draft_tokens, dtype=torch.int32, device=dev)
         accept_index = torch.zeros((self.bs, self.num_spec_step), dtype=torch.int32, device=dev)
         accept_token_num = torch.zeros(self.bs, dtype=torch.int32, device=dev)

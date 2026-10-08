@@ -1,7 +1,7 @@
 {
     "device_id": 0,
-    "device_name": "MetaX C500",
-    "num_tokens": 64,
+    "device_name": ["MetaX C500", "MetaX C600-UL", "Metax C600-U"],
+    "num_tokens": 8192,
     "num_experts": 256,
     "n_group": 8,
     "topk_group": 4,
@@ -10,5 +10,6 @@
     "routed_scaling_factor": 2.0,
     "scoring_func": 1,
     "dtype": "bfloat16",
+    "seed": 42,
     "samples": 1000
 }

@@ -1,6 +1,5 @@
 /*
  * Copyright (c) 2025 by SGLang team.
- * Copyright (c) 2025 by FlashInfer team.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,8 +15,9 @@
  */
 #include "pytorch_extension_utils.h"
 #include "speculative_sampling.cuh"
+#include "mcoplib_quantization.cuh"
 
-using namespace flashinfer;
+using namespace mcoplib;
 
 // predicts: [tot_num_draft_tokens]
 // accept_index: [bs, num_spec_step]

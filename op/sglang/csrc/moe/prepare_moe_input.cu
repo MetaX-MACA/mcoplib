@@ -2,10 +2,16 @@
 #include <cudaTypedefs.h>
 #include <torch/all.h>
 
-#include <flashinfer/vec_dtypes.cuh>
+#include "vec_dtypes.cuh"
 #include <iostream>
 
-#include "mctlass/array.h"
+template <typename T, int N>
+struct alignas(16) AlignedArray {
+  T data[N];
+  __device__ T& operator[](int index) { return data[index]; }
+  __device__ const T& operator[](int index) const { return data[index]; }
+};
+
 #include "utils.h"
 
 constexpr uint64_t THREADS_PER_EXPERT = 512;
@@ -180,7 +186,7 @@ __global__ void shuffleRowsKernel(
   if (blockIdx.x < num_dst_rows) {
     // Load 128-bits per thread
     constexpr uint64_t ELEM_PER_THREAD = 128 / sizeof(T) / 8;
-    using DataElem = mctlass::Array<T, ELEM_PER_THREAD>;
+    using DataElem = AlignedArray<T, ELEM_PER_THREAD>;
 
     // Duplicate and permute rows
     auto const* source_row_ptr = reinterpret_cast<DataElem const*>(input + source_row_idx * num_cols);
@@ -272,7 +278,7 @@ __global__ void apply_shuffle_mul_sum_kernel(
 
   constexpr uint32_t vec_size = 16 / sizeof(scalar_t);
   using t = float;
-  using vec_t = flashinfer::vec_t<t, vec_size>;
+  using vec_t = mcoplib::vec_t<t, vec_size>;
   int thread_idx = threadIdx.x;
   int stride = blockDim.x;
 

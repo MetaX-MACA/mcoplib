@@ -1,6 +1,6 @@
 {
     "device_id": 0,
-    "device_name": "MetaX C500",
+    "device_name": ["MetaX C500", "MetaX C600-UL", "Metax C600-U"],
     "num_layers": 32,
     "page_size": 16,
     "head_dim": 128,
@@ -8,5 +8,6 @@
     "total_pages": 8192,
     "copy_pages": 1024,
     "dtype": "float16",
-    "samples": 10
+    "seed": 42,
+    "samples": 100
 }

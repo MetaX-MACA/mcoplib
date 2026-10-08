@@ -1,0 +1,11 @@
+{
+    "device_id": 0,
+    "device_name": ["MetaX C500", "MetaX C600-UL", "Metax C600-U"],
+    "batch_size": 8,
+    "block_size": 16,
+    "use_seq_starts": true,
+    "reverse_block_table": true,
+    "fp8_value": 0,
+    "seed": 0,
+    "samples": 1000
+}

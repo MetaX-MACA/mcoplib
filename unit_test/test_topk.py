@@ -7,6 +7,7 @@ import pytest
 import torch
 import torch.nn as nn
 import mcoplib.sgl_kernel
+import mcoplib._C
 
 def _ref_torch_impl(score: torch.Tensor, seq_len: int, topk: int) -> torch.Tensor:
     assert score.dim() == 2
@@ -180,6 +181,111 @@ def test_topk_transform_kernel(bs: int, k: int, seq_len: int, table_len: int ) -
     bytes_accessed = bs * (2 * seq_len + k) * 4
     print(f"\n[Case: BS={bs}, SeqLen={seq_len}, K={k}]")
     run_cuda_benchmark("fast_topk_transform_fused", launch_fused_kernel, bytes_accessed)
+
+
+@pytest.mark.parametrize("bs", [1, 128, 2048, 4096])
+@pytest.mark.parametrize("topk", [512, 1024, 2048])
+@pytest.mark.parametrize("world", [1, 2, 4, 8])
+@torch.inference_mode()
+def test_stable_topk_gathered(bs: int, topk: int, world: int) -> None:
+    """DCP merge shape: candidates = topk * world (each rank contributes
+    topk candidates after the packed all-gather)."""
+    torch.manual_seed(42)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(42)
+    
+    def _stable_topk_gathered(gathered: torch.Tensor, out: torch.Tensor,
+                            topk: int) -> None:
+        """Dispatch to torch.ops._C.stable_topk_gathered."""
+        if not hasattr(torch.ops._C, "stable_topk_gathered"):
+            import mcoplib._C
+        if not hasattr(torch.ops._C, "stable_topk_gathered"):
+            raise RuntimeError(
+                "stable_topk_gathered not registered in torch.ops._C even after "
+                "importing mcoplib._C; the installed _C.abi3.so is stale. "
+                "Rebuild mcoplib, e.g.: pip uninstall mcoplib -y && "
+                "pip install -e . --no-build-isolation"
+            )
+        torch.ops._C.stable_topk_gathered(gathered, out, topk)
+
+    def _ref_stable_topk_gathered(gathered: torch.Tensor,
+                                topk: int) -> torch.Tensor:
+        """Independent CPU reference implementing the contract literally."""
+        scores = gathered[..., 0].cpu()
+        ids = gathered[..., 1].to(torch.int32).cpu()
+        valid = ids >= 0
+        sort_scores = scores.masked_fill(~valid, float("-inf"))
+        sort_ids = ids.masked_fill(~valid, 2 ** 31 - 1)
+        num_rows, num_candidates = ids.shape
+
+        order = torch.arange(num_candidates).expand(num_rows, num_candidates)
+        # token_id 升序 （key的后半段）
+        order = order.gather(
+            1, sort_ids.gather(1, order).argsort(dim=-1, stable=True)
+        )
+        # score 降序 （key的前半段）
+        order = order.gather(
+            1, sort_scores.gather(1, order).argsort(
+                dim=-1, descending=True, stable=True)
+        )
+
+        selected = ids.gather(1, order)
+        k = min(topk, num_candidates)
+        ref = torch.full((num_rows, topk), -1, dtype=torch.int32)
+        ref[:, :k] = selected[:, :k]
+        return ref.to(device=gathered.device)
+
+    def _make_gathered(rows: int, candidates: int, invalid_frac: float = 0.05,
+                    seed: int = 42) -> torch.Tensor:
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+        gathered = torch.randn(rows, candidates, 2, device="cuda")
+        ids = torch.randint(0, 1 << 23, (rows, candidates), device="cuda")
+        invalid = torch.rand(rows, candidates, device="cuda") < invalid_frac
+        ids[invalid] = -1
+        gathered[..., 1] = ids.to(torch.int32).to(torch.float32)
+        return gathered
+
+    def _assert_stable_topk_matches(out: torch.Tensor, ref: torch.Tensor,
+                                    bs: int, topk: int) -> None:
+        out_cpu = out.cpu().tolist()
+        ref_cpu = ref.cpu().tolist()
+        for i in range(bs):
+            more = set(out_cpu[i]) - set(ref_cpu[i])
+            less = set(ref_cpu[i]) - set(out_cpu[i])
+            assert not more and not less, (
+                f"{bs=}, {topk=}, row={i}, more={more}, less={less}"
+            )
+            n_valid = sum(1 for t in ref_cpu[i] if t >= 0)
+            assert sum(1 for t in out_cpu[i] if t >= 0) == n_valid, (
+                f"{bs=}, {topk=}, row={i}: valid count mismatch"
+            )
+            assert sum(1 for t in out_cpu[i] if t == -1) == topk - n_valid, (
+                f"{bs=}, {topk=}, row={i}: -1 count mismatch"
+            )
+
+    num_candidates = topk * world  # multiple of 512, matches the DSL sizing
+    gathered = _make_gathered(bs, num_candidates, seed=42)
+    out = torch.empty((bs, topk), dtype=torch.int32, device="cuda")
+    ref = _ref_stable_topk_gathered(gathered, topk)
+
+    def launch_kernel():
+        _stable_topk_gathered(gathered, out, topk)
+
+    # 功能验证
+    launch_kernel()
+    _assert_stable_topk_matches(out, ref, bs, topk)
+
+    # 计算总访存字节数: read gathered (8 B/candidate) + write out (4 B/slot)
+    bytes_accessed = bs * (num_candidates * 8 + topk * 4)
+    # num_candidates>7567时keys存global memory，
+    # 额外访存：初始写1次+每pass读4次（histogram+scatter+compact计数+compact搬移）。
+    # pass0后剩余key数量降至N/1024，后续访存可忽略。估算额外访存≈5×nc×8（写1+读4）。
+    if num_candidates > 7567:
+        bytes_accessed += bs * num_candidates * 8 * 5
+    print(f"\n[Case: BS={bs}, Candidates={num_candidates}, TopK={topk}]")
+    run_cuda_benchmark("stable_topk_gathered", launch_kernel, bytes_accessed)
 
 
 if __name__ == "__main__":

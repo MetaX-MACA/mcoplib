@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024 by FlashInfer team.
+ * 
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,12 +18,11 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 #include <torch/all.h>
-
+#include "mcoplib_sgl_common.cuh"
 #include "pos_enc.cuh"
 #include "utils.h"
-
-using namespace flashinfer;
-
+#include "vec_dtypes.cuh"
+using namespace mcoplib;
 void apply_rope_pos_ids_cos_sin_cache(
     at::Tensor q,
     at::Tensor k,

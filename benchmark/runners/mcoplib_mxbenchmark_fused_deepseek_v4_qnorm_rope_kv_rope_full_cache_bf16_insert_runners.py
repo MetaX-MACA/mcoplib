@@ -52,6 +52,7 @@ class Fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert_runner(OpBench
         self.max_position = config.get("max_position", 4096)
         self.block_size = config.get("block_size", 128)
         self.eps = config.get("eps", 1e-6)
+        self.seed = config.get("seed", None)
         self.kv_cache_dtype = config.get("kv_cache_dtype", "bfloat16")
 
 
@@ -74,6 +75,9 @@ class Fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert_runner(OpBench
 
 
     def prepare_and_get_launcher(self, dev_id, tc_s):
+        if self.seed is not None:
+            torch.manual_seed(self.seed)
+            torch.cuda.manual_seed_all(self.seed)
         dev = f"cuda:{dev_id}"
         num_tokens = self.num_tokens
 

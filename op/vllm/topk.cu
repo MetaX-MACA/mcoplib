@@ -3,6 +3,7 @@
 
 #include <torch/all.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <cuda_runtime.h>
 #include <algorithm>
 
@@ -19,6 +20,7 @@ void launch_persistent_topk(const torch::Tensor& logits,
                             torch::Tensor& workspace, int64_t max_seq_len) {
   namespace P = vllm::persistent;
 
+  at::cuda::OptionalCUDAGuard const device_guard(logits.device());
   const int64_t num_rows = logits.size(0);
   const int64_t stride = logits.stride(0);
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -250,6 +252,8 @@ void persistent_topk(const torch::Tensor& logits, const torch::Tensor& lengths,
               "persistent_topk supports k=512, k=1024, or k=2048, got k=", k);
   TORCH_CHECK(logits.stride(1) == 1, "logits strides[1] must be 1");
 
+  at::cuda::OptionalCUDAGuard const device_guard(logits.device());
+
   if (k == 512) {
     launch_persistent_topk<512>(logits, lengths, output, workspace,
                                 max_seq_len);
@@ -264,3 +268,79 @@ void persistent_topk(const torch::Tensor& logits, const torch::Tensor& lengths,
   TORCH_CHECK(false, "persistent_topk is not supported on ROCm");
 #endif
 }
+
+namespace vllm {
+namespace stable_topk_gathered {
+
+void launch_stable_topk_gathered(
+    const float* gathered, int* out,
+    int num_rows, int num_candidates, int topk,
+    cudaStream_t stream) {
+
+  const bool use_global = (num_candidates > MAX_SMEM_CANDIDATES);
+
+  const size_t smem_overhead =
+      sizeof(uint64_t)                               // prefix
+      + sizeof(uint32_t)                             // committed
+      + (size_t)WARPS_PER_BLOCK * sizeof(uint32_t)   // warp_totals
+      + (size_t)HIST_BINS * sizeof(uint32_t);        // hist
+
+  const size_t smem_bytes = use_global
+      ? smem_overhead
+      : (smem_overhead + (size_t)num_candidates * sizeof(uint64_t));
+
+  const size_t buf_bytes = use_global
+      ? num_rows * (size_t)num_candidates * sizeof(uint64_t)
+      : 0;
+
+  uint64_t* ka = nullptr;
+  uint64_t* kb = nullptr;
+  if (use_global) {
+    cudaMalloc(&ka, buf_bytes);
+    cudaMalloc(&kb, buf_bytes);
+  }
+
+  dim3 grid(num_rows);
+  dim3 block(BLOCK_SIZE);
+  stable_topk_gathered_kernel<<<grid, block, smem_bytes, stream>>>(
+      gathered, out, num_rows, num_candidates, topk, ka, kb);
+
+  if (use_global) {
+    cudaFree(ka);
+    cudaFree(kb);
+  }
+}
+
+}  // namespace stable_topk_gathered
+}  // namespace vllm
+
+#ifndef USE_ROCM
+void stable_topk_gathered(torch::Tensor gathered, torch::Tensor out,
+                          int64_t topk) {
+  const at::cuda::OptionalCUDAGuard device_guard(gathered.device());
+  TORCH_CHECK(gathered.is_cuda(), "gathered must be a CUDA tensor");
+  TORCH_CHECK(out.is_cuda(), "out must be a CUDA tensor");
+  TORCH_CHECK(gathered.dim() == 3, "gathered must be 3D");
+  TORCH_CHECK(gathered.size(2) == 2,
+              "gathered last dim must be 2 (score, token_id)");
+  TORCH_CHECK(topk > 0, "topk must be positive");
+  TORCH_CHECK(gathered.scalar_type() == at::kFloat,
+              "gathered must be float32");
+  TORCH_CHECK(out.scalar_type() == at::kInt, "out must be int32");
+  TORCH_CHECK(gathered.is_contiguous(), "gathered must be contiguous");
+  const int64_t num_rows = gathered.size(0);
+  const int64_t num_candidates = gathered.size(1);
+  TORCH_CHECK(out.size(0) == num_rows && out.size(1) == topk,
+              "out size mismatch");
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  // The -1 pre-fill is done inside the kernel (matching the DSL kernel's
+  // init), so no host-side memset is needed.
+  vllm::stable_topk_gathered::launch_stable_topk_gathered(
+      gathered.const_data_ptr<float>(), out.mutable_data_ptr<int32_t>(),
+      static_cast<int>(num_rows), static_cast<int>(num_candidates),
+      static_cast<int>(topk), stream);
+  const cudaError_t err = cudaGetLastError();
+  TORCH_CHECK(err == cudaSuccess,
+              "stable_topk_gathered failed: ", cudaGetErrorString(err));
+}
+#endif

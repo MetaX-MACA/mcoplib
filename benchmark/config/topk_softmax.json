@@ -1,6 +1,6 @@
 {
     "device_id": 0,
-    "device_name": "MetaX C280",
+    "device_name": ["MetaX C500", "MetaX C600-UL", "Metax C600-U"],
     "batch_size": 131072,
     "num_experts": 64,
     "top_k": 2,

@@ -1,0 +1,11 @@
+{
+    "device_id": 0,
+    "device_name": ["MetaX C500", "MetaX C600-UL", "Metax C600-U"],
+    "num_experts": 8,
+    "num_tokens": 512,
+    "hidden_size": 4096,
+    "dtype": "bfloat16",
+    "use_ue8m0": false,
+    "seed": 42,
+    "samples": 1000
+}

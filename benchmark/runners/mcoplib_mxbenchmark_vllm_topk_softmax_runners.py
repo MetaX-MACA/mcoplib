@@ -18,6 +18,7 @@ class Vllm_topk_softmax_runner(OpBenchmarkBase):
           Tensor     gating_output,       # [num_tokens, num_experts], f16/bf16/f32
           bool       renormalize,
           Tensor?    bias                 # optional, [num_experts], float32
+          Tensor?    is_padding           # optional, [num_tokens], bool
       )
     """
 
@@ -64,7 +65,7 @@ class Vllm_topk_softmax_runner(OpBenchmarkBase):
             dev_id,
             torch.ops._moe_C.topk_softmax,
             topk_weights, topk_indices, token_expert_indices,
-            gating, self.renormalize, None,
+            gating, self.renormalize, None, None,
         )
 
     def run_verification(self, dev_id):
@@ -77,7 +78,7 @@ class Vllm_topk_softmax_runner(OpBenchmarkBase):
         out_expert_indices = torch.empty(N, K, dtype=torch.int32, device=dev)
         torch.ops._moe_C.topk_softmax(
             out_weights, out_indices, out_expert_indices,
-            gating, self.renormalize, None,
+            gating, self.renormalize, None, None,
         )
         torch.cuda.synchronize()
         ref_vals, ref_idxs = torch.topk(gating.float(), K, dim=-1)

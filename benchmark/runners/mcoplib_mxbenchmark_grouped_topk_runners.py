@@ -48,6 +48,7 @@ class Grouped_topk_runner(OpBenchmarkBase):
         self.num_experts = config.get("num_experts", 256)
         self.n_group = config.get("n_group", 8)
         self.topk_group = config.get("topk_group", 4)
+        self.seed = config.get("seed", None)
         self.topk = config.get("topk", 8)
         self.renormalize = config.get("renormalize", True)
         self.routed_scaling_factor = config.get("routed_scaling_factor", 2.0)

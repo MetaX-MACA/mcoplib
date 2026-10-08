@@ -3,7 +3,7 @@
 
 #include <cmath>
 #include <cub/block/block_reduce.cuh>
-#include <flashinfer/vec_dtypes.cuh>
+#include "vec_dtypes.cuh"
 
 #include "utils.h"
 
@@ -16,7 +16,7 @@ per_tensor_absmax_kernel(const T* __restrict__ input, float* __restrict__ output
   const int grid_size = blockDim.x * gridDim.x;
 
   constexpr uint32_t vec_size = 16 / sizeof(T);
-  using vec_t = flashinfer::vec_t<T, vec_size>;
+  using vec_t = mcoplib::vec_t<T, vec_size>;
 
   const int32_t num_vec_elems = num_elements / vec_size;
 
@@ -57,7 +57,7 @@ __global__ void per_tensor_quant_fp8_kernel(
   // We want to store 128 bits of data at a time. 16 = 128 / 8 bits
   // Load is already vectorized, so 16 elements work for T.
   const uint32_t VEC_SIZE = 16;
-  using vec_t = flashinfer::vec_t<T, VEC_SIZE>;
+  using vec_t = mcoplib::vec_t<T, VEC_SIZE>;
 
   const int32_t num_vec_elems = num_elements / VEC_SIZE;
 

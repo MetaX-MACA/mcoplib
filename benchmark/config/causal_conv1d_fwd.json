@@ -1,0 +1,17 @@
+{
+    "device_id": 0,
+    "device_name": "MetaX C600U",
+    "tp": [8, 4],
+    "tokens": [2048, 16384],
+    "model_num_heads": 96,
+    "head_dim": 128,
+    "kernel_width": 4,
+    "request_token_cap": 3072,
+    "num_cache_lines": 212,
+    "activation": "silu",
+    "dtype": "bfloat16",
+    "seed": 1234,
+    "atol": 0.02,
+    "rtol": 0.02,
+    "samples": 100
+}

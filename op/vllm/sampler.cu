@@ -661,6 +661,7 @@ void top_k_per_row_decode(const torch::Tensor& logits, int64_t next_n,
   constexpr int kSortingAlgorithmThreshold = 12288;
   constexpr int kSplitWorkThreshold = 200 * 1000;
   constexpr int kNumThreadsPerBlock = 512;
+  const at::cuda::CUDAGuard device_guard(logits.device());
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   const auto numColumns = logits.size(1);
 
@@ -722,6 +723,7 @@ void top_k_per_row_prefill(const torch::Tensor& logits,
                            int64_t topK) {
   constexpr int kSortingAlgorithmThreshold = 12288;
   constexpr int kNumThreadsPerBlock = 512;
+  const at::cuda::CUDAGuard device_guard(logits.device());
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
   int numInsertionBlocks =

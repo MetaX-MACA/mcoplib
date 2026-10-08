@@ -1,6 +1,6 @@
 {
     "device_id": 0,
-    "device_name": "MetaX C500",
+    "device_name": ["MetaX C500", "MetaX C600-UL", "Metax C600-U"],
     "M": [1, 16, 128, 2048],
     "N": [4096, 8192],
     "K": [4096, 8192],

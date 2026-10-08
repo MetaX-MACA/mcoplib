@@ -1,6 +1,6 @@
 {
     "device_id": 0,
-    "device_name": "MetaX C500",
+    "device_name": ["MetaX C500", "MetaX C600-UL", "Metax C600-U"],
     "max_tokens_per_batch": 131072,
     "block_size": 128,
     "num_experts": 128,

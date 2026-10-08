@@ -12,6 +12,7 @@ class Fast_topk_transform_fused_runner(OpBenchmarkBase):
         self.batch_size = config.get("batch_size", 32)
         self.vocab_size = config.get("vocab_size", 64000)
         self.prefill_bs = config.get("prefill_bs", 32)
+        self.seed=config.get("seed",None)
         self.k = 2048
         if self.dtype != torch.float32:
             print(f"[Warning] {name} only supports float32 in kernel source. Forcing dtype to float32.")
@@ -33,6 +34,9 @@ class Fast_topk_transform_fused_runner(OpBenchmarkBase):
     def prepare_and_get_launcher(self, dev_id, tc_s):
         if not hasattr(torch.ops, "sgl_kernel") or not hasattr(torch.ops.sgl_kernel, "fast_topk_transform_fused"):
              raise RuntimeError("Operator 'torch.ops.sgl_kernel.fast_topk_transform_fused' not found.")
+        if self.seed is not None:
+            torch.manual_seed(self.seed)
+            torch.cuda.manual_seed_all(self.seed)
         with torch.cuda.stream(tc_s):
             dev = f'cuda:{dev_id}'
             score = torch.randn((self.batch_size, self.vocab_size), dtype=self.dtype, device=dev)

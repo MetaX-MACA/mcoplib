@@ -1,11 +1,12 @@
 {
     "device_id": 0,
-    "device_name": "MetaX C500",
+    "device_name": ["MetaX C500", "MetaX C600-UL", "Metax C600-U"],
     "bits": 4,
     "groupsize": 128,
     "m": 128,
     "k": 1024,
     "n": 4096,
     "dtype": "float16",
+    "seed": 42,
     "samples": 1000
 }

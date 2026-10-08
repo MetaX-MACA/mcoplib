@@ -2,62 +2,74 @@ import torch
 from mcoplib_mxbenchmark_op_wrapper import OpBenchmarkBase
 
 try:
-    import mcoplib.op as op
+    import mcoplib._C
 except ImportError:
-    op = None
+    pass
+
 
 class Rms_norm_runner(OpBenchmarkBase):
-    def __init__(self, name, config):
-        super().__init__(name, config)
-        self.B = config.get("batch_size", 64)
-        self.S = config.get("seq_len", 2048)
-        self.H = config.get("hidden_size", 4096)
-        self.var_epsilon = config.get("var_epsilon", 1e-6)
-        self.rms_div = config.get("rms_div", False)
+    def __init__(self,name,config):
+        super().__init__(name,config)
 
-    def define_metrics(self, state):
-        state.add_summary("Op", self.name)
-        state.add_summary("dtype", self.config.get("dtype", str(self.dtype)))
-        state.add_summary("Shape", f"({self.B} {self.S} {self.H})")
-        total_elements = self.B * self.S * self.H
-        state.add_element_count(total_elements)
-        element_size = 2 if self.dtype == torch.float16 else 4
-        reads = (total_elements * 2 + self.H) * element_size
-        writes = (total_elements * 2) * element_size
-        state.add_global_memory_reads(reads)
-        state.add_global_memory_writes(writes)
+        self.B=config.get("batch_size")
+        self.S=config.get("seq_len")
+        self.H=config.get("hidden_size")
+        self.heads=config.get("heads",0)
 
-    def prepare_and_get_launcher(self, dev_id, tc_s):
-        with torch.cuda.stream(tc_s):
-            dev = f'cuda:{dev_id}'
-            input_tensor = torch.randn(self.B, self.S, self.H, dtype=self.dtype, device=dev)
-            weight = torch.randn(self.H, dtype=self.dtype, device=dev)
-            residual = torch.randn(self.B, self.S, self.H, dtype=self.dtype, device=dev)
-            out = torch.empty(self.B, self.S, self.H, dtype=self.dtype, device=dev)
-            after_res = torch.empty(self.B, self.S, self.H, dtype=self.dtype, device=dev)
-        return self.make_launcher(dev_id, op.rms_norm,
-                                  out, input_tensor, weight, self.var_epsilon,
-                                  after_res, residual, self.rms_div)
+        self.var_epsilon=config.get("var_epsilon",1e-6)
 
-    def run_verification(self, dev_id):
-        dev = f'cuda:{dev_id}'
-        B, S, H = 2, 16, 128
-        input_tensor = torch.randn(B, S, H, dtype=self.dtype, device=dev)
-        weight = torch.randn(H, dtype=self.dtype, device=dev)
-        residual = torch.randn(B, S, H, dtype=self.dtype, device=dev)
-        out_op = torch.empty(B, S, H, dtype=self.dtype, device=dev)
-        after_res_op = torch.empty(B, S, H, dtype=self.dtype, device=dev)
-        op.rms_norm(out_op, input_tensor, weight, self.var_epsilon,
-                    after_res_op, residual, self.rms_div)
-        inp_f = input_tensor.float()
-        res_f = residual.float()
-        w_f = weight.float()
-        after_res_ref = inp_f + res_f
-        mean_sq = torch.mean(after_res_ref ** 2, dim=-1, keepdim=True)
-        rms = torch.sqrt(mean_sq + self.var_epsilon)
-        if self.rms_div:
-            normed = after_res_ref / rms
+        self.is_4d=self.heads>0
+
+        if self.is_4d:
+            self.head_dim=self.H//self.heads
+            self.shape=(self.B,self.S,self.heads,self.head_dim)
+            self.weight_dim=self.head_dim
         else:
-            normed = after_res_ref * (1.0 / rms)
-        out_ref = normed * w_f
-        return self.check_diff(out_op, out_ref.to(self.dtype))
+            self.shape=(self.B,self.S,self.H)
+            self.weight_dim=self.H
+
+
+    def define_metrics(self,state):
+        state.add_summary("Op",self.name)
+        state.add_summary("dtype",self.config.get("dtype",str(self.dtype)))
+        state.add_summary("Shape","("+" ".join(map(str,self.shape))+")")
+
+        total_elements=1
+        for x in self.shape:
+            total_elements*=x
+
+        state.add_element_count(total_elements)
+
+        element_size=2 if self.dtype in [torch.float16,torch.bfloat16] else 4
+
+        state.add_global_memory_reads((total_elements+self.weight_dim)*element_size)
+        state.add_global_memory_writes(total_elements*element_size)
+
+
+    def prepare_and_get_launcher(self,dev_id,tc_s):
+        with torch.cuda.stream(tc_s):
+            dev=f"cuda:{dev_id}"
+
+            input_tensor=torch.randn(*self.shape,dtype=self.dtype,device=dev)
+            weight=torch.randn(self.weight_dim,dtype=self.dtype,device=dev)
+            output=torch.empty_like(input_tensor)
+
+        return self.make_launcher(dev_id,torch.ops._C.rms_norm,output,input_tensor,weight,self.var_epsilon)
+
+
+    def run_verification(self,dev_id):
+        dev=f"cuda:{dev_id}"
+
+        input_tensor=torch.randn(*self.shape,dtype=self.dtype,device=dev)
+        weight=torch.randn(self.weight_dim,dtype=self.dtype,device=dev)
+        output=torch.empty_like(input_tensor)
+
+        torch.ops._C.rms_norm(output,input_tensor,weight,self.var_epsilon)
+
+        x=input_tensor.float()
+        w=weight.float()
+
+        mean_square=torch.mean(x*x,dim=-1,keepdim=True)
+        ref=x*torch.rsqrt(mean_square+self.var_epsilon)*w
+
+        return self.check_diff(output,ref.to(self.dtype))

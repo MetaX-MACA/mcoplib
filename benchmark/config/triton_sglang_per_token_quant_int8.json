@@ -1,0 +1,16 @@
+{
+    "device_id": 0,
+    "device_name": ["MetaX C500", "MetaX C600-UL", "MetaX C600-U"],
+    "case": [
+        {"M": 3072, "K": 7168},
+        {"M": 8192, "K": 7168},
+        {"M": 48152, "K": 384},
+        {"M": 65536, "K": 384},
+        {"M": 131072, "K": 384}
+    ],
+    "dtype": "bfloat16",
+    "scale_dtype": "float32",
+    "cal_sum": false,
+    "seed": 20260911,
+    "samples": 100
+}

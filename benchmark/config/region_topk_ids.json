@@ -1,0 +1,9 @@
+{
+    "device_id": 0,
+    "device_name": "MetaX C500",
+    "rows": 512,
+    "seq_regions": 4096,
+    "topk": 512,
+    "dtype": "float32",
+    "samples": 1000
+}

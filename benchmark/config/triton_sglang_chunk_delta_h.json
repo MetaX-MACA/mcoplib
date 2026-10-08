@@ -1,0 +1,16 @@
+{
+    "device_id": 0,
+    "device_name": ["MetaX C500", "MetaX C600-UL", "Metax C600-U"],
+    "case": [
+        {"total_tokens": 2048, "logical_batch": 1, "num_heads": 12},
+        {"total_tokens": 4096, "logical_batch": 16, "num_heads": 12},
+        {"total_tokens": 8192, "logical_batch": 4, "num_heads": 12},
+        {"total_tokens": 8192, "logical_batch": 64, "num_heads": 24},
+        {"total_tokens": 16384, "logical_batch": 256, "num_heads": 24}
+    ],
+    "head_dim": 128,
+    "key_head_ratio": 1,
+    "dtype": "bfloat16",
+    "seed": 20260910,
+    "samples": 100
+}

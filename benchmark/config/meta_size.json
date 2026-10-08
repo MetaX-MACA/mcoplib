@@ -1,5 +1,5 @@
 {
     "device_id": 0,
-    "device_name": "MetaX C500",
-    "samples": 1000
+    "device_name": ["MetaX C500", "MetaX C600-UL", "Metax C600-U"],
+    "samples": 5000
 }
