@@ -560,6 +560,7 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE_PARAM) __global__
     // NaN gating (from degenerate hidden states in CUDA graph padding) causes
     // softmax to produce all-NaN, which makes the argmax loop always pick
     // expert 0 for every top-k slot, producing duplicate expert IDs that
+    // crash FlashInfer's three-step MoE sort.
     // With 0s, the argmax uses index tie-breaking to pick [0,1,2,...,k-1].
 #pragma unroll
     for (int ii = 0; ii < VPT; ++ii) {

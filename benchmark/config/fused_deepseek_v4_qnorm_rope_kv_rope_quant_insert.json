@@ -15,6 +15,5 @@
     "positions_dtype": "int64",
     "fp8_scale": 1.0,
     "q_fp8_scale_inv": 1.0,
-    "seed": 42,
     "samples": 100
 }

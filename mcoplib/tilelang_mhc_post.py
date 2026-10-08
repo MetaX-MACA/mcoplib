@@ -1,7 +1,6 @@
 """Standalone extraction of SGLang's MHC post TileLang operator."""
 
 import math
-from functools import lru_cache
 
 import tilelang
 import tilelang.language as T
@@ -13,9 +12,6 @@ PASS_CONFIGS = {
     tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
     tilelang.PassConfigKey.TL_PTXAS_REGISTER_USAGE_LEVEL: 10,
 }
-
-C600U_AP_COUNT = 28
-C600UL_AP_COUNT = 32
 
 
 @tilelang.jit(pass_configs=PASS_CONFIGS)
@@ -109,64 +105,14 @@ def mhc_post_tilelang_split_hidden(
         T.copy(x_shared, x[i_n, 0, h_start])
 
 
-@lru_cache(maxsize=None)
-def _get_device_ap_count_by_index(device_index: int) -> int:
-    return torch.cuda.get_device_properties(device_index).multi_processor_count
-
-def _get_device_ap_count(device: torch.device | int | None = None) -> int:
-    """Return the cached AP count reported for a CUDA/MACA device."""
-    if device is None:
-        device_index = torch.cuda.current_device()
-    elif isinstance(device, int):
-        device_index = device
-    else:
-        if device.type != "cuda":
-            raise ValueError(f"expected a CUDA/MACA device, got {device}")
-        device_index = device.index
-        if device_index is None:
-            device_index = torch.cuda.current_device()
-    return _get_device_ap_count_by_index(device_index)
-
-def _select_mhc_post_config(
-    hidden: int, num_tokens: int, ap_count: int | None = None
-) -> tuple[int, int]:
-    """Use C600UL tuning for 32 APs and C600U tuning otherwise."""
-    if ap_count is None:
-        ap_count = _get_device_ap_count()
-
-    if ap_count != C600UL_AP_COUNT:
-        if hidden == 4096:
-            if num_tokens <= 13:
-                return 128, 128
-            if num_tokens <= 28:
-                return 256, 512
-            if num_tokens <= 52:
-                return 128, 256
-            return 64, 512
-        if hidden == 7168:
-            if num_tokens <= 3:
-                return 128, 128
-            if num_tokens <= 31:
-                return 128, 256
-            return 256, 1792
-
-        # Untuned hidden sizes retain the original C600U policy.
-        if num_tokens <= 56:
-            return 128, 512
-        return 64, 512
-
-    if hidden == 7168:
-        return 256, 1792
-
-    # Untuned hidden sizes retain the original C600UL policy.
+def _select_mhc_post_config(hidden: int, num_tokens: int) -> tuple[int, int]:
+    """Select (threads, hidden tile) for C600-U."""
+    if num_tokens <= 56:
+        return 128, 512
+    if hidden in (5120, 7168):
+        return 256, hidden // 4
     return 64, 512
 
-def _use_mhc_post_baseline(ap_count: int, hidden: int, num_tokens: int) -> bool:
-    """Use one block/token below the measured C600UL crossover."""
-    if ap_count != C600UL_AP_COUNT:
-        return False
-    token_limit = 128 if hidden == 4096 else 64
-    return num_tokens < token_limit
 
 def mhc_post(
     x: torch.Tensor,
@@ -174,20 +120,10 @@ def mhc_post(
     post_layer_mix: torch.Tensor,
     comb_res_mix: torch.Tensor,
 ) -> torch.Tensor:
+    out = torch.empty_like(residual)
     hc = residual.shape[-2]
     hidden = residual.shape[-1]
-    num_tokens = residual.shape[0]
-    ap_count = _get_device_ap_count(residual.device.index)
-
-    if _use_mhc_post_baseline(ap_count, hidden, num_tokens):
-        return mhc_post_baseline(x, residual, post_layer_mix, comb_res_mix)
-
-    out = torch.empty_like(residual)
-    threads, h_blk = _select_mhc_post_config(
-        hidden,
-        num_tokens,
-        ap_count=ap_count,
-    )
+    threads, h_blk = _select_mhc_post_config(hidden, residual.shape[0])
     mhc_post_tilelang_split_hidden(
         comb_res_mix,
         residual,
@@ -227,5 +163,4 @@ __all__ = [
     "mhc_post_tilelang_baseline",
     "mhc_post_tilelang_split_hidden",
     "_select_mhc_post_config",
-    "_use_mhc_post_baseline",
 ]

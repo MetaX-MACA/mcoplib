@@ -6,6 +6,5 @@
     "hidden_dim":[7168],
     "dtype":["bfloat16"],
     "output_dtype":["float32"],
-    "seed": 42,
     "samples":100
 }

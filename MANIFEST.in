@@ -5,7 +5,6 @@ include CMakeLists.txt
 include mcoplib/version
 
 recursive-include mcoplib/triton_utils *
-recursive-include mcoplib/*.py
 recursive-include include *
 recursive-include kernel *
 recursive-include common *

@@ -9,6 +9,5 @@
     "block_size": [8],
     "dtype": ["bfloat16"],
     "cache_dtype": ["uint8"],
-    "seed": 42,
     "samples": 1000
 }

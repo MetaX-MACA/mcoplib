@@ -1,5 +1,5 @@
 /*
- * 
+ * Copyright (c) 2023 by FlashInfer team.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,10 +16,9 @@
 #ifndef SGL_POS_ENC_CUH_
 #define SGL_POS_ENC_CUH_
 
-#include <sstream>
-#include "mcoplib_sgl_common.cuh"
-using namespace mcoplib;
-namespace mcoplib {
+#include <flashinfer/pos_enc.cuh>  // upstream
+
+namespace flashinfer {
 
 namespace kv_buffer_saver {
 
@@ -63,68 +62,6 @@ __device__ __forceinline__ void save(
 }
 
 }  // namespace kv_buffer_saver
-
-// ---------------------------------------------------------------------------
-// RoPE thread-local vector helpers, vendored from flashinfer pos_enc.cuh.
-// Adapted for mcoplib (namespace mcoplib, mcoplib::vec_t). Algorithm identical.
-// ---------------------------------------------------------------------------
-template <uint32_t vec_size, uint32_t bdx, typename T>
-__device__ __forceinline__ vec_t<float, vec_size> vec_apply_llama_rope_cos_sin(
-    const T* x, const vec_t<float, vec_size>& cos, const vec_t<float, vec_size>& sin,
-    const uint32_t rotary_dim = vec_size * bdx) {
-  vec_t<float, vec_size> permuted_vec, vec;
-  vec.cast_load(x + threadIdx.x * vec_size);
-
-  if (threadIdx.x * vec_size < rotary_dim) {
-    permuted_vec.cast_load(x + ((threadIdx.x * vec_size < rotary_dim / 2)
-                                    ? threadIdx.x * vec_size + rotary_dim / 2
-                                    : threadIdx.x * vec_size - rotary_dim / 2));
-#pragma unroll
-    for (uint32_t i = 0; i < vec_size; ++i) {
-      vec[i] =
-          vec[i] * cos[i] +
-          ((threadIdx.x * vec_size < rotary_dim / 2) ? -permuted_vec[i] : permuted_vec[i]) * sin[i];
-    }
-  }
-  return vec;
-}
-
-template <uint32_t vec_size, uint32_t bdx, typename T>
-__device__ __forceinline__ vec_t<float, vec_size> vec_apply_llama_rope_cos_sin_interleave(
-    const T* x, const vec_t<float, vec_size>& cos, const vec_t<float, vec_size>& sin,
-    const uint32_t rotary_dim = vec_size * bdx) {
-  vec_t<float, vec_size> vec, vec_before;
-  vec.cast_load(x + threadIdx.x * vec_size);
-
-  if (threadIdx.x * vec_size < rotary_dim) {
-    vec_before = vec;
-#pragma unroll
-    for (uint32_t i = 0; i < vec_size; ++i) {
-      vec[i] = vec[i] * cos[i] + ((i % 2 == 0) ? -vec_before[i ^ 1] : vec_before[i ^ 1]) * sin[i];
-    }
-  }
-  return vec;
-}
-
-template <uint32_t vec_size, uint32_t bdx, typename T>
-__device__ __forceinline__ vec_t<float, vec_size>
-vec_apply_llama_rope_cos_sin_interleave_reuse_half(const T* x, const vec_t<float, vec_size>& cos,
-                                                   const vec_t<float, vec_size>& sin,
-                                                   const uint32_t rotary_dim = vec_size * bdx) {
-  vec_t<float, vec_size> vec, vec_before;
-  vec.cast_load(x + threadIdx.x * vec_size);
-
-  if (threadIdx.x * vec_size < rotary_dim) {
-    vec_before = vec;
-#pragma unroll
-    for (uint32_t i = 0; i < vec_size; ++i) {
-      // i / 2 is to get the index of the first half of cos and sin
-      vec[i] = vec[i] * cos[i / 2] +
-               ((i % 2 == 0) ? -vec_before[i ^ 1] : vec_before[i ^ 1]) * sin[i / 2];
-    }
-  }
-  return vec;
-}
 
 template <
     bool save_kv_cache,
@@ -386,242 +323,6 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheEnhancedKernel(
     __VA_ARGS__                                                   \
   }
 
-// DISPATCH_INTERLEAVE / DISPATCH_HEAD_DIM were previously provided by flashinfer
-// (pos_enc.cuh / utils.cuh). Ported here so mcoplib no longer depends on
-// flashinfer. FLASHINFER_ERROR replaced with a std::invalid_argument throw.
-#ifndef DISPATCH_INTERLEAVE
-#define DISPATCH_INTERLEAVE(interleave, INTERLEAVE, ...) \
-  if (interleave) {                                      \
-    const bool INTERLEAVE = true;                        \
-    __VA_ARGS__                                          \
-  } else {                                               \
-    const bool INTERLEAVE = false;                       \
-    __VA_ARGS__                                          \
-  }
-#endif
-
-#ifndef DISPATCH_HEAD_DIM
-#define DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, ...)     \
-  switch (head_dim) {                                  \
-    case 64: {                                         \
-      constexpr size_t HEAD_DIM = 64;                  \
-      __VA_ARGS__                                      \
-      break;                                           \
-    }                                                  \
-    case 128: {                                        \
-      constexpr size_t HEAD_DIM = 128;                 \
-      __VA_ARGS__                                      \
-      break;                                           \
-    }                                                  \
-    case 256: {                                        \
-      constexpr size_t HEAD_DIM = 256;                 \
-      __VA_ARGS__                                      \
-      break;                                           \
-    }                                                  \
-    case 512: {                                        \
-      constexpr size_t HEAD_DIM = 512;                 \
-      __VA_ARGS__                                      \
-      break;                                           \
-    }                                                  \
-    default: {                                         \
-      std::ostringstream err_msg;                      \
-      err_msg << "Unsupported head_dim: " << head_dim; \
-      throw std::invalid_argument(err_msg.str());      \
-    }                                                  \
-  }
-#endif
-
-// ---------------------------------------------------------------------------
-// Non-"Enhanced" RoPE cos/sin-cache kernels + launcher, vendored from
-// flashinfer pos_enc.cuh so mcoplib no longer depends on flashinfer.
-// Adapted: FLASHINFER_CUDA_CALL -> MCOPLIB_CUDA_CALL, std::max<uint32_t> for
-// the constexpr vec_size. Uses plain cudaLaunchKernel (no PDL attribute).
-// ---------------------------------------------------------------------------
-template <bool interleave, uint32_t head_dim, uint32_t vec_size, uint32_t bdx, typename DType,
-          typename IdType>
-__global__ void BatchQKApplyRotaryPosIdsCosSinCacheHeadParallelismKernel(
-    DType* q, DType* k, DType* q_rope, DType* k_rope, float* __restrict__ cos_sin_cache,
-    IdType* __restrict__ pos_ids, uint32_t nnz, uint32_t num_qo_heads, uint32_t num_kv_heads,
-    uint32_t rotary_dim, size_t q_stride_n, size_t q_stride_h, size_t k_stride_n, size_t k_stride_h,
-    size_t q_rope_stride_n, size_t q_rope_stride_h, size_t k_rope_stride_n,
-    size_t k_rope_stride_h) {
-  uint32_t bx = blockIdx.x, tx = threadIdx.x, ty = threadIdx.y;
-  uint32_t by = blockIdx.y;
-  const uint32_t bdy = blockDim.y;
-
-  vec_t<float, vec_size> cos, sin;
-  if (bx * bdy + ty < nnz) {
-    const uint32_t idx = bx * bdy + ty;
-    const IdType pos = pos_ids[idx];
-
-    const int half_rotary_dim = rotary_dim / 2;
-
-    if (tx * vec_size < rotary_dim) {
-      int sin_offset = rotary_dim / 2;
-      int vec_idx;
-      if constexpr (interleave) {
-        vec_idx = (tx * vec_size) / 2;
-      } else {
-        vec_idx = (tx * vec_size) % half_rotary_dim;
-      }
-      cos.load(cos_sin_cache + (pos * rotary_dim) + vec_idx);
-      sin.load(cos_sin_cache + (pos * rotary_dim) + (sin_offset + vec_idx));
-    }
-
-    if (by < num_qo_heads) {
-      uint32_t qo_head_idx = by;
-      DType* q_ptr = q + get_elem_offset_impl(idx, qo_head_idx, 0, q_stride_n, q_stride_h);
-      DType* q_rope_ptr =
-          q_rope + get_elem_offset_impl(idx, qo_head_idx, 0, q_rope_stride_n, q_rope_stride_h);
-      vec_t<float, vec_size> q_vec;
-      if constexpr (interleave) {
-        q_vec = vec_apply_llama_rope_cos_sin_interleave_reuse_half<vec_size, bdx>(q_ptr, cos, sin,
-                                                                                  rotary_dim);
-      } else {
-        q_vec = vec_apply_llama_rope_cos_sin<vec_size, bdx>(q_ptr, cos, sin, rotary_dim);
-      }
-      q_vec.cast_store(q_rope_ptr + tx * vec_size);
-    } else {
-      uint32_t kv_head_idx = by - num_qo_heads;
-      DType* k_ptr = k + get_elem_offset_impl(idx, kv_head_idx, 0, k_stride_n, k_stride_h);
-      DType* k_rope_ptr =
-          k_rope + get_elem_offset_impl(idx, kv_head_idx, 0, k_rope_stride_n, k_rope_stride_h);
-      vec_t<float, vec_size> k_vec;
-      if constexpr (interleave) {
-        k_vec = vec_apply_llama_rope_cos_sin_interleave_reuse_half<vec_size, bdx>(k_ptr, cos, sin,
-                                                                                  rotary_dim);
-      } else {
-        k_vec = vec_apply_llama_rope_cos_sin<vec_size, bdx>(k_ptr, cos, sin, rotary_dim);
-      }
-      k_vec.cast_store(k_rope_ptr + tx * vec_size);
-    }
-  }
-}
-
-template <bool interleave, uint32_t head_dim, uint32_t vec_size, uint32_t bdx, typename DType,
-          typename IdType>
-__global__ void BatchQKApplyRotaryPosIdsCosSinCacheKernel(
-    DType* q, DType* k, DType* q_rope, DType* k_rope, float* __restrict__ cos_sin_cache,
-    IdType* __restrict__ pos_ids, uint32_t nnz, uint32_t num_qo_heads, uint32_t num_kv_heads,
-    uint32_t rotary_dim, size_t q_stride_n, size_t q_stride_h, size_t k_stride_n, size_t k_stride_h,
-    size_t q_rope_stride_n, size_t q_rope_stride_h, size_t k_rope_stride_n,
-    size_t k_rope_stride_h) {
-  uint32_t bx = blockIdx.x, tx = threadIdx.x, ty = threadIdx.y;
-  const uint32_t bdy = blockDim.y;
-
-  vec_t<float, vec_size> cos, sin;
-  if (bx * bdy + ty < nnz) {
-    const uint32_t idx = bx * bdy + ty;
-    const IdType pos = pos_ids[idx];
-    const int half_rotary_dim = rotary_dim / 2;
-
-    if (tx * vec_size < rotary_dim) {
-      int sin_offset = rotary_dim / 2;
-      int vec_idx;
-      if constexpr (interleave) {
-        vec_idx = (tx * vec_size) / 2;
-      } else {
-        vec_idx = (tx * vec_size) % half_rotary_dim;
-      }
-      cos.load(cos_sin_cache + (pos * rotary_dim) + vec_idx);
-      sin.load(cos_sin_cache + (pos * rotary_dim) + (sin_offset + vec_idx));
-    }
-
-#pragma unroll 1
-    for (uint32_t qo_head_idx = 0; qo_head_idx < num_qo_heads; ++qo_head_idx) {
-      DType* q_ptr = q + get_elem_offset_impl(idx, qo_head_idx, 0, q_stride_n, q_stride_h);
-      DType* q_rope_ptr =
-          q_rope + get_elem_offset_impl(idx, qo_head_idx, 0, q_rope_stride_n, q_rope_stride_h);
-      vec_t<float, vec_size> q_vec;
-      if constexpr (interleave) {
-        q_vec = vec_apply_llama_rope_cos_sin_interleave_reuse_half<vec_size, bdx>(q_ptr, cos, sin,
-                                                                                  rotary_dim);
-      } else {
-        q_vec = vec_apply_llama_rope_cos_sin<vec_size, bdx>(q_ptr, cos, sin, rotary_dim);
-      }
-      q_vec.cast_store(q_rope_ptr + tx * vec_size);
-    }
-
-#pragma unroll 1
-    for (uint32_t kv_head_idx = 0; kv_head_idx < num_kv_heads; ++kv_head_idx) {
-      DType* k_ptr = k + get_elem_offset_impl(idx, kv_head_idx, 0, k_stride_n, k_stride_h);
-      DType* k_rope_ptr =
-          k_rope + get_elem_offset_impl(idx, kv_head_idx, 0, k_rope_stride_n, k_rope_stride_h);
-      vec_t<float, vec_size> k_vec;
-      if constexpr (interleave) {
-        k_vec = vec_apply_llama_rope_cos_sin_interleave_reuse_half<vec_size, bdx>(k_ptr, cos, sin,
-                                                                                  rotary_dim);
-      } else {
-        k_vec = vec_apply_llama_rope_cos_sin<vec_size, bdx>(k_ptr, cos, sin, rotary_dim);
-      }
-      k_vec.cast_store(k_rope_ptr + tx * vec_size);
-    }
-  }
-}
-
-template <typename DType, typename IdType>
-cudaError_t BatchQKApplyRotaryPosIdsCosSinCache(
-    DType* q, DType* k, DType* q_rope, DType* k_rope, float* cos_sin_cache, IdType* pos_ids,
-    uint32_t nnz, uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t rotary_dim,
-    uint32_t head_dim, size_t q_stride_n, size_t q_stride_h, size_t k_stride_n, size_t k_stride_h,
-    size_t q_rope_stride_n, size_t q_rope_stride_h, size_t k_rope_stride_n, size_t k_rope_stride_h,
-    bool interleave, cudaStream_t stream = nullptr) {
-  int dev_id = 0;
-  int num_sms = 0;
-  MCOPLIB_CUDA_CALL(cudaGetDevice(&dev_id));
-  MCOPLIB_CUDA_CALL(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, dev_id));
-
-  DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
-    DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
-      constexpr uint32_t vec_size = std::max<uint32_t>(16 / sizeof(DType), HEAD_DIM / 32);
-      constexpr uint32_t bdx = HEAD_DIM / vec_size;
-      uint32_t num_threads = std::max(128U, bdx);
-      uint32_t bdy = num_threads / bdx;
-      uint32_t nblks_x = (nnz + bdy - 1) / bdy;
-      void* args[] = {(void*)&q,
-                      (void*)&k,
-                      (void*)&q_rope,
-                      (void*)&k_rope,
-                      (void*)&cos_sin_cache,
-                      (void*)&pos_ids,
-                      (void*)&nnz,
-                      (void*)&num_qo_heads,
-                      (void*)&num_kv_heads,
-                      (void*)&rotary_dim,
-                      (void*)&q_stride_n,
-                      (void*)&q_stride_h,
-                      (void*)&k_stride_n,
-                      (void*)&k_stride_h,
-                      (void*)&q_rope_stride_n,
-                      (void*)&q_rope_stride_h,
-                      (void*)&k_rope_stride_n,
-                      (void*)&k_rope_stride_h};
-      auto kernel_0 = BatchQKApplyRotaryPosIdsCosSinCacheKernel<INTERLEAVE, HEAD_DIM, vec_size, bdx,
-                                                                DType, IdType>;
-
-      int num_blocks_per_sm_0 = 0;
-      MCOPLIB_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-          &num_blocks_per_sm_0, kernel_0, num_threads, /*smem_size=*/0));
-      uint32_t num_ctas_0 = num_blocks_per_sm_0 * num_sms;
-
-      if ((nnz + bdy - 1) / bdy >= num_ctas_0) {
-        dim3 nblks(nblks_x);
-        dim3 nthrs(bdx, bdy);
-        MCOPLIB_CUDA_CALL(cudaLaunchKernel((void*)kernel_0, nblks, nthrs, args, 0, stream));
-      } else {
-        dim3 nblks(nblks_x, num_qo_heads + num_kv_heads);
-        dim3 nthrs(bdx, bdy);
-        auto kernel_1 =
-            BatchQKApplyRotaryPosIdsCosSinCacheHeadParallelismKernel<INTERLEAVE, HEAD_DIM, vec_size,
-                                                                     bdx, DType, IdType>;
-        MCOPLIB_CUDA_CALL(cudaLaunchKernel((void*)kernel_1, nblks, nthrs, args, 0, stream));
-      }
-    });
-  });
-
-  return cudaSuccess;
-}
-
 template <typename DType, typename IdType>
 cudaError_t BatchQKApplyRotaryPosIdsCosSinCacheEnhanced(
     DType* q,
@@ -659,8 +360,8 @@ cudaError_t BatchQKApplyRotaryPosIdsCosSinCacheEnhanced(
     cudaStream_t stream = nullptr) {
   int dev_id = 0;
   int num_sms = 0;
-  MCOPLIB_CUDA_CALL(cudaGetDevice(&dev_id));
-  MCOPLIB_CUDA_CALL(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, dev_id));
+  FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
+  FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, dev_id));
 
 #define LAUNCH_KERNEL_RAW(kernel_name)                                \
   do {                                                                \
@@ -670,7 +371,7 @@ cudaError_t BatchQKApplyRotaryPosIdsCosSinCacheEnhanced(
     config.dynamicSmemBytes = 0;                                      \
     config.stream = stream;                                           \
                                                                       \
-    MCOPLIB_CUDA_CALL(cudaLaunchKernelEx(                          \
+    FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(                          \
         &config,                                                      \
         kernel_name,                                                  \
         q,                                                            \
@@ -707,7 +408,7 @@ cudaError_t BatchQKApplyRotaryPosIdsCosSinCacheEnhanced(
     DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
       DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
         // operate on 16 Bytes at a time
-        constexpr uint32_t vec_size = std::max<uint32_t>(16 / sizeof(DType), HEAD_DIM / 32);
+        constexpr uint32_t vec_size = std::max(16 / sizeof(DType), HEAD_DIM / 32);
         // how many threads needed per head_dim
         constexpr uint32_t bdx = HEAD_DIM / vec_size;
         // how many threads needed per block
@@ -727,7 +428,7 @@ cudaError_t BatchQKApplyRotaryPosIdsCosSinCacheEnhanced(
             IdType>;
 
         int num_blocks_per_sm_0 = 0;
-        MCOPLIB_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
             &num_blocks_per_sm_0, kernel_0, num_threads, /*smem_size=*/0));
         uint32_t num_ctas_0 = num_blocks_per_sm_0 * num_sms;
 
@@ -756,6 +457,6 @@ cudaError_t BatchQKApplyRotaryPosIdsCosSinCacheEnhanced(
   return cudaSuccess;
 }
 
-} 
+}  // namespace flashinfer
 
 #endif  // SGL_POS_ENC_CUH_

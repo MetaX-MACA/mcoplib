@@ -147,6 +147,10 @@ def check_accuracy(gating_output, bias, cuda_topk_weights, cuda_topk_indices, cu
 
     return max_diff
 
+    # ---------------------------------------------------------
+    # 4. Performance Test
+    # ---------------------------------------------------------
+    print("\n[2/2] 正在进行耗时统计分析 (Profile Reference vs CUDA)...")
 
 def benchmark_cuda(gating_output, cuda_topk_weights, cuda_topk_indices, cuda_token_expert_indices, bias, renormalize, routed_scaling_factor, is_padding, warmup, runs):
     for _ in range(warmup):
@@ -389,6 +393,7 @@ def run_test():
         raise AssertionError(f"topk_sigmoid strict accuracy test failed: PASS={passed_cases}, FAIL={failed_cases}, TOTAL={TOTAL_CASES}")
 
     print("=== FINAL RESULT: PASS ===")
+
 
 
 if __name__ == "__main__":

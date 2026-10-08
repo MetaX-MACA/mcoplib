@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import math
 import os
-import time
 from dataclasses import dataclass
 
 import pytest
@@ -343,11 +342,7 @@ def test_causal_conv1d_fn_correctness_and_performance() -> None:
         pytest.skip("causal_conv1d_fn requires a CUDA device")
 
     device = torch.device("cuda")
-    torch.cuda.synchronize()
-    total_start = time.perf_counter()
     results = [_run_case(case, device) for case in CASES]
-    torch.cuda.synchronize()
-    total_elapsed_s = time.perf_counter() - total_start
 
     print("\ncausal_conv1d_fn: legacy vs C600U-optimized (BF16, width=4)")
     print(
@@ -363,7 +358,6 @@ def test_causal_conv1d_fn_correctness_and_performance() -> None:
             f"{result.legacy_gbps:>11.2f} {result.optimized_gbps:>9.2f} "
             f"{result.max_abs_error:>10.6f}"
         )
-    print(f"total elapsed time (including JIT compilation): {total_elapsed_s:.3f} s")
 
 
 @pytest.mark.parametrize("activation", [None, "silu"])

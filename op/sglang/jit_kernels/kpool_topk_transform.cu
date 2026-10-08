@@ -1,13 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// Diagnostic AOT staged-radix version with the two read-before-clear barriers
-// present in the supplied JIT kernel.  It is kept outside mcoplib so this
-// suspected intermittent GLM-5 correctness fix can be tested in isolation.
+// AOT implementation of SGLang's kpool_topk_transform operator for mcoplib.
 //
-// The operator selects K pool groups per score row, expands every selected
-// group to pool_size consecutive token indices, and fuses an optional page
-// table lookup or ragged offset.  K remains a compile-time template constant;
-// the ATen entry point dispatches the six supported specializations.
+// Each block selects the highest-scoring pool groups from one row, expands
+// them to token indices, and applies an optional offset or page-table mapping.
+// The normal path uses staged radix selection; oversized radix buckets fall
+// back to an exact full-row rescan. Long prefill rows cache their coarse radix
+// byte in shared memory to avoid a second full FP32 score scan.
 
 #include <ATen/core/TensorBody.h>
 #include <c10/cuda/CUDAStream.h>
@@ -28,20 +27,18 @@ constexpr int kMediumThreads = 512;
 constexpr int kLongStagingSize = 4096;
 constexpr std::size_t kLongDynamicSmem =
     2 * kLongStagingSize * sizeof(int32_t);  // 32 KiB
-// Both GLM-5 3-Ki workloads have score width <= 1024, so no threshold
-// bucket can contain more than 1024 candidates.  A dedicated instance avoids
-// reserving the long-row 4096-entry double buffer for these short rows.
+// Short rows cannot produce more candidates than their width, so a dedicated
+// instance avoids reserving the long-row staging allocation.
 constexpr int kShortStagingSize = 1024;
 constexpr std::size_t kShortDynamicSmem =
     2 * kShortStagingSize * sizeof(int32_t);  // 8 KiB
-constexpr int kRadix = 256;
-constexpr int kCoarseBinCacheMinBatch = 32;
+constexpr int64_t kShortStagingMinBatch = 32;
 constexpr int64_t kCoarseBinCacheMaxScoreWidth =
     kLongStagingSize * static_cast<int64_t>(sizeof(int32_t));
+constexpr int64_t kCoarseBinCacheMinBatch = 32;
+constexpr int kRadix = 256;
 constexpr int64_t kMediumMaxScoreWidth = 2048;
-// The two GLM-5 63-Ki workloads have score widths 16126 and 16383.  Keep the
-// Vec8 experiment scoped to those production shapes; the 3-Ki and generic 8-Ki
-// cases retain their existing scalar dispatch.
+// The GLM-5 63-Ki workloads have score widths 16126 and 16383.
 constexpr int64_t kVec8MinScoreWidth = 16126;
 constexpr int32_t kVec8Stride = 2;  // Two float4 loads per thread and iteration.
 
@@ -62,16 +59,16 @@ struct KpoolTopKParams {
   int32_t out_cols;
 };
 
-// float → fp16(压缩) → uint16(读比特) → 保序变换(修正符号) → 取高字节(分桶key)，四步把一个 float 变成 radix sort 能直接用的 0~255 桶号，且桶号的大小顺序和原始 float 一致。
-__device__ __forceinline__ uint8_t ordered_fp16_high_byte(float value) {  //强制内联展开，调用时强制展开
-  const __half half_value = __float2half_rn(value); //round to nearest, 1+5+10
+// Convert a score to an order-preserving coarse radix byte.
+__device__ __forceinline__ uint8_t ordered_fp16_high_byte(float value) {
+  const __half half_value = __float2half_rn(value);
   const uint16_t bits = __half_as_ushort(half_value);
-  const uint16_t key =
-      (bits & 0x8000u) ? static_cast<uint16_t>(~bits) : static_cast<uint16_t>(bits | 0x8000u); // uint16_t 0-65535
-  return static_cast<uint8_t>(key >> 8); // uint8_t 0-255
+  const uint16_t key = (bits & 0x8000u)
+      ? static_cast<uint16_t>(~bits)
+      : static_cast<uint16_t>(bits | 0x8000u);
+  return static_cast<uint8_t>(key >> 8);
 }
 
-// vectorize half2
 __device__ __forceinline__ void ordered_fp16_high_bytes(
     float first, float second, uint8_t& first_key, uint8_t& second_key) {
   const __half2 half_values = __floats2half2_rn(first, second);
@@ -133,7 +130,7 @@ __device__ __forceinline__ int32_t transform_token(
   return raw_token;
 }
 
-template <int K, int Threads, bool UseVec8, int StagingSize, bool CacheCoarseBins = false>
+template <int K, int Threads, bool UseVec8, int StagingSize, bool CacheCoarseBins>
 __device__ void radix_topk_exact_with_staged_fast_path(
     const float* __restrict__ input,
     int32_t* __restrict__ selected_indices,
@@ -142,11 +139,14 @@ __device__ void radix_topk_exact_with_staged_fast_path(
   static_assert(Threads >= kRadix + 1, "radix histogram requires at least 257 threads");
   static_assert(!UseVec8 || Threads == kDefaultThreads, "vec8 is tuned for 1024 threads");
   static_assert(StagingSize >= K, "staging buffer must hold at least K candidates");
+  static_assert(!CacheCoarseBins || UseVec8, "coarse-bin caching requires vec8");
 
-  // Two staged buffers preserve the fast JIT path for normal score
-  // distributions. If a threshold bucket exceeds this kernel instance's
-  // StagingSize, an exact full-row rescan fallback is used instead of silently
-  // truncating candidates as the attachment does.
+  // Two staged buffers handle normal score distributions. In the coarse-cache
+  // specialization, the first buffer is
+  // placed in the upper half while the lower half temporarily holds one radix
+  // byte per score; the lower half becomes the second buffer after coarse
+  // classification. If a threshold bucket exceeds this kernel instance's
+  // StagingSize, an exact full-row rescan prevents candidate truncation.
   alignas(128) __shared__ uint32_t histogram_buffer[2][kRadix + 128];
   alignas(128) __shared__ int32_t output_counter;
   alignas(128) __shared__ int32_t threshold_bin_id;
@@ -168,19 +168,14 @@ __device__ void radix_topk_exact_with_staged_fast_path(
   auto* coarse_bin_cache = reinterpret_cast<uint8_t*>(staged_indices);
   const auto staged_buffer = [&](int32_t buffer_index) {
     if constexpr (CacheCoarseBins) {
-      // While the coarse bytes are live, the first candidate buffer occupies
-      // the upper half.  Once the cache is dead, its lower half becomes the
-      // second refinement buffer, preserving the original two-buffer layout.
+      // Buffer 0 occupies the upper half while the lower half caches one byte
+      // per score. After coarse classification, the cache is dead and becomes
+      // refinement buffer 1.
       return staged_indices + (buffer_index == 0 ? StagingSize : 0);
-    } else {
-      return staged_indices + buffer_index * StagingSize;
     }
+    return staged_indices + buffer_index * StagingSize;
   };
   int32_t remain = K;
-  static_assert(!CacheCoarseBins || UseVec8, "coarse-bin caching requires vec8");
-  static_assert(
-      !CacheCoarseBins || StagingSize * sizeof(int32_t) >= kCoarseBinCacheMaxScoreWidth,
-      "coarse-bin cache must fit in half of dynamic shared memory");
 
   const auto run_suffix_sum = [&] {
 #pragma unroll 8
@@ -350,9 +345,7 @@ __device__ void radix_topk_exact_with_staged_fast_path(
     return;
   }
 
-  // Match the JIT kernel's barrier before reusing histogram storage.  Every
-  // thread must consume histogram[coarse_threshold + 1] above before any
-  // thread clears that element for the first FP32 refinement pass.
+  // All threads must consume the coarse suffix sum before it is cleared.
   __syncthreads();
 
   // Collect the threshold bucket and build the first FP32-byte histogram.
@@ -586,10 +579,7 @@ __device__ void radix_topk_exact_with_staged_fast_path(
       return;
     }
 
-    // Do not clear the suffix sums until all threads have consumed
-    // histogram[refine_threshold + 1] and made the same remain decision.
-    // Without this JIT barrier, fast threads can race ahead and make slower
-    // threads observe zero, creating divergent refinement state.
+    // All threads must consume the suffix sum before it is cleared.
     __syncthreads();
 
     if (tid < kRadix + 1) {
@@ -625,7 +615,7 @@ __device__ void radix_topk_exact_with_staged_fast_path(
   }
 }
 
-template <int K, int Threads, bool UseVec8, int StagingSize, bool CacheCoarseBins = false>
+template <int K, int Threads, bool UseVec8, int StagingSize, bool CacheCoarseBins>
 __global__ __launch_bounds__(Threads) void kpool_topk_transform_kernel(
     KpoolTopKParams params) {
   const int64_t row = static_cast<int64_t>(blockIdx.x);
@@ -705,7 +695,8 @@ __global__ __launch_bounds__(Threads) void kpool_topk_transform_kernel(
   }
 
   __shared__ int32_t selected_groups[K];
-  radix_topk_exact_with_staged_fast_path<K, Threads, UseVec8, StagingSize, CacheCoarseBins>(
+  radix_topk_exact_with_staged_fast_path<
+      K, Threads, UseVec8, StagingSize, CacheCoarseBins>(
       score_row, selected_groups, row_start, length);
 
   // GLM-5 fixes pool_size at four.  Specialize the output expansion so the
@@ -784,11 +775,13 @@ template <
 void launch_kpool_topk_transform_impl(
     const KpoolTopKParams& params, int64_t batch_size, cudaStream_t stream) {
   set_kernel_smem_once<
-      kpool_topk_transform_kernel<K, Threads, UseVec8, StagingSize, CacheCoarseBins>,
+      kpool_topk_transform_kernel<
+          K, Threads, UseVec8, StagingSize, CacheCoarseBins>,
       DynamicSmem>();
   const dim3 grid{static_cast<uint32_t>(batch_size)};
   const dim3 block{Threads};
-  kpool_topk_transform_kernel<K, Threads, UseVec8, StagingSize, CacheCoarseBins>
+  kpool_topk_transform_kernel<
+      K, Threads, UseVec8, StagingSize, CacheCoarseBins>
       <<<grid, block, DynamicSmem, stream>>>(params);
 }
 
@@ -799,39 +792,22 @@ void launch_kpool_topk_transform(
     bool use_short_staging,
     bool use_medium_threads,
     bool use_vec8,
-    bool constrained_shared_memory,
+    bool use_coarse_bin_cache,
     cudaStream_t stream) {
-  const int64_t score_width = params.score_stride;
   if (use_vec8) {
-    if (constrained_shared_memory && batch_size >= 32) {
+    if (use_coarse_bin_cache) {
       launch_kpool_topk_transform_impl<
-          K, kDefaultThreads, true, kShortStagingSize, false, kShortDynamicSmem>(
+          K, kDefaultThreads, true, kLongStagingSize, true, kLongDynamicSmem>(
           params, batch_size, stream);
     } else {
-      const bool use_coarse_bin_cache =
-          !constrained_shared_memory &&
-          score_width <= kCoarseBinCacheMaxScoreWidth &&
-          batch_size >= kCoarseBinCacheMinBatch;
-      if (use_coarse_bin_cache) {
-        launch_kpool_topk_transform_impl<
-            K, kDefaultThreads, true, kLongStagingSize, true, kLongDynamicSmem>(
-            params, batch_size, stream);
-      } else {
-        launch_kpool_topk_transform_impl<
-            K, kDefaultThreads, true, kLongStagingSize, false, kLongDynamicSmem>(
-            params, batch_size, stream);
-      }
+      launch_kpool_topk_transform_impl<
+          K, kDefaultThreads, true, kLongStagingSize, false, kLongDynamicSmem>(
+          params, batch_size, stream);
     }
   } else if (use_short_staging) {
-    if (constrained_shared_memory && batch_size < 32) {
-      launch_kpool_topk_transform_impl<
-          K, kDefaultThreads, false, kShortStagingSize, false, kShortDynamicSmem>(
-          params, batch_size, stream);
-    } else {
-      launch_kpool_topk_transform_impl<
-          K, kMediumThreads, false, kShortStagingSize, false, kShortDynamicSmem>(
-          params, batch_size, stream);
-    }
+    launch_kpool_topk_transform_impl<
+        K, kMediumThreads, false, kShortStagingSize, false, kShortDynamicSmem>(
+        params, batch_size, stream);
   } else if (use_medium_threads) {
     launch_kpool_topk_transform_impl<
         K, kMediumThreads, false, kLongStagingSize, false, kLongDynamicSmem>(
@@ -960,64 +936,79 @@ void kpool_topk_transform_interface(
       .out_cols = static_cast<int32_t>(output.size(1)),
   };
 
-  // Short rows use an exactly-sized 1024-candidate double buffer (8 KiB),
-  // while longer rows retain the 4096-candidate buffer and exact overflow
-  // fallback. Keep the implementations separate so the short kernel does not
-  // reserve long-row shared memory.
-  const bool use_short_staging = score.size(1) <= kShortStagingSize;
+  // Use the smaller staging instance only when enough row blocks are present
+  // to benefit from its higher occupancy.
+  const bool use_short_staging =
+      score.size(1) <= kShortStagingSize && batch_size >= kShortStagingMinBatch;
   const bool use_medium_threads =
       score.size(1) > group_topk + 1 && score.size(1) <= kMediumMaxScoreWidth;
   const bool use_vec8 = score.size(1) >= kVec8MinScoreWidth;
-  // Select the launch policy from the resource that constrains this kernel,
-  // rather than a product name.  GPUs exposing at most 64 KiB shared memory
-  // per multiprocessor benefit from the smaller staging footprint and the
-  // wide short-row block; higher-capacity devices retain the established
-  // C600U policy.  This also lets future SKUs inherit the appropriate path.
-  static const bool constrained_shared_memory = [] {
-    int device_id = 0;
-    cudaDeviceProp properties{};
-    const cudaError_t get_device_status = cudaGetDevice(&device_id);
-    const cudaError_t get_properties_status =
-        get_device_status == cudaSuccess
-        ? cudaGetDeviceProperties(&properties, device_id)
-        : get_device_status;
-    TORCH_CHECK(
-        get_properties_status == cudaSuccess,
-        "kpool_topk_transform failed to query GPU properties: ",
-        cudaGetErrorString(get_properties_status));
-    return properties.sharedMemPerMultiprocessor <= 64 * 1024;
-  }();
+  // Cache one coarse byte per score when it fits in half of the long staging
+  // allocation and the batch is large enough to amortize the extra writes.
+  const bool use_coarse_bin_cache =
+      use_vec8 && score.size(1) <= kCoarseBinCacheMaxScoreWidth &&
+      batch_size >= kCoarseBinCacheMinBatch;
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
   switch (group_topk) {
     case 128:
       launch_kpool_topk_transform<128>(
-          params, batch_size, use_short_staging, use_medium_threads, use_vec8,
-          constrained_shared_memory, stream);
+          params,
+          batch_size,
+          use_short_staging,
+          use_medium_threads,
+          use_vec8,
+          use_coarse_bin_cache,
+          stream);
       break;
     case 160:
       launch_kpool_topk_transform<160>(
-          params, batch_size, use_short_staging, use_medium_threads, use_vec8,
-          constrained_shared_memory, stream);
+          params,
+          batch_size,
+          use_short_staging,
+          use_medium_threads,
+          use_vec8,
+          use_coarse_bin_cache,
+          stream);
       break;
     case 192:
       launch_kpool_topk_transform<192>(
-          params, batch_size, use_short_staging, use_medium_threads, use_vec8,
-          constrained_shared_memory, stream);
+          params,
+          batch_size,
+          use_short_staging,
+          use_medium_threads,
+          use_vec8,
+          use_coarse_bin_cache,
+          stream);
       break;
     case 224:
       launch_kpool_topk_transform<224>(
-          params, batch_size, use_short_staging, use_medium_threads, use_vec8,
-          constrained_shared_memory, stream);
+          params,
+          batch_size,
+          use_short_staging,
+          use_medium_threads,
+          use_vec8,
+          use_coarse_bin_cache,
+          stream);
       break;
     case 256:
       launch_kpool_topk_transform<256>(
-          params, batch_size, use_short_staging, use_medium_threads, use_vec8,
-          constrained_shared_memory, stream);
+          params,
+          batch_size,
+          use_short_staging,
+          use_medium_threads,
+          use_vec8,
+          use_coarse_bin_cache,
+          stream);
       break;
     case 512:
       launch_kpool_topk_transform<512>(
-          params, batch_size, use_short_staging, use_medium_threads, use_vec8,
-          constrained_shared_memory, stream);
+          params,
+          batch_size,
+          use_short_staging,
+          use_medium_threads,
+          use_vec8,
+          use_coarse_bin_cache,
+          stream);
       break;
     default:
       TORCH_CHECK(false, "unsupported group_topk: ", group_topk);

@@ -29,7 +29,6 @@
 #include "../include/glm_attention_prepare.h"
 #include "../include/moe_step4_weighted_topk_gather.h"
 #include "../include/router_bias_topk.h"
-#include "../include/silu_mul_clamp_dsv4.h"
 
 #ifdef ENABLE_BUILD_GPTQ_MARLIN_OP
     #include "gptq_marlin.h"
@@ -41,15 +40,9 @@
 #include "../include/qk_rms_norm.h"
 #include "../include/fused_rmsnorm_rope_quant_reshape_and_cache.h"
 #include "../include/mhc_pre_big_fuse.h"
-#include "../include/mhc_post_cuda.h"
-#include "../include/chunk_gated_delta_rule_fwd_h.h"
 #include "../include/indexer_norm_rope.h"
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("mhc_post_cuda", &mhc_post_cuda,
-          "MHC post: BF16 activations and FP32 mixing weights",
-          py::arg("x"), py::arg("residual"),
-          py::arg("post_layer_mix"), py::arg("comb_res_mix"));
     m.def("mhc_pre_big_fuse_out", &mhc_pre_big_fuse_out,
           "Optimized mHC pre big-fuse kernel with preallocated outputs");
     m.def("fused_bias_dropout", &fused_bias_dropout);
@@ -182,13 +175,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("routed_scaling_factor"),
         py::arg("nan_row_i_out")
     );
-    m.def(
-        "silu_and_mul_clamp",
-        &silu_and_mul_clamp,
-        py::arg("input"),
-        py::arg("output"),
-        py::arg("swiglu_limit")
-    );
+    
     py::object torch_bfloat16 = py::module::import("torch").attr("bfloat16");
 
 #ifdef ENABLE_BUILD_GPTQ_MARLIN_OP
@@ -261,43 +248,4 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("fused_rmsnorm_rope_quant_reshape_and_cache",
       &fused_rmsnorm_rope_quant_reshape_and_cache,
       "Fused RMSNorm + RoPE + Quant + Reshape&Cache (in-place: packed_qkv / k_cache / v_cache)");
-
-    m.def("chunk_gated_delta_rule_fwd_h",
-      &chunk_gated_delta_rule_fwd_h,
-      "CUDA chunk_gated_delta_rule_fwd_h; same public signature as the Triton entry",
-      py::arg("k"), py::arg("w"), py::arg("u"),
-      py::arg("g") = py::none(), py::arg("gk") = py::none(),
-      py::arg("initial_state") = py::none(),
-      py::arg("initial_state_indices") = py::none(),
-      py::arg("save_new_value") = true,
-      py::arg("cu_seqlens") = py::none(),
-      py::arg("chunk_indices") = py::none(),
-      py::arg("use_exp2") = false,
-      py::kw_only(),
-      py::arg("_block_v") = py::none(),
-      py::arg("_num_warps") = py::none(),
-      py::arg("_num_stages") = 1);
-
-    m.def("chunk_gated_delta_rule_fwd_h_native_out",
-      &chunk_gated_delta_rule_fwd_h_native_out,
-      "Retained CUDA chunk_gated_delta_rule_fwd_h (optimized K=V=128 plus "
-      "generic K<=256 path, BT=64, preallocated h and optional v_new; "
-      "peer of the Triton entry in mcoplib.triton_sglang_chunk_delta_h)",
-      py::arg("k"), py::arg("w"), py::arg("u"), py::arg("gk"),
-      py::arg("initial_state"), py::arg("initial_state_indices"),
-      py::arg("cu_seqlens"), py::arg("chunk_offsets"),
-      py::arg("h"), py::arg("v_new"), py::arg("sequences"),
-      py::arg("chunks_per_sequence"), py::arg("use_exp2") = false,
-      py::arg("ragged") = false, py::arg("state_bf16") = false,
-      py::arg("g") = py::none());
-
-    m.def("chunk_gated_delta_rule_fwd_h_coverage",
-      &chunk_gated_delta_rule_fwd_h_coverage,
-      "Mirror of the production Triton host-side dispatch: returns "
-      "'<branch> <cuda_serves> <cuda_executes>'",
-      py::arg("B"), py::arg("T"), py::arg("Hg"), py::arg("K"), py::arg("H"),
-      py::arg("V"), py::arg("block_v"), py::arg("num_warps"),
-      py::arg("num_stages"), py::arg("N"), py::arg("NT"), py::arg("has_g"),
-      py::arg("has_gk"), py::arg("has_v_new"), py::arg("has_cu_seqlens"),
-      py::arg("tail_free"));
 }

@@ -298,48 +298,51 @@ def check_torch_version_compatibility():
         f"build={build_torch_ver}, runtime={runtime_torch_ver}.\n"
     )
 
-def _maca_min_compatibility_ok(*, verbose: bool = True) -> bool:
-    """MACA 最小兼容版本校验：通过返回 True，不通过返回 False（不再 sys.exit）。"""
+
+def check_maca_min_compatibility():
+    """运行期 MACA 最小兼容版本校验：低于最小版本则异常退出。
+
+    master (日期版) MACA 版本（如 ``20260531.1200``）跳过校验。
+    release 版本只比较前 3 位 (major.minor.patch)，兼容 3.7.0.38.dev4 /
+    3.7.0.38 / 3.7.0.38.c600u / 3.7.0.38.dsv4 等格式（第 4 位及以后后缀全部忽略）。
+    """
     run_maca_version = get_maca_version()
 
+    # master (date-based) 版本不参与 release 最小兼容版本比较，直接跳过。
     if is_maca_master_version(run_maca_version):
-        if verbose:
-            print(f"INFO: MACA version {run_maca_version} is a master (date-based) "
-                  f"build; skip minimum compatibility check.\n")
-        return True
+        print(
+            f"INFO: MACA version {run_maca_version} is a master (date-based) build; "
+            f"skip minimum compatibility check.\n"
+        )
+        return
 
     dir_path = os.path.dirname(os.path.abspath(__file__))
-    version_file = os.path.join(dir_path, "version")
+    version_file = dir_path + '/' + "version"
     min_compat_version = get_min_compatibility_maca_version(version_file)
 
     if min_compat_version is None:
-        print("WARNING Min_Compatibility_Maca_Version not found in version file, "
-              "skip minimum compatibility check.\n")
-        return True
+        # version 文件中没有最小兼容版本信息（例如旧版构建产物），跳过校验避免误伤。
+        print("WARNING Min_Compatibility_Maca_Version not found in version file, skip minimum compatibility check.\n")
+        return
 
     if run_maca_version is None:
         sys.stderr.write(
-            "ERROR: Cannot detect running MACA version; minimum required is "
-            f"{min_compat_version}.\n")
-        return False
+            "ERROR: MACA minimum compatibility version mismatch, aborting. "
+            f"Cannot detect running MACA version; minimum required is {min_compat_version}.\n"
+        )
+        sys.exit(1)
 
     if maca_version_lt(run_maca_version, min_compat_version):
         sys.stderr.write(
-            f"ERROR: Running MACA version {run_maca_version} is lower than the "
-            f"minimum required {min_compat_version} (compared by major.minor.patch).\n")
-        return False
+            "ERROR: MACA minimum compatibility version mismatch, aborting. "
+            f"Running MACA version {run_maca_version} is lower than the minimum required "
+            f"{min_compat_version} (compared by major.minor.patch).\n"
+        )
+        sys.exit(1)
 
-    if verbose:
-        print(f"INFO: MACA minimum compatibility check passed: "
-              f"{run_maca_version} >= {min_compat_version}.\n")
-    return True
-
-
-# 向后兼容：保留旧名，但语义改为「不通过则抛异常」而非 sys.exit。
-def check_maca_min_compatibility() -> None:
-    if not _maca_min_compatibility_ok():
-        raise RuntimeError(
-            "MACA minimum compatibility check failed (see error above).")
+    print(
+        f"INFO: MACA minimum compatibility check passed: {run_maca_version} >= {min_compat_version}.\n"
+    )
 
 def mcoplib_version_check():
     run_maca_version = get_maca_version()
@@ -351,14 +354,14 @@ def mcoplib_version_check():
     else:
         print("WARNING Get maca version or get mcoplib build maca version Fail.\n")
 
-def get_version() -> str:
-    # 供 pyproject.toml 的 dynamic version 使用，必须返回字符串。
+def get_version():
+    # Get the path to the mcoplib distribution
     version_path = os.path.join(os.path.dirname(__file__), "version")
-    version = "unknown"
+    version = "unknown"  # 默认值
     if os.path.exists(version_path):
         try:
-            with open(version_path, "r", encoding="utf-8") as f:  
-                version = f.read().strip()
+            with open(version_path, "r", encoding="utf-8") as f:
+                    version = f.read().strip()
         except Exception as e:
             print(f"WARNING Failed to read version file: {e} \n")
     else:
@@ -366,39 +369,13 @@ def get_version() -> str:
 
     print(f"Version info:{version} \n")
 
-def check_env(*, strict: bool = True, verbose: bool = True) -> bool:
-    """显式环境自检：torch / MACA 版本兼容性。
 
-    以前这些检查在 import 时自动运行且会 sys.exit(1)，导致「仅仅 import
-    mcoplib 就可能杀死解释器」。现在改为显式调用：
 
-        import mcoplib
-        mcoplib.check_env()            # 不兼容时抛 RuntimeError
-        mcoplib.check_env(strict=False)  # 只告警，永不退出/抛异常
-
-    Args:
-        strict: True 时 MACA 低于最小兼容版本抛 RuntimeError；
-                False 时仅告警并返回 False。
-        verbose: 是否打印 INFO banner。
-    Returns:
-        bool: 环境是否通过 MACA 最小兼容性检查。
-    """
-    if verbose:
-        print(f"INFO mcoplib version: {get_version()}\n")
-
-    # torch 兼容性：本就只告警，保持不变。
-    check_torch_version_compatibility()
-
-    # MACA master/release 版本一致性：只告警。
-    mcoplib_version_check()
-
-    # MACA 最小兼容版本：check_maca_min_compatibility 不通过时抛 RuntimeError。
-    try:
-        check_maca_min_compatibility()
-        return True
-    except RuntimeError:
-        if strict:
-            raise
-        return False
-if os.environ.get("MCOPLIB_AUTO_CHECK", "1") == "1":    
-    check_env(strict=True)
+print("INFO Print the version information of mcoplib during compilation.\n")
+get_version()
+print("INFO Staring Check the torch version compatibility of the operating environment.\n")
+check_torch_version_compatibility()
+print("INFO Staring Check the current MACA version of the operating environment.\n")
+mcoplib_version_check()
+print("INFO Staring Check the MACA minimum compatibility version of the operating environment.\n")
+check_maca_min_compatibility()

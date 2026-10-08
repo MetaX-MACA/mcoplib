@@ -24,6 +24,7 @@ limitations under the License.
 #endif
 
 #ifdef USE_ROCM
+// Adapted from flashinfer-rocm [PR#491](https://github.com/flashinfer-ai/flashinfer/pull/491)
 #define _DISPATCH_CASE_F16(c_type, ...) \
   case at::ScalarType::Half: {          \
     using c_type = __half;              \
@@ -38,7 +39,8 @@ limitations under the License.
 #endif  // USE_ROCM
 
 #ifndef USE_ROCM
-#ifdef MCOPLIB_ENABLE_F16
+// Adapt from FlashInfer
+#ifdef FLASHINFER_ENABLE_F16
 #define _DISPATCH_CASE_F16(c_type, ...) \
   case at::ScalarType::Half: {          \
     using c_type = nv_half;             \
@@ -46,9 +48,9 @@ limitations under the License.
   }
 #else
 #define _DISPATCH_CASE_F16(c_type, ...)
-#endif  // MCOPLIB_ENABLE_F16
+#endif  // FLASHINFER_ENABLE_F16
 
-#ifdef MCOPLIB_ENABLE_BF16
+#ifdef FLASHINFER_ENABLE_BF16
 #define _DISPATCH_CASE_BF16(c_type, ...) \
   case at::ScalarType::BFloat16: {       \
     using c_type = nv_bfloat16;          \
@@ -56,9 +58,9 @@ limitations under the License.
   }
 #else
 #define _DISPATCH_CASE_BF16(c_type, ...)
-#endif  // MCOPLIB_ENABLE_BF16
+#endif  // FLASHINFER_ENABLE_BF16
 
-#ifdef MCOPLIB_ENABLE_FP8_E4M3
+#ifdef FLASHINFER_ENABLE_FP8_E4M3
 #define _DISPATCH_CASE_FP8_E4M3(c_type, ...) \
   case at::ScalarType::Float8_e4m3fn: {      \
     using c_type = __nv_fp8_e4m3;            \
@@ -66,9 +68,9 @@ limitations under the License.
   }
 #else
 #define _DISPATCH_CASE_FP8_E4M3(c_type, ...)
-#endif  // MCOPLIB_ENABLE_FP8_E4M3
+#endif  // FLASHINFER_ENABLE_FP8_E4M3
 
-#ifdef MCOPLIB_ENABLE_FP8_E5M2
+#ifdef FLASHINFER_ENABLE_FP8_E5M2
 #define _DISPATCH_CASE_FP8_E5M2(c_type, ...) \
   case at::ScalarType::Float8_e5m2: {        \
     using c_type = __nv_fp8_e5m2;            \
@@ -76,7 +78,7 @@ limitations under the License.
   }
 #else
 #define _DISPATCH_CASE_FP8_E5M2(c_type, ...)
-#endif  
+#endif  // FLASHINFER_ENABLE_FP8_E5M2
 
 #define DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(pytorch_dtype, c_type, ...)                 \
   [&]() -> bool {                                                                        \

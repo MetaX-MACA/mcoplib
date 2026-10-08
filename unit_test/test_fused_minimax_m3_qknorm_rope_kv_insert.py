@@ -5,7 +5,7 @@
 
 import pytest
 import torch
-
+import vllm._custom_ops as ops
 import mcoplib._C
 
 from vllm.v1.attention.ops.triton_merge_attn_states import (
@@ -103,6 +103,7 @@ def test_dense_norm_rope(num_tokens, num_heads, num_kv_heads):
 
     torch.ops._C.fused_minimax_m3_qknorm_rope_kv_insert(qkv, q_w, k_w, cos_sin, positions, num_heads, num_kv_heads, ROTARY_DIM, eps, None, None, 0, None, None, None, None, 0, q_out, None, "auto", False, None, 1.0)
 
+    q_out, k_out, v_out = qkv.split([qsz, kvsz, kvsz], dim=-1)
     q_in, k_in, v_in = qkv_orig.split([qsz, kvsz, kvsz], dim=-1)
     q_out_ref = norm_rope_ref(q_in.view(num_tokens, num_heads, HEAD_DIM), q_w, positions, cos_sin, eps).view(num_tokens, qsz)
     k_ref = norm_rope_ref(k_in.view(num_tokens, num_kv_heads, HEAD_DIM), k_w, positions, cos_sin, eps).view(num_tokens, kvsz)
@@ -188,6 +189,8 @@ def test_sparse_full(num_tokens, block_size):
 
     print(f"\n[SPARSE FULL] tokens={num_tokens}, block={block_size} PASS")
 
+    _, k_out, v_out, index_q_out, index_k_out = qkv.split(splits, dim=-1)
+    q_in, k_in, v_in, index_q_in, index_k_in = qkv_orig.split(splits, dim=-1)
 
 # ============================================================
 # Test 3: sparse + skip index branch

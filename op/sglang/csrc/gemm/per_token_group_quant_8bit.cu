@@ -2,7 +2,7 @@
 #include <cuda_fp8.h>
 
 #include <cmath>
-#include "vec_dtypes.cuh"
+#include <flashinfer/vec_dtypes.cuh>
 
 #include "utils.h"
 
@@ -65,7 +65,7 @@ __global__ void per_token_group_quant_8bit_kernel(
   }
 
   constexpr uint32_t vec_size = 16 / sizeof(T);
-  using vec_t = mcoplib::vec_t<T, vec_size>;
+  using vec_t = flashinfer::vec_t<T, vec_size>;
 
   const int32_t num_vec_elems = group_size / vec_size;
 

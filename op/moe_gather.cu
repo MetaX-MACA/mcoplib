@@ -4,8 +4,6 @@
 #include <torch/torch.h>
 #include <cub/cub.cuh>
 #include "../kernel/utils.h"
-#include "mcoplib_ops_params_info.hpp"
-#include "mcoplib_ops_params_dump.hpp"
 
 __host__ __device__ __forceinline__
 int ceil_div(int x, int y) {
@@ -246,7 +244,7 @@ void launch_moe_gather(
 
     const int mpc  = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
 
-    if (D <= num_tokens && vec_ok) {
+    if (D == num_tokens && vec_ok) {
         // VPT=8 (16 B/thread) gives block = H/8 threads. For H=1536 that is 192
         // threads = 3 full 64-wide warps; VPT=16 was measured ~2x SLOWER because
         // block=H/16=96 is only 1.5 warps (half-idle third warp + low occupancy).
@@ -338,9 +336,6 @@ void moe_gather(at::Tensor scatter_tokens,
                 double res_scale = 1.0,
                 int64_t res_token_start = 0)
 {
-    DEBUG_TRACE_PARAMS(scatter_tokens, scatter_token_id, scatter_tokens_weight, convergent_tokens, residual_tokens, res_scale, res_token_start);
-    DEBUG_DUMP_PARAMS(scatter_tokens, scatter_token_id, scatter_tokens_weight, convergent_tokens, residual_tokens, res_scale, res_token_start);
-
     const int hidden_size = scatter_tokens.size(-1);
     const int D           = scatter_tokens.numel() / hidden_size;
     const int num_tokens  = convergent_tokens.size(0);

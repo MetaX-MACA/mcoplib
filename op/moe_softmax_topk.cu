@@ -6,8 +6,6 @@
 #include <cstring>
 #include <cstdlib>
 #include "../kernel/moe_softmax_topk.cuh"
-#include "mcoplib_ops_params_info.hpp"
-#include "mcoplib_ops_params_dump.hpp"
 
 // Constructs some constants needed to partition the work across threads at compile time.
 template <typename scalar_t, int EXPERTS, int BYTES_PER_LDG>
@@ -495,8 +493,6 @@ void moe_softmax_topk(
     at::Tensor gating_output,
     const bool pre_softmax)               // [num_tokens, num_experts]
 {
-    DEBUG_TRACE_PARAMS(topk_weights, topk_indices, gating_output, pre_softmax);
-    DEBUG_DUMP_PARAMS(topk_weights, topk_indices, gating_output, pre_softmax);
     const int num_experts = gating_output.size(-1);
     const int num_tokens = gating_output.numel() / num_experts;
     const int topk = topk_weights.size(-1);

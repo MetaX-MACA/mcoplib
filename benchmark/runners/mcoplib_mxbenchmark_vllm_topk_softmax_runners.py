@@ -18,7 +18,6 @@ class Vllm_topk_softmax_runner(OpBenchmarkBase):
           Tensor     gating_output,       # [num_tokens, num_experts], f16/bf16/f32
           bool       renormalize,
           Tensor?    bias                 # optional, [num_experts], float32
-          Tensor?    is_padding           # optional, [num_tokens], bool
       )
     """
 

@@ -6,8 +6,6 @@
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <cstdint>
-#include "mcoplib_ops_params_info.hpp"
-#include "mcoplib_ops_params_dump.hpp"
 
 #ifndef __shfl_down_sync_16
 #define __shfl_down_sync_16(mask, val, offset) __shfl_down_sync(mask, val, offset, 16)
@@ -191,10 +189,8 @@ void fused_rms_norm_rope(
     int64_t qk_rope_head_dim,
     double eps,
     c10::optional<at::Tensor> weight_q = c10::nullopt,
-    c10::optional<at::Tensor> weight_kv = c10::nullopt)
+    c10::optional<at::Tensor> weight_kv = c10::nullopt) 
 {
-  DEBUG_TRACE_PARAMS(q, kv, positions, freqs_cis, qk_rope_head_dim, eps, weight_q, weight_kv);
-  DEBUG_DUMP_PARAMS(q, kv, positions, freqs_cis, qk_rope_head_dim, eps, weight_q, weight_kv);
 
   TORCH_CHECK(q.is_cuda(), "q must be a CUDA tensor");
   TORCH_CHECK(kv.is_cuda(), "kv must be a CUDA tensor");

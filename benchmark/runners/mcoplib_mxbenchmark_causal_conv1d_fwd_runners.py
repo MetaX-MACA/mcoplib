@@ -56,8 +56,8 @@ class Causal_conv1d_fwd_runner(OpBenchmarkBase):
         state.add_summary(
             "Shape",
             (
-                f"TP={self.tp} tokens={self.tokens} requests={self.request_count} "
-                f"dim={self.dim} width={self.kernel_width}"
+                f"TP={self.tp}, tokens={self.tokens}, requests={self.request_count}, "
+                f"dim={self.dim}, width={self.kernel_width}"
             ),
         )
 
