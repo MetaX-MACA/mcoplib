@@ -34,8 +34,13 @@
 #include "../include/fused_deepseekv4_qkv_rms_norm_rope.h"
 #include "../include/fused_split_gemma_rmsnorm_rope.h"
 #include "../include/fused_split_gemma_rmsnorm_rope_no_pack.h"
+#include "../include/qk_rms_norm.h"
+#include "../include/mhc_pre_big_fuse.h"
+#include "../include/silu_mul_clamp_dsv4.h"
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("mhc_pre_big_fuse_out", &mhc_pre_big_fuse_out,
+          "Optimized mHC pre big-fuse kernel with preallocated outputs");
     m.def("fused_bias_dropout", &fused_bias_dropout);
     m.def("fused_rope_fwd", &fused_rope_fwd);
     m.def("fused_rope_bwd", &fused_rope_bwd);
@@ -50,6 +55,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("rms_norm_dynamic_per_token_quant", &rms_norm_dynamic_per_token_quant);
     m.def("head_rms_norm", &head_rms_norm);
     m.def("rms_norm", &rms_norm);
+    m.def("qk_rms_norm_inplace_cuda",
+          &qk_rms_norm_inplace_cuda,
+          py::arg("token_data"),
+          py::arg("q_norm_weight"),
+          py::arg("k_norm_weight"),
+          py::arg("q_head_num"),
+          py::arg("kv_head_num"),
+          py::arg("qk_head_dim"),
+          py::arg("eps"));
     m.def("all_reduce_max", &all_reduce_max);
     m.def("all_reduce_sum", &all_reduce_sum);
     m.def("moe_gather", &moe_gather);
@@ -73,7 +87,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("input"),
         py::arg("mask"),
         py::arg("swiglu_limit") = 0.0f,
-        py::arg("weight") = py::none()
+        py::arg("weight") = py::none(),
+        py::arg("gemm1_alpha") = 1.0f,
+        py::arg("gemm1_limit") = 0.0f
         );
     m.def(
         "silu_mul_mask",
@@ -84,11 +100,29 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("swiglu_limit") = 0.0f
     );
     m.def("fused_silu_mul_dq_mask_fp8_quant", &fused_silu_mul_dq_mask_quant_fp8_pack);
+
     m.def("fused_silu_mul_dq_reorder_quant", &fused_silu_mul_dq_quant_reordered_topk_interface);
     m.def("fused_silu_mul_dq_quant", &fused_silu_mul_dq_quant_interface);
-    
-    m.def("fused_silu_mul_dq_mask_quant_fp8_nopack", &fused_silu_mul_dq_mask_quant_fp8_nopack);
-
+  
+    m.def(
+        "fused_silu_mul_dq_mask_quant_fp8_nopack",
+        &fused_silu_mul_dq_mask_quant_fp8_nopack,
+        py::arg("output"),
+        py::arg("output_scale"),
+        py::arg("input"),
+        py::arg("mask"),
+        py::arg("quant_group"),
+        py::arg("swiglu_limit"),
+        py::arg("isTranspose") = py::none()
+    );
+      m.def(
+        "silu_and_mul_clamp",
+        &silu_and_mul_clamp,
+        py::arg("input"),
+        py::arg("output"),
+        py::arg("swiglu_limit")
+    );
+  
     py::object torch_bfloat16 = py::module::import("torch").attr("bfloat16");
 
 #ifdef ENABLE_BUILD_GPTQ_MARLIN_OP

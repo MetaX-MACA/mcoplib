@@ -26,6 +26,21 @@ def reference_rms_norm_with_weight(input, weight, epsilon):
 
     return output.to(input.dtype)
 
+def reference_rms_norm_4d_with_weight(input, weight, epsilon):
+    """
+    input: [batch, seq, head, hidden]
+    weight: [batch, hidden]
+    """
+    y = input.float() * torch.rsqrt(
+        input.float().pow(2).mean(-1, keepdim=True) + epsilon
+    )
+
+    y = y * weight.float().reshape(
+        input.shape[0], 1, 1, input.shape[-1]
+    )
+
+    return y.to(input.dtype)
+
 
 def reference_rms_norm_without_weight(input, epsilon):
     variance = input.float().pow(2).mean(dim=-1, keepdim=True)
@@ -267,6 +282,115 @@ def test_without_weight_param():
     print("Test PASSED: Precision requirements met!")
     return True
 
+def test_rms_norm_4d_weight():
+
+    print("\n" + "="*60)
+    print("Test: rms_norm 4D input with 2D weight")
+    print("="*60)
+
+    dtype = torch.bfloat16
+
+    batch = 5
+    seq = 8
+    heads = 8
+    hidden = 128
+
+    epsilon = 1e-6
+
+
+    torch.manual_seed(42)
+
+    input = torch.rand(
+        (batch, seq, heads, hidden),
+        dtype=dtype,
+        device="cuda"
+    )
+
+    weight = torch.rand(
+        (batch, hidden),
+        dtype=dtype,
+        device="cuda"
+    )
+
+
+    out = torch.empty_like(input)
+
+
+    ref_out = reference_rms_norm_4d_with_weight(
+        input,
+        weight,
+        epsilon
+    )
+
+
+    torch.ops._C.rms_norm(
+        out,
+        input,
+        weight,
+        epsilon
+    )
+
+
+    torch.cuda.synchronize()
+
+
+    # FP32比较，避免BF16截断影响观察
+    ref = ref_out.float()
+    result = out.float()
+
+
+    diff = torch.abs(
+        ref - result
+    )
+
+
+    max_diff = diff.max()
+    mean_diff = diff.mean()
+
+
+    cos_sim = torch.nn.functional.cosine_similarity(
+        ref.flatten(),
+        result.flatten(),
+        dim=0
+    )
+
+
+    print("\n========== RMSNorm Verify ==========")
+    print(f"max diff : {max_diff.item()}")
+    print(f"mean diff: {mean_diff.item()}")
+    print(f"cos sim  : {cos_sim.item()}")
+
+
+    max_idx = torch.argmax(diff)
+
+
+    print("\nmax diff index:")
+    print(
+        torch.unravel_index(
+            max_idx,
+            diff.shape
+        )
+    )
+
+
+    print("\nref value:")
+    print(
+        ref.flatten()[max_idx]
+    )
+
+
+    print("mcoplib value:")
+    print(
+        result.flatten()[max_idx]
+    )
+
+
+    assert cos_sim > 0.9999
+
+    print("\n4D weight test PASS")
+
+    return True
+
 
 def run_all_tests():
 
@@ -341,6 +465,28 @@ def run_all_tests():
                 )
             )
 
+            try:
+                test_rms_norm_4d_weight()
+
+                results.append(
+                    (
+                        "4D input weight_dim=2",
+                        True
+                    )
+                )
+
+            except Exception as e:
+                print(
+                    f"FAILED 4D weight test: {e}"
+                )
+
+                results.append(
+                    (
+                        "4D input weight_dim=2",
+                        False
+                    )
+                )
+
 
     print("\nSummary")
     for name, ok in results:
@@ -348,6 +494,8 @@ def run_all_tests():
             name,
             "PASS" if ok else "FAIL"
         )
+
+
 
 
 if __name__ == "__main__":

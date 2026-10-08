@@ -5,7 +5,9 @@ void fused_silu_mul_dq_mask_quant_pack(
     at::Tensor const& input, 
     at::Tensor const &mask,
     c10::optional<float> _swiglu_limit,
-    c10::optional<at::Tensor> weight);
+    c10::optional<at::Tensor> weight,
+    float gemm1_alpha,
+    float gemm1_limit);
 
 void fused_silu_mul_dq_mask_quant_fp8_pack(
     torch::Tensor& out,          

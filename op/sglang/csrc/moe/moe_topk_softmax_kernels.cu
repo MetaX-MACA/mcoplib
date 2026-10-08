@@ -23,7 +23,6 @@ limitations under the License.
 #ifndef USE_ROCM
 #include <cub/cub.cuh>
 #include <cub/util_type.cuh>
-#include <cuda/std/functional>
 #else
 #include <hipcub/hipcub.hpp>
 #include <hipcub/util_type.hpp>
@@ -405,8 +404,6 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__ void topkGatingSoftmax(
 
   // Determine the pointer type to use to read in the data depending on the BYTES_PER_LDG template param. In theory,
   // this can support all powers of 2 up to 16.
-  // NOTE(woosuk): The original implementation uses CUTLASS aligned array here.
-  // We defined our own aligned array and use it here to avoid the dependency on CUTLASS.
   using AccessType = AlignedArray<T, ELTS_PER_LDG>;
 
   // Finally, we pull in the data from global mem
@@ -694,6 +691,9 @@ void topkGatingSoftmaxKernelLauncher(
     case 256:
       LAUNCH_SOFTMAX(T, 256, WARPS_PER_TB);
       break;
+    case 512:
+      LAUNCH_SOFTMAX(T, 512, WARPS_PER_TB);
+      break;
     default: {
       TORCH_CHECK(
           softmax_workspace != nullptr,
@@ -749,7 +749,7 @@ void topk_softmax(
   const int topk = static_cast<int>(topk_weights.size(-1));
 
   const bool is_pow_2 = (num_experts != 0) && ((num_experts & (num_experts - 1)) == 0);
-  const bool needs_workspace = !is_pow_2 || num_experts > 256;
+  const bool needs_workspace = !is_pow_2 || num_experts > 512;
   const int64_t workspace_size = needs_workspace ? num_tokens * num_experts : 0;
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(gating_output));

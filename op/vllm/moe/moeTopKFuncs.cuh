@@ -114,7 +114,23 @@ struct TopKIdx<K_, true> {
   }
 
 template <int N, typename RedType>
-struct Sort;
+struct Sort {
+  // Generic descending sort (selection sort). Used for N without a
+  // hand-optimized specialization below (e.g. N=22 for Nemotron top-22).
+  static __device__ void run(RedType* topK) {
+#pragma unroll
+    for (int i = 0; i < N - 1; ++i) {
+#pragma unroll
+      for (int j = i + 1; j < N; ++j) {
+        if (topK[i].compValIdx < topK[j].compValIdx) {
+          RedType tmp = topK[i];
+          topK[i] = topK[j];
+          topK[j] = tmp;
+        }
+      }
+    }
+  }
+};
 
 template <typename RedType>
 struct Sort<1, RedType> {
@@ -260,6 +276,161 @@ __forceinline__ __device__ void reduceTopK(
                                         topKBufferIdx, minValue, actualK);
   }
 };
+
+template <int N>
+struct IsPowerOf2 {
+  static constexpr bool value = N > 0 && (N & (N - 1)) == 0;
+};
+
+template <int NumExperts, int NumTopExperts, int MinExperts, int MaxExperts,
+          int MinTopExperts, int MaxTopExperts>
+struct LaneOwnedTopKRange {
+  static_assert(MinExperts > 0 && MinExperts <= MaxExperts);
+  static_assert(MinTopExperts > 0 && MinTopExperts <= MaxTopExperts);
+  static constexpr bool kEnabled =
+      NumExperts >= MinExperts && NumExperts <= MaxExperts &&
+      NumTopExperts >= MinTopExperts && NumTopExperts <= MaxTopExperts;
+};
+
+static constexpr int kHIGH_EXPERT_LANE_OWNED_TOPK_MIN_EXPERTS = 512;
+static constexpr int kHIGH_EXPERT_LANE_OWNED_TOPK_MAX_EXPERTS = 1024;
+static constexpr int kHIGH_EXPERT_LANE_OWNED_TOPK_MIN_TOP_EXPERTS = 9;
+static constexpr int kHIGH_EXPERT_LANE_OWNED_TOPK_MAX_TOP_EXPERTS = 16;
+
+template <int NumExperts, int NumTopExperts>
+using HighExpertLaneOwnedTopKRange =
+    LaneOwnedTopKRange<NumExperts, NumTopExperts,
+                       kHIGH_EXPERT_LANE_OWNED_TOPK_MIN_EXPERTS,
+                       kHIGH_EXPERT_LANE_OWNED_TOPK_MAX_EXPERTS,
+                       kHIGH_EXPERT_LANE_OWNED_TOPK_MIN_TOP_EXPERTS,
+                       kHIGH_EXPERT_LANE_OWNED_TOPK_MAX_TOP_EXPERTS>;
+
+template <int K, typename Type, int N>
+__forceinline__ __device__ void reduceTopKForLane(
+    cg::thread_block_tile<kWARP_SIZE> const& warp, Type& out, int32_t& outIdx,
+    Type (&value)[N], int32_t (&idx)[N], Type const minValue, int32_t laneIdx) {
+  static_assert(K > 0, "Top K must have K > 0");
+  static_assert(K <= kWARP_SIZE, "Top K must have K <= kWARP_SIZE");
+  static_assert(N > 0, "Top K must have N > 0");
+  static_assert(N <= 64,
+                "Only support candidates number less than or equal to "
+                "64*32=2048");
+  using RedType = TopKRedType<Type>;
+  RedType topK[N];
+#pragma unroll
+  for (int nn = 0; nn < N; ++nn) {
+    topK[nn] = RedType{value[nn], idx[nn]};
+  }
+
+  Sort<N, RedType>::run(topK);
+
+  typename RedType::TypeCmp packedMax{};
+  typename RedType::TypeCmp lanePacked{};
+#pragma unroll
+  for (int kk = 0; kk < K; ++kk) {
+    bool update = kk > 0 && packedMax == topK[0].compValIdx;
+#pragma unroll
+    for (int nn = 0; nn < N; ++nn) {
+      topK[nn] = update && nn == N - 1 ? RedType{minValue, idx[nn]}
+                 : update              ? topK[nn + 1]
+                                       : topK[nn];
+    }
+    packedMax = topK[0].reduce(warp);
+    if (laneIdx == kk) {
+      lanePacked = packedMax;
+    }
+  }
+
+  if (laneIdx < K) {
+    RedType::unpack(out, outIdx, lanePacked);
+  } else {
+    out = minValue;
+    outIdx = -1;
+  }
+}
+
+// ---- bitonic merge top-K (generic: Chunks candidates/lane -> top-K) ----
+// Packed value: [twiddled_value(32) | 0(16) | (65535-idx)(16)]; larger = better.
+
+// Bitonic merge of a length-K bitonic sequence to descending order.
+template <int K, typename RedType>
+__device__ __forceinline__ void bmSort(RedType* X) {
+#pragma unroll
+  for (int off = K / 2; off >= 1; off >>= 1) {
+#pragma unroll
+    for (int i = 0; i < K; ++i) {
+      int j = i ^ off;
+      if (j > i && X[i].compValIdx < X[j].compValIdx) {
+        RedType t = X[i]; X[i] = X[j]; X[j] = t;
+      }
+    }
+  }
+}
+
+// Bitonic top-K merge of two sorted-descending K-lists A and B.
+template <int K, typename RedType>
+__device__ __forceinline__ void bmMerge(RedType* A, RedType* B) {
+#pragma unroll
+  for (int k = 0; k < K / 2; ++k) {
+    RedType t = B[k];
+    B[k] = B[K - 1 - k];
+    B[K - 1 - k] = t;
+  }
+#pragma unroll
+  for (int k = 0; k < K; ++k) {
+    if (A[k].compValIdx < B[k].compValIdx) {
+      RedType t = A[k];
+      A[k] = B[k];
+      B[k] = t;
+    }
+  }
+  if constexpr (IsPowerOf2<K>::value) {
+    bmSort<K>(A);
+  } else {
+    Sort<K, RedType>::run(A);
+  }
+}
+
+// Warp-wide top-K of `Chunks` candidates per lane via bitonic merge tournament.
+template <int Chunks, int K>
+__device__ __forceinline__ void warpTopKBitonic(
+    float (&value)[Chunks], int32_t (&idx)[Chunks],
+    float (&out_score)[K], int32_t (&out_idx)[K], float minValue) {
+  static_assert(K >= 1 && K <= kWARP_SIZE, "K must be in [1, 32]");
+  static_assert(Chunks >= 1 && Chunks <= 64, "Chunks must be in [1, 64]");
+  using RedType = TopKRedType<float>;
+  RedType A[Chunks];
+#pragma unroll
+  for (int k = 0; k < Chunks; ++k) A[k] = RedType{value[k], idx[k]};
+  Sort<Chunks, RedType>::run(A);
+
+  constexpr int Keep = Chunks < K ? Chunks : K;
+  RedType X[K];
+#pragma unroll
+  for (int k = 0; k < Keep; ++k) X[k] = A[k];
+#pragma unroll
+  for (int k = Keep; k < K; ++k) X[k] = RedType{minValue, RedType::kMaxIdx};
+
+#pragma unroll
+  for (int off = 1; off <= 16; off <<= 1) {
+    RedType B[K];
+#pragma unroll
+    for (int k = 0; k < K; ++k)
+      B[k].compValIdx = __shfl_xor_sync(0xffffffffu, X[k].compValIdx, off);
+    bmMerge<K, RedType>(X, B);
+  }
+#pragma unroll
+  for (int k = 0; k < K; ++k)
+    X[k].compValIdx = __shfl_sync(0xffffffffu, X[k].compValIdx, 0);
+#pragma unroll
+  for (int k = 0; k < K; ++k) {
+    float v;
+    int32_t i;
+    RedType::unpack(v, i, X[k].compValIdx);
+    out_score[k] = v;
+    out_idx[k] = i;
+  }
+}
 
 #undef TOPK_SWAP
 

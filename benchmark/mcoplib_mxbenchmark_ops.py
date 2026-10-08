@@ -60,6 +60,7 @@ SUPPORTED_OPERATORS = [
     "fused_moe_gate_deepseek",
     "fused_moe_gate_opt",
     "fused_rope_fwd",
+    "fused_silu_mul_dq_mask_quant",
     "fused_silu_mul_dq_quant_interface",
     "fused_unpack",
     "gather_and_maybe_dequant_cache",
@@ -75,11 +76,7 @@ SUPPORTED_OPERATORS = [
     "grouped_topk",
     "indexer_k_cache",
     "init_custom_ar",
-    "mctlass_moe_w4a16_gemm_kernel_mnk",
     "merge_attn_states",
-    "merge_state",
-    "merge_state_v2",
-    "meta_size",
     "moe_align_block_size",
     "moe_fused_gate",
     "moe_lora_align_block_size",
@@ -92,6 +89,7 @@ SUPPORTED_OPERATORS = [
     "per_token_group_fp8_quant",
     "persistent_topk",
     "prepare_moe_input",
+    "qk_rms_norm",
     "reshape_and_cache",
     "reshape_and_cache_flash",
     "rms_norm",
@@ -106,6 +104,7 @@ SUPPORTED_OPERATORS = [
     "sgl_rotary_embedding",
     "silu_and_mul",
     "silu_and_mul_quant",
+    "silu_mul_quant_varlen",
     "static_scaled_fp8_quant",
     "static_scaled_int8_quant",
     "swap_blocks",
@@ -409,7 +408,15 @@ def load_csv_data(filepath):
         reader = csv.reader(f)
         try: header = [h.strip() for h in next(reader)]
         except StopIteration: return [], []
-        data = [dict(zip(header, row)) for row in reader if len(row) >= len(header)]
+        data = []
+        for row in reader:
+            if not row:
+                continue
+            if len(row) < len(header):
+                row = row + [""] * (len(header) - len(row))
+            elif len(row) > len(header):
+                row = row[:len(header)]
+            data.append(dict(zip(header, row)))
         return header, data
 
 def preprocess_data(header, rows):
@@ -641,7 +648,6 @@ def perform_comparison(cur_raw, hist_raw, output_csv=None):
         cpu = parse_time_val(row.get("CPU Time (sec)", ""))
         op_name = get_op_display_name(row)
         d_type = row.get("dtype", "-")
-
         time_label = "Batch GPU"
         if parse_time_val(row.get("Batch GPU (sec)", "")) is None and \
            parse_time_val(row.get("GPU Time (sec)", "")) is not None:
@@ -663,6 +669,23 @@ def perform_comparison(cur_raw, hist_raw, output_csv=None):
             if get_row_key(h_row, dummy_header) == key:
                 matches.append((idx, h_row))
 
+        if not matches:
+            print(f" [DEBUG] No baseline match for op={op_name} shape={row.get('Shape','')} dtype={d_type}")
+            print(f"         current_key={key!r}")
+            shown = 0
+            for idx, h_row in enumerate(hist_rows):
+                if h_row.get("op_name") != op_name:
+                    continue
+                hkey = get_row_key(h_row, dummy_header)
+                if hkey != key:
+                    diffs = [(i, c, h) for i, (c, h) in enumerate(zip(key, hkey)) if c != h]
+                    print(f"         hist[{idx}] key={hkey!r} diffs={diffs[:3]}")
+                    shown += 1
+                    if shown >= 2:
+                        break
+            if shown == 0:
+                print(f"         (no historical row found with op_name={op_name!r})")
+
         perf_ratio_str = "None"
         perf_ratio_pct = None
         h_gpu = None
@@ -683,7 +706,14 @@ def perform_comparison(cur_raw, hist_raw, output_csv=None):
             print(row_fmt.format("Base", format_duration(h_gpu), gr, format_duration(h_cpu), cr, ""))
         else:
             print(f"{'Base':<15} | {'N/A':<15} | {'N/A':<10} | {'N/A':<15} | {'N/A':<15} |")
+<<<<<<< HEAD   (6d018d MCX-12432 and MXC-12941 add xcore1008 for wb-std)
+=======
+            cur_dev = row.get("Device Name") or row.get("Device")
+            print(f" [INFO] No historical row matched. Likely cause: device mismatch "
+                  f"(current={cur_dev!r}, baseline was for another device) "
+                  f"or different (Op/Shape/dtype) combination.")
 
+>>>>>>> CHANGE (2357ed remove the dependency on cutlass)
         print("Result:")
         print(f"Acc verify:{acc_status}")
         print(f"Performance verify:{perf_ratio_str}")

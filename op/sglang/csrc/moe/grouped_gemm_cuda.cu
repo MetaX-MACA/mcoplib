@@ -438,7 +438,7 @@ void GroupedGemm(torch::Tensor a,
   TORCH_CHECK(a.is_contiguous());
   TORCH_CHECK(b.is_contiguous());
   TORCH_CHECK(a.scalar_type() == b.scalar_type() && a.scalar_type() == c.scalar_type());
-  // NOTE: Use cuBLAS for SM90 until CUTLASS supports SM90-optimized grouped-gemm.
+  // NOTE: Use cuBLAS for grouped-gemm.
   if (a.scalar_type() == torch::kBFloat16) {
     // CublasGroupedGemm<c10::BFloat16, CUDA_R_16BF>(a, b, c, batch_sizes, trans_a, trans_b);
     CublasGroupedGemmMultiStream<c10::BFloat16, CUDA_R_16BF>(a, b, c, batch_sizes, trans_a, trans_b);

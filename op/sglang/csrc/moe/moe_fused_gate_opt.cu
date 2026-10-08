@@ -18,7 +18,7 @@ int64_t fused_moe_gate_opt(
     std::optional<double>  routed_scaling_factor
 ) {
     const at::cuda::OptionalCUDAGuard device_guard(device_of(gating_outputs));
-    TORCH_CHECK(((topk == 8) || (topk == 9)), "Expected topk = 8, but get topk = ", topk);
+    TORCH_CHECK(((topk == 8) || (topk == 9) || (topk == 16)), "Expected topk = 8/9/16, but get topk = ", topk);
     int dev = gating_outputs.get_device();
     int grid = gating_outputs.size(0);
     int num_experts = gating_outputs.size(1);
@@ -30,7 +30,7 @@ int64_t fused_moe_gate_opt(
     if(num_shared_experts > 0)
         TORCH_CHECK(((topk >= 9)), "Expected topk >= 9 when fused_num_shared_experts > 0, but get topk = ", topk);
     if(num_shared_experts == 0)
-        TORCH_CHECK(((topk == 8)), "Expected topk == 8 when fused_num_shared_experts = 0 or None, but get topk = ", topk);
+        TORCH_CHECK(((topk == 8) || (topk == 16)), "Expected topk == 8 or 16 when fused_num_shared_experts = 0 or None, but get topk = ", topk);
     if (num_shared_experts > 1)
     {
         cudaMalloc((void**)&d_shared_experts_ids, 512 * sizeof(int));
@@ -77,6 +77,8 @@ int64_t fused_moe_gate_opt(
     LAUNCH_MOE_GATE(0, 384, 1, 1, 8)
     LAUNCH_MOE_GATE(0, 448, 1, 1, 8)
     LAUNCH_MOE_GATE(0, 288, 1, 1, 8)
+    // TopK=16, 无共享专家配置 (kimi-k3 896 专家)
+    LAUNCH_MOE_GATE(0, 896, 1, 1, 16)
     // TopK=9, 1个共享专家配置 (按专家数排序)
     LAUNCH_MOE_GATE(1, 160, 1, 1, 9)
 

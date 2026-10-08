@@ -26,7 +26,6 @@ def set_seed(seed=42):
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)   # 多GPU
 
-
 def cosine_similarity(a, b):
     """
     计算两个tensor的余弦相似度
@@ -101,6 +100,15 @@ def biased_grouped_topk(
 ):
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
+    # Reference is the model-correct FP32 routing: sglang's upstream single-group
+    # topk kernel consumes FP32 scores/bias, and GLM/ceval quality is defined by
+    # FP32 gating. Compute the whole gate (sigmoid + bias + top-k selection) in
+    # FP32 here regardless of the input dtype, so this reference is the ground
+    # truth the bf16 kernel is compared against. (Previously this reference ran in
+    # the input dtype, i.e. bf16, which masked the kernel's bf16 selection bug.)
+    gating_output = gating_output.float()
+    correction_bias = correction_bias.float()
+
     scores = gating_output.sigmoid()
     num_token = scores.shape[0]
     num_experts = scores.shape[1]
@@ -148,11 +156,24 @@ def biased_grouped_topk(
 
     return topk_weights, topk_ids
 
-def moe_gate_func(q_len, num_experts, topk, num_expert_group, top_k_group, renormalize=True, num_shared_experts=1, test_dtype=torch.bfloat16, scale_factor=1.0, test_name=""):
-    print(f"moe_gate_func test_function_name:{test_name} test_dtype:{test_dtype} q_len:{q_len} num_experts:{num_experts} topk:{topk}")
+def moe_gate_func(q_len, num_experts, topk, num_expert_group, top_k_group, renormalize=True, num_shared_experts=1, test_dtype=torch.bfloat16, scale_factor=1.0, test_name="", near_tie=False):
+    print(f"moe_gate_func test_function_name:{test_name} test_dtype:{test_dtype} q_len:{q_len} num_experts:{num_experts} topk:{topk} near_tie:{near_tie}")
     set_seed(42)
-    gating_output = torch.rand(q_len, num_experts, dtype=test_dtype).cuda()
-    correction_bias = torch.rand(num_experts, dtype=test_dtype).cuda()
+    if near_tie:
+        # Adversarial GLM-style input: make sigmoid(logit)+bias cluster tightly
+        # around the top-k boundary so that the difference between the k-th and
+        # (k+1)-th expert is smaller than the bf16 ULP at that magnitude
+        # (~2**-8 ≈ 0.004 near 0.7). An FP32 gate resolves the ordering; a bf16
+        # gate rounds neighbours to the same/incorrectly-ordered value and flips
+        # the expert selection — exactly the GLM5.2/ceval failure mode.
+        base = torch.full((q_len, num_experts), 0.85, dtype=torch.float32)
+        # tiny per-expert perturbations well below the bf16 step near 0.7
+        jitter = (torch.arange(num_experts, dtype=torch.float32) - num_experts / 2) * 1e-3
+        gating_output = (base + jitter.unsqueeze(0)).to(test_dtype).cuda()
+        correction_bias = (torch.arange(num_experts, dtype=torch.float32) * 1e-3).to(test_dtype).cuda()
+    else:
+        gating_output = torch.rand(q_len, num_experts, dtype=test_dtype).cuda()
+        correction_bias = torch.rand(num_experts, dtype=test_dtype).cuda()
     out_routing_weights = torch.zeros(q_len, topk, dtype=torch.float).cuda()
     out_selected_experts = torch.zeros(q_len, topk, dtype=torch.int32).cuda()
     device = 0
@@ -181,6 +202,36 @@ class TestMoeGate(unittest.TestCase):
     def test_moe_gate_160_experts_bfloat16_f_0(self):
         moe_gate_func(q_len=16, num_experts=160, topk=8, num_expert_group=1, top_k_group=1, renormalize=True, num_shared_experts=0, test_dtype=torch.bfloat16, scale_factor=2.5, test_name="test_moe_gate_160_experts_bfloat16_f_0")
 
+    # GLM5.2 config (topk=8, num_expert_group=1, topk_group=1, 160 experts, bf16).
+    # Adversarial near-tie inputs at the top-k boundary: reproduces the bf16
+    # gating precision bug (wrong expert selection) that caused the ~3% ceval
+    # accuracy drop. With the FP32-gate kernel fix this must pass; with the old
+    # bf16-gate kernel the sorted expert-id equality check fails.
+    def test_moe_gate_160_experts_bfloat16_glm_near_tie(self):
+        moe_gate_func(q_len=16, num_experts=160, topk=8, num_expert_group=1, top_k_group=1, renormalize=True, num_shared_experts=0, test_dtype=torch.bfloat16, scale_factor=2.5, test_name="test_moe_gate_160_experts_bfloat16_glm_near_tie", near_tie=True)
+
+    # Same GLM config at 256 experts, near-tie adversarial input.
+    def test_moe_gate_256_experts_bfloat16_glm_near_tie(self):
+        moe_gate_func(q_len=16, num_experts=256, topk=8, num_expert_group=1, top_k_group=1, renormalize=True, num_shared_experts=0, test_dtype=torch.bfloat16, scale_factor=2.5, test_name="test_moe_gate_256_experts_bfloat16_glm_near_tie", near_tie=True)
+
+    # ---- Grouped routing (num_expert_group>1) coverage ----
+    # These exercise the moe_topk_block_phase1 device path (fused_topk with
+    # NUM_GROUPS>1), which the single-group tests above never touch. This is the
+    # DeepSeek-V3 style config dispatched by LAUNCH_MOE_GATE(0,256,8,4,8):
+    # 256 experts, 8 groups (32 experts/group), top-4 groups, top-8 experts.
+    # The fp32 rewrite of moe_topk_block_phase1 (sigmoid, score+bias sort key,
+    # per-group top1+top2 group score, and all three warp sorts done in fp32)
+    # is validated here: the near-tie case fails on the old bf16-internal grouped
+    # code (wrong group/expert selection) and passes with the fp32 fix.
+    def test_moe_gate_256_experts_group8_bfloat16_deepseek(self):
+        moe_gate_func(q_len=16, num_experts=256, topk=8, num_expert_group=8, top_k_group=4, renormalize=True, num_shared_experts=0, test_dtype=torch.bfloat16, scale_factor=2.5, test_name="test_moe_gate_256_experts_group8_bfloat16_deepseek")
+
+    def test_moe_gate_256_experts_group8_bfloat16_near_tie(self):
+        moe_gate_func(q_len=16, num_experts=256, topk=8, num_expert_group=8, top_k_group=4, renormalize=True, num_shared_experts=0, test_dtype=torch.bfloat16, scale_factor=2.5, test_name="test_moe_gate_256_experts_group8_bfloat16_near_tie", near_tie=True)
+
+    def test_moe_gate_256_experts_group8_float32_deepseek(self):
+        moe_gate_func(q_len=16, num_experts=256, topk=8, num_expert_group=8, top_k_group=4, renormalize=True, num_shared_experts=0, test_dtype=torch.float32, scale_factor=1.0, test_name="test_moe_gate_256_experts_group8_float32_deepseek")
+
     def test_moe_gate_160_experts_bfloat16_f_1(self):
         moe_gate_func(q_len=16, num_experts=160, topk=9, num_expert_group=1, top_k_group=1, renormalize=True, num_shared_experts=1, test_dtype=torch.float32, scale_factor=1.0, test_name="test_moe_gate_160_experts_bfloat16_f_1")
 
@@ -190,12 +241,21 @@ class TestMoeGate(unittest.TestCase):
     def test_moe_gate_256_experts_float16_t_1(self):
         moe_gate_func(q_len=6, num_experts=256, topk=8, num_expert_group=1, top_k_group=1, renormalize=True, num_shared_experts=0, test_dtype=torch.bfloat16, scale_factor=2.5,test_name="test_moe_gate_256_experts_float16_t_1")
 
-
     def test_moe_gate_288_experts_float32_t_0(self):
         moe_gate_func(q_len=32, num_experts=288, topk=8, num_expert_group=1, top_k_group=1, renormalize=True, num_shared_experts=0, test_dtype=torch.float32, scale_factor=1.0,test_name="test_moe_gate_288_experts_float32_t_0")
 
     def test_moe_gate_288_experts_float16_t_0(self):
         moe_gate_func(q_len=32, num_experts=288, topk=8, num_expert_group=1, top_k_group=1, renormalize=True, num_shared_experts=0, test_dtype=torch.bfloat16, scale_factor=1.0,test_name="test_moe_gate_288_experts_float16_t_0")
+
+    def test_moe_gate_896_experts_bfloat16_topk16(self):
+        # kimi-k3 配置: 896 路由专家, 16 选, 无共享专家, 单组
+        moe_gate_func(q_len=16, num_experts=896, topk=16, num_expert_group=1, top_k_group=1, renormalize=True, num_shared_experts=0, test_dtype=torch.bfloat16, scale_factor=1.0, test_name="test_moe_gate_896_experts_bfloat16_topk16")
+
+    def test_moe_gate_896_experts_float32_topk16(self):
+        moe_gate_func(q_len=16, num_experts=896, topk=16, num_expert_group=1, top_k_group=1, renormalize=True, num_shared_experts=0, test_dtype=torch.float32, scale_factor=2.5, test_name="test_moe_gate_896_experts_float32_topk16")
+
+    def test_moe_gate_896_experts_float16_topk16(self):
+        moe_gate_func(q_len=32, num_experts=896, topk=16, num_expert_group=1, top_k_group=1, renormalize=True, num_shared_experts=0, test_dtype=torch.float16, scale_factor=1.0, test_name="test_moe_gate_896_experts_float16_topk16")
 
     # def test_moe_gate_256_experts_bfloat16_f_1(self):
     #     moe_gate_func(q_len=16, num_experts=256, topk=9, num_expert_group=8, top_k_group=4, renormalize=True, num_shared_experts=1, test_dtype=torch.bfloat16, scale_factor=1.0)

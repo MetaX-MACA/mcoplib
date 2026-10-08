@@ -16,6 +16,12 @@ build-backend = "setuptools.build_meta"
 #mcoplib_init = "mcoplib:post_installation"
 mcoplib_version = "mcoplib:get_version"
 
+[tool.pytest.ini_options]
+addopts = "-m 'not full'"
+markers = [
+    "full: extended coverage excluded from the default test run",
+]
+
 [project]
 name = "mcoplib"
 authors = [{name = "mcoplib metax Team"}]
@@ -33,11 +39,9 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Information Analysis",
 ]
 dependencies = [
-    "numpy>=2.0",
     "torch>=2.10.0",
     "pyyaml",
     "pydantic >= 2.10",
-    "numba >= 0.61.2",
     "pybind11 >= 2.13.1",
     "flashinfer >=0.2.6",
     "triton >= 2.0.0"

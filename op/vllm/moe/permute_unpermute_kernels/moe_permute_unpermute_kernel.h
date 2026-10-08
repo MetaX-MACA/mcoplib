@@ -3,9 +3,24 @@
 // https://github.com/BBuf/tensorrt-llm-moe/tree/master
 
 #include <ATen/core/Tensor.h>
+#include <torch/types.h>
 
-#include <cutlass/array.h>
-#include <cutlass/numeric_types.h>
+namespace mcoplib_moe_detail {
+
+template <typename T, int N>
+struct alignas(16) AlignedArray {
+  using Element = T;
+  static constexpr int kElements = N;
+  T data[N];
+
+  __host__ __device__ T& operator[](int index) { return data[index]; }
+  __host__ __device__ const T& operator[](int index) const {
+    return data[index];
+  }
+};
+
+}  // namespace mcoplib_moe_detail
+
 #include "moe/permute_unpermute_kernels/dispatch.h"
 
 template <typename T>

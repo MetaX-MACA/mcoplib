@@ -1,0 +1,22 @@
+{
+    "device_id": 0,
+    "device_name": "MetaX C500",
+    "num_experts": 16,
+    "num_tokens": 2048,
+    "hidden_size": 2048,
+    "topk": 6,
+    "active_routes": 768,
+    "group_size": 128,
+    "dtype": "bfloat16",
+    "swiglu_limit": 10.0,
+    "scale_ue8m0": false,
+    "transposed": false,
+    "swizzle": false,
+    "enable_pdl": false,
+    "use_workspace": [false, true],
+    "persistent_grid": 416,
+    "output_threshold": 0.9999,
+    "scale_threshold": 0.999999,
+    "seed": 7,
+    "samples": 1000
+}

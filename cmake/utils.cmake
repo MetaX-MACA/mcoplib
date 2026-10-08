@@ -115,7 +115,6 @@ macro(clear_cuda_arches CUDA_ARCH_FLAGS)
     string(REPLACE "-metaxgpu-disable-bsm-offset=1" "-metaxgpu-disable-bsm-offset=0"
             CMAKE_CUDA_FLAGS ${CMAKE_CUDA_FLAGS})
 
-    # opt of cutlass w8a8
     string(APPEND CMAKE_CUDA_FLAGS " -mllvm -structurizecfg-skip-uniform-regions=true")
 
     # Remove all `-gencode` flags from `CMAKE_CUDA_FLAGS` since they will be modified

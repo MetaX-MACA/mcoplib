@@ -356,13 +356,6 @@ try:
 except ImportError as e:
     print("Failed to import from sgl_grouped_gemm_cuda with %r", e)
 
-try:
-    import mcoplib.sgl_moe_fused_w4a16
-except ImportError as e:
-    print("Failed to import from sgl_moe_fused_w4a16 with %r", e)
-
-
-
 #功能：mla中，对q做rotary_emb，对latent_cache做rms_normal，更新latent_cache和kv_a，之后对latent_cache做rotary_emb。
 #     调用torch的kv_b_proj计算kv，将数据从kv拷贝到k和v，从latent_cache中拷贝数据到k
 #输入：
@@ -421,11 +414,11 @@ Traceback (most recent call last):
 - optimize mcoplib project build
 - support mxbench for auto test op kernel `s perfromance
 - support profiler tools check op kernel `s perfromance
+- support for vllm 0.24.0  op kernels
 - support for vllm 0.25.0  op kernels
 - support Project-customized op kernels
 - support k-transformer op kernels
 - support verl op kernels
-- support all of mcopZoo op kernels
 - support auto print and dump op input params by setting env
 - support auto build mxbench running env by shell script
 - support auto test torch/py/c op api by mxbench cmd

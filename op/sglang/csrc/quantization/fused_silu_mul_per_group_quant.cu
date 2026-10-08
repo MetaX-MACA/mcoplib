@@ -135,17 +135,22 @@ __device__ __forceinline__ float silu_mul_value(
     const T* __restrict__ up,
     int64_t idx,
     float swiglu_limit) {
-  const float gate_v = static_cast<float>(gate[idx]);
-  const float up_v = static_cast<float>(up[idx]);
+  float gate_v = static_cast<float>(gate[idx]);
+  float up_v = static_cast<float>(up[idx]);
+  
+  if constexpr(kHasLimit) {
+    gate_v = fminf(gate_v, swiglu_limit);
+    up_v = fmaxf(-swiglu_limit, fminf(up_v, swiglu_limit));
+  }
 
   const float silu =
       gate_v * __builtin_mxc_rcpf(1.0f + __builtin_expf(-gate_v));
 
   float v = silu * up_v;
 
-  if constexpr (kHasLimit) {
-    v = fmaxf(-swiglu_limit, fminf(v, swiglu_limit));
-  }
+  // if constexpr (kHasLimit) {
+  //   v = fmaxf(-swiglu_limit, fminf(v, swiglu_limit));
+  // }
 
   return v;
 }
@@ -178,7 +183,7 @@ __device__ __forceinline__ quant_t do_quant(float x, float inv_scale) {
 // 1 block = 1 token + 1 group
 // blockDim = 128
 // ============================================================
-template <typename input_t, typename quant_t, bool kHasLimit>
+template <typename input_t, typename quant_t, bool kHasLimit, bool TRANS_SCATTER>
 __global__ void fused_silu_mul_per_group_quant_default_kernel(
     quant_t* __restrict__ out,
     float* __restrict__ scales,
@@ -223,14 +228,18 @@ __global__ void fused_silu_mul_per_group_quant_default_kernel(
   }
 
   const float qmax = quant_qmax<quant_t>();
-  const float absmax = fmaxf(smem[0], quant_min_absmax<quant_t>());
+  const float absmax = fmaxf(smem[0], 1e-10f);
   const float scale = absmax / qmax;
   const float inv_scale = qmax * __builtin_mxc_rcpf(absmax);
 
   const int64_t groups = hidden / GROUP;
 
   if (tid == 0) {
-    scales[static_cast<int64_t>(token_id) * groups + group_id] = scale;
+    if constexpr (TRANS_SCATTER) {
+      scales[static_cast<int64_t>(group_id) * gridDim.y + token_id] = scale;
+    } else {
+      scales[static_cast<int64_t>(token_id) * groups + group_id] = scale;
+    }
   }
 
   if (col < hidden) {
@@ -257,7 +266,7 @@ __global__ void fused_silu_mul_per_group_quant_default_kernel(
 //   gate_vec = *(AlignedArray<input_t, VEC>*)
 //   up_vec   = *(AlignedArray<input_t, VEC>*)
 // ============================================================
-template <typename input_t, typename quant_t, int VEC, bool kHasLimit>
+template <typename input_t, typename quant_t, int VEC, bool kHasLimit, bool TRANS_SCATTER>
 __global__ void fused_silu_mul_per_group_quant_vec_kernel(
     quant_t* __restrict__ out,
     float* __restrict__ scales,
@@ -316,17 +325,20 @@ __global__ void fused_silu_mul_per_group_quant_vec_kernel(
 
 #pragma unroll
   for (int i = 0; i < VEC; ++i) {
-    const float gate_v = static_cast<float>(gate_vec.data[i]);
-    const float up_v = static_cast<float>(up_vec.data[i]);
-
+    float gate_v = static_cast<float>(gate_vec.data[i]);
+    float up_v = static_cast<float>(up_vec.data[i]);
+    if constexpr(kHasLimit) {
+      gate_v = fminf(gate_v, swiglu_limit);
+      up_v = fmaxf(-swiglu_limit, fminf(up_v, swiglu_limit));
+    }
     const float silu =
         gate_v * __builtin_mxc_rcpf(1.0f + __builtin_expf(-gate_v));
 
     float v = silu * up_v;
 
-    if constexpr (kHasLimit) {
-      v = fmaxf(-swiglu_limit, fminf(v, swiglu_limit));
-    }
+    // if constexpr (kHasLimit) {
+    //   v = fmaxf(-swiglu_limit, fminf(v, swiglu_limit));
+    // }
 
     vals[i] = v;
     local_absmax = fmaxf(local_absmax, fabsf(v));
@@ -340,12 +352,16 @@ __global__ void fused_silu_mul_per_group_quant_vec_kernel(
   }
 
   const float qmax = quant_qmax<quant_t>();
-  const float absmax = fmaxf(local_absmax, quant_min_absmax<quant_t>());
+  const float absmax = fmaxf(local_absmax, 1e-10f);
   const float scale = absmax / qmax;
   const float inv_scale = qmax * __builtin_mxc_rcpf(absmax);
 
   if (subgroup_lane == 0) {
-    scales[static_cast<int64_t>(token_id) * groups + group_id] = scale;
+    if constexpr (TRANS_SCATTER) {
+      scales[static_cast<int64_t>(group_id) * gridDim.y + token_id] = scale;
+    } else {
+      scales[static_cast<int64_t>(token_id) * groups + group_id] = scale;
+    }
   }
 
   using OutVec = AlignedArray<quant_t, VEC>;
@@ -370,6 +386,7 @@ void launch_fused_silu_mul_per_group_quant_default(
     int64_t tokens,
     int64_t hidden,
     float swiglu_limit,
+    bool trans_scatter,
     cudaStream_t stream) {
   constexpr int GROUP = kSiluMulGroupSize;
 
@@ -377,9 +394,15 @@ void launch_fused_silu_mul_per_group_quant_default(
 
   dim3 grid(groups, tokens);
   dim3 block(GROUP);
-
-  fused_silu_mul_per_group_quant_default_kernel<input_t, quant_t, kHasLimit>
+  
+  if (trans_scatter) {
+    fused_silu_mul_per_group_quant_default_kernel<input_t, quant_t, kHasLimit, true>
       <<<grid, block, 0, stream>>>(out, scales, input, hidden, swiglu_limit);
+  } else {
+    fused_silu_mul_per_group_quant_default_kernel<input_t, quant_t, kHasLimit, false>
+      <<<grid, block, 0, stream>>>(out, scales, input, hidden, swiglu_limit);
+  }
+  
 }
 
 template <typename input_t, typename quant_t, int VEC, int BLOCK_THREADS,
@@ -391,6 +414,7 @@ void launch_fused_silu_mul_per_group_quant_vec(
     int64_t tokens,
     int64_t hidden,
     float swiglu_limit,
+    bool trans_scatter,
     cudaStream_t stream) {
   static_assert(VEC == 2 || VEC == 4 || VEC == 8);
   static_assert(BLOCK_THREADS == 64 ||
@@ -410,10 +434,16 @@ void launch_fused_silu_mul_per_group_quant_vec(
 
   dim3 grid(grid_x, tokens);
   dim3 block(BLOCK_THREADS);
-
-  fused_silu_mul_per_group_quant_vec_kernel<input_t, quant_t, VEC, kHasLimit>
+  
+  if (trans_scatter) {
+    fused_silu_mul_per_group_quant_vec_kernel<input_t, quant_t, VEC, kHasLimit, true>
       <<<grid, block, 0, stream>>>(out, scales, input, hidden, groups,
                                     swiglu_limit);
+  } else {
+    fused_silu_mul_per_group_quant_vec_kernel<input_t, quant_t, VEC, kHasLimit, false>
+      <<<grid, block, 0, stream>>>(out, scales, input, hidden, groups,
+                                    swiglu_limit);
+  }
 }
 
 // ============================================================
@@ -430,23 +460,24 @@ void dispatch_fused_silu_mul_per_group_quant(
     bool can_vec4,
     bool can_vec2,
     float swiglu_limit,
+    bool trans_scatter,
     cudaStream_t stream) {
   if (can_vec8) {
     if (hidden == 128) {
       launch_fused_silu_mul_per_group_quant_default<input_t, quant_t, kHasLimit>(
-          out, scales, input, tokens, hidden, swiglu_limit, stream);
+          out, scales, input, tokens, hidden, swiglu_limit, trans_scatter, stream);
     } else if (hidden <= 512) {
       launch_fused_silu_mul_per_group_quant_vec<input_t, quant_t, 8, 64, kHasLimit>(
-          out, scales, input, tokens, hidden, swiglu_limit, stream);
+          out, scales, input, tokens, hidden, swiglu_limit, trans_scatter, stream);
     } else if (hidden <= 1024) {
       launch_fused_silu_mul_per_group_quant_vec<input_t, quant_t, 8, 128, kHasLimit>(
-          out, scales, input, tokens, hidden, swiglu_limit, stream);
+          out, scales, input, tokens, hidden, swiglu_limit, trans_scatter, stream);
     } else if (hidden <= 2048) {
       launch_fused_silu_mul_per_group_quant_vec<input_t, quant_t, 8, 256, kHasLimit>(
-          out, scales, input, tokens, hidden, swiglu_limit, stream);
+          out, scales, input, tokens, hidden, swiglu_limit, trans_scatter, stream);
     } else {
       launch_fused_silu_mul_per_group_quant_vec<input_t, quant_t, 8, 512, kHasLimit>(
-          out, scales, input, tokens, hidden, swiglu_limit, stream);
+          out, scales, input, tokens, hidden, swiglu_limit, trans_scatter, stream);
     }
     return;
   }
@@ -454,19 +485,19 @@ void dispatch_fused_silu_mul_per_group_quant(
   if (can_vec4) {
     if (hidden == 128) {
       launch_fused_silu_mul_per_group_quant_default<input_t, quant_t, kHasLimit>(
-          out, scales, input, tokens, hidden, swiglu_limit, stream);
+          out, scales, input, tokens, hidden, swiglu_limit, trans_scatter, stream);
     } else if (hidden <= 512) {
       launch_fused_silu_mul_per_group_quant_vec<input_t, quant_t, 4, 64, kHasLimit>(
-          out, scales, input, tokens, hidden, swiglu_limit, stream);
+          out, scales, input, tokens, hidden, swiglu_limit, trans_scatter, stream);
     } else if (hidden <= 1024) {
       launch_fused_silu_mul_per_group_quant_vec<input_t, quant_t, 4, 128, kHasLimit>(
-          out, scales, input, tokens, hidden, swiglu_limit, stream);
+          out, scales, input, tokens, hidden, swiglu_limit, trans_scatter, stream);
     } else if (hidden <= 2048) {
       launch_fused_silu_mul_per_group_quant_vec<input_t, quant_t, 4, 256, kHasLimit>(
-          out, scales, input, tokens, hidden, swiglu_limit, stream);
+          out, scales, input, tokens, hidden, swiglu_limit, trans_scatter, stream);
     } else {
       launch_fused_silu_mul_per_group_quant_vec<input_t, quant_t, 4, 512, kHasLimit>(
-          out, scales, input, tokens, hidden, swiglu_limit, stream);
+          out, scales, input, tokens, hidden, swiglu_limit, trans_scatter, stream);
     }
     return;
   }
@@ -474,28 +505,49 @@ void dispatch_fused_silu_mul_per_group_quant(
   if (can_vec2) {
     if (hidden == 128) {
       launch_fused_silu_mul_per_group_quant_default<input_t, quant_t, kHasLimit>(
-          out, scales, input, tokens, hidden, swiglu_limit, stream);
+          out, scales, input, tokens, hidden, swiglu_limit, trans_scatter, stream);
     } else if (hidden <= 512) {
       launch_fused_silu_mul_per_group_quant_vec<input_t, quant_t, 2, 64, kHasLimit>(
-          out, scales, input, tokens, hidden, swiglu_limit, stream);
+          out, scales, input, tokens, hidden, swiglu_limit, trans_scatter, stream);
     } else if (hidden <= 1024) {
       launch_fused_silu_mul_per_group_quant_vec<input_t, quant_t, 2, 128, kHasLimit>(
-          out, scales, input, tokens, hidden, swiglu_limit, stream);
+          out, scales, input, tokens, hidden, swiglu_limit, trans_scatter, stream);
     } else if (hidden <= 2048) {
       launch_fused_silu_mul_per_group_quant_vec<input_t, quant_t, 2, 256, kHasLimit>(
-          out, scales, input, tokens, hidden, swiglu_limit, stream);
+          out, scales, input, tokens, hidden, swiglu_limit, trans_scatter, stream);
     } else {
       launch_fused_silu_mul_per_group_quant_vec<input_t, quant_t, 2, 512, kHasLimit>(
-          out, scales, input, tokens, hidden, swiglu_limit, stream);
+          out, scales, input, tokens, hidden, swiglu_limit, trans_scatter, stream);
     }
     return;
   }
 
   launch_fused_silu_mul_per_group_quant_default<input_t, quant_t, kHasLimit>(
-      out, scales, input, tokens, hidden, swiglu_limit, stream);
+      out, scales, input, tokens, hidden, swiglu_limit, trans_scatter, stream);
 }
 
 } // namespace vllm
+
+
+namespace {
+__global__ __launch_bounds__(256)
+void transpose_scale_kernel(const float* __restrict__ src, float* __restrict__ dst, int m, int G)
+{
+    __shared__ float tile[32][33];
+    const int bx = blockIdx.x * 32, by = blockIdx.y * 32;
+    #pragma unroll
+    for (int j = 0; j < 32; j += 8) {
+        int r = by + threadIdx.y + j, c = bx + threadIdx.x;
+        if (r < m && c < G) tile[threadIdx.y + j][threadIdx.x] = src[(long)r * G + c];
+    }
+    __syncthreads();
+    #pragma unroll
+    for (int j = 0; j < 32; j += 8) {
+        int r = bx + threadIdx.y + j, c = by + threadIdx.x;
+        if (r < G && c < m) dst[(long)r * m + c] = tile[threadIdx.x][threadIdx.y + j];
+    }
+}
+}
 
 // Note: only support group size 128
 //
@@ -509,7 +561,8 @@ void fused_silu_mul_per_group_quant(
     torch::Tensor& out,
     torch::Tensor& scales,
     const torch::Tensor& input,
-    c10::optional<double> _swiglu_limit) {
+    c10::optional<double> _swiglu_limit,
+    bool trans_scale) {
   TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
   TORCH_CHECK(out.is_cuda(), "out must be a CUDA tensor");
   TORCH_CHECK(scales.is_cuda(), "scales must be a CUDA tensor");
@@ -521,7 +574,6 @@ void fused_silu_mul_per_group_quant(
 
   TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
   TORCH_CHECK(out.is_contiguous(), "out must be contiguous");
-  TORCH_CHECK(scales.is_contiguous(), "scales must be contiguous");
 
   TORCH_CHECK(input.dim() >= 2,
               "input must have at least 2 dimensions, got ",
@@ -655,6 +707,16 @@ void fused_silu_mul_per_group_quant(
   const c10::cuda::OptionalCUDAGuard device_guard(device_of(input));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
+  const bool use_ws = trans_scale && tokens >= 512 && groups >= 8;
+  torch::Tensor ws;
+  float *scales_ptr = scales.data_ptr<float>();
+  if (use_ws) {
+    ws = torch::empty({tokens, groups},
+                      input.options().dtype(torch::kFloat32));
+    scales_ptr = ws.data_ptr<float>();
+  }
+  const bool trans_scatter = trans_scale && !use_ws;
+
   if (is_fp8_out) {
     VLLM_DISPATCH_FLOATING_TYPES(
         input.scalar_type(), "fused_silu_mul_per_group_quant", [&] {
@@ -664,7 +726,7 @@ void fused_silu_mul_per_group_quant(
                 c10::Float8_e4m3fn,
                 true>(
                 reinterpret_cast<c10::Float8_e4m3fn*>(out.data_ptr()),
-                scales.data_ptr<float>(),
+                scales_ptr,
                 input.data_ptr<scalar_t>(),
                 tokens,
                 hidden,
@@ -672,6 +734,7 @@ void fused_silu_mul_per_group_quant(
                 can_vec4,
                 can_vec2,
                 swiglu_limit,
+                trans_scatter,
                 stream);
           } else {
             vllm::dispatch_fused_silu_mul_per_group_quant<
@@ -679,7 +742,7 @@ void fused_silu_mul_per_group_quant(
                 c10::Float8_e4m3fn,
                 false>(
                 reinterpret_cast<c10::Float8_e4m3fn*>(out.data_ptr()),
-                scales.data_ptr<float>(),
+                scales_ptr,
                 input.data_ptr<scalar_t>(),
                 tokens,
                 hidden,
@@ -687,6 +750,7 @@ void fused_silu_mul_per_group_quant(
                 can_vec4,
                 can_vec2,
                 swiglu_limit,
+                trans_scatter,
                 stream);
           }
         });
@@ -696,7 +760,7 @@ void fused_silu_mul_per_group_quant(
           if (use_limit) {
             vllm::dispatch_fused_silu_mul_per_group_quant<scalar_t, int8_t, true>(
                 out.data_ptr<int8_t>(),
-                scales.data_ptr<float>(),
+                scales_ptr,
                 input.data_ptr<scalar_t>(),
                 tokens,
                 hidden,
@@ -704,11 +768,12 @@ void fused_silu_mul_per_group_quant(
                 can_vec4,
                 can_vec2,
                 swiglu_limit,
+                trans_scatter,
                 stream);
           } else {
             vllm::dispatch_fused_silu_mul_per_group_quant<scalar_t, int8_t, false>(
                 out.data_ptr<int8_t>(),
-                scales.data_ptr<float>(),
+                scales_ptr,
                 input.data_ptr<scalar_t>(),
                 tokens,
                 hidden,
@@ -716,8 +781,15 @@ void fused_silu_mul_per_group_quant(
                 can_vec4,
                 can_vec2,
                 swiglu_limit,
+                trans_scatter,
                 stream);
           }
         });
+  }
+  if (use_ws) {
+    transpose_scale_kernel<<<
+        dim3((groups + 31) / 32, (tokens + 31) / 32), dim3(32, 8), 0, stream>>>(
+        scales_ptr, scales.data_ptr<float>(), static_cast<int32_t>(tokens),
+        static_cast<int32_t>(groups));
   }
 }

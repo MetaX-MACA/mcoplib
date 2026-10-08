@@ -107,7 +107,6 @@ void merge_state(
     at::Tensor v_a, at::Tensor s_a, at::Tensor v_b, at::Tensor s_b, at::Tensor v_merged, at::Tensor s_merged);
 void merge_state_v2(
     at::Tensor v_a, at::Tensor s_a, at::Tensor v_b, at::Tensor s_b, at::Tensor v_merged, at::Tensor s_merged);
-// void cutlass_mla_decode(
 //     torch::Tensor const& out,
 //     torch::Tensor const& q_nope,
 //     torch::Tensor const& q_pe,
@@ -117,7 +116,6 @@ void merge_state_v2(
 //     torch::Tensor const& workspace,
 //     double sm_scale,
 //     int64_t num_kv_splits = 1 /* Set to 1 to avoid cuda_graph issue by default. */);
-// int64_t cutlass_mla_get_workspace_size(
 //     int64_t max_seq_len,
 //     int64_t num_batches,
 //     int64_t sm_count = 0,
@@ -149,7 +147,8 @@ void rms_norm_dynamic_per_group_quant(
     const torch::Tensor &weight, torch::Tensor &scales,
     int64_t quant_group_size, double variance_epsilon,
     const std::optional<at::Tensor> &scale_ub,
-    const std::optional<at::Tensor> &residual);
+    const std::optional<at::Tensor> &residual,
+    bool trans_scale=false);
 
 void apply_rope_pos_ids_cos_sin_cache(
     at::Tensor q,
@@ -212,6 +211,25 @@ void fast_topk_transform_ragged_interface(
     const at::Tensor& topk_indices_offset,
     std::optional<at::Tensor> row_starts_opt = std::nullopt);
 
+void kpool_topk_transform_interface(
+    const at::Tensor& score,
+    const at::Tensor& lengths,
+    at::Tensor& output,
+    int64_t pool_size,
+    std::optional<at::Tensor> page_table_opt = std::nullopt,
+    std::optional<at::Tensor> topk_indices_offset_opt = std::nullopt,
+    std::optional<at::Tensor> row_starts_opt = std::nullopt,
+    std::optional<at::Tensor> seq_lens_opt = std::nullopt,
+    std::optional<at::Tensor> page_table_row_index_opt = std::nullopt);
+
+void topk_transform_v1_interface(
+    const at::Tensor& scores,
+    const at::Tensor& seq_lens,
+    at::Tensor& page_indices,
+    const at::Tensor& page_table,
+    const int64_t page_size,
+    std::optional<at::Tensor> raw_indices_opt = std::nullopt);
+
 #ifdef USE_ROCM
 void gelu_quick(at::Tensor& out, const at::Tensor& input);
 #endif
@@ -245,11 +263,42 @@ void dsv4_fused_q_indexer_rope_hadamard_quant(
     const at::Tensor& freqs_cis,
     const at::Tensor& positions);
 
+void sgl_fused_hc_head(
+    torch::Tensor output,
+    torch::Tensor x,
+    torch::Tensor hc_fn,
+    torch::Tensor hc_scale,
+    torch::Tensor hc_base,
+    double norm_eps,
+    double hc_eps);
+/*
+ * MiniMax-M3 fused GemmaRMSNorm + partial NeoX RoPE (AOT port of
+ * sglang_jit/fused_gemma_qknorm_rope.cuh). Multi-group, in-place over qkv.
+ */
+void fused_gemma_qknorm_rope(
+    at::Tensor qkv,
+    at::Tensor w0,
+    at::Tensor w1,
+    at::Tensor w2,
+    at::Tensor w3,
+    at::Tensor cos_sin_cache,
+    at::Tensor positions,
+    int64_t off0,
+    int64_t cnt0,
+    int64_t off1,
+    int64_t cnt1,
+    int64_t off2,
+    int64_t cnt2,
+    int64_t off3,
+    int64_t cnt3,
+    int64_t num_groups,
+    double eps);
+
+    
 /*
  * From csrc/gemm
  */
 torch::Tensor awq_dequantize(torch::Tensor qweight, torch::Tensor scales, torch::Tensor qzeros);
-// void cutlass_scaled_fp4_mm(
 //     torch::Tensor& D,
 //     torch::Tensor const& A,
 //     torch::Tensor const& B,
@@ -467,7 +516,6 @@ void fused_qk_norm_rope(
     double attention_factor,
     int64_t rotary_dim);
 
-// void cutlass_fp4_group_mm(
 //     torch::Tensor& output,
 //     const torch::Tensor& a,
 //     const torch::Tensor& b,
@@ -497,9 +545,7 @@ void fused_qk_norm_rope(
 //     bool use_silu_and_mul);
 
 // /*
-//  * From csrc/moe/cutlass_moe/w4a8
 //  */
-// void get_cutlass_w4a8_moe_mm_data(
 //     const torch::Tensor& topk_ids,
 //     torch::Tensor& expert_offsets,
 //     torch::Tensor& problem_sizes1,
@@ -510,7 +556,6 @@ void fused_qk_norm_rope(
 //     const int64_t n,
 //     const int64_t k);
 
-// void cutlass_w4a8_moe_mm(
 //     torch::Tensor& d_tensors,
 //     torch::Tensor const& a_tensors,
 //     torch::Tensor const& b_tensors,
@@ -947,7 +992,26 @@ void fused_silu_mul_per_group_quant(
     torch::Tensor& out,
     torch::Tensor& scales,
     const torch::Tensor& input,
-    c10::optional<double> _swiglu_limit = c10::nullopt);
+    c10::optional<double> _swiglu_limit = c10::nullopt,
+    bool trans_scale=false);
+
+// The optional workspace is a contiguous CUDA int32 tensor with at least
+// 2 + 2 * T * topk elements. When it and persistent_grid are suitable, the
+// existing op selects the work-table persistent path; otherwise it falls back
+// to the normal kernel without changing results.
+void silu_mul_quant_varlen(
+    const torch::Tensor& input,
+    torch::Tensor& output,
+    torch::Tensor& output_scale,
+    const torch::Tensor& masked_m,
+    int64_t topk,
+    bool scale_ue8m0,
+    bool transposed,
+    bool swizzle,
+    c10::optional<double> swiglu_limit = c10::nullopt,
+    bool enable_pdl = false,
+    const c10::optional<torch::Tensor>& workspace = c10::nullopt,
+    int64_t persistent_grid = 0);
 
 void static_scaled_int8_quant(torch::Tensor& out, torch::Tensor const& input,
                               torch::Tensor const& scale,
@@ -987,29 +1051,6 @@ void causal_conv1d_fwd(
     const std::optional<at::Tensor>& has_initial_state,
     bool silu_activation,
     int64_t pad_slot_id);
-
-#if ENABLE_CUTALASS_OP
-    int64_t cutlass_moe_mm_gemm_kernel_m_w8a8(int64_t num_valid_tokens,
-                                            int64_t N, 
-                                            int64_t K, 
-                                            int64_t group);
-                                            
-    void cutlass_moe_mm_w8a8(at::Tensor const& a, 
-                            at::Tensor const& b, 
-                            at::Tensor& c,
-                            at::Tensor const& a_scales, 
-                            at::Tensor const& b_scales, 
-                            at::Tensor const& moe_weight,
-                            at::Tensor const& token_ids, 
-                            at::Tensor const& expert_ids,
-                            at::Tensor const& num_tokens_post_padded,
-                            int64_t N, 
-                            int64_t K, 
-                            int64_t EM, 
-                            int64_t num_valid_tokens, 
-                            int64_t topk, 
-                            bool mul_routed_weight);
-#endif
 
 // /*
 //  * From csrc/expert_specialization
@@ -1086,7 +1127,6 @@ int64_t fused_mla_normal_kv_element_wise(
 //     const std::optional<at::Tensor>& indices  // None, or batch_size x seqlen_q x topk
 // );
 
-// void FMHACutlassSM100FwdRun(
 //     at::Tensor workspace_buffer,
 //     at::Tensor q,
 //     at::Tensor k,
@@ -1104,30 +1144,13 @@ int64_t fused_mla_normal_kv_element_wise(
 // std::vector<at::Tensor>
 // sparse_prefill_fwd(const at::Tensor& q, const at::Tensor& kv, const at::Tensor& indices, double sm_scale, int64_t d_v);
 
-#if ENABLE_CUTALASS_OP
-    /*
-    * From csrc/cutlass_w8a8
-    */
-    void cutlass_scaled_mm(torch::Tensor& out, torch::Tensor const& a,
-                        torch::Tensor const& b, torch::Tensor const& a_scales,
-                        torch::Tensor const& b_scales,
-                        std::optional<torch::Tensor> const& bias);
-
-    void cutlass_scaled_mm_azp(torch::Tensor& out, torch::Tensor const& a,
-                            torch::Tensor const& b,
-                            torch::Tensor const& a_scales,
-                            torch::Tensor const& b_scales,
-                            torch::Tensor const& azp_adj,
-                            std::optional<torch::Tensor> const& azp,
-                            std::optional<torch::Tensor> const& bias);
-#endif
-
 torch::Tensor mx_awq_dequantize(torch::Tensor _kernel, torch::Tensor _scaling_factors, torch::Tensor _zeros, int64_t split_k_iters, int64_t thx, int64_t thy);
 
 void per_token_cast_to_fp8(
     torch::Tensor& out,
-    torch::Tensor& scale,   
-    torch::Tensor const& input);
+    torch::Tensor& scale,
+    torch::Tensor const& input,
+    bool trans_scale=false);
 /*
  * From csrc/sgl_diffusion/elementwise
  */

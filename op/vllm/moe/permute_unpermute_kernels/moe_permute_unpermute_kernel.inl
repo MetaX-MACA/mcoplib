@@ -1,5 +1,11 @@
 #pragma once
 
+template <typename T>
+struct BitsPerElement {
+  static constexpr int value = sizeof(T) * 8;
+};
+
+
 template <typename T, bool CHECK_SKIPPED>
 __global__ void expandInputRowsKernel(
     T const* unpermuted_input, T* permuted_output,
@@ -29,8 +35,8 @@ __global__ void expandInputRowsKernel(
 
   if (!CHECK_SKIPPED || blockIdx.x < *num_dest_rows) {
     // Load 128-bits per thread
-    constexpr int64_t ELEM_PER_THREAD = 128 / mctlass::sizeof_bits<T>::value;
-    using DataElem = mctlass::Array<T, ELEM_PER_THREAD>;
+    constexpr int64_t ELEM_PER_THREAD = 128 / BitsPerElement<T>::value;
+    using DataElem = mcoplib_moe_detail::AlignedArray<T, ELEM_PER_THREAD>;
 
     // Duplicate and permute rows
     int64_t const source_row = expanded_source_row / k;
@@ -102,16 +108,16 @@ __global__ void finalizeMoeRoutingKernel(
 
   // Load 128-bits per thread, according to the smallest data type we read/write
   constexpr int64_t FINALIZE_ELEM_PER_THREAD =
-      128 / std::min(mctlass::sizeof_bits<OutputType>::value,
-                     mctlass::sizeof_bits<T>::value);
+      128 / std::min(BitsPerElement<OutputType>::value,
+                     BitsPerElement<T>::value);
 
   int64_t const start_offset = threadIdx.x;
   int64_t const stride = blockDim.x;
   int64_t const num_elems_in_col = orig_cols / FINALIZE_ELEM_PER_THREAD;
 
-  using InputElem = mctlass::Array<T, FINALIZE_ELEM_PER_THREAD>;
-  using OutputElem = mctlass::Array<OutputType, FINALIZE_ELEM_PER_THREAD>;
-  using ComputeElem = mctlass::Array<float, FINALIZE_ELEM_PER_THREAD>;
+  using InputElem = mcoplib_moe_detail::AlignedArray<T, FINALIZE_ELEM_PER_THREAD>;
+  using OutputElem = mcoplib_moe_detail::AlignedArray<OutputType, FINALIZE_ELEM_PER_THREAD>;
+  using ComputeElem = mcoplib_moe_detail::AlignedArray<float, FINALIZE_ELEM_PER_THREAD>;
   auto const* expanded_permuted_rows_v =
       reinterpret_cast<InputElem const*>(expanded_permuted_rows);
   auto* reduced_row_ptr_v = reinterpret_cast<OutputElem*>(reduced_row_ptr);
@@ -120,7 +126,10 @@ __global__ void finalizeMoeRoutingKernel(
   for (int elem_index = start_offset; elem_index < num_elems_in_col;
        elem_index += stride) {
     ComputeElem thread_output;
-    thread_output.fill(0);
+    #pragma unroll
+    for (int i = 0; i < FINALIZE_ELEM_PER_THREAD; ++i) {
+      thread_output.data[i] = 0.0f;
+    }
     for (int k_idx = 0; k_idx < k; ++k_idx) {
       int64_t const expanded_original_row = original_row * k + k_idx;
       int64_t const expanded_permuted_row =

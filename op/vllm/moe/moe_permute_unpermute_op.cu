@@ -9,10 +9,17 @@
 #include "core/registration.h"
 #include "moe/permute_unpermute_kernels/moe_permute_unpermute_kernel.h"
 #include "../torch_utils.h"
-#include "cutlass/cutlass.h"
 
 // moe_permute kernels require at least CUDA 12.0
 // #if defined(CUDA_VERSION) && (CUDA_VERSION >= 12000)
+
+template <typename T, int N>
+struct alignas(16) AlignedArray {
+  T data[N];
+
+  __device__ T& operator[](int index) { return data[index]; }
+  __device__ const T& operator[](int index) const { return data[index]; }
+};
 
 namespace {
 
@@ -221,7 +228,7 @@ __global__ void shuffleInputRowsKernel(const T* input,
   if (blockIdx.x < num_dst_rows) {
     // Load 128-bits per thread
     constexpr int64_t ELEM_PER_THREAD = 128 / sizeof(T) / 8;
-    using DataElem = cutlass::Array<T, ELEM_PER_THREAD>;
+    using DataElem = AlignedArray<T, ELEM_PER_THREAD>;
 
     // Duplicate and permute rows
     auto const* source_row_ptr =

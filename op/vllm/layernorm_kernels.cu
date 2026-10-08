@@ -41,6 +41,17 @@ __global__ void rms_norm_default_kernel(
   __shared__ float s_variance;
   float variance = 0.0f;
   const int token_idx = blockIdx.x;
+  int batch_idx = 0;
+
+  if constexpr(NUM_DIMS == 2) {
+      batch_idx = blockIdx.x;
+  }
+  else if constexpr(NUM_DIMS == 3) {
+      batch_idx = blockIdx.x / input_shape_d2;
+  }
+  else if constexpr(NUM_DIMS == 4) {
+      batch_idx = blockIdx.x / (input_shape_d3 * input_shape_d2);
+  }
   const scalar_t *input_row = rms_input_row<scalar_t, NUM_DIMS>(
       input, input_stride_d2, input_stride_d3, input_stride_d4, input_shape_d2,
       input_shape_d3);
@@ -89,7 +100,7 @@ __global__ void rms_norm_default_kernel(
         output_vec[i] = dst;
       }
     } else {
-      const scalar_t *token_weight = weight + token_idx * weight_stride;
+      const scalar_t *token_weight = weight + batch_idx * weight_stride;
       const auto *weight_vec =
           reinterpret_cast<const vec_n_t<scalar_t, VEC_SIZE> *>(token_weight);
       for (int i = threadIdx.x; i < hidden_size / VEC_SIZE; i += blockDim.x) {
@@ -134,6 +145,17 @@ __global__ __launch_bounds__(BLOCK_SIZE) void rms_norm_cached_kernel(
   using Vec = vec_n_t<scalar_t, VEC_SIZE>;
   const int vec_count = hidden_size / VEC_SIZE;
   const int token_idx = blockIdx.x;
+  int batch_idx = 0;
+
+  if constexpr(NUM_DIMS == 2) {
+      batch_idx = blockIdx.x;
+  }
+  else if constexpr(NUM_DIMS == 3) {
+      batch_idx = blockIdx.x / input_shape_d2;
+  }
+  else if constexpr(NUM_DIMS == 4) {
+      batch_idx = blockIdx.x / (input_shape_d3 * input_shape_d2);
+  }
   const scalar_t *input_row = rms_input_row<scalar_t, NUM_DIMS>(
       input, input_stride_d2, input_stride_d3, input_stride_d4, input_shape_d2,
       input_shape_d3);
@@ -180,7 +202,7 @@ __global__ __launch_bounds__(BLOCK_SIZE) void rms_norm_cached_kernel(
       Vec w{}; 
       if constexpr (HAS_WEIGHT) { 
         if constexpr (PER_TOKEN_WEIGHT) {
-          const scalar_t *token_weight = weight + token_idx * weight_stride;
+          const scalar_t *token_weight = weight + batch_idx * weight_stride;
           const auto *token_weight_vec =
               reinterpret_cast<const Vec *>(token_weight); 
           w = token_weight_vec[vec_idx];
@@ -418,11 +440,9 @@ void rms_norm(torch::Tensor &out, torch::Tensor &input,
   if (input.stride(-1) != 1)
     input = input.contiguous();
   TORCH_CHECK(input.stride(-1) == 1);
-
   const bool has_weight = weight.has_value();
   const int hidden_size = input.size(-1);
   const int num_tokens = input.numel() / hidden_size;
-
   bool per_token_weight = false;
   int64_t weight_stride = 0;
 
@@ -434,16 +454,18 @@ void rms_norm(torch::Tensor &out, torch::Tensor &input,
       TORCH_CHECK(weight->size(0) == hidden_size);
       per_token_weight = false;
     } else if (weight->dim() == 2) {
-      TORCH_CHECK(weight->size(0) == num_tokens);
-      TORCH_CHECK(weight->size(1) == hidden_size);
+      // 修改：
+      // weight shape == [input.size(0), input.size(-1)]
+      TORCH_CHECK(weight->size(0) == input.size(0));
+      TORCH_CHECK(weight->size(-1) == input.size(-1));
       weight_stride = weight->stride(0);
       per_token_weight = true;
     } else {
       TORCH_CHECK(false,
-                  "rms_norm weight only supports [hidden] or [tokens,hidden]");
+                  "rms_norm weight only supports 1D or 2D");
     }
   }
-  
+
   const int num_dims = input.dim();
   const int64_t input_stride_d2 = input.stride(-2);
   const int64_t input_stride_d3 = num_dims >= 3 ? input.stride(-3) : 0;
@@ -482,9 +504,12 @@ void rms_norm(torch::Tensor &out, torch::Tensor &input,
                   0 &&
               (!has_weight ||
                reinterpret_cast<std::uintptr_t>(weight_ptr) % alignment == 0);
+          // Route to the cached kernel only when the row fully utilizes the
+          // block (vec_count >= cached_block), keeping short rows on default.
           const bool can_use_cached =
-              cached_block != 0 && items_per_thread >= 1 &&
-              items_per_thread <= 8 && pointers_aligned &&
+              cached_block != 0 && vec_count >= cached_block &&
+              items_per_thread >= 1 && items_per_thread <= 8 &&
+              pointers_aligned &&
               vllm::rms_rows_are_vector_aligned(
                   num_dims, vec_size, input_stride_d2, input_stride_d3,
                   input_stride_d4);

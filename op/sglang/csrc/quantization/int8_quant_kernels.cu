@@ -186,6 +186,181 @@ __global__ void dynamic_scaled_int8_quant_kernel(
   }
 }
 
+template<typename scalar_t, typename scale_type, typename VT, typename VT1, int NUM_VT,int NUM_THREADS>
+__global__ void dynamic_scaled_int8_quant_kernel_sreg_num_reg(
+    scalar_t const* __restrict__ input, int8_t* __restrict__ out,
+    scale_type* scale, const int hidden_size, int num_tokens) {
+
+  int const tid = threadIdx.x;
+  int64_t const token_idx = blockIdx.x;
+  float absmax_val = 0.0f;
+  constexpr int N = sizeof(VT) / sizeof(scalar_t);
+  // NUM_VT=1：每线程 1 个 VT，行为与旧版完全一致；NUM_VT=2：每线程 2 个 VT（2×float4）
+  float reg_src[NUM_VT][N];
+  scalar_t const* ptr_input = input + token_idx * hidden_size;
+  int reg_length = NUM_THREADS * NUM_VT * N;
+  int length = min(hidden_size, reg_length);
+  // 第 v 个向量起始元素号 = (v*NUM_THREADS + tid)*N（交错排布，同 silu_and_mul 系列）：
+  // 同一条 load/store 指令内相邻线程访问相邻 16B/8B，单条指令即完美合并；
+  // 两条 load 相互独立可同时在飞。越界保护按向量做（h%16==8 时第二个向量整体跳过）。
+  #pragma unroll
+  for(int v = 0; v < NUM_VT; ++v) {
+    int index = (v * NUM_THREADS + tid) * N;
+    if(index < length) {
+      VT reg_v = *(VT*)(ptr_input + index);
+      scalar_t* ptr_reg_src = (scalar_t*)&reg_v;
+      #pragma unroll
+      for(int i = 0; i < N; i++) {
+        reg_src[v][i] = (float)ptr_reg_src[i];
+      }
+      #pragma unroll
+      for(int i = 0; i < N; i++) {
+        float val = abs(reg_src[v][i]);
+        absmax_val = max(absmax_val, val);
+      }
+    }
+  }
+
+  // 块内 absmax 归约只由 NUM_THREADS 决定，原样保留；
+  // NUM_THREADS=256 → sm_size==16 分支，即原 (1024,2048] 档位已在跑的已验证路径
+  constexpr int sm_size = NUM_THREADS >> 4;
+  __shared__ float sm_max[sm_size];
+  float block_absmax_val;
+  if constexpr(sm_size == 64) {
+    for(int i = 8; i > 0; i >>= 1) {
+      absmax_val = max(__shfl_down_sync_16(0xffffffffffffffff, absmax_val, i), absmax_val);
+    }
+    int lane_id = threadIdx.x & 15;
+    int group_id = threadIdx.x >> 4;
+    if(lane_id == 0) {
+      sm_max[group_id] = absmax_val;
+    }
+    __syncthreads();
+    __shared__ float sm_max2[sm_size>>4];
+    if(threadIdx.x < sm_size) {
+      float data = sm_max[threadIdx.x];
+      for(int i = 8; i >= 1; i >>= 1) {
+        data = max(__shfl_down_sync_16(0xffffffffffffffff, data, i), data);
+      }
+      int local_group_id = threadIdx.x >> 4;
+      int local_lane_id = threadIdx.x & 15;
+      if(local_lane_id == 0) {
+        sm_max2[local_group_id] = data;
+      }
+    }
+    __syncthreads();
+    block_absmax_val = max(sm_max2[0], sm_max2[1]);
+    block_absmax_val = max(block_absmax_val, sm_max2[2]);
+    block_absmax_val = max(block_absmax_val, sm_max2[3]);
+  } else if constexpr (sm_size == 32) {
+    for(int i = 8; i > 0; i >>= 1) {
+      absmax_val = max(__shfl_down_sync_16(0xffffffffffffffff, absmax_val, i), absmax_val);
+    }
+    int lane_id = threadIdx.x & 15;
+    int group_id = threadIdx.x >> 4;
+    if(lane_id == 0) {
+      sm_max[group_id] = absmax_val;
+    }
+    __syncthreads();
+    __shared__ float sm_max2[sm_size>>4];
+    if(threadIdx.x < sm_size) {
+      float data = sm_max[threadIdx.x];
+      for(int i = 8; i >= 1; i >>= 1) {
+        data = max(__shfl_down_sync_16(0xffffffffffffffff, data, i), data);
+      }
+      int local_group_id = threadIdx.x >> 4;
+      int local_lane_id = threadIdx.x & 15;
+      if(local_lane_id == 0) {
+        sm_max2[local_group_id] = data;
+      }
+    }
+    __syncthreads();
+    block_absmax_val = max(sm_max2[0], sm_max2[1]);
+  } else if constexpr(sm_size == 16) {
+    for(int i = 8; i > 0; i >>=1 ) {
+      absmax_val = max(__shfl_down_sync_16(0xffffffffffffffff, absmax_val, i),absmax_val);
+    }
+    int lane_id = threadIdx.x & 15;
+    int group_id = threadIdx.x >> 4;
+    if(lane_id == 0) {
+      sm_max[group_id] = absmax_val;
+    }
+    __syncthreads();
+    if(threadIdx.x < sm_size) {
+      float data = sm_max[threadIdx.x];
+      for(int i = 8; i >= 1; i >>= 1) {
+        data = max(__shfl_down_sync_16(0xffffffffffffffff, data, i), data);
+      }
+      if(threadIdx.x == 0) {
+        sm_max[0] = data;
+      }
+    }
+    __syncthreads();
+    block_absmax_val = sm_max[0];
+  } else if constexpr(sm_size == 8) {
+    for(int i = 8; i > 0; i >>=1 ) {
+      absmax_val = max(__shfl_down_sync_16(0xffffffffffffffff, absmax_val, i) , absmax_val);
+    }
+    int lane_id = threadIdx.x & 15;
+    int group_id = threadIdx.x >> 4;
+    if(lane_id == 0) {
+      sm_max[group_id] = absmax_val;
+    }
+    __syncthreads();
+    if(threadIdx.x < sm_size) {
+      float data = sm_max[threadIdx.x];
+      for(int i = 4; i >= 1; i >>= 1) {
+        data = max(__shfl_down_sync_16(0xffffffffffffffff, data, i), data);
+      }
+      if(threadIdx.x == 0) {
+        sm_max[0] = data;
+      }
+    }
+    __syncthreads();
+    block_absmax_val = sm_max[0];
+  } else if constexpr(sm_size == 4) {
+    for(int i = 8; i > 0; i >>=1 ) {
+      absmax_val = max(__shfl_down_sync_16(0xffffffffffffffff, absmax_val, i), absmax_val);
+    }
+    int lane_id = threadIdx.x & 15;
+    int group_id = threadIdx.x >> 4;
+    if(lane_id == 0) {
+      sm_max[group_id] = absmax_val;
+    }
+    __syncthreads();
+    if(threadIdx.x < sm_size) {
+      float data = sm_max[threadIdx.x];
+      for(int i = 2; i >= 1; i >>= 1) {
+        data = max(__shfl_down_sync_16(0xffffffffffffffff, data, i), data);
+      }
+      if(threadIdx.x == 0) {
+        sm_max[0] = data;
+      }
+    }
+    __syncthreads();
+    block_absmax_val = sm_max[0];
+  }
+  if (tid == 0) {
+    scale[token_idx] = static_cast<scale_type>(block_absmax_val * 0.0078740157);
+  }
+  __syncthreads();
+  float const tmp_scale = 127.0f *__builtin_mxc_rcpf(block_absmax_val);
+  int8_t* ptr_output = out + token_idx * hidden_size;
+  #pragma unroll
+  for(int v = 0; v < NUM_VT; ++v) {
+    int index = (v * NUM_THREADS + tid) * N;
+    if(index < length) {
+      VT1 vdst;
+      int8_t* ptr_reg = (int8_t*)&vdst;
+      #pragma unroll
+      for(int i = 0; i < N; i++) {
+        ptr_reg[i] = float_to_int8_rn(reg_src[v][i] * tmp_scale);
+      }
+      *(VT1*)(ptr_output + index) = vdst;
+    }
+  }
+}
+
 template <typename scalar_t, typename scale_type, typename VT, typename VT1, int NUM_THREADS, bool WITHMASK>
 __global__ void dynamic_scaled_int8_quant_kernel_sreg_opt(
     scalar_t const* __restrict__ input, int8_t* __restrict__ out,
@@ -221,14 +396,133 @@ __global__ void dynamic_scaled_int8_quant_kernel_sreg_opt(
     }
   }
 
-  using BlockReduce = cub::BlockReduce<float, NUM_THREADS>;
-  __shared__ typename BlockReduce::TempStorage reduceStorage;
-  float const block_absmax_val_maybe =
-      BlockReduce(reduceStorage).Reduce(absmax_val, cub::Max(), NUM_THREADS);
-  __shared__ float block_absmax_val;
+  // using BlockReduce = cub::BlockReduce<float, NUM_THREADS>;
+  // __shared__ typename BlockReduce::TempStorage reduceStorage;
+  // float const block_absmax_val_maybe =
+  //     BlockReduce(reduceStorage).Reduce(absmax_val, cub::Max{}, NUM_THREADS);
+  // __shared__ float block_absmax_val;
+  constexpr int sm_size = NUM_THREADS >> 4;
+  constexpr int sm_size2 = sm_size / 2;
+
+  __shared__ float sm_max[sm_size];
+  float block_absmax_val;
+  if constexpr(sm_size == 64) {
+    for(int i = 8; i > 0; i >>= 1) {
+      absmax_val = max(__shfl_down_sync_16(0xffffffffffffffff, absmax_val, i), absmax_val);
+    }
+    int lane_id = threadIdx.x & 15;
+    int group_id = threadIdx.x >> 4;
+    if(lane_id == 0) {
+      sm_max[group_id] = absmax_val;
+    }
+    __syncthreads();
+    __shared__ float sm_max2[sm_size>>4];
+    if(threadIdx.x < sm_size) {
+      float data = sm_max[threadIdx.x];
+      for(int i = 8; i >= 1; i >>= 1) {
+        data = max(__shfl_down_sync_16(0xffffffffffffffff, data, i), data);
+      }
+      int local_group_id = threadIdx.x >> 4;
+      int local_lane_id = threadIdx.x & 15;
+      if(local_lane_id == 0) {
+        sm_max2[local_group_id] = data;
+      }
+    }
+    __syncthreads();
+    block_absmax_val = max(sm_max2[0], sm_max2[1]);
+    block_absmax_val = max(block_absmax_val, sm_max2[2]);
+    block_absmax_val = max(block_absmax_val, sm_max2[3]);
+  } else if constexpr (sm_size == 32) {
+    for(int i = 8; i > 0; i >>= 1) {
+      absmax_val = max(__shfl_down_sync_16(0xffffffffffffffff, absmax_val, i), absmax_val);
+    }
+    int lane_id = threadIdx.x & 15;
+    int group_id = threadIdx.x >> 4;
+    if(lane_id == 0) {
+      sm_max[group_id] = absmax_val;
+    }
+    __syncthreads();
+    __shared__ float sm_max2[sm_size>>4];
+    if(threadIdx.x < sm_size) {
+      float data = sm_max[threadIdx.x];
+      for(int i = 8; i >= 1; i >>= 1) {
+        data = max(__shfl_down_sync_16(0xffffffffffffffff, data, i), data);
+      }
+      int local_group_id = threadIdx.x >> 4;
+      int local_lane_id = threadIdx.x & 15;
+      if(local_lane_id == 0) {
+        sm_max2[local_group_id] = data;
+      }
+    }
+    __syncthreads();
+    block_absmax_val = max(sm_max2[0], sm_max2[1]);
+  } else if constexpr(sm_size == 16) {
+    for(int i = 8; i > 0; i >>=1 ) {
+      absmax_val = max(__shfl_down_sync_16(0xffffffffffffffff, absmax_val, i),absmax_val);
+    }
+    int lane_id = threadIdx.x & 15;
+    int group_id = threadIdx.x >> 4;
+    if(lane_id == 0) {
+      sm_max[group_id] = absmax_val;
+    }
+    __syncthreads();
+    if(threadIdx.x < sm_size) {
+      float data = sm_max[threadIdx.x];
+      for(int i = 8; i >= 1; i >>= 1) {
+        data = max(__shfl_down_sync_16(0xffffffffffffffff, data, i), data);
+      }
+      if(threadIdx.x == 0) {
+        sm_max[0] = data;
+      }
+    }
+    __syncthreads();
+    block_absmax_val = sm_max[0];
+  } else if constexpr(sm_size == 8) {
+    for(int i = 8; i > 0; i >>=1 ) {
+      absmax_val = max(__shfl_down_sync_16(0xffffffffffffffff, absmax_val, i) , absmax_val);
+    }
+    int lane_id = threadIdx.x & 15;
+    int group_id = threadIdx.x >> 4;
+    if(lane_id == 0) {
+      sm_max[group_id] = absmax_val;
+    }
+    __syncthreads();
+    if(threadIdx.x < sm_size) {
+      float data = sm_max[threadIdx.x];
+      for(int i = 4; i >= 1; i >>= 1) {
+        data = max(__shfl_down_sync_16(0xffffffffffffffff, data, i), data);
+      }
+      if(threadIdx.x == 0) {
+        sm_max[0] = data;
+      }
+    }
+    __syncthreads();
+    block_absmax_val = sm_max[0];
+  } else if constexpr(sm_size == 4) {
+    for(int i = 8; i > 0; i >>=1 ) {
+      absmax_val = max(__shfl_down_sync_16(0xffffffffffffffff, absmax_val, i), absmax_val);
+    }
+    int lane_id = threadIdx.x & 15;
+    int group_id = threadIdx.x >> 4;
+    if(lane_id == 0) {
+      sm_max[group_id] = absmax_val;
+    }
+    __syncthreads();
+    if(threadIdx.x < sm_size) {
+      float data = sm_max[threadIdx.x];
+      for(int i = 2; i >= 1; i >>= 1) {
+        data = max(__shfl_down_sync_16(0xffffffffffffffff, data, i), data);
+      }
+      if(threadIdx.x == 0) {
+        sm_max[0] = data;
+      }
+    }
+    __syncthreads();
+    block_absmax_val = sm_max[0];
+  }
   if (tid == 0) {
-    block_absmax_val = block_absmax_val_maybe;
-    scale[token_idx] = static_cast<scale_type>(block_absmax_val_maybe * 0.0078740157);
+    // block_absmax_val = block_absmax_val_maybe;
+    scale[token_idx] = static_cast<scale_type>(block_absmax_val * 0.0078740157);
   }
   __syncthreads();
   float const tmp_scale = 127.0f * __builtin_mxc_rcpf(block_absmax_val);
@@ -286,16 +580,41 @@ __global__ void dynamic_scaled_int8_quant_kernel_reg_opt(
     }
   }
 
-  using BlockReduce = cub::BlockReduce<float, 512>;
-  __shared__ typename BlockReduce::TempStorage reduceStorage;
-  float const block_absmax_val_maybe =
-      BlockReduce(reduceStorage).Reduce(absmax_val, cub::Max(), blockDim_x);
-  __shared__ float block_absmax_val;
-  if (tid == 0) {
-    block_absmax_val = (block_absmax_val_maybe);
-    scale[token_idx] = static_cast<scale_type>(block_absmax_val * 0.0078740157);
+  // using BlockReduce = cub::BlockReduce<float, 512>;
+  // __shared__ typename BlockReduce::TempStorage reduceStorage;
+  // float const block_absmax_val_maybe =
+  //     BlockReduce(reduceStorage).Reduce(absmax_val, cub::Max{}, blockDim_x);
+  // __shared__ float block_absmax_val;
+  __shared__ float sm_max[32];
+  __shared__ float sm_max2[2];
+  for(int i = 8; i >= 1; i >>= 1){
+    absmax_val = max(__shfl_down_sync_16(0xffffffffffffffff, absmax_val, i) , absmax_val);
+  }
+  int lane_id = threadIdx.x & 15;
+  int group_id = threadIdx.x >> 4;
+  if(lane_id == 0) {
+    sm_max[group_id] = absmax_val;
   }
   __syncthreads();
+  if(threadIdx.x < 32) {
+    float data = sm_max[threadIdx.x];
+    for(int i = 8; i >= 1; i>>=1) {
+      data = max(__shfl_down_sync_16(0xffffffffffffffff, data, i), data);
+    }
+    int local_group_id = threadIdx.x >> 4;
+    int local_lane_id = threadIdx.x & 15;
+    if(local_lane_id == 0) {
+      sm_max2[local_group_id] = data;
+    }
+  }
+  __syncthreads();
+  float block_absmax_val = max(sm_max2[0], sm_max2[1]);
+
+  if (tid == 0) {
+    // block_absmax_val = (block_absmax_val_maybe);
+    scale[token_idx] = static_cast<scale_type>(block_absmax_val * 0.0078740157);
+  }
+  // __syncthreads();
   float const tmp_scale = 127.0f * __builtin_mxc_rcpf(block_absmax_val);
   int8_t* ptr_output = out + token_idx * hidden_size;
   if(index < length) {
@@ -2676,7 +2995,10 @@ void dynamic_scaled_int8_quant(
         if (!azp) {
           int n = 16 / sizeof(scalar_t);
           if(hidden_size <= 4096 && ((hidden_size & (n - 1)) == 0) && n == 8) {
-            if(hidden_size > 256*n) {
+            if(hidden_size == 4096) {
+              int blockSize = 256;
+              vllm::dynamic_scaled_int8_quant_kernel_sreg_num_reg<scalar_t, float, float4, float2, 2, 256><<<grid, blockSize, 0, stream>>>(input.data_ptr<scalar_t>(),out.data_ptr<int8_t>(),scales.data_ptr<float>(),hidden_size, num_tokens);
+            } else if(hidden_size > 256*n) {
               vllm::dynamic_scaled_int8_quant_kernel_sreg_opt<scalar_t, float, float4, float2, 512, false><<<grid, 512, 0, stream>>>(input.data_ptr<scalar_t>(),out.data_ptr<int8_t>(),scales.data_ptr<float>(),hidden_size, num_tokens);
             } else if(hidden_size > 128*n) {
               vllm::dynamic_scaled_int8_quant_kernel_sreg_opt<scalar_t, float, float4, float2, 256, false><<<grid, 256, 0, stream>>>(input.data_ptr<scalar_t>(),out.data_ptr<int8_t>(),scales.data_ptr<float>(),hidden_size, num_tokens);

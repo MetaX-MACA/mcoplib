@@ -16,6 +16,7 @@ from setuptools import Extension, setup, find_packages
 from setuptools.command.build_ext import build_ext
 from setuptools.command.install import install
 from setuptools.command.build_py import build_py as _build_py
+from setuptools.command.sdist import sdist as _sdist
 #from setuptools_scm import get_version
 from torch.utils.cpp_extension import CUDA_HOME, ROCM_HOME, BuildExtension, CUDAExtension
 from setuptools.dist import Distribution
@@ -373,7 +374,6 @@ class repackage_wheel(build_ext):
                 "mcoplib/lmdeploy.cpython-310-x86_64-linux-gnu.so",
                 "mcoplib/sgl_kernel.cpython-310-x86_64-linux-gnu.so",
 				"mcoplib/sgl_grouped_gemm_cuda.cpython-310-x86_64-linux-gnu.so",
-				"mcoplib/sgl_moe_fused_w4a16.cpython-310-x86_64-linux-gnu.so",
             ]
 
             file_members = list(
@@ -399,6 +399,43 @@ class repackage_wheel(build_ext):
 class CustomDist(Distribution):
     def get_fullname(self):
         return f"{self.get_name()}-metax"
+
+
+class sdist_with_git(_sdist):
+    """自定义 sdist：在打包 tarball 前，将 git commit id 写入 version 文件。
+
+    `python -m build --sdist` 会创建不含 .git 的源码包。
+    后续 `pip install` 从 sdist 构建 wheel 时，.git 已不存在，
+    无法获取 commit id。此命令在打包前将正确的 commit 写入
+    mcoplib/version，确保 wheel 构建时版本号包含 git commit。
+    """
+    def run(self):
+        # 尝试获取 git commit 并写入 version 文件
+        git_commit = _get_git_commit_direct()
+        if git_commit:
+            version_file = os.path.join(str(ROOT_DIR), "mcoplib", "version")
+            try:
+                content = ""
+                if os.path.isfile(version_file):
+                    with open(version_file, "r", encoding="utf-8") as f:
+                        content = f.read()
+                # 替换 GIT_COMMIT = '...' 为实际值
+                if "GIT_COMMIT" in content:
+                    content = re.sub(
+                        r"GIT_COMMIT\s*=\s*['\"]([^'\"]*)['\"]",
+                        f"GIT_COMMIT = '{git_commit}'",
+                        content
+                    )
+                else:
+                    content += f"GIT_COMMIT = '{git_commit}'\n"
+                with open(version_file, "w", encoding="utf-8") as f:
+                    f.write(content)
+                print(f"[info] sdist: wrote GIT_COMMIT = '{git_commit}' to version file")
+            except Exception as e:
+                print(f"[warn] sdist: failed to write git commit to version file: {e}")
+        else:
+            print("[info] sdist: git commit not available, version file will use fallback")
+        _sdist.run(self)
 
 def _no_device() -> bool:
     return MCOPLIB_TARGET_DEVICE == "empty"
@@ -615,25 +652,74 @@ def check_requirements_or_exit():
 def get_repository_version() -> str:
     """
     获取打包版本号，严格遵循 PEP-440 规范。
+    版本格式: 0.4.10+g7bdf49.maca3.8.0.25.torch2.10
+    其中 g7bdf49 是 git commit 前缀 g + 7位短 hash。
     """
     version = mcoplib_version
     sep = "+" if "+" not in version else "."  # dev versions might contain +
 
     maca_version_str = get_maca_version()
-    
+
     torch_version = torch.__version__
     major_minor_version = ".".join(torch_version.split(".")[:2])
-    
-    # 注意：PEP-440 规定 local version (+ 后面的内容) 只能包含字母、数字和点号。
-    # 必须把原本的 '-torch' 改为 '.torch'，否则 setuptools/wheel 打包会报错。
+
+    # 读取 git commit（优先从 version 文件，回退到 git 命令）
+    git_commit = _read_git_commit_from_version_file()
+    if not git_commit or git_commit == "unknown":
+        git_commit = _get_git_commit_direct()
+
+    # 构建版本字符串 — 始终使用 '+' 作为 local version 分隔符
+    # 有 commit: 0.4.10+g7bdf49.maca3.8.0.25.torch2.10
+    # 无 commit: 0.4.10+maca3.8.0.25.torch2.10
+    local_parts = []
+    if git_commit and git_commit != "unknown":
+        local_parts.append(f"g{git_commit}")
+
     if maca_version_str:
-        # 去除 MACA 字符串中可能存在的不合规连字符
         safe_maca_version = maca_version_str.replace("-", ".")
-        version += f"{sep}maca{safe_maca_version}.torch{major_minor_version}"
-    else:
-        version += f"{sep}torch{major_minor_version}"
-        
+        local_parts.append(f"maca{safe_maca_version}")
+
+    local_parts.append(f"torch{major_minor_version}")
+
+    version += f"{sep}" + ".".join(local_parts)
+
     return version
+
+
+def _read_git_commit_from_version_file() -> Optional[str]:
+    """从 mcoplib/version 文件中读取 GIT_COMMIT 的值。"""
+    version_file = os.path.join(str(ROOT_DIR), "mcoplib", "version")
+    if not os.path.isfile(version_file):
+        return None
+    try:
+        with open(version_file, "r", encoding="utf-8") as f:
+            for line in f:
+                if "GIT_COMMIT" in line:
+                    match = re.search(r"GIT_COMMIT\s*=\s*['\"]([^'\"]+)['\"]", line)
+                    if match:
+                        return match.group(1).strip()
+    except Exception:
+        pass
+    return None
+
+
+def _get_git_commit_direct() -> Optional[str]:
+    """直接调用 git 获取 short commit hash（需要 .git 存在）。"""
+    if not git_available():
+        return None
+    try:
+        # 先检查是否在 git 仓库中
+        subprocess.check_output(
+            ["git", "rev-parse", "--git-dir"],
+            cwd=str(ROOT_DIR), stderr=subprocess.DEVNULL
+        )
+        commit = subprocess.check_output(
+            ["git", "rev-parse", "--short=7", "HEAD"],
+            cwd=str(ROOT_DIR), stderr=subprocess.DEVNULL
+        ).decode().strip()
+        return commit if commit else None
+    except Exception:
+        return None
 
 def git_available() -> bool:
     try:
@@ -699,25 +785,51 @@ def add_safe_directory_if_needed(path: str) -> bool:
 
 def get_git_branch_commit():
     """
-    尝试读取 git 信息；如果不可用，则使用环境变量回退；再次不可用则返回 'unknown'。
+    尝试读取 git 信息；如果不可用，则使用环境变量回退；再次不可用则返回 None。
     """
     try:
+        # 先检查是否在 git 仓库中
+        subprocess.check_output(
+            ["git", "rev-parse", "--git-dir"],
+            cwd=str(ROOT_DIR), stderr=subprocess.DEVNULL
+        )
         branch = subprocess.check_output(
             ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-            stderr=subprocess.DEVNULL
+            cwd=str(ROOT_DIR), stderr=subprocess.DEVNULL
         ).decode().strip()
         commit = subprocess.check_output(
-            ["git", "rev-parse", "--short", "HEAD"],
-            stderr=subprocess.DEVNULL
+            ["git", "rev-parse", "--short=7", "HEAD"],
+            cwd=str(ROOT_DIR), stderr=subprocess.DEVNULL
         ).decode().strip()
         return branch, commit
     except Exception as e:
-        # 回退到环境变量（方便 CI 在无 .git 时也能写入）
-        print(f"get_git_branch_commit exception:{e} {os.getcwd()}")
+        # 非 git 仓库（如 sdist 构建），回退到环境变量
+        env_branch = os.environ.get("GIT_BRANCH")
+        env_commit = os.environ.get("GIT_COMMIT")
+        if env_branch and env_commit:
+            print(f"[info] Not a git repo, using env vars: branch={env_branch}, commit={env_commit}")
+            return env_branch, env_commit
+        print(f"get_git_branch_commit: not a git repo or git unavailable: {e}")
         return None, None
 
 def write_git_info_file(target_path):
     maca_version = get_maca_version()
+    
+    # 1. 【新增逻辑】在执行覆盖前，先尝试从旧的 version 文件读取已经存在的内容
+    old_commit = _read_git_commit_from_version_file()
+    old_branch = "unknown"
+    if os.path.isfile(target_path):
+        try:
+            with open(target_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    if "GIT_BRANCH" in line:
+                        match = re.search(r"GIT_BRANCH\s*=\s*['\"]([^'\"]+)['\"]", line)
+                        if match:
+                            old_branch = match.group(1).strip()
+        except Exception:
+            pass
+
+    # 2. 正常去获取 Git 信息
     git_status = add_safe_directory_if_needed(ROOT_DIR)
     if not git_status:
         print(f" [warn] Git invalid or No Git on directory :{ROOT_DIR} So cannot get project git info.")
@@ -728,9 +840,14 @@ def write_git_info_file(target_path):
             print(f"[warn ] canont Get mcoplib project Git info in directory:{os.getcwd()}.")
             branch, commit = "unknown", "unknown"
 
-    # The version file is always written so that runtime minimum-compatibility
-    # checks can read Min_Compatibility_Maca_Version / Build_Maca_Version even
-    # when git is unavailable at build time.
+    # 3. 【新增核心逻辑】如果当前环境取到的是 unknown（例如临时解压目录），但旧文件里有真实值，则继承旧值
+    if commit == "unknown" and old_commit and old_commit != "unknown":
+        print(f"[info] Retaining existing git commit {old_commit} from existing version file.")
+        commit = old_commit
+        branch = old_branch
+
+    # 4. 写入 version 文件
+    build_torch_version = torch.__version__
     content = (
         f'Mcoplib_Version = {mcoplib_version!r}\n'
         f'Build_Maca_Version = {maca_version!r}\n'
@@ -757,8 +874,6 @@ if os.environ.get("BUILD_DEFAULT_OP_SUBMODULE", "ON") == "ON" :
 if os.environ.get("BUILD_SGLANG_SUBMODULE", "ON") == "ON" :
     ext_modules.append(CMakeExtension(name="mcoplib.sgl_kernel"))
     ext_modules.append(CMakeExtension(name="mcoplib.sgl_grouped_gemm_cuda"))
-    ext_modules.append(CMakeExtension(name="mcoplib.sgl_moe_fused_w4a16"))
-    ext_modules.append(CMakeExtension(name="mcoplib.sgl_grouped_gemm_mctlass_int8"))
 
 if os.environ.get("BUILD_VLLM_SUBMODULE", "ON") == "ON" :
     ext_modules.append(CMakeExtension(name="mcoplib._moe_C"))
@@ -774,6 +889,7 @@ else:
     cmdclass = {
         "build_ext": cmake_build_ext,
         "install": custom_install,  # Use our custom install command
+        "sdist": sdist_with_git,    # 写入 git commit 到 version 文件
         #"build_py": build_py
     }
 
@@ -782,6 +898,9 @@ if not cmdclass or "install" not in cmdclass:
     if cmdclass is None:
         cmdclass = {}
     cmdclass["install"] = custom_install
+# 始终注册自定义 sdist 命令
+if "sdist" not in cmdclass:
+    cmdclass["sdist"] = sdist_with_git
 
 # 在 setup() 调用前执行 MACA 最小兼容版本校验（编译期拦截）
 check_maca_min_compatibility()

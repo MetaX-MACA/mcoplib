@@ -343,69 +343,6 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def("awq_to_gptq_4bit(Tensor qweight) -> Tensor");
   ops.impl("awq_to_gptq_4bit", torch::kCUDA, &awq_to_gptq_4bit);
 
-#if ENABLE_CUTALASS_OP
-  // CUTLASS w8a8 GEMM, supporting symmetric per-tensor or per-row/column
-  // quantization, as well as bias
-  ops.def(
-      "cutlass_scaled_mm(Tensor! out, Tensor a,"
-      "                  Tensor b, Tensor a_scales,"
-      "                  Tensor b_scales, Tensor? bias) -> ()",
-      {stride_tag});
-  ops.impl("cutlass_scaled_mm", torch::kCUDA, &cutlass_scaled_mm);
-
-  // CUTLASS w8a8 GEMM, supporting asymmetric per-tensor or per-row/column
-  // quantization.
-  ops.def(
-      "cutlass_scaled_mm_azp(Tensor! out, Tensor a,"
-      "                  Tensor b, Tensor a_scales,"
-      "                  Tensor b_scales, Tensor azp_adj,"
-      "                  Tensor? azp, Tensor? bias) -> ()",
-      {stride_tag});
-  ops.impl("cutlass_scaled_mm_azp", torch::kCUDA, &cutlass_scaled_mm_azp);
-
-  // Check if cutlass scaled_mm is supported for CUDA devices of the given
-  // capability
-  ops.def("cutlass_scaled_mm_supports_fp8(int cuda_device_capability) -> bool");
-  ops.impl("cutlass_scaled_mm_supports_fp8", &cutlass_scaled_mm_supports_fp8);
-
-  // Check if cutlass scaled_mm supports block quantization (used by DeepSeekV3)
-  ops.def(
-      "cutlass_scaled_mm_supports_block_fp8(int cuda_device_capability) -> "
-      "bool");
-  ops.impl("cutlass_scaled_mm_supports_block_fp8",
-           &cutlass_scaled_mm_supports_block_fp8);
-
-  // Check if cutlass grouped gemm is supported for CUDA devices of the given
-  // capability
-  ops.def("cutlass_group_gemm_supported(int cuda_device_capability) -> bool");
-  ops.impl("cutlass_group_gemm_supported", &cutlass_group_gemm_supported);
-
-  // CUTLASS MLA decode
-  ops.def(
-      "cutlass_mla_decode(Tensor! out, Tensor q_nope, Tensor q_pe,"
-      "                   Tensor kv_c_and_k_pe_cache, Tensor seq_lens,"
-      "                   Tensor page_table, float scale) -> ()");
-  ops.impl("cutlass_mla_decode", torch::kCUDA, &cutlass_mla_decode);
-
-//   // Compute NVFP4 block quantized tensor.
-//   ops.def(
-//       "scaled_fp4_quant(Tensor! output, Tensor input,"
-//       "                 Tensor! output_scale, Tensor input_scale) -> ()");
-//   ops.impl("scaled_fp4_quant", torch::kCUDA, &scaled_fp4_quant);
-
-  // Compute NVFP4 experts quantization.
-  ops.def(
-      "scaled_fp4_experts_quant(Tensor! output, Tensor! output_scale,"
-      "Tensor input, Tensor input_global_scale, Tensor input_offset_by_experts,"
-      "Tensor output_scale_offset_by_experts) -> ()");
-  ops.impl("scaled_fp4_experts_quant", torch::kCUDA, &scaled_fp4_experts_quant);
-
-  // Check if cutlass_scaled_mm_fp4 is supported for CUDA devices
-  // of the given capability
-  ops.def("cutlass_scaled_mm_supports_fp4(int cuda_device_capability) -> bool");
-  ops.impl("cutlass_scaled_mm_supports_fp4", &cutlass_scaled_mm_supports_fp4);
-#endif
-
   // Quantized GEMM for GPTQ.
   // Note: even though the C++ inferred schema is correct for this op, it seems
   // to prevent the meta function registry.
