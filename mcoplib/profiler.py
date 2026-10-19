@@ -19,6 +19,10 @@ def _timestamp() -> str:
     return datetime.now().strftime("%Y%m%dT%H%M%S")
 
 
+def _resolve_output_dir(default_output_dir):
+    return os.getenv("PROFILER_OUTPUT_DIR", default_output_dir)
+
+
 def _track_handler(prof, output_dir, func_name):
     """
     Track handler implementation that matches test.py track_handler format.
@@ -120,7 +124,9 @@ def profiler(
                             active=1,
                             repeat=repeat
                         ),
-                        on_trace_ready=lambda prof: _track_handler(prof, output_dir, func.__name__),
+                on_trace_ready=lambda prof: _track_handler(
+                    prof, _resolve_output_dir(output_dir), func.__name__
+                ),
                         with_modules=True,
                         record_shapes=True,
                         profile_memory=True
