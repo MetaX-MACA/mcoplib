@@ -3,6 +3,7 @@
 
 #include <torch/cuda.h>
 #include <c10/cuda/CUDAGuard.h>
+
 #include <cstring>
 #include <cfloat>
 #include <cub/cub.cuh>
@@ -161,8 +162,7 @@ __device__ void vectorized_process(size_t thread_rank, size_t num_threads,
 }
 
 template <int step, int kNumThreadsPerBlock, int kNumBins, int kNumFinalItems,
-          bool multipleBlocksPerRow, bool mergeBlocks,
-          bool useTopK512Optimization, typename SmemFinalType,
+          bool multipleBlocksPerRow, bool mergeBlocks, typename SmemFinalType,
           typename SmemOutputType>
 __device__ bool processHistogramStep(
     const int* indices, const float* logits, int rowEnd, uint32_t& logitPattern,
@@ -188,15 +188,10 @@ __device__ bool processHistogramStep(
                     << patternShift;
   }
 
-  int negativeInfinityCount = 0;
   auto distributeToBins = [&](float logit, int /* idx */ = 0) {
     if (isPartialMatch<patternShift>(logit, logitPattern)) {
       uint32_t binIdx = extractBinIdx<step>(logit);
-      if (useTopK512Optimization && __float_as_uint(logit) == 0xff800000u) {
-        ++negativeInfinityCount;
-      } else {
-        atomicAdd(&smemFinal.histo.data[binIdx], 1);
-      }
+      atomicAdd(&smemFinal.histo.data[binIdx], 1);
     }
   };
 
@@ -209,12 +204,6 @@ __device__ bool processHistogramStep(
          idx += kNumThreadsPerBlock) {
       float logit = logits[idx * stride1];
       distributeToBins(logit, idx);
-    }
-  }
-  if constexpr (useTopK512Optimization) {
-    if (negativeInfinityCount > 0) {
-      const auto bin = extractBinIdx<step>(-INFINITY);
-      atomicAdd(&smemFinal.histo.data[bin], negativeInfinityCount);
     }
   }
   // Make sure the histogram is ready.
@@ -273,12 +262,6 @@ __device__ bool processHistogramStep(
 
   // The threshold bin.
   thresholdBinIdx = smemThresholdBinIdx[0];
-  // Resolve a -inf cutoff with exact tie emission, keeping sort padding out.
-  const bool finalBinFits =
-      smemFinalBinSize[0] <= kNumFinalItems &&
-      !(useTopK512Optimization && step < 3 &&
-        isPartialMatch<patternShift>(-INFINITY, logitPattern) &&
-        thresholdBinIdx == extractBinIdx<step>(-INFINITY));
 
   auto processBins = [&](float logit, int idx) {
     if (isPartialMatch<patternShift>(logit, logitPattern)) {
@@ -287,7 +270,8 @@ __device__ bool processHistogramStep(
       // 1. This is step 0 and the threshold bin is small enough (no step 1)
       // 2. This is step >= 1 (where pattern matching filters correctly)
       // This prevents duplicates when step 0 and step 1 both run.
-      bool shouldWriteDirectly = (step == 0 && finalBinFits) || (step >= 1);
+      bool shouldWriteDirectly =
+          (step == 0 && smemFinalBinSize[0] <= kNumFinalItems) || (step >= 1);
       if (binIdx < thresholdBinIdx && shouldWriteDirectly) {
         // The element is part of the top-k selection
         int dstIdx = atomicAdd(&smemFoundTopKValues[0], 1);
@@ -303,7 +287,8 @@ __device__ bool processHistogramStep(
       }
       if constexpr (step < 3) {
         // Only fill the final items for sorting if the threshold bin fits
-        if (binIdx == thresholdBinIdx && finalBinFits) {
+        if (binIdx == thresholdBinIdx &&
+            smemFinalBinSize[0] <= kNumFinalItems) {
           int dstIdx = atomicAdd(&smemFinalDstIdx[0], 1);
           smemFinal.items.logits[dstIdx] = logit;
           if constexpr (mergeBlocks) {
@@ -348,21 +333,17 @@ __device__ bool processHistogramStep(
   __syncthreads();
 
   // Check if we should continue to next step
-  return !finalBinFits;
+  return smemFinalBinSize[0] > kNumFinalItems;
 }
 
 // Follows half - 11 - 11 - 10 bit iterations
-// Keep the adaptive kernel's device instantiation separate from legacy calls.
 template <int kNumThreadsPerBlock, int kNumBins, bool useRadixSort,
-          bool multipleBlocksPerRow = false, bool mergeBlocks = false,
-          bool deviceLengthAware = false, bool useTopK512Optimization = false>
+          bool multipleBlocksPerRow = false, bool mergeBlocks = false>
 static __device__ void topKPerRowJob(const int* indices, const float* logits,
                                      int rowStart, int rowEnd, int* outIndices,
                                      float* outLogits, int stride1, int topK) {
-  static_assert(!deviceLengthAware || multipleBlocksPerRow != mergeBlocks);
-  static_assert(!useTopK512Optimization || kNumThreadsPerBlock == 1024);
   // The number of slots for the final pass.
-  static constexpr int kNumFinalItems = useTopK512Optimization ? 1024 : 2048;
+  static constexpr int kNumFinalItems = 2048;
   // The number of elements per thread for the final sort.
   static constexpr int kNumFinalItemsPerThread =
       kNumFinalItems / kNumThreadsPerBlock;
@@ -428,7 +409,7 @@ static __device__ void topKPerRowJob(const int* indices, const float* logits,
          rowIt += kNumThreadsPerBlock) {
       outIndices[rowIt] = -1;
       if constexpr (multipleBlocksPerRow) {
-        outLogits[rowIt] = useTopK512Optimization ? -INFINITY : -FLT_MAX;
+        outLogits[rowIt] = -FLT_MAX;
       }
     }
 
@@ -446,8 +427,7 @@ static __device__ void topKPerRowJob(const int* indices, const float* logits,
   // Step 0: Process first 11 bits of half representation
   bool continueToNextStep =
       processHistogramStep<0, kNumThreadsPerBlock, kNumBins, kNumFinalItems,
-                           multipleBlocksPerRow, mergeBlocks,
-                           useTopK512Optimization>(
+                           multipleBlocksPerRow, mergeBlocks>(
           indices, logits, rowEnd, logitPattern, thresholdBinIdx, smemOutput,
           smemThresholdBinIdx, smemFinalDstIdx, smemFinalBinSize,
           smemFoundTopKValues, smemFinal, stride1, rowStart, topK);
@@ -456,8 +436,7 @@ static __device__ void topKPerRowJob(const int* indices, const float* logits,
     // Step 1: Process next 11 bits
     continueToNextStep =
         processHistogramStep<1, kNumThreadsPerBlock, kNumBins, kNumFinalItems,
-                             multipleBlocksPerRow, mergeBlocks,
-                             useTopK512Optimization>(
+                             multipleBlocksPerRow, mergeBlocks>(
             indices, logits, rowEnd, logitPattern, thresholdBinIdx, smemOutput,
             smemThresholdBinIdx, smemFinalDstIdx, smemFinalBinSize,
             smemFoundTopKValues, smemFinal, stride1, rowStart, topK);
@@ -467,8 +446,7 @@ static __device__ void topKPerRowJob(const int* indices, const float* logits,
     // Step 2: Process next 11 bits
     continueToNextStep =
         processHistogramStep<2, kNumThreadsPerBlock, kNumBins, kNumFinalItems,
-                             multipleBlocksPerRow, mergeBlocks,
-                             useTopK512Optimization>(
+                             multipleBlocksPerRow, mergeBlocks>(
             indices, logits, rowEnd, logitPattern, thresholdBinIdx, smemOutput,
             smemThresholdBinIdx, smemFinalDstIdx, smemFinalBinSize,
             smemFoundTopKValues, smemFinal, stride1, rowStart, topK);
@@ -477,8 +455,7 @@ static __device__ void topKPerRowJob(const int* indices, const float* logits,
   if (continueToNextStep) {
     // Step 3: Process last 10 bits
     processHistogramStep<3, kNumThreadsPerBlock, kNumBins, kNumFinalItems,
-                         multipleBlocksPerRow, mergeBlocks,
-                         useTopK512Optimization>(
+                         multipleBlocksPerRow, mergeBlocks>(
         indices, logits, rowEnd, logitPattern, thresholdBinIdx, smemOutput,
         smemThresholdBinIdx, smemFinalDstIdx, smemFinalBinSize,
         smemFoundTopKValues, smemFinal, stride1, rowStart, topK);
@@ -488,7 +465,50 @@ static __device__ void topKPerRowJob(const int* indices, const float* logits,
     // The histogram did not proceed to the final 10 bits, therefore we need to
     // sort the final items The logits of the elements to be sorted in the final
     // pass.
-    auto insertionSort = [&]() {
+    if constexpr (useRadixSort) {
+      // Sorting with radix sort
+      float finalLogits[kNumFinalItemsPerThread];
+      // The indices of the elements to be sorted in the final pass.
+      int finalIndices[kNumFinalItemsPerThread];
+
+#pragma unroll
+      for (int ii = 0; ii < kNumFinalItemsPerThread; ++ii) {
+        finalLogits[ii] = -FLT_MAX;
+      }
+
+      // Read the elements from SMEM.
+#pragma unroll
+      for (int ii = 0; ii < kNumFinalItemsPerThread; ++ii) {
+        int srcIdx = ii * kNumThreadsPerBlock + threadIdx.x;
+        if (srcIdx < smemFinalDstIdx[0]) {
+          finalLogits[ii] = smemFinal.items.logits[srcIdx];
+          finalIndices[ii] = smemFinal.items.indices[srcIdx];
+        }
+      }
+      // Make sure the shared memory has been read.
+      __syncthreads();
+
+      // Sort the elements.
+      FinalSort(smemFinal.finalSort)
+          .SortDescendingBlockedToStriped(finalLogits, finalIndices);
+
+      // Copy the data back to the shared memory storage.
+      int baseIdx = smemFoundTopKValues[0];
+
+#pragma unroll
+      for (int ii = 0; ii < kNumFinalItemsPerThread; ++ii) {
+        int srcIdx = ii * kNumThreadsPerBlock + threadIdx.x;
+        int dstIdx = baseIdx + srcIdx;
+
+        if (dstIdx < topK) {
+          smemOutput[dstIdx] = finalIndices[ii];
+          if constexpr (multipleBlocksPerRow) {
+            reinterpret_cast<float*>(smemOutput + topK)[dstIdx] =
+                finalLogits[ii];
+          }
+        }
+      }
+    } else {
       // Sorting with insertion sort
       auto baseIdx = smemFoundTopKValues[0];
       for (int i = threadIdx.x; i < smemFinalDstIdx[0];
@@ -510,57 +530,6 @@ static __device__ void topKPerRowJob(const int* indices, const float* logits,
           }
         }
       }
-    };
-    if constexpr (useRadixSort) {
-      if (useTopK512Optimization && smemFinalDstIdx[0] <= 128) {
-        insertionSort();
-      } else {
-        // Sorting with radix sort
-        float finalLogits[kNumFinalItemsPerThread];
-        // The indices of the elements to be sorted in the final pass.
-        int finalIndices[kNumFinalItemsPerThread];
-
-#pragma unroll
-        for (int ii = 0; ii < kNumFinalItemsPerThread; ++ii) {
-          finalLogits[ii] = useTopK512Optimization ? -INFINITY : -FLT_MAX;
-          if constexpr (useTopK512Optimization) finalIndices[ii] = -1;
-        }
-
-        // Read the elements from SMEM.
-#pragma unroll
-        for (int ii = 0; ii < kNumFinalItemsPerThread; ++ii) {
-          int srcIdx = ii * kNumThreadsPerBlock + threadIdx.x;
-          if (srcIdx < smemFinalDstIdx[0]) {
-            finalLogits[ii] = smemFinal.items.logits[srcIdx];
-            finalIndices[ii] = smemFinal.items.indices[srcIdx];
-          }
-        }
-        // Make sure the shared memory has been read.
-        __syncthreads();
-
-        // Sort the elements.
-        FinalSort(smemFinal.finalSort)
-            .SortDescendingBlockedToStriped(finalLogits, finalIndices);
-
-        // Copy the data back to the shared memory storage.
-        int baseIdx = smemFoundTopKValues[0];
-
-#pragma unroll
-        for (int ii = 0; ii < kNumFinalItemsPerThread; ++ii) {
-          int srcIdx = ii * kNumThreadsPerBlock + threadIdx.x;
-          int dstIdx = baseIdx + srcIdx;
-
-          if (dstIdx < topK) {
-            smemOutput[dstIdx] = finalIndices[ii];
-            if constexpr (multipleBlocksPerRow) {
-              reinterpret_cast<float*>(smemOutput + topK)[dstIdx] =
-                  finalLogits[ii];
-            }
-          }
-        }
-      }
-    } else {
-      insertionSort();
     }
     __syncthreads();
   }
@@ -643,6 +612,7 @@ __device__ __forceinline__ uint32_t topk_sb_key(float x) {
   const uint32_t bits = __float_as_uint(x);
   return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
 }
+
 
 // Inclusive prefix sum over the 64 lanes of a MACA warp (hardware shuffle
 // subgroup is 16 lanes, so use the full-warp log-sweep).
@@ -3644,6 +3614,7 @@ void top_k_per_row_decode(const torch::Tensor& logits, int64_t next_n,
   const int seqLensIs2D = seqLens.dim() == 2 ? 1 : 0;
   const uint32_t cap = query_chunk_cap();
   const int sms = sm_count_once();
+
 
   // Path A stages the whole row in shared memory. From ~4K columns up, once
   // rows outnumber SMs, Path C's two light global passes win instead:

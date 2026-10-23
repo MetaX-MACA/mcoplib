@@ -27,18 +27,20 @@ namespace batched_moe_align_block_size {
 // Note num_threads needs to be 1024 for BlockScan Reduction in the kernel.
 static constexpr int32_t num_threads = 1024;
 static constexpr int32_t num_blocks = 1;
-template <bool cooperative_writes>
 __global__ void batched_moe_align_block_size_kernel(
     int32_t const num_batches, int32_t const max_tokens_per_batch,
     int32_t const block_size, int32_t const* __restrict__ batch_num_tokens,
     int32_t* __restrict__ sorted_ids, int32_t* __restrict__ block_ids,
     int32_t* __restrict__ num_tokens_post_pad) {
+  // TODO(varun): This is a naive implementation. Could be optimized.
+
+  size_t const batch_id = threadIdx.x;
   size_t const stride = blockDim.x * gridDim.x;
   int32_t const num_blocks_per_batch =
       CEILDIV(max_tokens_per_batch, block_size);
-  size_t const sorted_ids_size =
-      static_cast<size_t>(num_blocks_per_batch) * num_batches * block_size;
-  size_t const block_ids_size = sorted_ids_size / block_size;
+  int32_t const sorted_ids_size =
+      num_blocks_per_batch * num_batches * block_size;
+  int32_t const block_ids_size = sorted_ids_size / block_size;
   int32_t const SENTINEL =
       num_batches * max_tokens_per_batch;  // To denote invalid entries.
   // Intialize sorted_ids
@@ -51,8 +53,8 @@ __global__ void batched_moe_align_block_size_kernel(
   }
 
   int32_t b_num_tokens = 0;
-  if (threadIdx.x < num_batches) {
-    b_num_tokens = batch_num_tokens[threadIdx.x];
+  if (batch_id < num_batches) {
+    b_num_tokens = batch_num_tokens[batch_id];
   }
   int32_t const ceil_b_num_tokens =
       CEILDIV(b_num_tokens, block_size) * block_size;
@@ -64,56 +66,20 @@ __global__ void batched_moe_align_block_size_kernel(
   BlockScan(temp_storage).ExclusiveSum(ceil_b_num_tokens, cumsum_val);
   __syncthreads();
 
-  if (threadIdx.x == num_batches - 1) {
+  bool const is_last_batch = batch_id == (num_batches - 1);
+  if (is_last_batch) {
     *num_tokens_post_pad = cumsum_val + ceil_b_num_tokens;
   }
 
-  if constexpr (cooperative_writes) {
-    __shared__ int32_t batch_cumsum[num_threads];
-    __shared__ int32_t valid_tokens[num_threads];
-    __shared__ int32_t batch_num_blocks[num_threads];
-    if (threadIdx.x < num_batches) {
-      batch_cumsum[threadIdx.x] = cumsum_val;
-      valid_tokens[threadIdx.x] = b_num_tokens;
-      batch_num_blocks[threadIdx.x] = ceil_b_num_tokens / block_size;
-    }
-    __syncthreads();
-
-    int32_t const max_num_groups = blockDim.x / WARP_SIZE;
-    int32_t num_groups = 1;
-    while (num_groups < num_batches && num_groups < max_num_groups) {
-      num_groups *= 2;
-    }
-    int32_t const threads_per_batch = blockDim.x / num_groups;
-    int32_t const group_id = threadIdx.x / threads_per_batch;
-    int32_t const group_offset = threadIdx.x % threads_per_batch;
-
-    // Assign at least one warp to each batch when possible.
-    for (int32_t batch_id = group_id; batch_id < num_batches;
-         batch_id += num_groups) {
-      size_t const batch_offset =
-          static_cast<size_t>(batch_id) * max_tokens_per_batch;
-      size_t const cumsum = batch_cumsum[batch_id];
-      for (size_t i = group_offset; i < valid_tokens[batch_id];
-           i += threads_per_batch) {
-        sorted_ids[cumsum + i] = static_cast<int32_t>(batch_offset + i);
-      }
-
-      size_t const block_start = cumsum / block_size;
-      for (size_t i = group_offset; i < batch_num_blocks[batch_id];
-           i += threads_per_batch) {
-        block_ids[block_start + i] = batch_id;
-      }
-    }
-  } else if (threadIdx.x < num_batches) {
-    size_t const batch_id = threadIdx.x;
-    size_t const batch_offset = batch_id * max_tokens_per_batch;
+  if (batch_id < num_batches) {
+    int32_t const batch_offset = batch_id * max_tokens_per_batch;
     for (size_t i = 0; i < b_num_tokens; ++i) {
-      sorted_ids[cumsum_val + i] = static_cast<int32_t>(batch_offset + i);
+      sorted_ids[cumsum_val + i] = batch_offset + i;
     }
 
-    size_t const block_start = cumsum_val / block_size;
-    for (size_t i = 0; i < ceil_b_num_tokens / block_size; ++i) {
+    int32_t const block_start = cumsum_val / block_size;
+    int32_t const num_blocks = ceil_b_num_tokens / block_size;
+    for (size_t i = 0; i < num_blocks; ++i) {
       block_ids[block_start + i] = batch_id;
     }
   }
@@ -408,48 +374,6 @@ __device__ __forceinline__ bool moe_sum_pad_aware_skip(
   return false;
 }
 
-template<typename scalar_t, typename idx_t, int TOPK, bool PAD_AWARE>
-__global__ void moe_sum_vec_small_token_kernel(
-  scalar_t* __restrict__ out,          // [num_tokens, d], contiguous
-    const scalar_t* __restrict__ input,  // [num_tokens, topk, d], d contiguous
-    const int64_t num_tokens, const int d, const int64_t stride_token,
-    const int64_t stride_topk, const idx_t* __restrict__ topk_ids,
-    const int32_t* __restrict__ expert_map, const int64_t stride_tk_token,
-    const int64_t stride_tk_k) {
-      using vec_t = vllm::vec_n_t<scalar_t, MOE_SUM_VEC<scalar_t>>;  // 16-byte pack
-      const int token = blockIdx.x;
-      constexpr int VEC = MOE_SUM_VEC<scalar_t>;
-      int stride = blockDim.x * VEC;
-      const scalar_t* ptr_block_input = input + token * stride_token;
-      scalar_t* ptr_output = out + token * d;
-      for(int i = threadIdx.x * VEC; i < d; i += stride) {
-          const scalar_t* in_tok = ptr_block_input + i;
-          const idx_t* tk_tok = nullptr;
-          if constexpr (PAD_AWARE) {
-            tk_tok = topk_ids + token * stride_tk_token;
-          }
-          float acc[VEC];
-          #pragma unroll
-          for (int j = 0; j < VEC; ++j) acc[j] = 0.f;
-          #pragma unroll
-          for (int k = 0; k < TOPK; ++k) {
-            if constexpr (PAD_AWARE) {
-              if (moe_sum_pad_aware_skip(tk_tok, expert_map, k * stride_tk_k)) {
-                continue;
-              }
-            }
-            vec_t packed = *reinterpret_cast<const vec_t*>(in_tok + k * stride_topk);
-            #pragma unroll
-            for (int j = 0; j < VEC; ++j) acc[j] += static_cast<float>(packed.val[j]);
-          }
-
-          vec_t outp;
-          #pragma unroll
-          for (int j = 0; j < VEC; ++j) outp.val[j] = static_cast<scalar_t>(acc[j]);
-          
-          *reinterpret_cast<vec_t*>(ptr_output + i) = outp;
-      }
-}
 
 template <typename scalar_t, typename idx_t, int TOPK, bool PAD_AWARE>
 __global__ void moe_sum_vec_kernel(
@@ -986,21 +910,11 @@ void batched_moe_align_block_size(int64_t max_tokens_per_batch,
   TORCH_CHECK(num_tokens_post_pad.size(0) == 1);
   TORCH_CHECK(B <= batched_kernel::num_threads);
 
-  // Avoid coordination overhead for small capacities or many batches.
-  int64_t const cooperative_threshold = std::max<int64_t>(256, 8 * B);
-  bool const use_cooperative_writes =
-      max_tokens_per_batch >= cooperative_threshold;
-  auto kernel =
-      use_cooperative_writes
-          ? batched_kernel::batched_moe_align_block_size_kernel<true>
-          : batched_kernel::batched_moe_align_block_size_kernel<false>;
-  kernel<<<batched_kernel::num_blocks, batched_kernel::num_threads, 0,
-           stream>>>(
-      B, max_tokens_per_batch, block_size,
-      reinterpret_cast<const int32_t*>(batch_num_tokens.const_data_ptr()),
-      reinterpret_cast<int32_t*>(sorted_ids.mutable_data_ptr()),
-      reinterpret_cast<int32_t*>(batch_ids.mutable_data_ptr()),
-      reinterpret_cast<int32_t*>(num_tokens_post_pad.mutable_data_ptr()));
+  batched_kernel::batched_moe_align_block_size_kernel<<<
+      batched_kernel::num_blocks, batched_kernel::num_threads, 0, stream>>>(
+      B, max_tokens_per_batch, block_size, batch_num_tokens.data_ptr<int32_t>(),
+      sorted_ids.data_ptr<int32_t>(), batch_ids.data_ptr<int32_t>(),
+      num_tokens_post_pad.data_ptr<int32_t>());
 }
 
 void moe_sum(torch::stable::Tensor& input,   // [num_tokens, topk, hidden_size]
@@ -1019,7 +933,6 @@ void moe_sum(torch::stable::Tensor& input,   // [num_tokens, topk, hidden_size]
   const int64_t stride_topk = input.stride(1);
   const int64_t stride_hidden = input.stride(2);
   
-  if(num_tokens == 0) return;
   const torch::stable::accelerator::DeviceGuard device_guard(
       output.get_device_index());
   
@@ -1047,17 +960,10 @@ void moe_sum(torch::stable::Tensor& input,   // [num_tokens, topk, hidden_size]
     }
 
 #define LAUNCH_MOE_SUM_PAD_AWARE_VEC(TOPK)                                     \
-  if(num_tokens <= 64) { \
-    vllm::moe::moe_sum_vec_small_token_kernel<scalar_t, idx_t, TOPK, true>                   \
-        <<<num_tokens, dim3(block), 0, stream>>>(                                      \
-            out_ptr, in_ptr, num_tokens, hidden_size, stride_token, stride_topk, \
-            topk_ids_ptr, expert_map_ptr, stride_tk_token, stride_tk_k);\
-  } else {\
-    vllm::moe::moe_sum_vec_kernel<scalar_t, idx_t, TOPK, true>                   \
-        <<<grid, dim3(block), 0, stream>>>(                                      \
-            out_ptr, in_ptr, num_tokens, hidden_size, stride_token, stride_topk, \
-            topk_ids_ptr, expert_map_ptr, stride_tk_token, stride_tk_k);\
-  }
+  vllm::moe::moe_sum_vec_kernel<scalar_t, idx_t, TOPK, true>                   \
+      <<<grid, dim3(block), 0, stream>>>(                                      \
+          out_ptr, in_ptr, num_tokens, hidden_size, stride_token, stride_topk, \
+          topk_ids_ptr, expert_map_ptr, stride_tk_token, stride_tk_k)
 
     VLLM_STABLE_DISPATCH_FLOATING_TYPES(
         input.scalar_type(), "moe_sum_pad_aware", [&] {
@@ -1129,17 +1035,10 @@ void moe_sum(torch::stable::Tensor& input,   // [num_tokens, topk, hidden_size]
   }
 
   #define LAUNCH_MOE_SUM_VEC(TOPK)                                      \
-  if(num_tokens <= 64) {  \
-      vllm::moe::moe_sum_vec_small_token_kernel<scalar_t, int32_t, TOPK, false>       \
-      <<<num_tokens, dim3(block), 0, stream>>>(out_ptr, in_ptr, num_tokens, \
+  vllm::moe::moe_sum_vec_kernel<scalar_t, int32_t, TOPK, false>       \
+      <<<grid, dim3(block), 0, stream>>>(out_ptr, in_ptr, num_tokens, \
                                          hidden_size, stride_token,   \
-                                         stride_topk, nullptr, nullptr, 0, 0);\
-  } else {\
-    vllm::moe::moe_sum_vec_kernel<scalar_t, int32_t, TOPK, false>       \
-        <<<grid, dim3(block), 0, stream>>>(out_ptr, in_ptr, num_tokens, \
-                                          hidden_size, stride_token,   \
-                                          stride_topk, nullptr, nullptr, 0, 0);\
-  }
+                                         stride_topk, nullptr, nullptr, 0, 0)
 
 
   VLLM_STABLE_DISPATCH_FLOATING_TYPES(input.scalar_type(), "moe_sum", [&] {

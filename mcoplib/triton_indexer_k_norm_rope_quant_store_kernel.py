@@ -16,10 +16,8 @@ Quant modes (``QUANT_MODE`` constexpr, fully decoupled code paths):
 
 * ``0`` — per-token FP8 (e4m3) with a single fp32 power-of-2 scale.
 * ``1`` — MXFP4 (2 E2M1 nibbles/byte + ue8m0 per 32 elements).
-* ``2`` — per-token INT8: the whole 128-dim head is one quant block carrying
-  a single fp32 scale ``amax / 127`` (dequant = ``code * scale``); its 4
-  bytes live in the block's scale region after the value bytes — the same
-  segregated per-token layout the FP8 mode uses.
+* ``2`` — per-group INT8: 32 consecutive elements form one group, each group
+  carries one fp32 scale ``amax / 127`` (dequant = ``code * scale``).
 """
 
 import os
@@ -82,6 +80,9 @@ _QUANT_FP8 = 0
 _QUANT_FP4 = 1
 _QUANT_INT8 = 2
 
+# INT8 per-group quantization: group size in elements.
+INT8_GROUP_SIZE = 32
+
 # fp32 magic number for round-to-nearest-even integer conversion:
 # adding 1.5 * 2**23 forces the fp32 adder to round to the nearest integer.
 _RNE_MAGIC = 12582912.0  # 1.5 * 2**23
@@ -90,7 +91,6 @@ _RNE_MAGIC_BITS = 0x4B400000
 
 def _fp4_asm_default() -> bool:
     """Pick the MXFP4 pack implementation.
-
     MACA (triton 3.6.0 / maca 3.8.x) cannot even load a kernel image that
     contains ``cvt.rn.satfinite.e2m1x2`` — the specialization fails at
     ``load_binary`` with "device kernel image is invalid". Default to the
@@ -142,9 +142,9 @@ def indexer_k_norm_rope_store(
         compress_ratio: group size; keys are emitted at group boundaries.
         use_fp4_cache: MXFP4 (2 nibbles/byte + ue8m0 per 32) when True, else
             per-token FP8 with a single fp32 scale.
-        use_int8_cache: per-token INT8 (one fp32 scale ``scale = amax / 127``
-            for the whole 128-dim head, stored as 4 bytes in the scale
-            region) when True. Mutually exclusive with ``use_fp4_cache``.
+        use_int8_cache: per-group INT8 (32 elements per group, one fp32 scale
+            per group, ``scale = amax / 127``) when True. Mutually exclusive
+            with ``use_fp4_cache``.
     """
     num_tokens = kv_slot_mapping.numel()
     assert k_pre.ndim == 2 and k_pre.shape[1] == 128
@@ -162,7 +162,7 @@ def indexer_k_norm_rope_store(
     head_dim = k_pre.shape[1]
     if use_int8_cache:
         token_stride = head_dim
-        scale_dim = 4  # single fp32 scale per token
+        scale_dim = (head_dim // INT8_GROUP_SIZE) * 4  # fp32 scale per group
         quant_mode = _QUANT_INT8
     elif use_fp4_cache:
         token_stride = head_dim // 2
@@ -394,20 +394,30 @@ def _indexer_k_norm_rope_quant_store_kernel(
             mask=active[:, None],
         )
     else:
-        # ── Per-token symmetric INT8: one 128-wide block, one fp32 scale ─
-        amax = tl.maximum(tl.max(tl.abs(result), axis=1), 1e-4)  # [TP]
-        inv_scale = 127.0 / amax
-        qf = result * inv_scale[:, None]
+        # ── Per-group INT8: 32 consecutive elements / one fp32 scale ──
+        # scale = amax / 127 (stored fp32); code = rne(x / scale) which is
+        # always in [-127, 127] (see module docstring), so no clamp.
+        N_QUANT_BLOCKS: tl.constexpr = HEAD_SIZE // 32
+        res_2d = tl.reshape(result, (TP, N_QUANT_BLOCKS, 32))
+        amax = tl.max(tl.abs(res_2d), axis=2)
+        # All-zero group: keep the scale finite so codes stay 0.
+        amax = tl.maximum(amax, 1e-12)
+        inv_scale = 127.0 / amax  # [TP, N_QUANT_BLOCKS]
+        qf = res_2d * inv_scale[:, :, None]
         # Round-to-nearest-even integer via the fp32 magic-number add; the
         # bitcast/subtract pair recovers the two's-complement value for
         # |qf| < 2**22, which always holds here.
         qi = (qf + 12582912.0).to(tl.uint32, bitcast=True) - 0x4B400000
         q = qi.to(tl.int8)
-        codes = q.to(tl.uint8, bitcast=True)
-        scale_bits = (amax / 127.0).to(tl.uint32, bitcast=True)
-        scale_bytes = (
-            (scale_bits[:, None] >> (8 * tl.arange(0, 4)[None, :])) & 0xFF
-        ).to(tl.uint8)
+        codes = tl.reshape(q, (TP, HEAD_SIZE)).to(tl.uint8, bitcast=True)
+        scale_bits = (amax * (1.0 / 127.0)).to(tl.uint32, bitcast=True)
+        scale_bytes = tl.reshape(
+            (
+                (scale_bits[:, :, None] >> (8 * tl.arange(0, 4)[None, None, :]))
+                & 0xFF
+            ).to(tl.uint8),
+            (TP, SCALE_DIM),
+        )
 
         tl.store(
             val_ptr[:, None] + block[None, :], codes,

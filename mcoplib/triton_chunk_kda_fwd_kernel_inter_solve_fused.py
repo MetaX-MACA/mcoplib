@@ -113,7 +113,11 @@ else:
             {"BK": 64, "BV": 32, "pipeline": "cpasync", "scenario": "unroll"}, num_warps=1, num_stages=4
         ),
     ],
-    key=["H", "K", "BC", "V", "FUSE_RECOMPUTE", "FUSE_DIAGONAL"],
+    key=[
+        "T", "H", "K", "BT", "BC", "V",
+        "IS_VARLEN", "USE_SAFE_GATE",
+        "FUSE_RECOMPUTE", "FUSE_DIAGONAL",
+    ],
     **autotune_cache_kwargs,
 )
 

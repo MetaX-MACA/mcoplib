@@ -195,7 +195,7 @@ GlobalMem BW (bytes/sec),BWUtil,Samples,Batch GPU (sec)
 2. **逐个执行**：对每个算子调用 `python mcoplib_mxbenchmark_ops.py --op <name> --<mode> --csv <path>`，超时 600 秒。
 3. **解析输出**：从子进程 stdout 用正则提取 `[VERIFY]` / `Acc verify:` / `Performance verify:` / `[APPEND]/[SKIP]/[UPDATE]` 等标志。
 4. **分类判定**：根据模式与捕获的标志判定每算子为 `SUCCESS` / `FAILED` / `SKIPPED`。
-5. **汇总输出**：打印每算子结果表格 + 末尾 `SUMMARY` 行（total/success/failed/skipped）+ 失败算子名单；运行结束后写入 `testall_output.json` 整体汇总（见下文「整体汇总 JSON 文件」）。
+5. **汇总输出**：打印每算子结果表格 + 末尾 `SUMMARY` 行（total/success/failed/skipped）+ 失败算子名单；同时写入 `testall_output.txt` 详细日志。
 
 ## 判定规则
 
@@ -271,8 +271,8 @@ FAILED OPS (3):
 No failures.        # 无失败时显示
 ```
 
-### 整体汇总 JSON 文件
-全部算子运行结束后写入 `testall_output.json`（取代旧的 `testall_output.txt` 逐算子日志），内容仅包含整体信息：`total`/`success`/`failed`/`skipped` 计数、`elapsed_time` 整体耗时（字符串，带单位，如 `"21.32s"`）、`failed_ops`/`skipped_ops` 算子清单，以及最外层 `result`——仅当所有算子都 SUCCESS 时为 `success`，存在任何 FAILED 或 SKIPPED 算子即为 `failed`。逐算子执行详情（状态/原因/耗时）见运行 stdout 的逐算子表格。
+### 详细日志文件
+全部算子的逐个执行详情（含子进程返回码、解析到的标志位、耗时）写入 `testall_output.txt`，便于事后排查。
 
 ## 退出码
 - `0`：全部成功（含 SKIPPED），无 FAILED

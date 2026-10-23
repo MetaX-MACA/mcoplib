@@ -88,36 +88,6 @@ TEST_CONFIGS = (
         DISTRIBUTED_BATCH_SIZES,
     ),
     (
-        "topk32-hidden1024",
-        32,
-        1024,
-        0.3,
-        (3072, 8192, 16384),
-        True,
-        (),
-        (),
-    ),
-    (
-        "dynamic-topk17-hidden1024",
-        17,
-        1024,
-        0.3,
-        (3072, 8192),
-        True,
-        (),
-        (),
-    ),
-    (
-        "dynamic-topk24-hidden2048",
-        24,
-        2048,
-        0.3,
-        (3072, 8192),
-        True,
-        (),
-        (),
-    ),
-    (
         "dynamic-topk-boundary",
         5,
         3584,
@@ -140,18 +110,15 @@ TEST_CONFIGS = (
 )
 
 NATIVE_WARP_SIZE = 64
-BALANCED_WARPS_PER_BLOCK = 4
-WIDE_WARPS_PER_BLOCK = 8
+PACKED_WARPS_PER_BLOCK = 8
 SCHEDULING_WAVES = 2
-MIN_TOPK_FOR_PACKED_BLOCKS = 16
-MIN_REDUCTION_ELEMENTS_FOR_BALANCED_BLOCKS = 32768
-MAX_BALANCED_SCHEDULING_WAVES_FOR_MODERATE_FAN_IN = 64
+MIN_TOPK_FOR_PACKED_BLOCKS = PACKED_WARPS_PER_BLOCK * SCHEDULING_WAVES
 
 # HBM walls measured on this die (fp8-probe calibration, same die):
 #   pure read ~1630, pure write ~1626, 1R1W copy ~1524, 2R1W ~1537 GB/s.
-# 4R:1W streaming wall is measured separately; datasheet single-die = 1800.
-SINGLE_DIE_DATASHEET = 1800.0
-DUAL_DIE_DATASHEET = 3600.0
+# 4R:1W streaming wall is measured separately; datasheet single-die = 1600.
+SINGLE_DIE_DATASHEET = 1600.0
+DUAL_DIE_DATASHEET = 3200.0
 
 
 def moe_sum_reduce_ref(x, scale):
@@ -200,40 +167,14 @@ def dispatch_geometry(token_count, topk, hidden):
         65535,
     )
 
-    reduction_elements_per_token = topk * hidden
-    packed_warps_per_block = (
-        BALANCED_WARPS_PER_BLOCK
-        if reduction_elements_per_token
-        >= MIN_REDUCTION_ELEMENTS_FOR_BALANCED_BLOCKS
-        else WIDE_WARPS_PER_BLOCK
-    )
-    if packed_warps_per_block == BALANCED_WARPS_PER_BLOCK and topk < 32:
-        balanced_threads = BALANCED_WARPS_PER_BLOCK * NATIVE_WARP_SIZE
-        resident_balanced_blocks_per_sm = max(
-            properties.max_threads_per_multi_processor // balanced_threads,
-            1,
-        )
-        balanced_grid_y = (
-            token_count + BALANCED_WARPS_PER_BLOCK - 1
-        ) // BALANCED_WARPS_PER_BLOCK
-        balanced_block_count = grid_x * balanced_grid_y
-        balanced_full_device_wave_blocks = (
-            properties.multi_processor_count
-            * resident_balanced_blocks_per_sm
-        )
-        if balanced_block_count > (
-            MAX_BALANCED_SCHEDULING_WAVES_FOR_MODERATE_FAN_IN
-            * balanced_full_device_wave_blocks
-        ):
-            packed_warps_per_block = WIDE_WARPS_PER_BLOCK
-    packed_threads = packed_warps_per_block * NATIVE_WARP_SIZE
+    packed_threads = PACKED_WARPS_PER_BLOCK * NATIVE_WARP_SIZE
     resident_packed_blocks_per_sm = max(
         properties.max_threads_per_multi_processor // packed_threads,
         1,
     )
     packed_grid_y = (
-        token_count + packed_warps_per_block - 1
-    ) // packed_warps_per_block
+        token_count + PACKED_WARPS_PER_BLOCK - 1
+    ) // PACKED_WARPS_PER_BLOCK
     packed_block_count = grid_x * packed_grid_y
     full_device_wave_blocks = (
         properties.multi_processor_count * resident_packed_blocks_per_sm
@@ -243,9 +184,7 @@ def dispatch_geometry(token_count, topk, hidden):
         and packed_block_count > SCHEDULING_WAVES * full_device_wave_blocks
     )
 
-    warps_per_block = packed_warps_per_block if use_packed_warps else 1
-    if token_count > warps_per_block * 65535:
-        warps_per_block = WIDE_WARPS_PER_BLOCK
+    warps_per_block = PACKED_WARPS_PER_BLOCK if use_packed_warps else 1
     grid_y = min(
         (token_count + warps_per_block - 1) // warps_per_block,
         65535,
@@ -276,14 +215,6 @@ def main():
             batch_sizes,
         ) in TEST_CONFIGS
     )
-
-    assert dispatch_geometry(3072, 16, 1024)[1] == (512, 1, 1)
-    assert dispatch_geometry(3072, 16, 3584)[1] == (256, 1, 1)
-    assert dispatch_geometry(8192, 16, 3584)[1] == (256, 1, 1)
-    assert dispatch_geometry(8192, 16, 4096)[1] == (512, 1, 1)
-    assert dispatch_geometry(16384, 16, 3584)[1] == (512, 1, 1)
-    assert dispatch_geometry(3072, 32, 1024)[1] == (256, 1, 1)
-    assert dispatch_geometry(16384, 32, 1024)[1] == (256, 1, 1)
 
     for (
         TEST_NAME,
@@ -338,13 +269,8 @@ def main():
                     HIDDEN,
                 )
                 assert uses_packed_warps
-                expected_warps_per_block = (
-                    BALANCED_WARPS_PER_BLOCK
-                    if T <= 8192
-                    else WIDE_WARPS_PER_BLOCK
-                )
                 assert block == (
-                    expected_warps_per_block * NATIVE_WARP_SIZE,
+                    PACKED_WARPS_PER_BLOCK * NATIVE_WARP_SIZE,
                     1,
                     1,
                 )

@@ -60,7 +60,7 @@ constexpr size_t kSmem = 4 * 1024 * sizeof(uint32_t);  // 16KB (bytes); 2 buffer
 // keep the first `length` entries, set others to -1. Vectorized: int4 (128-bit)
 // streaming stores — dst rows are 16B-aligned (bid*TopK*4). src alignment is
 // unknown so loads stay scalar __ldg. 1024 threads, 512 int4 groups.
-__device__ __forceinline__ void decode_naive_topk_transform(
+__device__ void decode_naive_topk_transform(
     const float* __restrict__ score,
     int32_t length,
     int32_t* __restrict__ dst_page_table,
@@ -173,7 +173,7 @@ __device__ __forceinline__ void warp64_detect(
 }
 
 
-__device__ __forceinline__ void fast_topk_cuda_tl(
+__device__ void fast_topk_cuda_tl(
     const float* __restrict__ input, int32_t* __restrict__ index, int row_start, int length) {
   // ORIGINAL pasted body (topk.cu) — RESTORED for A/B perf measurement. Uses this file's
   // kSmem (16KB -> SMEM_INPUT_SIZE=2048) so ONLY the algorithm differs, not the smem size.

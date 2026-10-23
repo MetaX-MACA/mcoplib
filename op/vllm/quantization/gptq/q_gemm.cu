@@ -1804,6 +1804,7 @@ bool launch_gemm_gptq(int m, int n, int k, int quant_group, const input_tp* dA,
   const int THREADS = 256;
   int BLOCKS_M = div_ceil(m, SLICE_M);
   if (BLOCKS_M >= max_blocks_m && BLOCKS_M % max_blocks_m != 0) {
+
     TORCH_CHECK(false, "launch_gemm_gptq: input m is invalid, m=", m,
                 ", blocks_m=", BLOCKS_M, " (must be divisible by max_blocks_m=", max_blocks_m,
                 " when blocks_m >= max_blocks_m)");

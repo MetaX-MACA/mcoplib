@@ -15,8 +15,7 @@ Semantics (DeepSeek V4.1 indexer K, fused):
                slot >= 0 write the cache; everyone else is masked out
   4. quant   : fp8  -> per-token e4m3 + one fp32 pow2 scale (scale row 4B)
                fp4  -> MXFP4: 2 E2M1 nibbles/byte + ue8m0 per 32 elements
-               int8 -> per-token (whole 128-dim head) codes + one fp32
-                       scale amax/127 in the 4-byte scale region,
+               int8 -> per-group (32 elems) codes + fp32 scale amax/127,
                        code = round-to-nearest-even(x * 127 / amax)
   5. store   : paged uint8 cache [num_blocks, block_size, value_bytes +
                scale_bytes]; token s of block b: values at
@@ -75,7 +74,7 @@ MAX_POS = 4096
 EPS = 1e-20
 BLOCK_SIZE = 16
 MODES = ("fp8", "int8", "fp4")
-LAYOUT = {"fp8": (128, 4), "fp4": (64, 4), "int8": (128, 4)}
+LAYOUT = {"fp8": (128, 4), "fp4": (64, 4), "int8": (128, 16)}
 THR_IDEAL = {"fp8": 0.999, "int8": 0.999, "fp4": 0.95}
 TARGET_GBPS = 1300.0
 
@@ -113,13 +112,14 @@ def quant_fp8_ref(x):
 
 
 def quant_int8_ref(x):
-    """Per-token INT8 (single 128-wide block), RNE rounding (torch.round)
-    and scale computed as amax / 127 — both match the kernel's fp32
-    magic-number path expression for expression."""
-    amax = x.abs().amax(-1, keepdim=True).clamp(min=1e-4)
+    """Per-32-group INT8, RNE rounding (torch.round) and scale computed as
+    amax * (1/127) — both match the kernel's fp32 magic-number path."""
+    V = x.shape[0]
+    g = x.view(V, 4, 32)
+    amax = g.abs().amax(-1, keepdim=True).clamp(min=1e-12)
     inv = 127.0 / amax
-    q = (x * inv).round().clamp(-127.0, 127.0).to(torch.int8)
-    return q, (amax.squeeze(-1) / 127.0).contiguous()
+    q = (g * inv).round().clamp(-127.0, 127.0).to(torch.int8)
+    return q.view(V, 128), (amax.squeeze(-1) * (1.0 / 127.0)).contiguous()
 
 
 def quant_fp4_ref(x):
@@ -152,7 +152,7 @@ def dequant_fp8(codes, scale):
 
 
 def dequant_int8(codes, scales):
-    return codes.float() * scales[:, None]
+    return codes.float() * scales.repeat_interleave(32, dim=1)
 
 
 def dequant_fp4(packed, ue8m0):
@@ -375,7 +375,7 @@ def check_case(cid, mode, c, reps=20, expect_codes=None, note=""):
         act_deq = dequant_fp8(act_v, act_s.view(torch.float32).flatten())
     elif mode == "int8":
         act_deq = dequant_int8(
-            act_v.view(torch.int8), act_s.view(torch.float32).flatten()
+            act_v.view(torch.int8), act_s.view(torch.float32).view(-1, 4)
         )
     else:
         act_deq = dequant_fp4(act_v, act_s)
@@ -503,9 +503,9 @@ def part_d():
     check_case(nxt(), "int8", c, note="seq_pos_cr2")
     # int8 RNE tie crafting: k_pre rows [8, 8, 8, 0.., +-16@64, +-8@66]
     # give variance exactly 512/128 = 4 -> rsqrt = 0.5 -> post-norm
-    # [4, 4, 4, .., +-8@64, .., +-4@66] with identity rope; per-token
-    # amax = 8 -> inv = 15.875 exact -> code 127@64 and exactly +-63.5
-    # @0-2,66, which round-to-nearest-even must send to +-64 (never +-63).
+    # [4, 4, 4, .., +-8@64, .., +-4@66] with identity rope; group 2 amax = 8
+    # -> inv = 15.875 exact -> codes 127@64 and exactly +-63.5@66, which
+    # round-to-nearest-even must send to +-64 (never +-63).
     for sign in (1, -1):
         c = build_case(4, 1, "int8", slots_mode="dense")
         c["cos_sin"] = torch.zeros(
@@ -521,7 +521,7 @@ def part_d():
         c["k_pre"][:4] = kp
         c["valid"] = c["slots"] >= 0
         expect = torch.zeros(4, 128, dtype=torch.uint8, device=DEVICE)
-        expect[:, 0:3] = 64  # RNE(+63.5) -> 64 (tie to even)
+        expect[:, 0:3] = 127  # 4 * 127/4
         expect[:, 64] = 127 if sign > 0 else 129  # +-127
         expect[:, 66] = 64 if sign > 0 else 192  # RNE(+-63.5) -> +-64
         check_case(

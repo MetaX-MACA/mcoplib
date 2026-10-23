@@ -35,7 +35,6 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from mcoplib.triton_sglang_chunk_delta_h import (  # noqa: E402
     CHUNK_SIZE,
-    _is_metax_c500,
     _launch_chunk_gated_delta_rule_fwd_h,
     chunk_gated_delta_rule_fwd_h,
     chunk_gated_delta_rule_fwd_h_baseline,
@@ -322,21 +321,7 @@ def _benchmark(
     # bytes count the repeated K/W/GK reads across V tiles; unique bytes count
     # each accessed tensor element once. Hardware HBM transactions may differ
     # because this model intentionally excludes cache-line and cache-hit effects.
-    # On C500, the optimized packed H=12 path requests BV=64 but dispatches the
-    # fused kernel with BV=32; use the actual tile size for the byte model.
-    device_index = inputs["k"].device.index
-    if device_index is None:
-        device_index = torch.cuda.current_device()
-    kernel_block_v = (
-        32
-        if _is_metax_c500(device_index)
-        and variant == "optimized"
-        and case.total_tokens == 8192
-        and case.logical_batch == 4
-        and case.heads == 12
-        else block_v
-    )
-    v_tiles = math.ceil(V / kernel_block_v)
+    v_tiles = math.ceil(V / block_v)
     k_head_reuse = case.heads // inputs["k"].shape[2]
     gk_endpoint_bytes = (
         total_chunks * case.heads * K * inputs["gk"].element_size()
@@ -388,7 +373,7 @@ def _benchmark(
             "cache-line/cache-hit effects"
         ),
         "total_chunks": total_chunks,
-        "grid": [v_tiles, case.logical_batch * case.heads],
+        "grid": [math.ceil(V / block_v), case.logical_batch * case.heads],
     }
     del inputs, h, v_new, state_slots, index_sets, offsets
     torch.cuda.empty_cache()

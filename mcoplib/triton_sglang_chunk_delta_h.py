@@ -6,19 +6,18 @@ The public K=V=128 path uses the retained BV=64, four-warp specialization.
 The original SGLang BV=32, four-warp configuration remains available as an
 explicit baseline. Other K/V shapes retain the conservative baseline launch.
 
-K=V=128 launches use these specializations:
+Three K=V=128 launches are specialized, in this precedence order:
 
-1. On MetaX C500, ``_chunk_gated_delta_rule_fwd_kernel_h_k128_fused`` with
-   BV=32 for the N=4, H=Hg=12, T=8192 packed production family;
-2. ``_chunk_gated_delta_rule_fwd_kernel_h_k128_single_chunk`` for a single
+1. ``_chunk_gated_delta_rule_fwd_kernel_h_k128_single_chunk`` for a single
    whole chunk at N=1, H=Hg=8;
-3. ``_chunk_gated_delta_rule_fwd_kernel_h_k128_fused`` for N=1, H=Hg=8;
-4. ``_chunk_gated_delta_rule_fwd_kernel_h_k128_tailfree`` when every sequence
+2. ``_chunk_gated_delta_rule_fwd_kernel_h_k128_fused`` for N=1, H=Hg=8;
+3. ``_chunk_gated_delta_rule_fwd_kernel_h_k128_tailfree`` when every sequence
    length is a whole number of chunks: it drops all ``boundary_check`` work and
    keeps the recurrent state transposed as ``[64, BV]`` so the loop needs no
    ``tl.trans``.
 
-Other launches use ``chunk_gated_delta_rule_fwd_kernel_h_blockdim64``.
+Everything else, including every ragged launch, uses
+``chunk_gated_delta_rule_fwd_kernel_h_blockdim64`` unchanged.
 """
 
 import functools
@@ -30,20 +29,6 @@ import triton.language as tl
 
 
 CHUNK_SIZE = 64
-
-
-@functools.lru_cache(maxsize=None)
-def _is_metax_c500(device_index: int) -> bool:
-    """Return whether a logical CUDA/MACA device is a MetaX C500.
-
-    The packed H=12 specialization has opposite performance behavior on C500
-    and C600-U. Cache the device-name lookup per logical device so launch-time
-    dispatch supports heterogeneous multi-GPU processes without repeatedly
-    querying the runtime.
-    """
-
-    device_name = torch.cuda.get_device_name(device_index).upper()
-    return "METAX" in device_name and "C500" in device_name
 
 
 def _tensor_cache(fn: Callable[..., Any]) -> Callable[..., Any]:
@@ -788,53 +773,6 @@ def _launch_chunk_gated_delta_rule_fwd_h(
             chunk_offsets = prepare_chunk_offsets(cu_seqlens, BT)
         NT = total_chunks or int(chunk_offsets[-1].item())
 
-    device_index = k.device.index
-    if device_index is None:
-        device_index = torch.cuda.current_device()
-
-    # On C500, the packed H=12 production family benefits from the fused K=128
-    # operand path at BV=32. C600-U regresses on that path, so it and unmeasured
-    # devices retain the generic BV=64 kernel.
-    use_k128_packed_h12 = (
-        _is_metax_c500(device_index)
-        and K == 128
-        and V == 128
-        and T == 8192
-        and N == 4
-        and H == 12
-        and Hg == 12
-        and block_v == 64
-        and num_warps == 4
-        and num_stages == 1
-        and g is None
-        and gk is not None
-        and v_new is not None
-        and cu_seqlens is not None
-    )
-    if use_k128_packed_h12:
-        _chunk_gated_delta_rule_fwd_kernel_h_k128_fused[(4, N * H)](
-            k=k,
-            v=u,
-            w=w,
-            v_new=v_new,
-            gk=gk,
-            h=h,
-            initial_state=initial_state,
-            initial_state_indices=initial_state_indices,
-            stride_init_state=stride_init_state,
-            cu_seqlens=cu_seqlens,
-            chunk_offsets=chunk_offsets,
-            T=T,
-            H=H,
-            Hg=Hg,
-            BV=32,
-            NT_BUCKET=0 if NT <= 32 else (1 if NT <= 128 else 2),
-            USE_EXP2=use_exp2,
-            num_warps=num_warps,
-            num_stages=num_stages,
-        )
-        return
-
     use_k128_fused = (
         K == 128
         and V == 128
@@ -870,10 +808,9 @@ def _launch_chunk_gated_delta_rule_fwd_h(
         return
 
     if use_k128_fused:
-        # C500 H8/T8192 has only 32 CTAs at BV32 for 104 APs. Use BV16
-        # on this exact shape to expose 64 independent V tiles/head programs;
-        # other devices and shapes keep the retained BV32 configuration.
-        k128_long_bv = 16 if _is_metax_c500(device_index) and T == 8192 else 32
+        # The long recurrent shape benefits from twice as many independent
+        # V tiles. Short single-chunk shapes stay on the BV64 kernel above.
+        k128_long_bv = 32
         _chunk_gated_delta_rule_fwd_kernel_h_k128_fused[
             (triton.cdiv(V, k128_long_bv), N * H)
         ](

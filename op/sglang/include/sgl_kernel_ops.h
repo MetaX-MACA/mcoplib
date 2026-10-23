@@ -115,10 +115,6 @@ std::vector<at::Tensor> sparse_attention_fwd(
     bool return_lse);
 
 void sparse_attention_clear_cache();
-void chunk_kda_fwd_intra_token_parallel(
-    const at::Tensor& q, const at::Tensor& k, const at::Tensor& g,
-    const at::Tensor& beta, const at::Tensor& aqk, const at::Tensor& akk,
-    double scale);
 //     torch::Tensor const& out,
 //     torch::Tensor const& q_nope,
 //     torch::Tensor const& q_pe,
@@ -284,14 +280,6 @@ void dsv4_fused_q_indexer_rope_hadamard_quant(
     const at::Tensor& freqs_cis,
     const at::Tensor& positions);
 
-void sgl_fused_hc_head(
-    torch::Tensor output,
-    torch::Tensor x,
-    torch::Tensor hc_fn,
-    torch::Tensor hc_scale,
-    torch::Tensor hc_base,
-    double norm_eps,
-    double hc_eps);
 /*
  * MiniMax-M3 fused GemmaRMSNorm + partial NeoX RoPE (AOT port of
  * sglang_jit/fused_gemma_qknorm_rope.cuh). Multi-group, in-place over qkv.
@@ -1094,6 +1082,3 @@ torch::Tensor timestep_embedding(
     double downscale_freq_shift,
     double scale,
     int64_t max_period);
-
-void silu_and_mul_clamp_check(const torch::Tensor& input,
-                        torch::Tensor& output, double swiglu_limit);

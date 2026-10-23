@@ -97,7 +97,7 @@ __global__ void moe_sum_reduce_kernel(
     float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
     float a4 = 0.0f, a5 = 0.0f, a6 = 0.0f, a7 = 0.0f;
 
-    #pragma unroll 8
+    #pragma unroll
     for (int k = 0; k < TOPK; ++k) {
       const int64_t offset_k = base + static_cast<int64_t>(k) * stride_topk;
 
@@ -526,80 +526,41 @@ void moe_sum_reduce(at::Tensor& input, at::Tensor& output, double routed_scaling
     const float scale = static_cast<float>(routed_scaling_factor);
 
     if (token_num > 128) {
-      // This vectorized path uses a 64-thread warp and 8 BF16/thread. One warp
-      // per block remains the default for low-fan-in reductions and launches
-      // without enough parallel work.
+      // C600-U tuning: warp=64 (native warp), 8 BF16/thread (128-bit coalesced
+      // load). One warp per block (WARPS_PER_BLOCK=1) remains the default for
+      // low-fan-in reductions and launches without enough parallel work.
       //
-      // High-fan-in reductions group token-warps once the packed launch has
-      // more than two full scheduling waves. Four warps per block has lower
-      // scheduling overhead for sufficiently long per-token reductions;
-      // eight warps remains better for shorter reductions. The decision uses
-      // only operator dimensions and current device properties.
+      // High-fan-in reductions can instead group eight token-warps per block
+      // once the packed launch contains more than two full scheduling waves.
+      // The decision below depends only on operator dimensions and current
+      // device properties; it does not encode a model name or hidden size.
       //
       // The kernel maps token -> blockIdx.y (no y-grid-stride, so grid.y must
-      // cover every token). grid.y is capped at 65535, so the selected block
-      // is widened to eight warps when needed to preserve token coverage.
+      // cover every token). grid.y is capped at 65535, so WPB=1 is valid only
+      // while token_num <= 65535; beyond that we widen the block (WPB=8, up to
+      // 524280 tokens) to keep full coverage.
       const int64_t n_chunks = hidden_dim / 8;
       int64_t grid_x = (n_chunks + 64 - 1) / 64;
       if (grid_x > 65535) grid_x = 65535;
 
       constexpr int kNativeWarpSize = 64;
-      constexpr int kBalancedWarpsPerBlock = 4;
-      constexpr int kWideWarpsPerBlock = 8;
+      constexpr int kPackedWarpsPerBlock = 8;
       constexpr int kSchedulingWaves = 2;
-      constexpr int kMinTopkForPackedBlocks = 16;
-      constexpr int64_t kMinReductionElementsForBalancedBlocks = 32768;
-      constexpr int kMaxBalancedSchedulingWavesForModerateFanIn = 64;
+      constexpr int kMinTopkForPackedBlocks =
+          kPackedWarpsPerBlock * kSchedulingWaves;
 
-      const int64_t reduction_elements_per_token = topk_num * hidden_dim;
-      int packed_warps_per_block =
-          reduction_elements_per_token >=
-                  kMinReductionElementsForBalancedBlocks
-              ? kBalancedWarpsPerBlock
-              : kWideWarpsPerBlock;
-
+      constexpr int kPackedThreads = kPackedWarpsPerBlock * kNativeWarpSize;
       bool use_packed_warps = false;
       if (topk_num >= kMinTopkForPackedBlocks) {
         const auto* device_props = at::cuda::getCurrentDeviceProperties();
-
-        // With moderate fan-in, retain the wide block for very deep launches;
-        // this preserves its large-token throughput. Higher fan-in continues
-        // to use the balanced block because its lower scheduling overhead
-        // remains beneficial at high launch depths.
-        if (packed_warps_per_block == kBalancedWarpsPerBlock &&
-            topk_num < 32) {
-          const int balanced_threads =
-              kBalancedWarpsPerBlock * kNativeWarpSize;
-          int64_t resident_balanced_blocks_per_sm =
-              device_props->maxThreadsPerMultiProcessor / balanced_threads;
-          if (resident_balanced_blocks_per_sm < 1) {
-            resident_balanced_blocks_per_sm = 1;
-          }
-          const int64_t balanced_grid_y =
-              (token_num + kBalancedWarpsPerBlock - 1) /
-              kBalancedWarpsPerBlock;
-          const int64_t balanced_block_count = grid_x * balanced_grid_y;
-          const int64_t balanced_full_device_wave_blocks =
-              static_cast<int64_t>(device_props->multiProcessorCount) *
-              resident_balanced_blocks_per_sm;
-          if (balanced_block_count >
-              kMaxBalancedSchedulingWavesForModerateFanIn *
-                  balanced_full_device_wave_blocks) {
-            packed_warps_per_block = kWideWarpsPerBlock;
-          }
-        }
-
-        const int packed_threads =
-            packed_warps_per_block * kNativeWarpSize;
         int64_t resident_packed_blocks_per_sm =
-            device_props->maxThreadsPerMultiProcessor / packed_threads;
+            device_props->maxThreadsPerMultiProcessor / kPackedThreads;
         if (resident_packed_blocks_per_sm < 1) {
           resident_packed_blocks_per_sm = 1;
         }
 
         const int64_t packed_grid_y =
-            (token_num + packed_warps_per_block - 1) /
-            packed_warps_per_block;
+            (token_num + kPackedWarpsPerBlock - 1) / kPackedWarpsPerBlock;
         const int64_t packed_block_count = grid_x * packed_grid_y;
         const int64_t full_device_wave_blocks =
             static_cast<int64_t>(device_props->multiProcessorCount) *
@@ -607,11 +568,6 @@ void moe_sum_reduce(at::Tensor& input, at::Tensor& output, double routed_scaling
         use_packed_warps =
             packed_block_count >
             kSchedulingWaves * full_device_wave_blocks;
-      }
-
-      int warps_per_block = use_packed_warps ? packed_warps_per_block : 1;
-      if (token_num > static_cast<int64_t>(warps_per_block) * 65535) {
-        warps_per_block = kWideWarpsPerBlock;
       }
 
       #define LAUNCH_KERNEL_WPB(WPB, TOPK) \
@@ -629,10 +585,8 @@ void moe_sum_reduce(at::Tensor& input, at::Tensor& output, double routed_scaling
         } while (0)
 
       #define LAUNCH_KERNEL(TOPK) \
-        do { if (warps_per_block == 1) \
+        do { if (token_num <= 65535 && !use_packed_warps) \
                LAUNCH_KERNEL_WPB(1, TOPK); \
-             else if (warps_per_block == 4) \
-               LAUNCH_KERNEL_WPB(4, TOPK); \
              else \
                LAUNCH_KERNEL_WPB(8, TOPK); } while (0)
 
@@ -648,20 +602,13 @@ void moe_sum_reduce(at::Tensor& input, at::Tensor& output, double routed_scaling
         case 16: LAUNCH_KERNEL(16); break;
         case 32: LAUNCH_KERNEL(32); break;
         default: {
-          int64_t grid_y =
-              (token_num + warps_per_block - 1) / warps_per_block;
+          const int WPB = (token_num <= 65535 && !use_packed_warps) ? 1 : 8;
+          int64_t grid_y = (token_num + WPB - 1) / WPB;
           if (grid_y > 65535) grid_y = 65535;
           dim3 grid(static_cast<unsigned>(grid_x), static_cast<unsigned>(grid_y));
-          if (warps_per_block == 1) {
+          if (WPB == 1) {
             dim3 block(1 * 64);
             moe_sum_reduce_dynamic_kernel<1><<<grid, block, 0, stream>>>(
-                reinterpret_cast<const at::BFloat16*>(input.data_ptr<at::BFloat16>()),
-                reinterpret_cast<at::BFloat16*>(output.data_ptr<at::BFloat16>()),
-                token_num, hidden_dim, topk_num,
-                in_stride_token, in_stride_topk, out_stride_token, scale);
-          } else if (warps_per_block == 4) {
-            dim3 block(4 * 64);
-            moe_sum_reduce_dynamic_kernel<4><<<grid, block, 0, stream>>>(
                 reinterpret_cast<const at::BFloat16*>(input.data_ptr<at::BFloat16>()),
                 reinterpret_cast<at::BFloat16*>(output.data_ptr<at::BFloat16>()),
                 token_num, hidden_dim, topk_num,

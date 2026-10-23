@@ -197,7 +197,7 @@ struct FusedQNormRopeParams {
   const void* __restrict__ q_input;
   void* __restrict__ q_output;
   const float* __restrict__ freqs_cis;
-  const void* __restrict__ positions;
+  const int32_t* __restrict__ positions;
   int64_t q_input_stride_batch;
   int64_t q_output_stride_batch;
   uint32_t batch_size;
@@ -245,7 +245,7 @@ __global__ __launch_bounds__(kFusedQBlockSize, 16) void fused_q_norm_rope_kernel
       static_cast<const bf16_t*>(params.q_input) + batch_id * params.q_input_stride_batch + head_id * kHeadDim;
   const auto output_ptr =
       static_cast<bf16_t*>(params.q_output) + batch_id * params.q_output_stride_batch + head_id * kHeadDim;
-  const auto position = static_cast<const int32_t*>(params.positions)[batch_id];
+  const auto position = params.positions[batch_id];
 
   __shared__ Storage s_rope[kFusedQNumWarps][kRopeSize];
 
@@ -309,104 +309,6 @@ __global__ __launch_bounds__(kFusedQBlockSize, 16) void fused_q_norm_rope_kernel
   bf16x2_t rotated = __float22bfloat162_rn(make_float2(rot_real, rot_imag));
   auto out_elem = reinterpret_cast<bf16x2_t*>(output_ptr + (kHeadDim - kRopeDim));
   out_elem[lane_id] = rotated;
-}
-constexpr int kWarp = 64;
-constexpr int kLPH = 8;      // 每个 head 用 8 个 lane，归约只需 3 级 shuffle
-constexpr int kBlock = 256;  // 4 个 warp
-constexpr int kBPS = 24;     // 每个 SM 发 24 个 block
-
-// 每个 warp 同时处理 64/LPH = 8 个 head；
-// lane 负责的 16B 块号 = sl + LPH*k (k < C)，同一个 head 的 8 个 lane 读连续的 128B
-template <int64_t HD, int64_t RD, typename PosT>
-__global__ __launch_bounds__(kBlock) void fused_q_norm_rope_fast_kernel(
-    const __grid_constant__ FusedQNormRopeParams params) {
-  constexpr int kVec = 16 / sizeof(bf16_t);   // 8
-  constexpr int NCH = HD / kVec;
-  constexpr int C = NCH / kLPH;
-  constexpr int SG = kWarp / kLPH;
-  constexpr int WPB = kBlock / kWarp;
-  constexpr int RC0 = (HD - RD) / kVec;
-  constexpr int KR0 = RC0 / kLPH;
-  constexpr int NKR = C - KR0;
-  constexpr float kInvH = 1.0f / float(HD);
-  static_assert(C * kLPH == NCH, "bad head_dim");
-  static_assert(RD % kVec == 0 && RD <= HD, "bad rope_dim");
-
-  using Vec = AlignedVec<bf16_t, kVec>;
-  using FVec = AlignedVec<float, kVec>;
-
-  const int lane = threadIdx.x & (kWarp - 1);
-  const int sub = lane / kLPH;
-  const int sl = lane & (kLPH - 1);
-
-  const uint32_t H = params.num_q_heads;
-  const uint32_t total = params.batch_size * H;
-  const PosT* __restrict__ pos = static_cast<const PosT*>(params.positions);
-  const bf16_t* __restrict__ qin = static_cast<const bf16_t*>(params.q_input);
-  bf16_t* __restrict__ qout = static_cast<bf16_t*>(params.q_output);
-  const float* __restrict__ freqs = params.freqs_cis;
-  const float eps = params.eps;
-  const uint32_t stride = gridDim.x * WPB * SG;
-
-  for (uint32_t base = (blockIdx.x * WPB + threadIdx.x / kWarp) * SG; base < total; base += stride) {
-    const uint32_t w = base + sub;
-    const bool valid = w < total;
-    const uint32_t b = valid ? w / H : 0;
-    const uint32_t h = valid ? w - b * H : 0;
-    const bf16_t* in = qin + int64_t(b) * params.q_input_stride_batch + int64_t(h) * HD;
-    bf16_t* out = qout + int64_t(b) * params.q_output_stride_batch + int64_t(h) * HD;
-
-    const int64_t p = valid ? int64_t(pos[b]) : 0;
-
-    Vec x[C];
-#pragma unroll
-    for (int k = 0; k < C; ++k)
-      if (valid) x[k].load(in, sl + kLPH * k);
-
-    FVec f[NKR];
-#pragma unroll
-    for (int r = 0; r < NKR; ++r) {
-      const int c = sl + kLPH * (KR0 + r);
-      if (valid && c >= RC0) f[r].load(freqs + p * RD, c - RC0);
-    }
-
-    float ss = 0.f;
-    if (valid) {
-#pragma unroll
-      for (int k = 0; k < C; ++k)
-#pragma unroll
-        for (int j = 0; j < kVec; ++j) {
-          const float v = bf16_to_float(x[k][j]);
-          ss = fmaf(v, v, ss);
-        }
-    }
-#pragma unroll
-    for (int off = kLPH >> 1; off > 0; off >>= 1)
-      ss += __shfl_xor_sync(0xffffffffffffffffULL, ss, off);
-
-    if (!valid) continue;
-    const float inv = rsqrtf(ss * kInvH + eps);
-
-#pragma unroll
-    for (int k = 0; k < C; ++k) {
-      Vec o;
-#pragma unroll
-      for (int j = 0; j < kVec; ++j) o[j] = float_to_bf16(bf16_to_float(x[k][j]) * inv);
-      if constexpr (true) {
-        if (k >= KR0 && (sl + kLPH * k) >= RC0) {
-          const FVec& ff = f[k >= KR0 ? k - KR0 : 0];
-#pragma unroll
-          for (int j = 0; j < kVec; j += 2) {
-            const float re = bf16_to_float(o[j]), im = bf16_to_float(o[j + 1]);
-            const float fr = ff[j], fi = ff[j + 1];
-            o[j]     = float_to_bf16(re * fr - im * fi);
-            o[j + 1] = float_to_bf16(re * fi + im * fr);
-          }
-        }
-      }
-      o.store(out, sl + kLPH * k);
-    }
-  }
 }
 
 // ============================================================================
@@ -627,14 +529,6 @@ __global__ __launch_bounds__(kFusedQBlockSize, 16) void fused_q_indexer_rope_had
 // Host-side launchers (PyTorch C++ extension API)
 // ============================================================================
 
-inline const cudaDeviceProp& GetDeviceProp() {
-  static cudaDeviceProp prop = [] {
-    cudaDeviceProp p;
-    cudaGetDeviceProperties(&p, 0);
-    return p;
-  }();
-  return prop;
-}
 void dsv4_fused_q_norm_rope(
     const at::Tensor& q_input,
     at::Tensor& q_output,
@@ -647,9 +541,7 @@ void dsv4_fused_q_norm_rope(
   TORCH_CHECK(q_output.scalar_type() == at::ScalarType::BFloat16, "q_output must be bfloat16");
   TORCH_CHECK(q_input.dim() == 3, "q_input must be 3D: (B, H, D)");
   TORCH_CHECK(q_output.dim() == 3, "q_output must be 3D: (B, H, D)");
-  TORCH_CHECK(
-      positions.scalar_type() == at::ScalarType::Int || positions.scalar_type() == at::ScalarType::Long,
-      "positions must be int32 or int64");
+  TORCH_CHECK(positions.scalar_type() == at::ScalarType::Int, "positions must be int32");
 
   const int64_t B = q_input.size(0);
   const int64_t H = q_input.size(1);
@@ -659,14 +551,14 @@ void dsv4_fused_q_norm_rope(
   TORCH_CHECK(q_input.stride(2) == 1 && q_output.stride(2) == 1, "last dim must be contiguous");
   TORCH_CHECK(q_input.stride(1) == D && q_output.stride(1) == D, "head dim must be contiguous");
 
-  if (B == 0 || H == 0) return;
+  if (B == 0) return;
 
   const auto stream = at::cuda::getCurrentCUDAStream(q_input.get_device());
   const auto params = FusedQNormRopeParams{
       .q_input = q_input.data_ptr(),
       .q_output = q_output.data_ptr(),
       .freqs_cis = freqs_cis.data_ptr<float>(),
-      .positions = positions.data_ptr(),
+      .positions = positions.data_ptr<int32_t>(),
       .q_input_stride_batch = q_input.stride(0),
       .q_output_stride_batch = q_output.stride(0),
       .batch_size = static_cast<uint32_t>(B),
@@ -675,31 +567,9 @@ void dsv4_fused_q_norm_rope(
   };
   const uint32_t total_works = static_cast<uint32_t>(B * H);
   const uint32_t num_blocks = CEILDIV(total_works, kFusedQNumWarps);
-  constexpr int64_t kRopeDim = 64;
 
-  if (D == 512) {
-    constexpr int kVec = 16 / sizeof(bf16_t);
-    const bool ok = freqs_cis.scalar_type() == at::ScalarType::Float && freqs_cis.is_contiguous() &&
-                    freqs_cis.size(-1) == kRopeDim && positions.is_contiguous() &&
-                    q_input.stride(0) % kVec == 0 && q_output.stride(0) % kVec == 0 &&
-                    reinterpret_cast<uintptr_t>(params.q_input) % 16 == 0 &&
-                    reinterpret_cast<uintptr_t>(params.q_output) % 16 == 0 &&
-                    reinterpret_cast<uintptr_t>(params.freqs_cis) % 32 == 0;
-    if (ok) {
-      cudaDeviceProp prop = GetDeviceProp();
-      constexpr uint32_t per_block = (kBlock / kWarp) * (kWarp / kLPH);
-      const uint32_t cap = prop.multiProcessorCount * kBPS;
-      const uint32_t grid = std::max(1u, std::min(CEILDIV(total_works, per_block), cap));
-      if (positions.scalar_type() == at::ScalarType::Long){
-        fused_q_norm_rope_fast_kernel<512, 64, int64_t><<<grid, kBlock, 0, stream>>>(params);
-      }
-      else {
-        fused_q_norm_rope_fast_kernel<512, 64, int32_t><<<grid, kBlock, 0, stream>>>(params);
-      }
-      return;
-    }
-  }
   // Dispatch on head_dim. DeepSeek V4 uses D=192 with kRopeDim=64.
+  constexpr int64_t kRopeDim = 64;
   switch (D) {
     case 128:
       fused_q_norm_rope_kernel<128, kRopeDim><<<num_blocks, kFusedQBlockSize, 0, stream>>>(params);

@@ -190,145 +190,6 @@ inline int GetGroupsPerBlockX(int64_t padded_groups_per_row) {
   return 4;
 }
 
-// ===========================================================================
-// Register-resident fast path for the generic (float-scale) kernel,
-// specialized for group_size == 128.
-//
-// 16 threads per group (same geometry as the smem kernel), so each thread
-// owns 8 elements: 16 B for bf16/fp16 (one uint4) / 32 B for fp32 (two
-// uint4). Those bytes live in registers across the whole
-// absmax-reduce -> scale -> quantize pipeline, so the smem staging buffer,
-// its write+read LSU traffic and the __syncthreads() all disappear.
-//
-// Vecs are assigned interleaved: thread `lane` of a group owns vec
-// (v * 16 + lane), v = 0..VECS_PER_THREAD-1, so every load AND store
-// instruction is one contiguous coalesced run for any dtype (a blocked
-// 8-elem-per-thread split would make fp32 loads stride 32 B and use only
-// half of each 32 B sector per instruction).
-//
-// With no block-wide barrier left, out-of-range tail groups can simply
-// return early -- the grid is ceil(num_groups / 16), no more
-// GetGroupsPerBlock divisibility dance.
-// ===========================================================================
-template <typename T, typename DST_DTYPE, bool IS_COLUMN_MAJOR,
-          bool SCALE_UE8M0>
-__global__ void per_token_group_quant_8bit_regs_kernel(
-    const T* __restrict__ input, void* __restrict__ output_q,
-    float* __restrict__ output_s, const int num_groups, const float eps,
-    const float min_8bit, const float max_8bit, const int scale_num_rows = 0,
-    const int scale_stride = 0) {
-  constexpr int GROUP_SIZE = 128;
-  constexpr int THREADS_PER_GROUP = 16;  // 同 smem 版：16 线程/组
-  constexpr int GROUPS_PER_BLOCK = 16;   // 16 组 × 16 线程 = 256 线程
-  constexpr int ELEMS_PER_VEC = 16 / sizeof(T);           // 8 / 4 / 2
-  constexpr int VECS_PER_THREAD =
-      GROUP_SIZE / (THREADS_PER_GROUP * ELEMS_PER_VEC);   // 1 / 2 / 4
-  static_assert(GROUP_SIZE ==
-                    THREADS_PER_GROUP * VECS_PER_THREAD * ELEMS_PER_VEC,
-                "group layout mismatch");
-
-  const int local_group_id = threadIdx.x / THREADS_PER_GROUP;
-  const int lane_id = threadIdx.x % THREADS_PER_GROUP;
-  const int64_t global_group_id =
-      static_cast<int64_t>(blockIdx.x) * GROUPS_PER_BLOCK + local_group_id;
-
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  cudaGridDependencySynchronize();
-#endif
-
-  if (global_group_id >= num_groups) {
-    return;
-  }
-
-  const int64_t block_group_offset = global_group_id * GROUP_SIZE;
-
-  float* scale_output;
-  if constexpr (IS_COLUMN_MAJOR) {
-    const int row_idx = global_group_id / scale_num_rows;
-    const int col_idx = global_group_id % scale_num_rows;
-    scale_output = output_s + col_idx * scale_stride + row_idx;
-  } else {
-    scale_output = output_s + global_group_id;
-  }
-
-  // ---- pass 1: global -> registers，顺手累加 local absmax ----
-  const T* group_input = input + block_group_offset;
-  alignas(16) T regs[VECS_PER_THREAD][ELEMS_PER_VEC];  // 每行恰好 16B
-  float local_absmax = eps;
-#pragma unroll
-  for (int v = 0; v < VECS_PER_THREAD; ++v) {
-    *reinterpret_cast<uint4*>(&regs[v][0]) = *reinterpret_cast<const uint4*>(
-        group_input + (v * THREADS_PER_GROUP + lane_id) * ELEMS_PER_VEC);
-#pragma unroll
-    for (int e = 0; e < ELEMS_PER_VEC; ++e) {
-      local_absmax =
-          fmaxf(local_absmax, fabsf(static_cast<float>(regs[v][e])));
-    }
-  }
-
-  local_absmax = GroupReduceMax(local_absmax);  // 16 线程组内 4 次 shfl_xor
-
-  float y_s = local_absmax / max_8bit;
-  if constexpr (SCALE_UE8M0) {
-    y_s = exp2f(ceilf(log2f(fmaxf(fabsf(y_s), 1e-10f))));
-  }
-
-  if (lane_id == 0) {
-    *scale_output = y_s;
-  }
-
-  // ---- pass 2: registers -> 量化后的 global（没有 smem 往返）----
-  // 逐元素除法换成一次倒数 + 乘法（与本文件 packed register kernel 一致）。
-  // UE8M0 路径下 y_s 是 2 的幂，倒数乘与除法 bit 级一致；仅非 UE8M0 路径
-  // 可能有 1ulp 差。要完全对齐基线就把 `* inv_y` 改回 `/ y_s`。
-  const float inv_y =  __builtin_mxc_rcpf(y_s);
-  DST_DTYPE* group_output =
-      static_cast<DST_DTYPE*>(output_q) + block_group_offset;
-#pragma unroll
-  for (int v = 0; v < VECS_PER_THREAD; ++v) {
-    DST_DTYPE* out_v =
-        group_output + (v * THREADS_PER_GROUP + lane_id) * ELEMS_PER_VEC;
-    if constexpr (ELEMS_PER_VEC == 8) {  // bf16/fp16：8 字节一次写
-      uint32_t w[2] = {0u, 0u};
-#pragma unroll
-      for (int e = 0; e < 8; ++e) {
-        float q = fminf(fmaxf(static_cast<float>(regs[v][e]) * inv_y, min_8bit),
-                        max_8bit);
-        DST_DTYPE qb = DST_DTYPE(q);
-        w[e >> 2] |= static_cast<uint32_t>(
-                         *reinterpret_cast<uint8_t*>(&qb)) << ((e & 3) * 8);
-      }
-      *reinterpret_cast<uint2*>(out_v) = make_uint2(w[0], w[1]);
-    } else if constexpr (ELEMS_PER_VEC == 4) {  // fp32：4 字节一次写
-      uint32_t w = 0u;
-#pragma unroll
-      for (int e = 0; e < 4; ++e) {
-        float q = fminf(fmaxf(static_cast<float>(regs[v][e]) * inv_y, min_8bit),
-                        max_8bit);
-        DST_DTYPE qb = DST_DTYPE(q);
-        w |= static_cast<uint32_t>(*reinterpret_cast<uint8_t*>(&qb))
-             << (e * 8);
-      }
-      *reinterpret_cast<uint32_t*>(out_v) = w;
-    } else {  // double：2 字节一次写
-      uint16_t w = 0u;
-#pragma unroll
-      for (int e = 0; e < ELEMS_PER_VEC; ++e) {
-        float q = fminf(fmaxf(static_cast<float>(regs[v][e]) * inv_y, min_8bit),
-                        max_8bit);
-        DST_DTYPE qb = DST_DTYPE(q);
-        w |= static_cast<uint16_t>(*reinterpret_cast<uint8_t*>(&qb))
-             << (e * 8);
-      }
-      *reinterpret_cast<uint16_t*>(out_v) = w;
-    }
-  }
-
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  cudaTriggerProgrammaticLaunchCompletion();
-#endif
-}
-
 void per_token_group_quant_8bit(const torch::stable::Tensor& input,
                                 torch::stable::Tensor& output_q,
                                 torch::stable::Tensor& output_s,
@@ -357,15 +218,7 @@ void per_token_group_quant_8bit(const torch::stable::Tensor& input,
   const bool is_column_major = output_s.stride(0) < output_s.stride(1);
   const int scale_num_rows = output_s.size(1);
   const int scale_stride = output_s.stride(1);
-  
-  constexpr int REGS_GROUPS_PER_BLOCK = 16;  // 16 组 × 16 线程 = 256 线程
-  const bool use_regs_kernel =
-      group_size == 128 &&
-      (reinterpret_cast<uintptr_t>(input.data_ptr()) & 0xF) == 0 &&
-      (reinterpret_cast<uintptr_t>(output_q.data_ptr()) & 0x7) == 0;
-  const int regs_num_blocks = static_cast<int>(
-      (num_groups + REGS_GROUPS_PER_BLOCK - 1) / REGS_GROUPS_PER_BLOCK);
-  const int regs_num_threads = REGS_GROUPS_PER_BLOCK * THREADS_PER_GROUP;
+
 
 #ifndef USE_ROCM
   #define LAUNCH_KERNEL_INST(T, DST_DTYPE, COL_MAJOR, UE8M0, SMEM_BYTES)     \
@@ -397,71 +250,23 @@ void per_token_group_quant_8bit(const torch::stable::Tensor& input,
     } while (0)
 #endif
 
-#ifndef USE_ROCM
-  #define LAUNCH_REGS_KERNEL_INST(T, DST_DTYPE, COL_MAJOR, UE8M0)         \
-    do {                                                                  \
-      cudaLaunchConfig_t config = {};                                     \
-      config.gridDim = dim3(regs_num_blocks);                             \
-      config.blockDim = dim3(regs_num_threads);                           \
-      config.dynamicSmemBytes = 0;                                        \
-      config.stream = stream;                                             \
-      config.numAttrs = 0;                                                \
-      config.attrs = nullptr;                                             \
-      cudaLaunchKernelEx(                                                 \
-          &config,                                                        \
-          per_token_group_quant_8bit_regs_kernel<T, DST_DTYPE, COL_MAJOR, \
-                                                 UE8M0>,                  \
-          static_cast<T*>(input.data_ptr()), output_q.data_ptr(),         \
-          static_cast<float*>(output_s.data_ptr()), num_groups,           \
-          (float)eps, (float)min_8bit, (float)max_8bit, scale_num_rows,   \
-          scale_stride);                                                  \
-    } while (0)
-#else
-  #define LAUNCH_REGS_KERNEL_INST(T, DST_DTYPE, COL_MAJOR, UE8M0)         \
-    do {                                                                  \
-      per_token_group_quant_8bit_regs_kernel<T, DST_DTYPE, COL_MAJOR,     \
-                                             UE8M0>                       \
-          <<<dim3(regs_num_blocks), dim3(regs_num_threads), 0, stream>>>( \
-              static_cast<T*>(input.data_ptr()), output_q.data_ptr(),     \
-              static_cast<float*>(output_s.data_ptr()), num_groups,       \
-              (float)eps, (float)min_8bit, (float)max_8bit,               \
-              scale_num_rows, scale_stride);                              \
-    } while (0)
-#endif
-
 #define LAUNCH_KERNEL(T, DST_DTYPE)                                     \
   do {                                                                  \
-     if (use_regs_kernel) {                                                  \
-      if (is_column_major) {                                                \
-        if (scale_ue8m0) {                                                  \
-          LAUNCH_REGS_KERNEL_INST(T, DST_DTYPE, true, true);                \
-        } else {                                                            \
-          LAUNCH_REGS_KERNEL_INST(T, DST_DTYPE, true, false);               \
-        }                                                                   \
-      } else {                                                              \
-        if (scale_ue8m0) {                                                  \
-          LAUNCH_REGS_KERNEL_INST(T, DST_DTYPE, false, true);               \
-        } else {                                                            \
-          LAUNCH_REGS_KERNEL_INST(T, DST_DTYPE, false, false);              \
-        }                                                                   \
-      }                                                                     \
-    } else {                                                              \
-      size_t smem_bytes =                                                 \
-          static_cast<size_t>(groups_per_block) * group_size * sizeof(T); \
-      if (is_column_major) {                                              \
-        if (scale_ue8m0) {                                                \
-          LAUNCH_KERNEL_INST(T, DST_DTYPE, true, true, smem_bytes);       \
-        } else {                                                          \
-          LAUNCH_KERNEL_INST(T, DST_DTYPE, true, false, smem_bytes);      \
-        }                                                                 \
-      } else {                                                            \
-        if (scale_ue8m0) {                                                \
-          LAUNCH_KERNEL_INST(T, DST_DTYPE, false, true, smem_bytes);      \
-        } else {                                                          \
-          LAUNCH_KERNEL_INST(T, DST_DTYPE, false, false, smem_bytes);     \
-        }                                                                 \
-      }                                                                   \
-  }\
+    size_t smem_bytes =                                                 \
+        static_cast<size_t>(groups_per_block) * group_size * sizeof(T); \
+    if (is_column_major) {                                              \
+      if (scale_ue8m0) {                                                \
+        LAUNCH_KERNEL_INST(T, DST_DTYPE, true, true, smem_bytes);       \
+      } else {                                                          \
+        LAUNCH_KERNEL_INST(T, DST_DTYPE, true, false, smem_bytes);      \
+      }                                                                 \
+    } else {                                                            \
+      if (scale_ue8m0) {                                                \
+        LAUNCH_KERNEL_INST(T, DST_DTYPE, false, true, smem_bytes);      \
+      } else {                                                          \
+        LAUNCH_KERNEL_INST(T, DST_DTYPE, false, false, smem_bytes);     \
+      }                                                                 \
+    }                                                                   \
   } while (0)
 
   VLLM_STABLE_DISPATCH_FLOATING_TYPES(
@@ -477,7 +282,6 @@ void per_token_group_quant_8bit(const torch::stable::Tensor& input,
 
 #undef LAUNCH_KERNEL
 #undef LAUNCH_KERNEL_INST
-#undef LAUNCH_REGS_KERNEL_INST
 }
 
 // Register-resident fast path for group_size==128.

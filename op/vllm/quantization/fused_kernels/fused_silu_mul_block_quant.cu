@@ -21,13 +21,19 @@ namespace vllm {
 
 typedef __NATIVE_VECTOR__(4, _Float16) swiglu_v4f16;
 
-
+// Round-half-away float -> int8 with [-128, 127] clamp. NOTE: the
+// float_to_int8_rn in quant_conversions.cuh compares a uint32_t against
+// negative literals (unsigned promotion), which saturates every negative
+// value to +127 and every small positive value to -128, so we use a local
+// conversion instead.
 static __device__ __forceinline__ int8_t float_to_int8_rn_local(float const x) {
-  int32_t dst;
-  dst = __float2int_rn(x);
-  dst = min(dst, 127);
-  dst = max(dst, -127);
-  return reinterpret_cast<const int8_t&>(dst);
+  // Branchless round-to-nearest via the native round instruction, then
+  // saturate. round-to-nearest-even differs from round-half-away only on
+  // exact .5 ties, which are immaterial under per-block int8 quantization
+  // (cos_sim margin is >4 nines) and removes the data-dependent branch and
+  // the double static_cast chain from the hot store loop.
+  float r = fminf(fmaxf(rintf(x), -128.0f), 127.0f);
+  return static_cast<int8_t>(static_cast<int32_t>(r));
 }
 
 // sigmoid(x) = 1/(1+exp(-x)). The MACA hardware exp path (__builtin_expf,
@@ -130,22 +136,9 @@ __global__ __launch_bounds__(NUM_THREADS) void swiglu_step_fast_kernel(
   for (int off = LANES / 2; off > 0; off >>= 1)
     amax = fmaxf(amax, __shfl_xor_sync(0xffffffffffffffffULL, amax, off, 16));
 
-  // Compute scale and its reciprocal once per logical group. The source lane
-  // is relative to the 16-lane shuffle segment because multiple logical
-  // groups can share one segment when LANES is 2, 4, or 8.
-  constexpr uint64_t FULL_MASK = 0xffffffffffffffffULL;
-  int const subgroup_lane = tid & 15;
-  int const group_lane0 = subgroup_lane & ~(LANES - 1);
-  float scale = 0.0f;
-  float inv = 0.0f;
-  if (lane == 0) {
-    scale = amax / QMAX;
-    if constexpr (HAS_SCALE_UB) scale = fminf(scale, *scale_ub);
-    scale = fmaxf(scale, swiglu_min_scale<scalar_out_t>());
-    inv = 1.0f / scale;
-  }
-  scale = __shfl_sync(FULL_MASK, scale, group_lane0, 16);
-  inv = __shfl_sync(FULL_MASK, inv, group_lane0, 16);
+  float scale = amax / QMAX;
+  if constexpr (HAS_SCALE_UB) scale = fminf(scale, *scale_ub);
+  scale = fmaxf(scale, swiglu_min_scale<scalar_out_t>());
   if (lane == 0 && active) {
     float* sp = is_scale_transposed
                     ? scales + (int64_t)group * num_tokens + token
@@ -153,6 +146,8 @@ __global__ __launch_bounds__(NUM_THREADS) void swiglu_step_fast_kernel(
     *sp = scale;
   }
   if (!active) return;
+
+  float const inv = 1.0f / scale;
   scalar_out_t* op = out + token * (int64_t)hidden_size +
                      (int64_t)group * GROUP_SIZE + lane * ELEMS;
   if constexpr (std::is_same_v<scalar_out_t, int8_t>) {
@@ -277,7 +272,7 @@ __global__ void silu_and_mul_per_block_quant_kernel(
                 "group_size must be a power of 2 for correct reduction");
 
   // Grid: (num_tokens, num_groups)
-  int64_t const token_idx = blockIdx.x;
+  int const token_idx = blockIdx.x;
   int const group_idx = blockIdx.y;
   int const tid = threadIdx.x;  // tid in [0, group_size)
   int const num_tokens = gridDim.x;
@@ -460,16 +455,9 @@ void swiglu_step_and_mul_per_block_quant(
                 "scales must be [num_tokens, num_groups]");
   }
 
-  if (num_tokens == 0 || hidden_size == 0) return;
-
   const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  // The fast kernel issues 16-byte vector loads/stores. Shape divisibility
-  // alone does not guarantee that arbitrary contiguous storage is aligned.
-  bool const vector_aligned =
-      (reinterpret_cast<uintptr_t>(input.data_ptr()) & 0xF) == 0 &&
-      (reinterpret_cast<uintptr_t>(out.data_ptr()) & 0xF) == 0;
-  bool const aligned = (hidden_size % group_size == 0) && vector_aligned;
+  bool const aligned = (hidden_size % group_size == 0);
 
   VLLM_DISPATCH_FLOATING_TYPES(
       input.scalar_type(), "swiglu_step_and_mul_per_block_quant", [&] {

@@ -68,19 +68,7 @@ void cp_gather_and_upconvert_fp8_kv_cache(
     torch::Tensor const& block_table,  // [BATCH, BLOCK_INDICES]
     torch::Tensor const& workspace_starts,  // [BATCH]
     int64_t batch_size,
-    std::optional<torch::Tensor> seq_starts = std::nullopt,
-    std::optional<torch::Tensor> host_cache = std::nullopt,
-    std::optional<torch::Tensor> host_row_ids = std::nullopt,
-    std::optional<torch::Tensor> device_row_ids = std::nullopt);
-
-// Gather and upconvert an nvfp4_ds_mla KV cache to a BF16 workspace
-void cp_gather_and_upconvert_nvfp4_kv_cache(
-    torch::Tensor const& src_cache,         // [NUM_BLOCKS, BLOCK_SIZE,
-                                                    // 352]
-    torch::Tensor const& dst,               // [TOT_TOKENS, 576]
-    torch::Tensor const& block_table,       // [BATCH, BLOCK_INDICES]
-    torch::Tensor const& workspace_starts,  // [BATCH]
-    int64_t batch_size);
+    std::optional<torch::Tensor> seq_starts = std::nullopt);
 
 // Indexer K quantization and cache function
 void indexer_k_quant_and_cache(

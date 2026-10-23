@@ -873,7 +873,6 @@ void fast_topk_transform_interface(
           params.input, params.lengths, params.input_stride, dst_page_table.data_ptr<int32_t>(),
           src_page_table.data_ptr<int32_t>(), src_stride, static_cast<uint32_t>(B), stream);
     }
-
   } else {
     // Device-adaptive: GPUs with > 96KB optin smem run the 24KB HIGH scheme; GPUs
     // with <= 64KB smem run the 16KB LOW scheme. Both templates are instantiated.

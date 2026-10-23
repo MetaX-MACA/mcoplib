@@ -61,9 +61,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   m.def("sparse_attention_clear_cache() -> ()", &sparse_attention_clear_cache);
 
-  m.def("chunk_kda_fwd_intra_token_parallel(Tensor q, Tensor k, Tensor g, Tensor beta, Tensor(a!) aqk, Tensor(b!) akk, float scale) -> ()");
-  m.impl("chunk_kda_fwd_intra_token_parallel", torch::kCUDA, &chunk_kda_fwd_intra_token_parallel);
-
   /*
    * From csrc/elementwise
    */
@@ -72,11 +69,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   m.def("fused_add_rmsnorm(Tensor! input, Tensor! residual, Tensor weight, float eps, bool enable_pdl) -> ()");
   m.impl("fused_add_rmsnorm", torch::kCUDA, &sgl_fused_add_rmsnorm);
-
-
-  m.def("fused_hc_head(Tensor! output, Tensor x, Tensor hc_fn, Tensor hc_scale, "
-      "Tensor hc_base, float norm_eps, float hc_eps) -> ()");
-  m.impl("fused_hc_head", torch::kCUDA, &sgl_fused_hc_head);
 
 //   m.def("gemma_rmsnorm(Tensor! output, Tensor input, Tensor weight, float eps, bool enable_pdl) -> ()");
 //   m.impl("gemma_rmsnorm", torch::kCUDA, &gemma_rmsnorm);
@@ -762,13 +754,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "float downscale_freq_shift,"
       "float scale,"
       "int max_period) -> Tensor");
-  m.impl("timestep_embedding", torch::kCUDA, &timestep_embedding);
-
-  m.def(
-    "silu_and_mul_clamp_check(Tensor input,"
-    "Tensor output,"
-    "float swiglu_limit) -> ()");
-  m.impl("silu_and_mul_clamp_check", torch::kCUDA, &silu_and_mul_clamp_check);
+  m.impl("timestep_embedding", torch::kCUDA, &timestep_embedding);  
 }
 
 REGISTER_EXTENSION(common_ops)

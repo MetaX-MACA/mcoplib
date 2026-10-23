@@ -68,12 +68,12 @@ def reference(
     up = x[:, hidden:]
 
     y = torch.nn.functional.silu(gate) * up
+
     # Match the kernel: when swiglu_limit is provided, the SiLU(gate)*up output
     # is symmetrically clamped to [-swiglu_limit, +swiglu_limit] BEFORE the
     # per-group absmax reduction and quantization.
     if swiglu_limit is not None:
         y = torch.clamp(y, -swiglu_limit, swiglu_limit)
-
     grouped = y.view(tokens, groups, GROUP_SIZE)
     amax = grouped.abs().amax(dim=-1)
 
@@ -156,7 +156,6 @@ def check_functional_case(
     input_tensor = make_input(input_shape, input_dtype)
     out = torch.empty((*shape_prefix, hidden), device="cuda", dtype=quant_dtype)
     scales = torch.empty((tokens, groups), device="cuda", dtype=torch.float32)
-
     # When swiglu_limit is None, the C++ kernel skips the clamp entirely
     # (use_limit=false, kHasLimit=false). The reference must match this.
     ref_limit = swiglu_limit
@@ -165,6 +164,7 @@ def check_functional_case(
     )
 
     call_op(out, scales, input_tensor, swiglu_limit=swiglu_limit)
+
     torch.cuda.synchronize()
 
     torch.testing.assert_close(
@@ -227,6 +227,7 @@ def valid_tensors(
 
 def run_shape_checks() -> None:
     out, scales, input_tensor = valid_tensors()
+
     call_op(out, scales, input_tensor, swiglu_limit=None)
     torch.cuda.synchronize()
     print("PASS shape_check valid")

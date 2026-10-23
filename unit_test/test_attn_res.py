@@ -10,7 +10,6 @@ import mcoplib._C
 HIDDEN_SIZE = 7168
 MAX_BLOCKS = 8
 EPS = 1e-5
-BLOCK_WRITE_IDX = 0
 
 C500_THEORETICAL_BW_GBPS = 1550.0
 
@@ -20,7 +19,7 @@ def randn(*shape):
 
 
 def reference(prefix, delta, blocks, norm_weight, qk_weight, output_norm_weight, num_blocks):
-    if delta is not None:
+    if delta.numel() != 0:
         prefix = prefix + delta
 
     values = torch.cat([blocks[:, :num_blocks], prefix.unsqueeze(1)], dim=1)
@@ -31,7 +30,7 @@ def reference(prefix, delta, blocks, norm_weight, qk_weight, output_norm_weight,
 
     output = torch.matmul(probs.unsqueeze(1), values).squeeze(1)
 
-    if output_norm_weight is not None:
+    if output_norm_weight.numel() != 0:
         output = F.rms_norm(output, (HIDDEN_SIZE,), output_norm_weight, EPS)
 
     return output
@@ -45,20 +44,20 @@ def _bytes_per_token(num_blocks, has_delta):
     return read_bytes + write_bytes
 
 
-def _measure_kernel(prefix, delta, blocks, norm_weight, qk_weight, output_norm_weight, output, num_blocks, block_write_idx, iters=100, warmup=10):
+def _measure_kernel(prefix, delta, blocks, norm_weight, qk_weight, output_norm_weight, output, num_blocks, iters=100, warmup=10):
     stream = torch.cuda.current_stream()
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
 
     for _ in range(warmup):
-        torch.ops._C.kimi_k3_attn_res(prefix, delta, blocks, norm_weight, qk_weight, output_norm_weight, output, num_blocks, block_write_idx, EPS, EPS)
+        torch.ops._C.kimi_k3_attn_res(prefix, delta, blocks, norm_weight, qk_weight, output_norm_weight, output, num_blocks, EPS, EPS)
 
     stream.synchronize()
 
     start.record(stream)
 
     for _ in range(iters):
-        torch.ops._C.kimi_k3_attn_res(prefix, delta, blocks, norm_weight, qk_weight, output_norm_weight, output, num_blocks, block_write_idx, EPS, EPS)
+        torch.ops._C.kimi_k3_attn_res(prefix, delta, blocks, norm_weight, qk_weight, output_norm_weight, output, num_blocks, EPS, EPS)
 
     end.record(stream)
     stream.synchronize()
@@ -115,7 +114,7 @@ def test_kimi_k3_attn_res(num_tokens, num_blocks, has_delta):
     if has_delta:
         delta = randn(num_tokens, HIDDEN_SIZE).contiguous()
     else:
-        delta = None
+        delta = torch.empty(0, HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16)
 
     blocks = randn(num_tokens, MAX_BLOCKS, HIDDEN_SIZE).contiguous()
 
@@ -129,7 +128,7 @@ def test_kimi_k3_attn_res(num_tokens, num_blocks, has_delta):
 
     output = torch.empty(num_tokens, HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16)
 
-    torch.ops._C.kimi_k3_attn_res(prefix, delta, blocks, norm_weight, qk_weight, output_norm_weight, output, num_blocks, BLOCK_WRITE_IDX, EPS, EPS)
+    torch.ops._C.kimi_k3_attn_res(prefix, delta, blocks, norm_weight, qk_weight, output_norm_weight, output, num_blocks, EPS, EPS)
 
     torch.testing.assert_close(output, expected, atol=8e-2, rtol=3e-2)
 
@@ -141,7 +140,7 @@ def test_kimi_k3_attn_res(num_tokens, num_blocks, has_delta):
 
     assert output.is_contiguous()
 
-    avg_ms = _measure_kernel(prefix, delta, blocks, norm_weight, qk_weight, output_norm_weight, output, num_blocks, BLOCK_WRITE_IDX)
+    avg_ms = _measure_kernel(prefix, delta, blocks, norm_weight, qk_weight, output_norm_weight, output, num_blocks)
 
     _print_benchmark(num_tokens, num_blocks, has_delta, avg_ms)
 
@@ -150,7 +149,7 @@ def test_kimi_k3_attn_res(num_tokens, num_blocks, has_delta):
 def test_kimi_k3_attn_res_block_counts(num_blocks):
     prefix = randn(1, HIDDEN_SIZE).contiguous()
 
-    delta = None
+    delta = torch.empty(0, HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16)
 
     blocks = randn(1, MAX_BLOCKS, HIDDEN_SIZE).contiguous()
 
@@ -164,7 +163,7 @@ def test_kimi_k3_attn_res_block_counts(num_blocks):
 
     output = torch.empty(1, HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16)
 
-    torch.ops._C.kimi_k3_attn_res(prefix, delta, blocks, norm_weight, qk_weight, output_norm_weight, output, num_blocks, BLOCK_WRITE_IDX, EPS, EPS)
+    torch.ops._C.kimi_k3_attn_res(prefix, delta, blocks, norm_weight, qk_weight, output_norm_weight, output, num_blocks, EPS, EPS)
 
     torch.testing.assert_close(output, expected, atol=8e-2, rtol=3e-2)
 

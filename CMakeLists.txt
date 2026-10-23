@@ -256,9 +256,6 @@ if (BUILD_VLLM_SUBMODULE)
     "${VLLM_SRC_DIR}/attention/dcp_utils/dcp_direct_a2a_lse_reduce.cu"
     "${VLLM_SRC_DIR}/attention/dcp_utils/dcp_direct_kv_gather.cu"
     "${VLLM_SRC_DIR}/attention/dcp_utils/dcp_direct_q_gather.cu"
-    "${VLLM_SRC_DIR}/vocab_parallel_embedding_kernels.cu"
-    "${VLLM_SRC_DIR}/hisparse_kernels.cu"
-    "${VLLM_SRC_DIR}/nvfp4_ds_mla_cache_kernels.cu"
     "${VLLM_SRC_DIR}/torch_bindings.cpp")
     
 
@@ -438,7 +435,6 @@ if (BUILD_DEFAULT_OP_SUBMODULE)
       "${MCOPLIB_SRCS_DIR}/fused_softplus_sqrt.cu"
       "${MCOPLIB_SRCS_DIR}/moe_swiglu_dq.cu"
       "${MCOPLIB_SRCS_DIR}/moe_softmax_topk.cu"
-      "${MCOPLIB_SRCS_DIR}/chunk_gated_delta_rule_fwd_h_native.cu"
       "${MCOPLIB_SRCS_DIR}/all_reduce.cu"
       "${MCOPLIB_SRCS_DIR}/rotary_embedding.cu"
       "${MCOPLIB_SRCS_DIR}/moe_gather.cu"
@@ -462,12 +458,9 @@ if (BUILD_DEFAULT_OP_SUBMODULE)
       "${MCOPLIB_SRCS_DIR}/fused_split_qkv_gemma_rmsnorm_rope_no_pack.cu"
       "${MCOPLIB_SRCS_DIR}/moe_step4_weighted_topk_gather.cu"
       "${MCOPLIB_SRCS_DIR}/fused_masked_situ_quant_int8_pack.cu"
-      "${MCOPLIB_SRCS_DIR}/per_token_quant_int8.cu"
-      "${MCOPLIB_SRCS_DIR}/router_bias_topk.cu"
-      "${MCOPLIB_SRCS_DIR}/silu_mul_clamp_dsv4.cu")
+      "${MCOPLIB_SRCS_DIR}/per_token_quant_int8.cu")
   list(APPEND MCOPLIB_EXT_SRC
-      "${MCOPLIB_SRCS_DIR}/mhc_pre_big_fuse.cu"
-      "${MCOPLIB_SRCS_DIR}/mhc_post_cuda.cu")
+      "${MCOPLIB_SRCS_DIR}/mhc_pre_big_fuse.cu")
 
   if (GLOBAL_ENABLE_BUILD_GPTQ_MARLIN)
       list(APPEND MCOPLIB_EXT_SRC
@@ -509,13 +502,11 @@ if (BUILD_SGLANG_SUBMODULE)
       "${SGLANG_KERNELS_SRCS_DIR}/csrc/allreduce/custom_all_reduce.cu"
       #"${SGLANG_KERNELS_SRCS_DIR}/csrc/attention/cascade.cu"
       "${SGLANG_KERNELS_SRCS_DIR}/csrc/attention/merge_attn_states.cu"
-      "${SGLANG_KERNELS_SRCS_DIR}/csrc/attention/chunk_kda_fwd_intra_token_parallel.cu"
       "${SGLANG_KERNELS_SRCS_DIR}/csrc/attention/vertical_slash_index.cu"
       "${SGLANG_KERNELS_SRCS_DIR}/csrc/attention/fused_mla.cu"
       "${SGLANG_KERNELS_SRCS_DIR}/csrc/attention/sparse_attention.cu"
       "${SGLANG_KERNELS_SRCS_DIR}/csrc/elementwise/activation.cu"
       "${SGLANG_KERNELS_SRCS_DIR}/csrc/elementwise/fused_add_rms_norm_kernel.cu"
-      "${SGLANG_KERNELS_SRCS_DIR}/csrc/elementwise/fused_hc_head.cu"
       "${SGLANG_KERNELS_SRCS_DIR}/csrc/elementwise/rope.cu"
       "${SGLANG_KERNELS_SRCS_DIR}/csrc/elementwise/pos_enc.cu"
       "${SGLANG_KERNELS_SRCS_DIR}/csrc/elementwise/topk.cu"
@@ -555,8 +546,7 @@ if (BUILD_SGLANG_SUBMODULE)
       "${SGLANG_KERNELS_SRCS_DIR}/csrc/moe/kimi_k2_moe_fused_gate.cu"
       "${SGLANG_KERNELS_SRCS_DIR}/csrc/moe/fused_qknorm_rope_kernel.cu"
       "${SGLANG_KERNELS_SRCS_DIR}/csrc/moe/moe_topk_sigmoid_kernels.cu"
-      "${SGLANG_KERNELS_SRCS_DIR}/csrc/mamba/causal_conv1d.cu"
-      "${SGLANG_KERNELS_SRCS_DIR}/jit_kernels/silu_and_mul_masked_post_quant.cu")
+      "${SGLANG_KERNELS_SRCS_DIR}/csrc/mamba/causal_conv1d.cu")
 
   set_gencode_flags_for_srcs(
     SRCS "${MCOPLIB_SGLANG_KERNEL_SRC}"

@@ -160,8 +160,8 @@ def reference(q, k, v, g, beta, scale, fuse_recompute, fuse_diagonal, use_safe_g
 
     if fuse_recompute:
         out["u"] = _unchunkify(Ainv @ (vc * bc[..., None]))
-        out["w"] = _unchunkify(Ainv @ (kc * bc[..., None] * torch.exp2(gc)))
-        out["kg"] = _unchunkify(kc * torch.exp2(gc[..., -1:, :] - gc))
+        out["w"] = _unchunkify(Ainv @ (kc * bc[..., None] * torch.exp(gc)))
+        out["kg"] = _unchunkify(kc * torch.exp(gc[..., -1:, :] - gc))
     return out
 
 
@@ -373,8 +373,8 @@ def torch_baseline(x, scale, fuse_recompute):
     Ainv = torch.linalg.solve_triangular(eye - M, eye.expand_as(M), upper=False)
     if fuse_recompute:
         _ = Ainv @ (vc * bc[..., None])
-        _ = Ainv @ (kc * bc[..., None] * torch.exp2(gc))
-        _ = kc * torch.exp2(gc[..., -1:, :] - gc)
+        _ = Ainv @ (kc * bc[..., None] * torch.exp(gc))
+        _ = kc * torch.exp(gc[..., -1:, :] - gc)
     return Aqk, Ainv
 
 
@@ -384,37 +384,28 @@ def run_perf(args):
     print(header)
     print("-" * len(header))
     scale = K ** -0.5
-    combos = [
-            # (fuse_recompute, fuse_diagonal, safe_gate)
-            (False, False, False),
-            (False, False, True),   # Akkd 为"已求逆"的对角块
-            (True,  True,  False),
-            (False, True,  False),
-        ]
-    for (fr, fd, sg) in combos:
-        print(fr,fd,sg)
-        for tp, tokens in itertools.product([8, 4], [2048, 3072, 4096, 8192, 16384]):
-            H = 96 // tp
-            B, T = args.batch, tokens
-            x = make_inputs(B, T, H, args.varlen, fd)
-            run = build_runner(B, T, H, x, sg,
-                            fr, fd)
-            run()  # warmup + autotune
-            torch.cuda.synchronize()
+    for tp, tokens in itertools.product([8, 4], [2048, 4096, 8192, 16384]):
+        H = 96 // tp
+        B, T = args.batch, tokens
+        x = make_inputs(B, T, H, args.varlen, args.fuse_diagonal)
+        run = build_runner(B, T, H, x, args.safe_gate,
+                           args.fuse_recompute, args.fuse_diagonal)
+        run()  # warmup + autotune
+        torch.cuda.synchronize()
 
-            ms = triton.testing.do_bench(run, warmup=10, rep=50, quantiles=None)
-            base_ms = triton.testing.do_bench(
-                lambda: torch_baseline(x, scale, fr),
-                warmup=3, rep=10, quantiles=None,
-            )
+        ms = triton.testing.do_bench(run, warmup=10, rep=50, quantiles=None)
+        base_ms = triton.testing.do_bench(
+            lambda: torch_baseline(x, scale, args.fuse_recompute),
+            warmup=3, rep=10, quantiles=None,
+        )
 
-            fl = kernel_flops(B, T, H, fr, fd)
-            by = kernel_bytes(B, T, H, fr)
-            print(f"{'TP'+str(tp):>4} {H:>4} {tokens:>7} {x['NT']:>5} "
-                f"{ms:>9.4f} {fl/(ms*1e-3)/1e12:>9.2f} {by/(ms*1e-3)/1e9:>8.1f} ")
+        fl = kernel_flops(B, T, H, args.fuse_recompute, args.fuse_diagonal)
+        by = kernel_bytes(B, T, H, args.fuse_recompute)
+        print(f"{'TP'+str(tp):>4} {H:>4} {tokens:>7} {x['NT']:>5} "
+              f"{ms:>9.4f} {fl/(ms*1e-3)/1e12:>9.2f} {by/(ms*1e-3)/1e9:>8.1f} ")
 
-            del x, run
-            torch.cuda.empty_cache()
+        del x, run
+        torch.cuda.empty_cache()
 
 
 # --------------------------------------------------------------------------- #

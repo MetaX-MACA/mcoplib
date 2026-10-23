@@ -176,10 +176,34 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _call_fused(q_in, q_head_padded, kv, k_cache, slot_mapping, positions, cos_sin_cache, eps, bs, apply_q_norm=None, kv_mxfp8=False):
+def _call_fused(
+    q_in,
+    q_head_padded,
+    kv,
+    k_cache,
+    slot_mapping,
+    positions,
+    cos_sin_cache,
+    eps,
+    bs,
+    apply_q_norm=None,
+):
+    args = (
+        q_in,
+        kv,
+        k_cache,
+        slot_mapping,
+        positions,
+        cos_sin_cache,
+        q_head_padded,
+        eps,
+        bs,
+    )
     if apply_q_norm is None:
-        apply_q_norm = True
-    return torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(q_in, kv, k_cache, slot_mapping, positions, cos_sin_cache, q_head_padded, eps, bs, apply_q_norm, kv_mxfp8)
+        return torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(*args)
+    return torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+        *args, apply_q_norm
+    )
 
 
 def _as_stored_fp8(t: torch.Tensor) -> torch.Tensor:
