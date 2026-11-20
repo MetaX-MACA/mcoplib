@@ -6,6 +6,6 @@
     "qk_head_dim": [128],
     "v_head_dim": [128],
     "dtype": ["bfloat16"],
-    "eps": [1e-5],
-    "samples": 1000
+    "eps": [1e-05],
+    "samples": 100
 }

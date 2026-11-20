@@ -58,6 +58,8 @@ SUPPORTED_OPERATORS = [
     "fused_add_rmsnorm",
     "fused_bias_dropout",
     "fused_mla_absorb_rotary_emb",
+    "fused_mla_RMS_rotary_emb",
+    "fused_mla_normal_kv_element_wise",
     "fused_moe_gate_deepseek",
     "fused_moe_gate_opt",
     "fused_rope_fwd",
@@ -172,7 +174,16 @@ SUPPORTED_OPERATORS = [
     "fused_gdn_decode_post_conv_mtp",
     "cp_gather_and_upconvert_fp8_kv_cache",
     "dsv3_fused_a_gemm",
-    "fused_deepseek_v4_qnorm_rope_kv_rope_int8_insert"
+    "fused_deepseek_v4_qnorm_rope_kv_rope_int8_insert",
+    "situ_and_mul_quant",
+    "vocab_parallel_embedding",
+    "masked_moe_activation",
+    "hisparse_gather_compact",
+    "hisparse_gather_plan",
+    "hisparse_resolve_residency",
+    "hisparse_invalidate_written_slots",
+    "moe_prepare_scatter",
+    "fused_deepseek_v4_kv_rope_insert"
 ]
 # =============================================================================
 #  Global Config: Ignored Operators
@@ -406,9 +417,7 @@ def create_benchmark_wrapper(op_instance):
             print(f" (Failed: {e})", end="")
 
         # 3. Sample Configuration
-        raw_samples = op_instance.config.get("samples", 100)
-        target_samples = max(1, raw_samples - 16) 
-        state.set_min_samples(target_samples)
+        state.set_min_samples(op_instance.config.get("samples", 100))
         op_instance.define_metrics(state)
         
         tc_s = torch.cuda.ExternalStream(
@@ -637,7 +646,7 @@ def perform_smart_update(temp_csv_path, target_csv_path):
     print("-" * 80 + f"\n[SUMMARY] Updated: {updated_cnt}, Kept: {kept_cnt}\n" + "=" * 80 + "\n")
 
 def perform_generate(temp_csv_path, target_csv_path):
-    print("\n" + "="*80 +f"\n{' Generate Mode (Fill Missing) ':^80}\n" + "="*80)
+    print("\n" + "="*80 + f"\n{' Generate Mode (Fill Missing) ':^80}\n" + "="*80)
     raw_h, raw_r = load_csv_data(temp_csv_path)
     new_h, new_r = preprocess_data(raw_h, raw_r)
     if not new_r: return
@@ -646,49 +655,58 @@ def perform_generate(temp_csv_path, target_csv_path):
         old_raw_h, old_raw_r = load_csv_data(target_csv_path)
         old_h, old_r = preprocess_data(old_raw_h, old_raw_r)
     else:
+        old_raw_h, old_raw_r = [], []
         old_h, old_r = [], []
 
     combined_header = list(old_h)
-    if not combined_header: combined_header = list(new_h)
+    if not combined_header:
+        combined_header = list(new_h)
     else:
         for col in new_h:
-            if col not in combined_header: combined_header.append(col)
+            if col not in combined_header:
+                combined_header.append(col)
 
     if "op_name" in combined_header:
         combined_header.remove("op_name")
         combined_header.insert(0, "op_name")
 
-    history_map = {get_row_key(r, combined_header): idx for idx, r in enumerate(old_r)}
-
-    final_rows = list(old_r)
     rows_to_append = []
     append_cnt = 0
     skip_cnt = 0
 
     for new_row in new_r:
         for col in combined_header:
-            if col not in new_row: new_row[col] = ""
-
-        key = get_row_key(new_row, combined_header)
-        match_idx = history_map.get(key, -1)
+            if col not in new_row:
+                new_row[col] = ""
 
         d_type = new_row.get("dtype", "")
         op_str = get_op_display_name(new_row)
-        if d_type: op_str += f" [{d_type}]"
+        if d_type:
+            op_str += f" [{d_type}]"
 
-        if match_idx >= 0:
-            print(f"[SKIP]   {op_str:<35} (Exists)")
-            skip_cnt += 1
-        else:
-            rows_to_append.append(new_row)
-            print(f"[APPEND] {op_str:<35}")
-            append_cnt += 1
+        rows_to_append.append(new_row)
+        print(f"[APPEND] {op_str:<35}")
+        append_cnt += 1
 
-    final_rows.extend(rows_to_append)
     if append_cnt > 0:
-        _write_csv(target_csv_path, combined_header, final_rows)
+        if os.path.exists(target_csv_path) and os.path.getsize(target_csv_path) > 0:
+            # 已有文件：仅追加新数据，不重写历史内容
+            append_header = old_raw_h
+
+            with open(target_csv_path, "a", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=append_header, extrasaction="ignore")
+                for row in rows_to_append:
+                    disk_row = dict(row)
+                    if "Benchmark" in append_header and "op_name" in disk_row:
+                        disk_row["Benchmark"] = disk_row.pop("op_name")
+                    writer.writerow(disk_row)
+        else:
+            # 文件不存在或为空：创建文件并写入表头和新增数据
+            _write_csv(target_csv_path, combined_header, rows_to_append)
+
     else:
         print("[INFO] No new data to write.")
+
     print("-" * 80 + f"\n[SUMMARY] Appended: {append_cnt}, Skipped: {skip_cnt}\n" + "=" * 80 + "\n")
 
 def perform_comparison(cur_raw, hist_raw, output_csv=None):
@@ -1007,7 +1025,15 @@ if __name__ == "__main__":
             print(f"[CONFIG {cfg_idx+1}/{len(expanded_configs)}] {shape_info}")
             print(f"{'='*60}")
 
-        bench.register(create_benchmark_wrapper(op_instance)).set_name(op_instance.name)
+        samples = single_config.get("samples", 100)
+        if type(samples) is not int or not 1 <= samples <= (1 << 63) - 1:
+            raise ValueError(f"samples must be a positive int64, got {samples!r}")
+        (
+            bench.register(create_benchmark_wrapper(op_instance))
+            .set_name(op_instance.name)
+            .set_stopping_criterion("fixed-samples")
+            .set_criterion_param_int64("max-samples", samples)
+        )
 
     # 7. Prepare Temp File
     need_temp_csv = active_mode
@@ -1039,7 +1065,6 @@ if __name__ == "__main__":
         if temp_csv:
             run_args.extend(["--csv", temp_csv])
 
-        run_args.extend(["--min-time", "1.5"])
         run_args.extend(["--timeout", "600"])
         run_args.extend(["--throttle-threshold", "0"])
         run_args.extend(unknown)

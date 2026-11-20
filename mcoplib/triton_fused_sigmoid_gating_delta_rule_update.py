@@ -4,6 +4,8 @@ import torch
 import triton
 import triton.language as tl
 
+from . import triton_fused_sigmoid_gating_delta_rule_update_xcore1000 as _xcore1000
+
 
 @triton.jit(do_not_specialize=["T"])
 def fused_sigmoid_gating_delta_rule_update_kernel(
@@ -1081,7 +1083,8 @@ def _fused_sigmoid_gating_delta_rule_update_with_strategy(
     ):
         raise ValueError(f"unsupported internal strategy: {strategy!r}")
 
-    if strategy == "auto":
+    auto_strategy = strategy == "auto"
+    if auto_strategy:
         strategy = _select_execution_strategy(
             num_sequences=N,
             value_heads=HV,
@@ -1137,6 +1140,45 @@ def _fused_sigmoid_gating_delta_rule_update_with_strategy(
                     strategy = "dual_opt_norms"
                 else:
                     strategy = "dual_opt_norms_dims"
+    # Measured C500 decode configurations. Keep the C600 strategy hierarchy
+    # for other architectures and contracts, including target verification.
+    use_c500_decode_bv16 = (
+        auto_strategy
+        and B == 1 and T == N and K == V == 128
+        and is_kda and use_qk_l2norm_in_kernel
+        and lower_bound == -5.0
+        and softplus_beta == 1.0 and softplus_threshold == 20.0
+        and not disable_state_update
+        and intermediate_states_buffer is None
+        and retrieve_parent_token is None and not cache_ring
+        and initial_state_source is not None
+        and initial_state_indices is not None and cu_seqlens is not None
+        and initial_state_source.dtype == torch.float32
+        and q.dtype == k.dtype == v.dtype == torch.bfloat16
+        and (
+            (
+                T == 8 and H == HV == 8
+                and initial_state_source.shape == (307, 8, 128, 128)
+                and stride_q == stride_k == stride_v == 3072
+                and stride_a == 1024 and stride_b == 8
+            )
+            or (
+                H == HV == 64 and T in (1, 2, 4, 8)
+                and initial_state_source.shape in (
+                    (9, 64, 128, 128), (64, 64, 128, 128)
+                )
+                and stride_q == stride_k == stride_v == (
+                    8192 if T == 1 else 24576
+                )
+                and stride_a == 8192 and stride_b == 64
+            )
+        )
+        and q.device.type == "cuda"
+        and _xcore1000.is_supported_xcore(q.device.index)
+    )
+    if use_c500_decode_bv16:
+        strategy = "dual_opt" if H == 64 and T == 8 else "single_opt"
+
     flexible_dims = strategy in (
         "dual_opt_norms_dims",
         "dual_opt_norms_dims_bv32",
@@ -1265,6 +1307,13 @@ def _fused_sigmoid_gating_delta_rule_update_with_strategy(
             "Q/K norm precompute requires KDA normalization and HV divisible by H"
         )
 
+    use_xcore_workspace = (
+        auto_strategy
+        and (use_n1_static6_recurrent or use_n2_static6_recurrent)
+        and lower_bound == -5.0
+        and _xcore1000.is_supported_xcore(q.device.index)
+    )
+
     if use_fast_path:
         if strategy in (
             "dual_opt_norms_dims_bv32",
@@ -1279,6 +1328,9 @@ def _fused_sigmoid_gating_delta_rule_update_with_strategy(
             opt_num_warps = (
                 8 if use_static_six and opt_bv == 128 else (4 if opt_bv == 128 else 2)
             )
+        if use_c500_decode_bv16:
+            opt_bv = 16
+            opt_num_warps = 1
         # 实测表明 N*HV<104 时额外 kernel launch/中间张量流量得不偿失；
         # 大规模时将非线性门计算移出串行递推更快。
         # Gate/beta are independent across tokens.  Materialize them once so
@@ -1297,6 +1349,29 @@ def _fused_sigmoid_gating_delta_rule_update_with_strategy(
                 device=q.device,
                 dtype=torch.float32,
             )
+            if use_xcore_workspace:
+                precompute_base, recurrent_base = _xcore1000.workspace_base_kernels(
+                    sigmoid_gating_precompute_kernel,
+                    fused_sigmoid_gating_delta_rule_update_kernel_n1_static6,
+                    _xcore1000.glm53_flash_n2_recurrent_kernel,
+                )
+                precompute_base[(all_tokens, HV)](
+                    A_log=A_log, a=a, dt_bias=dt_bias, b=b, q=q, k=k,
+                    workspace=workspace, lower_bound=lower_bound,
+                    stride_a=stride_a, stride_b=stride_b,
+                    stride_q=stride_q, stride_k=stride_k, TOKENS=all_tokens,
+                    num_warps=1, num_stages=1,
+                )
+                recurrent_base[(N * HV, 8 if use_n1_static6_recurrent else 4)](
+                    workspace=workspace, q=q, k=k, v=v, o=o,
+                    h0_source=initial_state_source, h0_indices=initial_state_indices,
+                    cu_seqlens=cu_seqlens, stride_h0_source=initial_state_source.stride(0),
+                    intermediate_states_buffer=intermediate_states_buffer,
+                    intermediate_state_indices=intermediate_state_indices,
+                    scale=scale, stride_q=stride_q, stride_k=stride_k, stride_v=stride_v,
+                    TOKENS=all_tokens, num_warps=4, num_stages=1,
+                )
+                return o.squeeze(0)
             workspace_offset = 0
             gate_decay = workspace[
                 workspace_offset : workspace_offset + gate_numel

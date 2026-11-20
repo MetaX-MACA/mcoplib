@@ -2,8 +2,8 @@
     "device_id": 0,
     "device_name": ["MetaX C500", "MetaX C600-UL", "Metax C600-U"],
     "rank": 0,
-    "world_size": 2,
+    "world_size": [2, 4, 8],
     "full_nvlink": true,
-    "rank_data_size": 8388608,
+    "rank_data_size": [1048576, 8388608, 33554432, 134217728],
     "samples": 100
 }

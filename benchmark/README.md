@@ -155,8 +155,30 @@ python mcoplib_mxbenchmark_ops.py --op rms_norm --compare --csv statistics/mcopl
 1. 解析参数 → 校验 `--op` 是否在 `SUPPORTED_OPERATORS` 白名单中。
 2. 从 `config/<op>.json` 加载配置，从 `runners/mcoplib_mxbenchmark_<op>_runners.py` 加载 runner 类。
 3. 调用 `runner.run_verification()` 做精度校验（与参考实现对比余弦相似度）。**校验失败会调用 `os._exit(0)` 终止进程**，此时 stdout 缓冲可能未刷新。
-4. 校验通过后，注册到 nvbench 执行性能采样（warmup 10 次 + 采样 N 次，N 由 config 的 `samples` 字段决定）。
+4. 每组展开配置以 `fixed-samples` 准则注册到 nvbench；校验通过后执行 10 次手动 warmup，再执行 nvbench warmup 和性能采样。`samples=N` 控制正式记录的 Cold 采样数及异步 Batch 执行数，均为 N；校验与 warmup 不计入这两列。
 5. 采样完成后，按模式做后处理：`--generate` 调 `perform_generate`，`--update` 调 `perform_smart_update`，`--compare` 调 `perform_comparison`。
+
+## 固定采样数
+
+- `config/<op>.json` 的 `samples` 必须为正整数（int64），缺省为 100；每个 shape/dtype 组合独立采样。
+- 默认 GPU 异步执行时，Cold 和 Batch 的 `Samples` 均严格为 N；不再使用 `samples - 16`，也不再强制追加 `--min-time 1.5`。
+- `fixed-samples` 模式不因时间或噪声目标追加采样；`min-time` 参数仅保留兼容性，在该模式中忽略。样本少时噪声可能增大，N<5 时现有统计实现会显示无限 Noise，这不表示采样计数错误。
+- `_force_sync` runner 保留原执行方式，只产生 Cold；CPU-only 不属于本次精确 Cold/Batch 支持范围。
+- 转发的 nvbench CLI 参数仍可覆盖注册配置。手动切换 `--stopping-criterion` 将重置该准则参数；如需覆盖固定次数，应使用 `--stopping-criterion fixed-samples --max-samples N`（顺序不可颠倒）。
+- mxbench 的默认 `stdrel`、`entropy` 路径保持原行为；仅本入口显式选择 `fixed-samples`。固定模式未达目标即超时时报错，不将不足 N 的结果当作完整采样。
+
+### mxbench 依赖补丁与重建
+
+本功能需要更新 native 库和 Python 扩展，不能只替换 `libnvbench.so`。Batch 循环是头文件模板，必须重新编译 `_nvbench*.so`。
+
+`.deps/mxbench` 不在主仓库跟踪范围内，配套源码补丁保存在 `benchmark/patches/mxbench_fixed_samples.patch`。新依赖 checkout 可在仓库根目录先检查、再应用；已经应用时不要重复应用：
+
+```bash
+git -C .deps/mxbench apply --check "$PWD/benchmark/patches/mxbench_fixed_samples.patch"
+git -C .deps/mxbench apply "$PWD/benchmark/patches/mxbench_fixed_samples.patch"
+```
+
+按上面的环境准备步骤先 `source env.sh` 并使用 `/opt/conda/bin` Python，再通过本地 `build_env_local.sh` 重建两部分；安装 Python wheel 时若版本号未变化，需 `pip install --force-reinstall --no-deps <新wheel>`。不要使用 `.deps/mxbench/rebuild.sh`，其路径硬编码为其他 checkout。重建后检查 `cuda.bench._nvbench.__file__` 和 `ldd`，确保实际加载的是配套的新库与扩展。
 
 ## 输出说明
 - `[VERIFY] <op> -> PASS/FAIL (1-CosSim: <diff>)`：精度验证结果。

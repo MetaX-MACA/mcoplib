@@ -51,6 +51,17 @@ if device == "maca":
 device_torch_lib = getattr(torch, device)
 device_platform = _check_platform()
 
+# MetaX capability 80 corresponds to the xcore1000/xcore1008 generation
+# (C500 family). Keep the C500-specific launch configuration isolated
+# from newer MetaX architectures and all non-MetaX backends.
+try:
+    _current_target = triton.runtime.driver.active.get_current_target()
+    is_xcore1000_or_1008 = (
+        _current_target.backend == "maca" and _current_target.arch == 80
+    )
+except BaseException:
+    is_xcore1000_or_1008 = False
+
 is_amd = device_platform == "amd"
 is_intel = device_platform == "intel"
 is_nvidia = device_platform == "nvidia"
@@ -88,10 +99,49 @@ if not is_gather_supported:
 else:
     gather = tl.gather
 
+
 if is_tf32_supported:
     SOLVE_TRIL_DOT_PRECISION = tl.constexpr("tf32")
 else:
     SOLVE_TRIL_DOT_PRECISION = tl.constexpr("ieee")
+
+
+_DEFAULT_AUTOTUNE_CONFIGS = [
+    triton.Config(
+        {"BK": 32, "BV": 128, "pipeline": "cpasync", "scenario": "unroll"},
+        num_warps=1,
+        num_stages=4,
+    ),
+    triton.Config(
+        {"BK": 32, "BV": 16, "pipeline": "cpasync", "scenario": "unroll"},
+        num_warps=1,
+        num_stages=4,
+    ),
+    triton.Config(
+        {"BK": 64, "BV": 64, "pipeline": "cpasync", "scenario": "unroll"},
+        num_warps=1,
+        num_stages=4,
+    ),
+    triton.Config(
+        {"BK": 64, "BV": 32, "pipeline": "cpasync", "scenario": "unroll"},
+        num_warps=1,
+        num_stages=4,
+    ),
+]
+
+_XCORE1000_1008_CONFIG = triton.Config(
+    {"BK": 32, "BV": 64, "pipeline": "cpasync", "scenario": "unroll"},
+    num_warps=2,
+    num_stages=4,
+)
+
+_AUTOTUNE_CONFIGS = (
+    # A single config bypasses runtime benchmarking in Triton's Autotuner.
+    [_XCORE1000_1008_CONFIG]
+    if is_xcore1000_or_1008
+    else _DEFAULT_AUTOTUNE_CONFIGS
+)
+
 
 @triton.heuristics(
     {
@@ -99,20 +149,7 @@ else:
     }
 )
 @triton.autotune(
-    configs=[
-        triton.Config(
-            {"BK": 32, "BV": 128, "pipeline": "cpasync", "scenario": "unroll"}, num_warps=1, num_stages=4
-        ),
-        triton.Config(
-            {"BK": 32, "BV": 16, "pipeline": "cpasync", "scenario": "unroll"}, num_warps=1, num_stages=4
-        ),
-        triton.Config(
-            {"BK": 64, "BV": 64, "pipeline": "cpasync", "scenario": "unroll"}, num_warps=1, num_stages=4
-        ),
-        triton.Config(
-            {"BK": 64, "BV": 32, "pipeline": "cpasync", "scenario": "unroll"}, num_warps=1, num_stages=4
-        ),
-    ],
+    configs=_AUTOTUNE_CONFIGS,
     key=["H", "K", "BC", "V", "FUSE_RECOMPUTE", "FUSE_DIAGONAL"],
     **autotune_cache_kwargs,
 )

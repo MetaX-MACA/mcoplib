@@ -129,55 +129,96 @@ def test_topk_transform_v1(bs: int, seq_len: int) -> None:
         #     assert bw >= 800.0, f"bandwidth {bw:.1f} GB/s below target 800 GB/s (bs={bs}, seq={seq_len})"
 
 
+def _fp32_keys_cpu(score: torch.Tensor) -> torch.Tensor:
+    """Integer order: NaNs greatest, signed zeros equal, subnormals preserved."""
+    bits = score.cpu().contiguous().view(torch.int32).to(torch.int64) & 0xFFFFFFFF
+    magnitude = bits & 0x7FFFFFFF
+    bits = torch.where(magnitude == 0, 0, bits)
+    keys = torch.where((bits & 0x80000000) != 0, (~bits) & 0xFFFFFFFF,
+                       bits | 0x80000000)
+    return torch.where(magnitude > 0x7F800000, 0xFFFFFFFF, keys)
+
+
 @pytest.mark.parametrize("seq_len", [4096, 20000], ids=["histogram", "radix"])
+@pytest.mark.parametrize("topk", TOPK_LIST)
+@pytest.mark.parametrize("with_raw", [True, False], ids=["raw", "page_only"])
 @torch.inference_mode()
-def test_topk_transform_v1_cuda_graph_replay(seq_len: int) -> None:
-    """Captured execution must replay correctly with changed score contents."""
+def test_topk_transform_v1_cuda_graph_replay(seq_len: int, topk: int, with_raw: bool) -> None:
+    """Verify eager and replay independently, including data-dependent paths."""
     bs = 2
     score = torch.randn(bs, seq_len, dtype=torch.float32, device="cuda")
     seq_lens = torch.full((bs,), seq_len, dtype=torch.int32, device="cuda")
-    page_table = torch.arange(TABLE_LEN, dtype=torch.int32, device="cuda")
+    n_pages = (seq_len + PAGE_SIZE - 1) // PAGE_SIZE
+    page_table = torch.arange(n_pages, dtype=torch.int32, device="cuda")
     page_table = page_table.unsqueeze(0).expand(bs, -1).contiguous()
-    page_indices = torch.empty((bs, TOPK), dtype=torch.int32, device="cuda")
-    raw_indices = torch.empty_like(page_indices)
+    page_indices = torch.empty((bs, topk), dtype=torch.int32, device="cuda")
+    raw_indices = torch.empty_like(page_indices) if with_raw else None
 
     def launch() -> None:
         torch.ops.sgl_kernel.topk_transform_v1.default(
             score, seq_lens, page_indices, page_table, PAGE_SIZE, raw_indices
         )
 
-    # Initialize one-time function attributes before capture.
-    launch()
+    def check(tag: str) -> None:
+        pages = page_indices.cpu().long()
+        table = page_table.cpu().long()
+        if raw_indices is None:
+            # The page table is a permutation, so page-only output is invertible.
+            inverse = torch.argsort(table, dim=1)
+            physical = (pages.clamp_min(0) >> 4)
+            assert bool((physical < n_pages).all()), f"{tag}: invalid physical page"
+            raw = (inverse.gather(1, physical) << 4) | (pages.clamp_min(0) & 15)
+            raw[pages == -1] = -1
+        else:
+            raw = raw_indices.cpu().long()
+        keys = _fp32_keys_cpu(score)
+        for row, length in enumerate(seq_lens.cpu().tolist()):
+            selected = raw[row]
+            if length <= topk:
+                expected = torch.arange(topk)
+                expected[length:] = -1
+                assert torch.equal(selected, expected), f"{tag}: naive output"
+            else:
+                assert bool(((selected >= 0) & (selected < length)).all()), tag
+                assert selected.unique().numel() == topk, f"{tag}: duplicate index"
+                expected = torch.topk(keys[row, :length], topk).values.sort().values
+                actual = keys[row, selected].sort().values
+                assert torch.equal(actual, expected), f"{tag}: wrong top-k values"
+            valid = selected >= 0
+            expected_page = torch.full_like(selected, -1)
+            expected_page[valid] = ((table[row, selected[valid] >> 4] << 4) |
+                                    (selected[valid] & 15))
+            assert torch.equal(pages[row], expected_page), f"{tag}: page mapping"
+
+    launch()  # Initialize function attributes outside capture.
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
-    try:
-        with torch.cuda.graph(graph):
-            launch()
-    except Exception as exc:
-        pytest.fail(
-            f"topk_transform_v1 graph capture failed for {seq_len=}: "
-            f"{type(exc).__name__}: {exc}"
-        )
-
-    for seed in (101, 202):
-        generator = torch.Generator(device="cuda").manual_seed(seed)
-        score.copy_(torch.randn(score.shape, generator=generator, device="cuda"))
-        graph.replay()
-        # Keep raw indices in their original (unsorted) order for the page
-        # mapping check. Only sort copies for the unordered Top-K comparison.
-        graph_raw = raw_indices.clone()
-        graph_raw_sorted = torch.sort(graph_raw, dim=-1).values
-        graph_page = page_indices.clone()
-
+    with torch.cuda.graph(graph):
         launch()
-        torch.cuda.synchronize()
-        eager_raw = torch.sort(raw_indices, dim=-1).values
-        assert_equal(score, eager_raw, graph_raw_sorted, bs, TOPK, seq_len)
-        expected_page = _ref_page_to_indices(graph_raw, page_table, PAGE_SIZE)
-        assert torch.equal(expected_page, graph_page), (
-            f"graph page transform mismatch for {seq_len=}, {seed=}"
-        )
+
+    generator = torch.Generator().manual_seed(101)
+    for phase in ("normal", "subnormal", "negative_nan", "dense", "normal_again"):
+        host = torch.randn((bs, seq_len), generator=generator)
+        if phase == "subnormal":
+            host = torch.randint(1, 0x800000, (bs, seq_len), generator=generator,
+                                 dtype=torch.int32).view(torch.float32)
+            host.view(torch.int32)[1] |= -2147483648
+        elif phase == "negative_nan":
+            host.view(torch.int32)[:, :topk + 17] = -4194304
+        elif phase == "dense":
+            host = (torch.arange(bs * seq_len, dtype=torch.int32).reshape(bs, seq_len)
+                    % 4096 + 0x3F800000).view(torch.float32)
+        score.copy_(host)
+        seq_lens.copy_(torch.tensor([seq_len, topk - 3 if phase == "dense" else seq_len - 7],
+                                    dtype=torch.int32, device="cuda"))
+        # Change page contents without changing captured addresses.
+        page_table.copy_(torch.arange(n_pages - 1, -1, -1, dtype=torch.int32,
+                                      device="cuda").expand(bs, -1))
+        graph.replay()
+        check(f"graph/{phase}/K{topk}/W{seq_len}")
+        launch()
+        check(f"eager/{phase}/K{topk}/W{seq_len}")
 
 
 if __name__ == "__main__":
-    pytest.main(["-s", "-v", __file__])
+    raise SystemExit(pytest.main(["-s", "-v", __file__]))

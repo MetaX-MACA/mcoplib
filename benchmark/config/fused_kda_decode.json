@@ -8,5 +8,5 @@
     "dtype": ["bfloat16"],
     "lower_bound": [-5.0, null],
     "seed": 42,
-    "samples": 1000
+    "samples": 100
 }

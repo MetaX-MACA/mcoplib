@@ -13,7 +13,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 #include <ATen/cuda/CUDAContext.h>
+#include <type_traits>
+#include <cstring>
 #include "utils.h"
+#include "fused_hc_head_h5120.cuh"
+#include "fused_hc_head_h5120_splitk.cuh"
 
 namespace {
 
@@ -212,6 +216,26 @@ FusedHcHeadPersistent(const T* __restrict__ x, const float* __restrict__ hc_fn,
   }
 }
 
+// Keep H2 allocation/launch setup out of the shared dispatcher's inline body.
+// Its effect on non-target host latency must be measured after compilation.
+__attribute__((noinline)) void launch_hc_head_h5120_splitk(
+    const torch::Tensor& x, const float* fn, const float* sc, const float* bs,
+    maca_bfloat16* yp, const maca_bfloat16* xp, uint32_t num_tokens,
+    float ne, float he, cudaStream_t stream) {
+  constexpr int kSplits = 20;
+  // The public API includes this allocation and both launches. The buffer
+  // is produced and consumed on the current stream before allocator reuse.
+  auto partials = at::empty(
+      {static_cast<int64_t>(num_tokens), kSplits, 5},
+      x.options().dtype(at::kFloat));
+  float* stats = partials.data_ptr<float>();
+  mhc_head_h5120::hc_head_h5120_splitk_partial_kernel<kSplits>
+      <<<dim3(num_tokens, kSplits), 128, 0, stream>>>(xp, fn, stats);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  mhc_head_h5120::hc_head_h5120_splitk_collapse_kernel<kSplits>
+      <<<dim3(num_tokens, 5), 128, 0, stream>>>(xp, stats, sc, bs, yp, ne, he);
+}
+
 template<typename T>
 void launch_fused_hc_head(const torch::Tensor& output, const torch::Tensor& x,
                           const float* fn, const float* sc, const float* bs,
@@ -226,6 +250,44 @@ void launch_fused_hc_head(const torch::Tensor& output, const torch::Tensor& x,
               "fused_hc_head: x / output / hc_fn must be 16B aligned");
   TORCH_CHECK(hidden % PV == 0 && stride_x % PV == 0,
               "fused_hc_head: hidden and x.stride(0) must be multiples of ", PV);
+
+  if constexpr (std::is_same_v<T, maca_bfloat16>) {
+    if (hc_mult == 4 && hidden == 5120) {
+      // Optimizations are limited to the measured C500 and xcore1000/xcore1008.
+      // Other architectures retain H0 under the same fixed support contract.
+      TORCH_CHECK(x.is_contiguous() && ne == 1e-6f && he == 1e-6f,
+                  "fused_hc_head: H5120 BF16 AOT baseline requires contiguous x "
+                  "and norm_eps=hc_eps=1e-6");
+      const auto* props = at::cuda::getDeviceProperties(x.get_device());
+      const char* arch = props->mxArchName;
+      // Permit runtime feature suffixes, but require an exact architecture name.
+      const bool is_target_arch =
+          (std::strncmp(arch, "xcore1000", 9) == 0 ||
+           std::strncmp(arch, "xcore1008", 9) == 0) &&
+          (arch[9] == '\0' || arch[9] == ':');
+      const bool use_c500_optimizations = is_target_arch &&
+          std::strcmp(props->name, "MetaX C500") == 0;
+      if (use_c500_optimizations && num_tokens >= 1 && num_tokens <= 4) {
+        launch_hc_head_h5120_splitk(x, fn, sc, bs, yp, xp, num_tokens, ne, he, stream);
+        return;
+      }
+      // Range candidate: one CTA/token, with a first-wave cut at 104 C500 APs.
+      // Keep H3 ownership through N=2048 and the support baseline beyond it.
+      if (use_c500_optimizations && num_tokens >= 5 && num_tokens <= 2048) {
+        if (num_tokens <= 104) {
+          mhc_head_h5120::hc_head_h5120_threads256_kernel<true><<<num_tokens, 256, 16896, stream>>>(
+              fn, bs, sc, yp, xp, static_cast<int>(num_tokens));
+        } else {
+          mhc_head_h5120::hc_head_h5120_threads256_kernel<false><<<num_tokens, 256, 16896, stream>>>(
+              fn, bs, sc, yp, xp, static_cast<int>(num_tokens));
+        }
+      } else {
+        mhc_head_h5120::hc_head_fuse_tilelang_kernel<<<num_tokens, 128, 16896, stream>>>(
+            fn, bs, sc, yp, xp, static_cast<int>(num_tokens));
+      }
+      return;
+    }
+  }
 
   const uint32_t grid = std::min<uint32_t>(num_tokens, num_ap);
 

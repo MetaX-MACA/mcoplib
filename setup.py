@@ -34,7 +34,7 @@ except Exception as e:
 
 #检测python版本
 if sys.version_info < (3, 9):
-    sys.stderr.write("ERROR: Mcoplib Building Python 3.9+ is required. Detected Python Version less than 3.9: "
+    sys.stderr.write("ERROR: mcoplib Building Python 3.9+ is required. Detected Python Version less than 3.9: "
                      f"{sys.version_info.major}.{sys.version_info.minor}\n")
     raise SystemExit(1)
 
@@ -44,7 +44,7 @@ CMAKE_EXECUTABLE = 'cmake' if not USE_MACA else 'cmake_maca'
 #Python 当前解释器的扩展后缀
 ext_suffix = sysconfig.get_config_var('EXT_SUFFIX') or '.so'
 name="mcoplib"
-mcoplib_version="0.4.15"
+mcoplib_version="0.4.16"
 
 
 
@@ -55,7 +55,7 @@ logger = logging.getLogger(__name__)
 
 MCOPLIB_TARGET_DEVICE = "cuda"
 
-MIN_COMPATIBILITY_MACA_VERSION="3.7.0"
+MIN_COMPATIBILITY_MACA_VERSION="3.8.2"
 MAIN_CUDA_VERSION = "12.8"
 
 def is_sccache_available() -> bool:
@@ -812,14 +812,14 @@ def write_git_info_file(target_path):
     # 4. 写入 version 文件
     build_torch_version = torch.__version__
     content = (
-        f'Mcoplib_Version = {mcoplib_version!r}\n'
+        f'mcoplib_Version = {mcoplib_version!r}\n'
         f'Build_Maca_Version = {maca_version!r}\n'
         f'Build_Torch_Version = {build_torch_version!r}\n'
         f'Min_Compatibility_Maca_Version = {MIN_COMPATIBILITY_MACA_VERSION!r}\n'
         f'GIT_BRANCH = {branch!r}\n'
         f'GIT_COMMIT = {commit!r}\n'
-        f'Vllm Op Version = 0.30.0\n'
-        f'SGlang Op Version  = 0.5.21\n'
+        f'Vllm Op Version = 0.32.0\n'
+        f'SGlang Op Version  = 0.5.22\n'
     )
     os.makedirs(os.path.dirname(target_path), exist_ok=True)
     with open(target_path, "w", encoding="utf-8") as f:

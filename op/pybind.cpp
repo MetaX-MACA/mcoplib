@@ -11,6 +11,7 @@
 #include "../include/fused_softplus_sqrt.h"
 #include "../include/moe_swiglu_dq.h"
 #include "../include/moe_softmax_topk.h"
+#include "../include/moe_init_routing_v4.h"
 #include "../include/all_reduce.h"
 #include "../include/moe_gather.h"
 #include "../include/rotary_embedding.h"
@@ -43,22 +44,16 @@
 #include "../include/mhc_pre_big_fuse.h"
 #include "../include/mhc_post_cuda.h"
 #include "../include/chunk_gated_delta_rule_fwd_h.h"
+#include "../include/fused_sigmoid_gating_delta_rule_update.h"
 #include "../include/indexer_norm_rope.h"
+#include "../include/moe_finalize_routing.h"
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("mhc_post_cuda", &mhc_post_cuda,
-          "MHC post: BF16 activations and FP32 mixing weights",
           py::arg("x"), py::arg("residual"),
           py::arg("post_layer_mix"), py::arg("comb_res_mix"));
     m.def(
         "mhc_pre_big_fuse_out", &mhc_pre_big_fuse_out,
-        "Optimized mHC pre big-fuse kernel with preallocated outputs.  The "
-        "trailing optional arguments select the hidden=5120 delayed pre-mix / "
-        "fused RMSNorm contract: norm_weight enables fused RMSNorm, "
-        "pre_mix_in supplies a carried pre-mix (Path B), pre_mix_out saves the "
-        "next pre-mix (Path A when pre_mix_in is omitted), aux_out writes "
-        "the mean over the four residual streams, and residual_out selects "
-        "the first-layer [N,H] -> [N,4,H] broadcast contract.",
         py::arg("gemm_out_mul"), py::arg("gemm_out_sqrsum"),
         py::arg("hc_scale"), py::arg("hc_base"), py::arg("residual"),
         py::arg("post_mix"), py::arg("comb_mix"), py::arg("layer_input"),
@@ -70,7 +65,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("pre_mix_out") = py::none(),
         py::arg("aux_out") = py::none(), py::arg("norm_eps") = 1e-6,
         py::arg("rms_numel") = -1,
-        py::arg("residual_out") = py::none());
+        py::arg("residual_out") = py::none(),
+        py::arg("quant_scales") = py::none(),
+        py::arg("output_rms") = py::none(),
+        py::arg("output_quant_int8") = py::none());
     m.def("fused_bias_dropout", &fused_bias_dropout);
     m.def("fused_rope_fwd", &fused_rope_fwd);
     m.def("fused_rope_bwd", &fused_rope_bwd);
@@ -82,6 +80,32 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("fused_gelu_bwd", &fused_gelu_bwd);
     m.def("moe_swiglu_dynamic_quantize", &moe_swiglu_dynamic_quantize);
     m.def("moe_softmax_topk", &moe_softmax_topk);
+    m.def("moe_init_routing_v4_workspace_size", &moe_init_routing_v4_workspace_size,
+          py::arg("x"), py::arg("expert_idx"), py::arg("expert_num"),
+          py::arg("quant_mode") = -1);
+    m.def("moe_init_routing_v4", &moe_init_routing_v4,
+          py::arg("x"), py::arg("expert_idx"), py::arg("expert_num"),
+          py::arg("quant_mode") = -1, py::arg("row_idx_type") = 0,
+          py::arg("expert_tokens_num_type") = 1,
+          py::arg("expert_tokens_num_flag") = true,
+          py::arg("active_num") = 0,
+          py::arg("active_expert_range") = std::vector<int64_t>{},
+          py::arg("scale") = py::none(), py::arg("topk_weight") = py::none(),
+          py::arg("active_num_optional") = py::none(),
+          py::arg("active_info") = py::none());
+    m.def("moe_init_routing_v4_out", &moe_init_routing_v4_out,
+          py::arg("x"), py::arg("expert_idx"), py::arg("expanded_x"),
+          py::arg("expanded_row_idx"), py::arg("expert_tokens"),
+          py::arg("expanded_scale"), py::arg("expanded_topk_weight"),
+          py::arg("workspace"), py::arg("expert_num"),
+          py::arg("quant_mode") = -1, py::arg("row_idx_type") = 0,
+          py::arg("expert_tokens_num_type") = 1,
+          py::arg("expert_tokens_num_flag") = true,
+          py::arg("active_num") = 0,
+          py::arg("active_expert_range") = std::vector<int64_t>{},
+          py::arg("scale") = py::none(), py::arg("topk_weight") = py::none(),
+          py::arg("active_num_optional") = py::none(),
+          py::arg("active_info") = py::none());
     m.def("rms_norm_dynamic_per_token_quant", &rms_norm_dynamic_per_token_quant);
     m.def("head_rms_norm", &head_rms_norm);
     m.def("rms_norm", &rms_norm);
@@ -121,7 +145,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("eps") = 1e-6, py::arg("q_norm_weight_bias") = 1.0);
     m.def("all_reduce_max", &all_reduce_max);
     m.def("all_reduce_sum", &all_reduce_sum);
-    m.def("moe_gather", &moe_gather);
+    m.def("moe_gather", &moe_gather,
+          py::arg("scatter_tokens"), py::arg("scatter_token_id"),
+          py::arg("scatter_tokens_weight"), py::arg("convergent_tokens"),
+          py::arg("residual_tokens") = py::none(), py::arg("res_scale") = 1.0,
+          py::arg("res_token_start") = 0,
+          py::arg("scatter_tokens_scale") = py::none());
     m.def("rotary_embedding", &rotary_embedding);
     m.def("store_kv_cache_cuda_interface", &store_kv_cache_cuda_interface);
     m.def("moe_scatter_dynamic_quant", &moe_scatter_dynamic_quant);
@@ -174,7 +203,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("fused_silu_mul_dq_mask_fp8_quant", &fused_silu_mul_dq_mask_quant_fp8_pack);
 
     m.def("fused_silu_mul_dq_reorder_quant", &fused_silu_mul_dq_quant_reordered_topk_interface);
-    m.def("fused_silu_mul_dq_quant", &fused_silu_mul_dq_quant_interface);
+    m.def("fused_silu_mul_dq_quant", &fused_silu_mul_dq_quant_interface);    
+    m.def("fused_silu_mul_dq_quant", &fused_silu_mul_dq_quant_smooth_interface,
+          py::arg("out"), py::arg("scale"), py::arg("input"),
+          py::arg("per_token_scale"));
     
     m.def(
         "fused_silu_mul_dq_mask_quant_fp8_nopack",
@@ -319,4 +351,92 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       py::arg("num_stages"), py::arg("N"), py::arg("NT"), py::arg("has_g"),
       py::arg("has_gk"), py::arg("has_v_new"), py::arg("has_cu_seqlens"),
       py::arg("tail_free"));
+
+    m.def(
+      "fused_sigmoid_gating_delta_rule_update_native_out",
+      &fused_sigmoid_gating_delta_rule_update_native_out,
+      "Preallocated CUDA native GLM5.3-flash KDA target-verify kernel",
+      py::arg("A_log"), py::arg("a"), py::arg("dt_bias"),
+      py::arg("softplus_beta"), py::arg("softplus_threshold"),
+      py::arg("lower_bound"), py::arg("q"), py::arg("k"), py::arg("v"),
+      py::arg("b"), py::arg("o"), py::arg("h0_source"),
+      py::arg("h0_indices"), py::arg("stride_h0_source"),
+      py::arg("cu_seqlens"), py::arg("intermediate_states_buffer"),
+      py::arg("intermediate_state_indices"), py::arg("cache_steps"),
+      py::arg("retrieve_parent_token_ptr"),
+      py::arg("stride_retrieve_parent_token_seq"),
+      py::arg("stride_retrieve_parent_token_token"), py::arg("scale"),
+      py::arg("T"), py::arg("stride_a"), py::arg("stride_q"),
+      py::arg("stride_k"), py::arg("stride_v"), py::arg("stride_b"),
+      py::arg("NP2_T"), py::arg("B"), py::arg("H"), py::arg("HV"),
+      py::arg("K"), py::arg("V"), py::arg("BK"), py::arg("BV"),
+      py::arg("USE_INITIAL_STATE"), py::arg("USE_QK_L2NORM_IN_KERNEL"),
+      py::arg("IS_VARLEN"), py::arg("IS_KDA"),
+      py::arg("USE_LOWER_BOUND"), py::arg("DISABLE_STATE_UPDATE"),
+      py::arg("CACHE_INTERMEDIATE_STATES"),
+      py::arg("HAS_EAGLE_TREE_CUSTOM_ATTN_MASK"),
+      py::arg("replayssm_rawv"), py::arg("replayssm_rawk"),
+      py::arg("replayssm_g"), py::arg("replayssm_beta"),
+      py::arg("stride_rawv_slot"), py::arg("stride_rawk_slot"),
+      py::arg("stride_g_slot"), py::arg("stride_beta_slot"),
+      py::arg("MAX_CACHE_LEN"), py::arg("CACHE_RING"),
+      py::arg("SPLIT_N_HV_GRID") = true, py::arg("workspace") = py::none(),
+      py::arg("value_block") = 0);
+
+    m.def(
+      "fused_sigmoid_gating_delta_rule_update_native_precompute",
+      &fused_sigmoid_gating_delta_rule_update_native_precompute,
+      "Diagnostic: materialize only the native precompute workspace",
+      py::arg("A_log"), py::arg("a"), py::arg("dt_bias"), py::arg("b"),
+      py::arg("q"), py::arg("k"), py::arg("workspace"),
+      py::arg("lower_bound"), py::arg("stride_a"), py::arg("stride_b"),
+      py::arg("stride_q"), py::arg("stride_k"), py::arg("T"));
+
+    m.def(
+      "fused_sigmoid_gating_delta_rule_update_native_recurrent",
+      &fused_sigmoid_gating_delta_rule_update_native_recurrent,
+      "Diagnostic: run only the native recurrent launch on a ready workspace",
+      py::arg("workspace"), py::arg("q"), py::arg("k"), py::arg("v"),
+      py::arg("o"), py::arg("h0_source"), py::arg("h0_indices"),
+      py::arg("cu_seqlens"), py::arg("intermediate_states_buffer"),
+      py::arg("intermediate_state_indices"), py::arg("stride_h0_source"),
+      py::arg("stride_q"), py::arg("stride_k"), py::arg("stride_v"),
+      py::arg("scale"), py::arg("T"), py::arg("value_block"),
+      py::arg("variant") = 0);
+
+    m.def(
+      "fused_sigmoid_gating_delta_rule_update",
+      &fused_sigmoid_gating_delta_rule_update_native,
+      "Allocating CUDA native peer of the Triton fused sigmoid gating update",
+      py::arg("A_log"), py::arg("a"), py::arg("dt_bias"),
+      py::arg("softplus_beta"), py::arg("softplus_threshold"),
+      py::arg("q"), py::arg("k"), py::arg("v"), py::arg("b"),
+      py::arg("initial_state_source"), py::arg("initial_state_indices"),
+      py::arg("scale") = py::none(),
+      py::arg("use_qk_l2norm_in_kernel") = false,
+      py::arg("cu_seqlens") = py::none(), py::arg("is_kda") = false,
+      py::arg("lower_bound") = py::none(),
+      py::arg("disable_state_update") = false,
+      py::arg("intermediate_states_buffer") = py::none(),
+      py::arg("intermediate_state_indices") = py::none(),
+      py::arg("cache_steps") = py::none(),
+      py::arg("retrieve_parent_token") = py::none(),
+      py::arg("cache_ring") = false, py::arg("replayssm_rawv") = py::none(),
+      py::arg("replayssm_rawk") = py::none(),
+      py::arg("replayssm_g") = py::none(),
+      py::arg("replayssm_beta") = py::none());
+
+     m.def(
+        "moe_finalize_routing",
+        &moe_finalize_routing,
+        py::arg("out"),
+        py::arg("expanded_x"),
+        py::arg("expanded_row_idx"),
+        py::arg("x1") = py::none(),
+        py::arg("x2") = py::none(),
+        py::arg("bias") = py::none(),
+        py::arg("scales") = py::none(),
+        py::arg("expert_idx") = py::none(),
+        py::arg("drop_pad_mode") = 0,
+        py::arg("k") = 1);
 }

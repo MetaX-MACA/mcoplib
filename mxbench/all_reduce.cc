@@ -234,63 +234,19 @@ std::vector<float> benchmark_py_func(py::object func, py::object input, py::obje
     return durations;
 }
 
-// int main() {
-//     py::scoped_interpreter guard{}; // start the interpreter and keep it alive
 
-//     try {
-//         // import modules
-//         py::object torch = py::module_::import("torch");
-//         py::object mcop = py::module_::import("mcoplib.op");
-        
-
-//         // get functions
-//         py::object all_reduce_max = mcop.attr("all_reduce_max");
-//         py::object all_reduce_sum = mcop.attr("all_reduce_sum");
-
-//         // prepare data on GPU (use Python torch API, not libtorch)
-//         int m = 4096, n = 4096;
-//         py::object input = torch.attr("rand")(py::make_tuple(m, n),
-//                                               py::arg("device")="cuda",
-//                                               py::arg("dtype")=torch.attr("bfloat16"));
-//         py::object output = torch.attr("zeros")(py::make_tuple(m),
-//                                                 py::arg("device")="cuda",
-//                                                 py::arg("dtype")=torch.attr("bfloat16"));
-
-//         // benchmark all_reduce_max
-//         auto dur1 = benchmark_py_func(all_reduce_max, input, output, 10, 100);
-//         double avg1 = 0.0;
-//         for (auto v: dur1) avg1 += v;
-//         avg1 /= dur1.size();
-//         std::cout << "all_reduce_max avg time = " << avg1 << " ms\n";
-
-//         // benchmark all_reduce_sum
-//         auto dur2 = benchmark_py_func(all_reduce_sum, input, output, 10, 100);
-//         double avg2 = 0.0;
-//         for (auto v: dur2) avg2 += v;
-//         avg2 /= dur2.size();
-//         std::cout << "all_reduce_sum avg time = " << avg2 << " ms\n";
-//     } catch (py::error_already_set &e) {
-//         std::cerr << "Python error: " << e.what() << std::endl;
-//         return 1;
-//     } catch (std::exception &e) {
-//         std::cerr << "std exception: " << e.what() << std::endl;
-//         return 2;
-//     }
-
-//     return 0;
-// }
 
 void all_reduce_benchmark(nvbench::state &state)
 {
 
     std::cout<<"======================>2"<<std::endl;
     py::object torch = py::module_::import("torch");
-    py::object mcop = py::module_::import("mcoplib.op");
+    py::object mcoplib = py::module_::import("mcoplib.op");
     
     std::cout<<"======================>3"<<std::endl;
     // get functions
-    py::object all_reduce_max = mcop.attr("all_reduce_max");
-    py::object all_reduce_sum = mcop.attr("all_reduce_sum");
+    py::object all_reduce_max = mcoplib.attr("all_reduce_max");
+    py::object all_reduce_sum = mcoplib.attr("all_reduce_sum");
 
     std::cout<<"======================>4"<<std::endl;
     // prepare data on GPU (use Python torch API, not libtorch)

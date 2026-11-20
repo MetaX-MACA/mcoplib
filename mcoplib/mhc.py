@@ -21,6 +21,7 @@ from mcoplib import op as mcoplib_ops
 
 HC_MULT = 4
 HIDDEN_SIZE = 5120
+PACKED_INT8_ROW_ELEMENTS = ((HIDDEN_SIZE + 4 + 511) // 512) * 256
 MIX_SIZE = HC_MULT * (2 + HC_MULT)
 HC_HIDDEN_SIZE = HC_MULT * HIDDEN_SIZE
 SUPPORTED_NUM_SPLITS = (1, 4, 16)
@@ -144,7 +145,25 @@ def mhc_pre(
     norm_eps: float | None = None,
     pre_mix_in: torch.Tensor | None = None,
     pre_mix_out: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    quant_mode: str = "none",
+) -> (
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    | tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]
+    | tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]
+):
     """Run the complete MHC pre path and return ``post, comb, layer_input``.
 
     The output order follows ``triton_sglang_mhc.mhc_pre``. DeepGEMM's split
@@ -162,6 +181,14 @@ def mhc_pre(
 
     ``pre_mix_out`` is an out parameter and is not included in the return
     tuple; the caller retains the same Tensor and can pass it to the next call.
+
+    ``quant_mode='int8'`` returns an INT8 layer input and a separate FP32
+    per-token scale plus the BF16 RMSNorm output. ``quant_mode='pack_int8'``
+    returns a BF16 storage container whose bytes hold 5120 INT8 values, one
+    FP32 scale, and zero padding per token; it additionally returns the separate
+    scale, BF16 RMSNorm output and unpacked INT8 output. Both modes require
+    fused RMSNorm. The default mode retains the original three-result BF16
+    interface.
     """
     outer_shape, num_tokens, residual_flat = _residual_layout(residual)
     device = residual.device
@@ -180,6 +207,10 @@ def mhc_pre(
     pre_mix_out_flat = _prepare_pre_mix(
         "pre_mix_out", pre_mix_out, outer_shape, num_tokens, device
     )
+    if quant_mode not in ("none", "int8", "pack_int8"):
+        raise ValueError("quant_mode must be 'none', 'int8', or 'pack_int8'")
+    if quant_mode != "none" and norm_weight is None:
+        raise ValueError("quantized mhc_pre requires norm_weight")
 
     norm_weight_bf: torch.Tensor | None = None
     if norm_weight is not None:
@@ -206,8 +237,36 @@ def mhc_pre(
     comb_mix_flat = torch.empty(
         (num_tokens, HC_MULT * HC_MULT), device=device, dtype=torch.float32
     )
-    layer_input_flat = torch.empty(
-        (num_tokens, HIDDEN_SIZE), device=device, dtype=torch.bfloat16
+    if quant_mode == "int8":
+        layer_input_flat = torch.empty(
+            (num_tokens, HIDDEN_SIZE), device=device, dtype=torch.int8
+        )
+    elif quant_mode == "pack_int8":
+        layer_input_flat = torch.empty(
+            (num_tokens, PACKED_INT8_ROW_ELEMENTS),
+            device=device,
+            dtype=torch.bfloat16,
+        )
+    else:
+        layer_input_flat = torch.empty(
+            (num_tokens, HIDDEN_SIZE), device=device, dtype=torch.bfloat16
+        )
+    quant_scales_flat = (
+        torch.empty((num_tokens,), device=device, dtype=torch.float32)
+        if quant_mode != "none"
+        else None
+    )
+    output_rms_flat = (
+        torch.empty(
+            (num_tokens, HIDDEN_SIZE), device=device, dtype=torch.bfloat16
+        )
+        if quant_mode != "none"
+        else None
+    )
+    output_quant_int8_flat = (
+        torch.empty((num_tokens, HIDDEN_SIZE), device=device, dtype=torch.int8)
+        if quant_mode == "pack_int8"
+        else None
     )
 
     if num_tokens != 0:
@@ -250,11 +309,35 @@ def mhc_pre(
             aux_out=None,
             norm_eps=1e-6 if norm_eps is None else norm_eps,
             rms_numel=HC_HIDDEN_SIZE,
+            quant_scales=quant_scales_flat,
+            output_rms=output_rms_flat,
+            output_quant_int8=output_quant_int8_flat,
         )
 
     post_mix = post_mix_flat.view(*outer_shape, HC_MULT, 1)
     comb_mix = comb_mix_flat.view(*outer_shape, HC_MULT, HC_MULT)
-    layer_input = layer_input_flat.view(*outer_shape, HIDDEN_SIZE)
+    layer_input = layer_input_flat.view(*outer_shape, layer_input_flat.shape[-1])
+    if quant_mode == "pack_int8":
+        assert quant_scales_flat is not None
+        assert output_rms_flat is not None
+        assert output_quant_int8_flat is not None
+        return (
+            post_mix,
+            comb_mix,
+            layer_input,
+            quant_scales_flat.view(*outer_shape),
+            output_rms_flat.view(*outer_shape, HIDDEN_SIZE),
+            output_quant_int8_flat.view(*outer_shape, HIDDEN_SIZE),
+        )
+    if quant_scales_flat is not None:
+        assert output_rms_flat is not None
+        return (
+            post_mix,
+            comb_mix,
+            layer_input,
+            quant_scales_flat.view(*outer_shape),
+            output_rms_flat.view(*outer_shape, HIDDEN_SIZE),
+        )
     return post_mix, comb_mix, layer_input
 
 

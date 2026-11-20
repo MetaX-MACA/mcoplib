@@ -1,11 +1,11 @@
 {
     "device_id": 0,
-    "device_name": ["MetaX C500", "MetaX C600-UL", "Metax C600-U"],
-    "batch_size": 8,
-    "block_size": 16,
-    "use_seq_starts": true,
-    "reverse_block_table": true,
-    "fp8_value": 0,
-    "seed": 0,
-    "samples": 1000
+    "device_name": ["MetaX C500", "MetaX C600-UL", "MetaX C600-U"],
+    "batch_size": [4, 8],
+    "block_size": [16, 32],
+    "use_seq_starts": [false, true],
+    "use_host_rows": [false, true],
+    "reverse_block_table": [false, true],
+    "fp8_value": [0],
+    "samples": 100
 }

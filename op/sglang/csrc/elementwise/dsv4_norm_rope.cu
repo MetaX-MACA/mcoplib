@@ -313,27 +313,65 @@ __global__ __launch_bounds__(kFusedQBlockSize, 16) void fused_q_norm_rope_kernel
 constexpr int kWarp = 64;
 constexpr int kLPH = 8;      // 每个 head 用 8 个 lane，归约只需 3 级 shuffle
 constexpr int kBlock = 256;  // 4 个 warp
-constexpr int kBPS = 24;     // 每个 SM 发 24 个 block
+constexpr int kBPS = 16;     // 每个 SM 发 16 个 block
+
+struct DivModFast {
+  DivModFast(int d = 1) {
+    d_ = (d == 0) ? 1 : d;
+    for (l_ = 0;; ++l_) {
+      if ((1U << l_) >= d_) break;
+    }
+    uint64_t one = 1;
+    uint64_t m = ((one << 32) * ((one << l_) - d_)) / d_ + 1;
+    m_ = static_cast<uint32_t>(m);
+  }
+  __device__ __inline__ int div(int idx) const {
+    uint32_t tm = __umulhi(m_, idx);
+    return (tm + idx) >> l_;
+  }
+  uint32_t d_;
+  uint32_t l_;
+  uint32_t m_;
+};
+
+constexpr static uint32_t seil = 0x03020706u;
+__device__ __forceinline__ void f32x2_cvt_bf16x2(uint32_t& dst, float src[2]) {
+  uint32_t tmp[2];
+  tmp[0] = __builtin_mxc_ubfe(*(reinterpret_cast<uint32_t*>(src)), 16, 1);
+  tmp[0] = tmp[0] + *reinterpret_cast<uint32_t*>(src);
+  tmp[0] = (uint32_t)0x7fff + tmp[0];
+  tmp[1] = __builtin_mxc_ubfe(*(reinterpret_cast<uint32_t*>(src + 1)), 16, 1);
+  tmp[1] = tmp[1] + *(reinterpret_cast<uint32_t*>(src + 1));
+  tmp[1] = (uint32_t)0x7fff + tmp[1];
+  dst = __builtin_mxc_byte_perm(tmp[0], tmp[1], seil);
+}
+
+__device__ __forceinline__ bf16x2_t float2_to_bf16x2(float a, float b) {
+  float s[2] = {a, b};
+  uint32_t u;
+  f32x2_cvt_bf16x2(u, s);
+  return *reinterpret_cast<bf16x2_t*>(&u);
+}
 
 // 每个 warp 同时处理 64/LPH = 8 个 head；
 // lane 负责的 16B 块号 = sl + LPH*k (k < C)，同一个 head 的 8 个 lane 读连续的 128B
 template <int64_t HD, int64_t RD, typename PosT>
 __global__ __launch_bounds__(kBlock) void fused_q_norm_rope_fast_kernel(
-    const __grid_constant__ FusedQNormRopeParams params) {
-  constexpr int kVec = 16 / sizeof(bf16_t);   // 8
-  constexpr int NCH = HD / kVec;
+    const __grid_constant__ FusedQNormRopeParams params, const DivModFast head_div) {
+  constexpr int kVec = 16 / sizeof(bf16x2_t);   // 4
+  constexpr int NCH = HD / (2 * kVec);
   constexpr int C = NCH / kLPH;
   constexpr int SG = kWarp / kLPH;
   constexpr int WPB = kBlock / kWarp;
-  constexpr int RC0 = (HD - RD) / kVec;
+  constexpr int RC0 = (HD - RD) / (2 * kVec);
   constexpr int KR0 = RC0 / kLPH;
   constexpr int NKR = C - KR0;
   constexpr float kInvH = 1.0f / float(HD);
   static_assert(C * kLPH == NCH, "bad head_dim");
-  static_assert(RD % kVec == 0 && RD <= HD, "bad rope_dim");
+  static_assert(RD % (2 * kVec) == 0 && RD <= HD, "bad rope_dim");
 
-  using Vec = AlignedVec<bf16_t, kVec>;
-  using FVec = AlignedVec<float, kVec>;
+  using Vec = AlignedVec<bf16x2_t, kVec>;
+  using FVec = AlignedVec<float, 2 * kVec>;
 
   const int lane = threadIdx.x & (kWarp - 1);
   const int sub = lane / kLPH;
@@ -351,57 +389,64 @@ __global__ __launch_bounds__(kBlock) void fused_q_norm_rope_fast_kernel(
   for (uint32_t base = (blockIdx.x * WPB + threadIdx.x / kWarp) * SG; base < total; base += stride) {
     const uint32_t w = base + sub;
     const bool valid = w < total;
-    const uint32_t b = valid ? w / H : 0;
-    const uint32_t h = valid ? w - b * H : 0;
+    const uint32_t ww = valid ? w : 0u;
+    const uint32_t b = head_div.div(ww);
+    const uint32_t h = ww - b * H;
     const bf16_t* in = qin + int64_t(b) * params.q_input_stride_batch + int64_t(h) * HD;
     bf16_t* out = qout + int64_t(b) * params.q_output_stride_batch + int64_t(h) * HD;
 
-    const int64_t p = valid ? int64_t(pos[b]) : 0;
 
     Vec x[C];
-#pragma unroll
-    for (int k = 0; k < C; ++k)
-      if (valid) x[k].load(in, sl + kLPH * k);
-
     FVec f[NKR];
-#pragma unroll
-    for (int r = 0; r < NKR; ++r) {
-      const int c = sl + kLPH * (KR0 + r);
-      if (valid && c >= RC0) f[r].load(freqs + p * RD, c - RC0);
-    }
-
-    float ss = 0.f;
     if (valid) {
+#pragma unroll
+      for (int k = 0; k < C; ++k) x[k].load(in, sl + kLPH * k);
+      const float* fp = freqs + int64_t(pos[b]) * RD;
+#pragma unroll
+      for (int r = 0; r < NKR; ++r) {
+        const int c = sl + kLPH * (KR0 + r);
+        if (c >= RC0) f[r].load(fp, c - RC0);
+      }
+    } else {
 #pragma unroll
       for (int k = 0; k < C; ++k)
 #pragma unroll
-        for (int j = 0; j < kVec; ++j) {
-          const float v = bf16_to_float(x[k][j]);
-          ss = fmaf(v, v, ss);
-        }
+        for (int j = 0; j < kVec; ++j) *reinterpret_cast<uint32_t*>(&x[k][j]) = 0u;
     }
+
+    float s0 = 0.f, s1 = 0.f;
+#pragma unroll
+    for (int k = 0; k < C; ++k) {
+#pragma unroll
+      for (int j = 0; j < kVec; ++j) {
+        const float2 v = __bfloat1622float2(x[k][j]);
+        s0 = fmaf(v.x, v.x, s0);
+        s1 = fmaf(v.y, v.y, s1);
+      }
+    }
+    float ss = s0 + s1;
 #pragma unroll
     for (int off = kLPH >> 1; off > 0; off >>= 1)
       ss += __shfl_xor_sync(0xffffffffffffffffULL, ss, off);
 
     if (!valid) continue;
-    const float inv = rsqrtf(ss * kInvH + eps);
+    const float inv = rsqrtf(fmaf(ss, kInvH, eps));
 
 #pragma unroll
     for (int k = 0; k < C; ++k) {
       Vec o;
 #pragma unroll
-      for (int j = 0; j < kVec; ++j) o[j] = float_to_bf16(bf16_to_float(x[k][j]) * inv);
-      if constexpr (true) {
-        if (k >= KR0 && (sl + kLPH * k) >= RC0) {
-          const FVec& ff = f[k >= KR0 ? k - KR0 : 0];
+      for (int j = 0; j < kVec; ++j) {
+        const float2 v = __bfloat1622float2(x[k][j]);
+        o[j] = float2_to_bf16x2(v.x * inv, v.y * inv);
+      }
+      if (k >= KR0 && (sl + kLPH * k) >= RC0) {
+        const FVec& ff = f[k >= KR0 ? k - KR0 : 0];
 #pragma unroll
-          for (int j = 0; j < kVec; j += 2) {
-            const float re = bf16_to_float(o[j]), im = bf16_to_float(o[j + 1]);
-            const float fr = ff[j], fi = ff[j + 1];
-            o[j]     = float_to_bf16(re * fr - im * fi);
-            o[j + 1] = float_to_bf16(re * fi + im * fr);
-          }
+        for (int j = 0; j < kVec; ++j) {
+          const float2 v = __bfloat1622float2(o[j]);
+          const float fr = ff[2 * j], fi = ff[2 * j + 1];
+          o[j] = float2_to_bf16x2(v.x * fr - v.y * fi, v.x * fi + v.y * fr);
         }
       }
       o.store(out, sl + kLPH * k);
@@ -682,6 +727,7 @@ void dsv4_fused_q_norm_rope(
     const bool ok = freqs_cis.scalar_type() == at::ScalarType::Float && freqs_cis.is_contiguous() &&
                     freqs_cis.size(-1) == kRopeDim && positions.is_contiguous() &&
                     q_input.stride(0) % kVec == 0 && q_output.stride(0) % kVec == 0 &&
+                    total_works < (1u << 31) &&
                     reinterpret_cast<uintptr_t>(params.q_input) % 16 == 0 &&
                     reinterpret_cast<uintptr_t>(params.q_output) % 16 == 0 &&
                     reinterpret_cast<uintptr_t>(params.freqs_cis) % 32 == 0;
@@ -690,15 +736,17 @@ void dsv4_fused_q_norm_rope(
       constexpr uint32_t per_block = (kBlock / kWarp) * (kWarp / kLPH);
       const uint32_t cap = prop.multiProcessorCount * kBPS;
       const uint32_t grid = std::max(1u, std::min(CEILDIV(total_works, per_block), cap));
+      const DivModFast head_div(params.num_q_heads);
       if (positions.scalar_type() == at::ScalarType::Long){
-        fused_q_norm_rope_fast_kernel<512, 64, int64_t><<<grid, kBlock, 0, stream>>>(params);
+        fused_q_norm_rope_fast_kernel<512, 64, int64_t><<<grid, kBlock, 0, stream>>>(params, head_div);
       }
       else {
-        fused_q_norm_rope_fast_kernel<512, 64, int32_t><<<grid, kBlock, 0, stream>>>(params);
+        fused_q_norm_rope_fast_kernel<512, 64, int32_t><<<grid, kBlock, 0, stream>>>(params, head_div);
       }
       return;
     }
   }
+
   // Dispatch on head_dim. DeepSeek V4 uses D=192 with kRopeDim=64.
   switch (D) {
     case 128:

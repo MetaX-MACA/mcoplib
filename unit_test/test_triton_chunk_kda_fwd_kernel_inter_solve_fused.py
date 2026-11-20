@@ -16,8 +16,10 @@ Accuracy + performance benchmark for chunk_kda_fwd_kernel_inter_solve_fused.
 import argparse
 import functools
 import itertools
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional, Tuple
 
+import pytest
 import torch
 import triton
 
@@ -41,6 +43,61 @@ RTOL_RECOMPUTE = 1e-2  # u/w 多一层 Ainv 累积
 
 # 条件数护栏阈值
 AINV_MAX_LIMIT = 1e3
+
+
+@dataclass(frozen=True)
+class GLM53FlashCase:
+    name: str
+    tokens: int
+    heads: int
+    requests: int
+    chunks: int
+    launches: int
+
+
+# C500 trace 中的全部唯一 tensor shapes。最热的 T=64 shape 在 trace 中因
+# BK=32/64 分成两个 variants，这里合并为一个 unit-test shape。
+GLM53_FLASH_CASES = (
+    GLM53FlashCase("decode_t64_h64_r1", 64, 64, 1, 1, 321708),
+    GLM53FlashCase("prefill_t8192_h8_r1", 8192, 8, 1, 128, 29920),
+    GLM53FlashCase("prefill_t8192_h8_r2", 8192, 8, 2, 128, 2720),
+    GLM53FlashCase("short_t17_h8_r1", 17, 8, 1, 1, 1632),
+    GLM53FlashCase("short_t1_h8_r1", 1, 8, 1, 1, 1360),
+    GLM53FlashCase("prefill_t3072_h8_r1", 3072, 8, 1, 48, 816),
+    GLM53FlashCase("short_t19_h8_r1", 19, 8, 1, 1, 544),
+    GLM53FlashCase("prefill_t8192_h8_r4", 8192, 8, 4, 128, 544),
+    GLM53FlashCase("prefill_t8192_h8_r3", 8192, 8, 3, 128, 544),
+    GLM53FlashCase("prefill_t8164_h8_r3", 8164, 8, 3, 128, 272),
+    GLM53FlashCase("prefill_t8130_h8_r4", 8130, 8, 4, 128, 272),
+    GLM53FlashCase("prefill_t8170_h8_r4", 8170, 8, 4, 128, 272),
+    GLM53FlashCase("prefill_t5056_h8_r2", 5056, 8, 2, 79, 272),
+    GLM53FlashCase("prefill_t7168_h8_r1", 7168, 8, 1, 112, 272),
+    GLM53FlashCase("prefill_t8177_h8_r2", 8177, 8, 2, 128, 272),
+    GLM53FlashCase("prefill_t8141_h8_r2", 8141, 8, 2, 128, 272),
+    GLM53FlashCase("prefill_t8133_h8_r2", 8133, 8, 2, 128, 272),
+    GLM53FlashCase("prefill_t8148_h8_r2", 8148, 8, 2, 128, 272),
+    GLM53FlashCase("prefill_t8149_h8_r2", 8149, 8, 2, 128, 272),
+    GLM53FlashCase("prefill_t4672_h8_r1", 4672, 8, 1, 73, 272),
+    GLM53FlashCase("short_t4_h8_r1", 4, 8, 1, 1, 272),
+    GLM53FlashCase("prefill_t2985_h8_r1", 2985, 8, 1, 47, 272),
+    GLM53FlashCase("prefill_t5092_h8_r2", 5092, 8, 2, 80, 272),
+    GLM53FlashCase("short_t1_h64_r1", 1, 64, 1, 1, 136),
+    GLM53FlashCase("short_t17_h64_r1", 17, 64, 1, 1, 136),
+    GLM53FlashCase("short_t19_h64_r1", 19, 64, 1, 1, 68),
+    GLM53FlashCase("short_t41_h64_r1", 41, 64, 1, 1, 34),
+    GLM53FlashCase("short_t36_h64_r1", 36, 64, 1, 1, 34),
+    GLM53FlashCase("short_t13_h64_r1", 13, 64, 1, 1, 34),
+    GLM53FlashCase("short_t49_h64_r1", 49, 64, 1, 1, 34),
+)
+SHAPE_SETS = {"GLM5.3-flash": GLM53_FLASH_CASES}
+
+# 默认 unit test 覆盖三个不同执行边界；其余 trace shapes 由 catalog test 锁定。
+GLM53_FLASH_UNIT_CASES = tuple(
+    case
+    for case in GLM53_FLASH_CASES
+    if case.name
+    in {"decode_t64_h64_r1", "prefill_t8192_h8_r1", "short_t19_h8_r1"}
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -81,14 +138,19 @@ def prepare_chunk_indices(cu_seqlens: torch.Tensor, chunk_size: int) -> torch.Te
 def _chunkify(x: torch.Tensor) -> torch.Tensor:
     """[B, T, H, D] -> [B, H, NT, BT, D]"""
     B, T, H, D = x.shape
-    assert T % BT == 0, f"T={T} 必须是 BT={BT} 的整数倍"
-    return x.view(B, T // BT, BT, H, D).permute(0, 3, 1, 2, 4).contiguous()
+    padded_t = triton.cdiv(T, BT) * BT
+    if padded_t != T:
+        x = torch.cat((x, x.new_zeros(B, padded_t - T, H, D)), dim=1)
+    return x.view(B, padded_t // BT, BT, H, D).permute(0, 3, 1, 2, 4).contiguous()
 
 
-def _unchunkify(x: torch.Tensor) -> torch.Tensor:
+def _unchunkify(x: torch.Tensor, tokens: Optional[int] = None) -> torch.Tensor:
     """[B, H, NT, BT, D] -> [B, T, H, D]"""
     B, H, NT, bt, D = x.shape
-    return x.permute(0, 2, 3, 1, 4).reshape(B, NT * bt, H, D).contiguous()
+    result = x.permute(0, 2, 3, 1, 4).reshape(B, NT * bt, H, D)
+    if tokens is not None:
+        result = result[:, :tokens]
+    return result.contiguous()
 
 
 # --------------------------------------------------------------------------- #
@@ -105,11 +167,19 @@ def reference(q, k, v, g, beta, scale, fuse_recompute, fuse_diagonal, use_safe_g
       M_max    float          max|M|，用于条件数护栏
       u, w, kg [B, T, H, V/K] （fuse_recompute 时）
     """
+    tokens = q.shape[1]
     f64 = torch.float64
     qc = _chunkify(q.to(f64))
     kc = _chunkify(k.to(f64))
     vc = _chunkify(v.to(f64))
-    gc = _chunkify(g.to(f64))
+    gate = g.to(f64)
+    padded_t = triton.cdiv(tokens, BT) * BT
+    if padded_t != tokens:
+        # kg 以 chunk 的最后一个有效 gate 为基准；尾块不能用 0 padding。
+        gate = torch.cat(
+            (gate, gate[:, -1:].expand(-1, padded_t - tokens, -1, -1)), dim=1
+        )
+    gc = _chunkify(gate)
     bc = _chunkify(beta.to(f64).unsqueeze(-1)).squeeze(-1)  # [B,H,NT,BT]
 
     # 以 chunk 首行为基准做数值稳定化
@@ -151,17 +221,17 @@ def reference(q, k, v, g, beta, scale, fuse_recompute, fuse_diagonal, use_safe_g
             diag_in[..., sl, :] = blk
 
     out: Dict[str, Any] = {
-        "Aqk": _unchunkify(Aqk),
-        "Ainv": _unchunkify(Ainv),
-        "Akkd_in": _unchunkify(diag_in),
-        "Akkd_out": _unchunkify(diag_out),
+        "Aqk": _unchunkify(Aqk, tokens),
+        "Ainv": _unchunkify(Ainv, tokens),
+        "Akkd_in": _unchunkify(diag_in, tokens),
+        "Akkd_out": _unchunkify(diag_out, tokens),
         "M_max": Mkk.abs().max().item(),
     }
 
     if fuse_recompute:
-        out["u"] = _unchunkify(Ainv @ (vc * bc[..., None]))
-        out["w"] = _unchunkify(Ainv @ (kc * bc[..., None] * torch.exp2(gc)))
-        out["kg"] = _unchunkify(kc * torch.exp2(gc[..., -1:, :] - gc))
+        out["u"] = _unchunkify(Ainv @ (vc * bc[..., None]), tokens)
+        out["w"] = _unchunkify(Ainv @ (kc * bc[..., None] * torch.exp2(gc)), tokens)
+        out["kg"] = _unchunkify(kc * torch.exp2(gc[..., -1:, :] - gc), tokens)
     return out
 
 
@@ -272,7 +342,7 @@ def _block_mask(T: int, device, with_diagonal: bool) -> torch.Tensor:
         if i == j and not with_diagonal:
             continue
         m[i * BC:(i + 1) * BC, j * BC:(j + 1) * BC] = True
-    return m.repeat(T // BT, 1)
+    return m.repeat(triton.cdiv(T, BT), 1)[:T]
 
 
 @torch.no_grad()
@@ -324,6 +394,35 @@ def run_accuracy(B, T, H, varlen, safe_gate, fuse_recompute, fuse_diagonal,
 
     print(f"    -> {'PASS' if ok else 'FAIL'}\n")
     return ok
+
+
+def test_glm53_flash_shape_catalog() -> None:
+    cases = SHAPE_SETS["GLM5.3-flash"]
+    assert len(cases) == 30
+    assert sum(case.launches for case in cases) == 364072
+    assert len({case.name for case in cases}) == len(cases)
+    for case in cases:
+        assert case.heads in (8, 64)
+        assert case.requests >= 1
+        assert case.chunks >= triton.cdiv(case.tokens, BT)
+
+
+@pytest.mark.parametrize(
+    "case", GLM53_FLASH_UNIT_CASES, ids=lambda case: case.name
+)
+def test_glm53_flash_target_shapes(case: GLM53FlashCase) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("chunk KDA requires a CUDA device")
+
+    assert run_accuracy(
+        B=1,
+        T=case.tokens,
+        H=case.heads,
+        varlen=True,
+        safe_gate=True,
+        fuse_recompute=True,
+        fuse_diagonal=True,
+    )
 
 
 # --------------------------------------------------------------------------- #

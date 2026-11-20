@@ -90,6 +90,10 @@ constexpr int kVecElems = 8;  // 8 bf16 == one uint4 load / one uint2 fp8 store
 // batches have enough rows for one warp per row.
 constexpr int kDecodeRowSplitMaxTokens = 64;
 
+constexpr int kHeadsPerLightWarp = 4;
+
+constexpr int kTokensPerHeavyWarp = 2;
+
 #if defined(USE_ROCM) && defined(__gfx942__)
 constexpr float kFp8Max = 224.0f;
 #else
@@ -304,6 +308,53 @@ __device__ __forceinline__ void writeLatent576(
   }
 }
 
+// Local E4M3FN encoder (RNE rounding, saturate to +-448), bit-identical to
+// torch's `.to(float8_e4m3fn)`. Kept private to this translation unit so the
+// shared quant_utils.cuh stub (whose missing specialization used to delete
+// this whole path under NDEBUG) stays untouched -- other ops are unaffected.
+namespace kimi_k3_fp8 {
+__device__ __forceinline__ uint8_t float_to_fp8_e4m3fn_bits(float val) {
+  constexpr uint32_t kFp8MaxBits = UINT32_C(0x43E00000);    // 448.0f
+  constexpr uint32_t kMinNormalBits = UINT32_C(121) << 23;  // 2^-6
+  constexpr uint32_t kDenormMask = UINT32_C(141) << 23;     // 2^14
+  uint32_t f_bits = __float_as_uint(val);
+  uint32_t const sign = f_bits & UINT32_C(0x80000000);
+  f_bits ^= sign;
+  uint32_t result;
+  if (f_bits >= kFp8MaxBits) {
+    result = UINT32_C(0x7E);  // saturate: e4m3fn has no inf
+  } else if (f_bits < kMinNormalBits) {
+    uint32_t const sum_bits = __float_as_uint(__uint_as_float(f_bits) +
+                                              __uint_as_float(kDenormMask));
+    result = (sum_bits - kDenormMask) >> 20;  // 0..8
+  } else {
+    
+    uint32_t const mant_odd = (f_bits >> 20) & 1;
+    f_bits += UINT32_C(0x7FFFF) + mant_odd - UINT32_C(0x3C000000);
+    result = f_bits >> 20;  // 0x08..0x7E
+  }
+  return static_cast<uint8_t>(result | (sign >> 24));
+}
+
+__device__ __forceinline__ uint8_t scaled_quant_e4m3fn(float val,
+                                                        float scale) {
+  float const inv_scale = __builtin_mxc_rcpf(scale);
+  float const scaled = fminf(fmaxf(val * inv_scale, -448.0f), 448.0f);
+  return float_to_fp8_e4m3fn_bits(scaled);
+}
+
+__device__ __forceinline__ uint8_t quant_e4m3fn_normal_bits(float scaled) {
+  uint32_t f_bits = __float_as_uint(scaled);
+  uint32_t const sign = f_bits & UINT32_C(0x80000000);
+  f_bits ^= sign;
+  uint32_t const mant_odd = (f_bits >> 20) & 1;
+  f_bits += UINT32_C(0x7FFFF) + mant_odd - UINT32_C(0x3C000000);
+  return static_cast<uint8_t>((f_bits >> 20) | (sign >> 24));
+}
+
+constexpr float kMinNormalScaled = 0.0244140625f;  // 2^-6 * 1.25
+}  // namespace kimi_k3_fp8
+
 // Write [kv_c | k_pe] into the fp8_ds_mla 656B entry using one warp: NoPE 512
 // as fp8 in 4 tiles of 128 (per-tile dynamic absmax scale, 4 fp32 scales at
 // [512,528)), RoPE 64 as bf16 at [528,656). Bit-compatible with
@@ -329,16 +380,16 @@ __device__ __forceinline__ void writeDsMlaCache(
   for (int offset = 4; offset > 0; offset /= 2) {
     max_abs = fmaxf(max_abs, VLLM_SHFL_XOR_SYNC_WIDTH(max_abs, offset, 8));
   }
-  float const tile_scale = fmaxf(max_abs / kFp8ScaleDivisor, FLT_MIN);
+  float tile_scale = fmaxf(max_abs / kFp8ScaleDivisor, 1e-4f);
+  tile_scale = exp2f(ceilf(log2f(tile_scale)));
   if ((laneId & 7) == 0) {
     reinterpret_cast<float*>(row)[kKvLoraRank / 4 + tile] = tile_scale;
   }
   uint8_t res[kElemsPerLane];
 #pragma unroll
   for (int i = 0; i < kElemsPerLane; i++) {
-    res[i] =
-        fp8::scaled_convert<uint8_t, scalar_t, Fp8KVCacheDataType::kFp8E4M3>(
-            vals[i], tile_scale);
+    res[i] = kimi_k3_fp8::scaled_quant_e4m3fn(static_cast<float>(vals[i]),
+                                              tile_scale);
   }
   *reinterpret_cast<uint4*>(row + laneId * kElemsPerLane) =
       *reinterpret_cast<const uint4*>(res);
@@ -356,6 +407,113 @@ __device__ __forceinline__ void writeDsMlaCache(
   } else {
     *reinterpret_cast<int32_t*>(rope_dst) =
         *reinterpret_cast<const int32_t*>(pe + laneId * 2);
+  }
+}
+
+template <typename scalar_t, bool APPLY_ROPE = false, int HT = 2>
+__device__ __forceinline__ void writeDsMlaCacheMulti(
+    uint8_t* const (&row)[HT], const scalar_t* const (&kvc)[HT],
+    const scalar_t* const (&pe)[HT], int laneId,
+    const float* const (&cos_sin)[HT]) {
+  constexpr int kElemsPerLane = kKvLoraRank / 32;  // 16
+  int const tile = laneId >> 3;                    // 8 lanes per tile
+  // ---- stage 1: all tokens' loads in flight ----
+  scalar_t vals[HT][kElemsPerLane];
+#pragma unroll
+  for (int t = 0; t < HT; ++t) {
+    *reinterpret_cast<uint4*>(vals[t]) =
+        *reinterpret_cast<const uint4*>(kvc[t] + laneId * kElemsPerLane);
+    *reinterpret_cast<uint4*>(vals[t] + 8) =
+        *reinterpret_cast<const uint4*>(kvc[t] + laneId * kElemsPerLane + 8);
+  }
+
+  // ---- stage 2: interleaved compute + store ----
+  float max_abs[HT];
+  float min_abs[HT];  // lane-local min |val|, for the subnormal fast-path test
+#pragma unroll
+  for (int t = 0; t < HT; ++t) {
+    max_abs[t] = 0.0f;
+    min_abs[t] = FLT_MAX;
+    for (int i = 0; i < kElemsPerLane; ++i) {
+      float const a = fabsf(static_cast<float>(vals[t][i]));
+      max_abs[t] = fmaxf(max_abs[t], a);
+      min_abs[t] = fminf(min_abs[t], a);
+    }
+  }
+#pragma unroll
+  for (int offset = 4; offset > 0; offset /= 2) {
+#pragma unroll
+    for (int t = 0; t < HT; ++t) {
+      max_abs[t] =
+          fmaxf(max_abs[t], VLLM_SHFL_XOR_SYNC_WIDTH(max_abs[t], offset, 8));
+    }
+  }
+  float tile_scale[HT];
+  float inv_scale[HT];
+#pragma unroll
+  for (int t = 0; t < HT; ++t) {
+    tile_scale[t] = fmaxf(max_abs[t] / kFp8ScaleDivisor, FLT_MIN);
+    // Hoisted: one fast-reciprocal per token instead of one per element.
+    inv_scale[t] = __builtin_mxc_rcpf(tile_scale[t]);
+  }
+  if ((laneId & 7) == 0) {
+#pragma unroll
+    for (int t = 0; t < HT; ++t) {
+      reinterpret_cast<float*>(row[t])[kKvLoraRank / 4 + tile] = tile_scale[t];
+    }
+  }
+  uint8_t res[HT][kElemsPerLane];
+#pragma unroll
+  for (int t = 0; t < HT; ++t) {
+    if (min_abs[t] * inv_scale[t] >= kimi_k3_fp8::kMinNormalScaled) {
+#pragma unroll
+      for (int i = 0; i < kElemsPerLane; ++i) {
+        float const scaled =
+            fminf(fmaxf(static_cast<float>(vals[t][i]) * inv_scale[t],
+                        -448.0f),
+                  448.0f);
+        res[t][i] = kimi_k3_fp8::quant_e4m3fn_normal_bits(scaled);
+      }
+    } else {
+#pragma unroll
+      for (int i = 0; i < kElemsPerLane; ++i) {
+        res[t][i] = kimi_k3_fp8::scaled_quant_e4m3fn(
+            static_cast<float>(vals[t][i]), tile_scale[t]);
+      }
+    }
+  }
+#pragma unroll
+  for (int t = 0; t < HT; ++t) {
+    *reinterpret_cast<uint4*>(row[t] + laneId * kElemsPerLane) =
+        *reinterpret_cast<const uint4*>(res[t]);
+  }
+  // rope segment: 64 bf16 = 32 lanes x 2 elems
+  if constexpr (APPLY_ROPE) {
+    using Converter = vllm::_typeConvert<scalar_t>;
+    using packed_t = typename Converter::packed_hip_type;
+#pragma unroll
+    for (int t = 0; t < HT; ++t) {
+      scalar_t* rope_dst =
+          reinterpret_cast<scalar_t*>(row[t]) + kKvLoraRank / 2 + 8 +
+          laneId * 2;
+      packed_t const src =
+          *reinterpret_cast<packed_t const*>(pe[t] + laneId * 2);
+      float2 const xy = Converter::convert(src);
+      float const cos = static_cast<float>(cos_sin[t][laneId]);
+      float const sin =
+          static_cast<float>(cos_sin[t][laneId + kQkRopeHeadDim / 2]);
+      *reinterpret_cast<packed_t*>(rope_dst) = Converter::convert(
+          make_float2(xy.x * cos - xy.y * sin, xy.x * sin + xy.y * cos));
+    }
+  } else {
+#pragma unroll
+    for (int t = 0; t < HT; ++t) {
+      scalar_t* rope_dst =
+          reinterpret_cast<scalar_t*>(row[t]) + kKvLoraRank / 2 + 8 +
+          laneId * 2;
+      *reinterpret_cast<int32_t*>(rope_dst) =
+          *reinterpret_cast<const int32_t*>(pe[t] + laneId * 2);
+    }
   }
 }
 
@@ -569,6 +727,26 @@ __global__ void fusedKimiK3MLAKVConcatPackKernel(
 #endif
 }
 
+// Rotate one uint4 chunk (8 bf16 = 4 pairs) by the cos/sin held in cs/sn.
+// Used by the 2-head light path for q and k_pe rotations.
+template <typename scalar_t>
+__device__ __forceinline__ uint4 rotateChunk8(uint4 v, float4 cs, float4 sn) {
+  using Converter = vllm::_typeConvert<scalar_t>;
+  using packed_t = typename Converter::packed_hip_type;
+  auto const* p = reinterpret_cast<packed_t const*>(&v);
+  uint4 out;
+  auto* o = reinterpret_cast<packed_t*>(&out);
+  float const cos_arr[kVecElems / 2] = {cs.x, cs.y, cs.z, cs.w};
+  float const sin_arr[kVecElems / 2] = {sn.x, sn.y, sn.z, sn.w};
+#pragma unroll
+  for (int i = 0; i < kVecElems / 2; i++) {
+    float2 const xy = Converter::convert(p[i]);
+    o[i] = Converter::convert(
+        make_float2(xy.x * cos_arr[i] - xy.y * sin_arr[i],
+                    xy.x * sin_arr[i] + xy.y * cos_arr[i]));
+  }
+  return out;
+}
 // ────────────────────────────────────────────────────────────────────────────
 // ds_mla variant: concat full key (bf16) + fp8_ds_mla latent cache insert
 //
@@ -580,7 +758,7 @@ __global__ void fusedKimiK3MLAKVConcatPackKernel(
 // (tile = L>>3, absmax-reduced within its 8-lane tile group), then all 32 lanes
 // write 2 RoPE bf16 each.
 // ────────────────────────────────────────────────────────────────────────────
-template <typename scalar_t, bool APPLY_ROPE>
+template <typename scalar_t, bool APPLY_ROPE,  int HP = kHeadsPerLightWarp>
 __global__ void fusedKimiK3MLAKeyConcatDsMlaInsertKernel(
     scalar_t* __restrict__ q, int64_t const q_tok_stride,
     int64_t const q_head_stride, const scalar_t* __restrict__ k_nope,
@@ -597,39 +775,150 @@ __global__ void fusedKimiK3MLAKeyConcatDsMlaInsertKernel(
   int const warpsPerBlock = blockDim.x / 32;
   int const laneId = threadIdx.x % 32;
   int const globalWarpIdx = blockIdx.x * warpsPerBlock + threadIdx.x / 32;
-  int const slotsPerToken = num_heads + 1;
-  int const tokenIdx = globalWarpIdx / slotsPerToken;
-  int const slotIdx = globalWarpIdx % slotsPerToken;
-  if (tokenIdx >= num_tokens) return;
-
+  int const lightOrders = (num_heads + HP - 1) / HP;
+  constexpr int kHeavyTokens = kTokensPerHeavyWarp;
+  int64_t const lightWarps =
+      static_cast<int64_t>(num_tokens) * lightOrders;
+  int64_t const heavyWarps =
+      (static_cast<int64_t>(num_tokens) + kHeavyTokens - 1) / kHeavyTokens;
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
   cudaGridDependencySynchronize();
 #endif
+  if (globalWarpIdx < lightWarps) {//轻重分离
+    int const tokenIdx = globalWarpIdx / lightOrders;
+    int const slotIdx = globalWarpIdx % lightOrders;
 
-  const float* rope_cache = nullptr;
-  if constexpr (APPLY_ROPE) {
-    rope_cache = cos_sin_cache + position_ids[tokenIdx] * kQkRopeHeadDim;
-  }
+    const float* rope_cache = nullptr;
+    if constexpr (APPLY_ROPE) {
+      rope_cache = cos_sin_cache + position_ids[tokenIdx] * kQkRopeHeadDim;
+    }
+    int const h0 = slotIdx * HP;
+    scalar_t* qh0 = q + tokenIdx * q_tok_stride + h0 * q_head_stride;
+    const scalar_t* kn0 =
+        k_nope + tokenIdx * kn_tok_stride + h0 * kn_head_stride;
+    const scalar_t* pe = k_pe + tokenIdx * k_pe_tok_stride;
+    scalar_t* ko0 = k_out + tokenIdx * ko_tok_stride + h0 * ko_head_stride;
+    constexpr int kQChunks = HP * kQkRopeHeadDim / kVecElems;  // HP*8
+    uint4 qv = make_uint4(0, 0, 0, 0);
+    if (laneId < kQChunks && h0 + laneId / 8 < num_heads) {
+      scalar_t const* qh = qh0 + (laneId / 8) * q_head_stride;
+      qv = *reinterpret_cast<const uint4*>(
+          qh + kQkNopeHeadDim + (laneId & 7) * kVecElems);
+    }
+    constexpr int kKnChunks = HP * kQkNopeHeadDim / kVecElems;  // HP*16
+    constexpr int kKnRounds = (kKnChunks + 31) / 32;
+    uint4 kv[kKnRounds];
+#pragma unroll
+    for (int r = 0; r < kKnRounds; ++r) {
+      int const chunk = r * 32 + laneId;
+      kv[r] = make_uint4(0, 0, 0, 0);
+      if (chunk < kKnChunks && h0 + chunk / 16 < num_heads) {
+        const scalar_t* kn = kn0 + (chunk / 16) * kn_head_stride;
+        kv[r] = *reinterpret_cast<const uint4*>(
+            kn + (chunk & 15) * kVecElems);
+      }
+    }
+    uint4 pv = make_uint4(0, 0, 0, 0);
+    bool const pe_lane = laneId < kQkRopeHeadDim / kVecElems;  // 8 lanes
+    if (pe_lane) {
+      pv = *reinterpret_cast<const uint4*>(pe + laneId * kVecElems);
+    }
+    float4 cs = make_float4(0.f, 0.f, 0.f, 0.f);
+    float4 sn = make_float4(0.f, 0.f, 0.f, 0.f);
+    if constexpr (APPLY_ROPE) {
+      if (laneId < kQChunks) {
+        int const pair = (laneId & 7) * (kVecElems / 2);  // 0,4,8,...,28
+        cs = *reinterpret_cast<const float4*>(rope_cache + pair);
+        sn = *reinterpret_cast<const float4*>(
+            rope_cache + pair + kQkRopeHeadDim / 2);
+      }
+    }
 
-  if (slotIdx < num_heads) {
-    scalar_t* qh = q + tokenIdx * q_tok_stride + slotIdx * q_head_stride;
-    writePrefillQuery<scalar_t, false, APPLY_ROPE>(
-        qh, qh, laneId, sizeof(scalar_t), 1.0f, rope_cache);
-    // Full key (bf16): k_out[t, h] = [k_nope[t, h] | k_pe[t]].
-    writeFullKey<scalar_t, false, APPLY_ROPE>(
-        k_out + tokenIdx * ko_tok_stride + slotIdx * ko_head_stride,
-        k_nope + tokenIdx * kn_tok_stride + slotIdx * kn_head_stride,
-        k_pe + tokenIdx * k_pe_tok_stride, laneId, sizeof(scalar_t), 1.0f,
-        rope_cache);
+    if constexpr (APPLY_ROPE) {
+      if (laneId < kQChunks && h0 + laneId / 8 < num_heads) {
+        scalar_t* qh = qh0 + (laneId / 8) * q_head_stride;
+        *reinterpret_cast<uint4*>(
+            qh + kQkNopeHeadDim + (laneId & 7) * kVecElems) =
+            rotateChunk8<scalar_t>(qv, cs, sn);
+      }
+    }
+#pragma unroll
+    for (int r = 0; r < kKnRounds; ++r) {
+      int const chunk = r * 32 + laneId;
+      if (chunk < kKnChunks && h0 + chunk / 16 < num_heads) {
+        scalar_t* ko = ko0 + (chunk / 16) * ko_head_stride;
+        *reinterpret_cast<uint4*>(ko + (chunk & 15) * kVecElems) = kv[r];
+      }
+    }
+    if (pe_lane) {
+      if constexpr (APPLY_ROPE) {
+        uint4 const rotated = rotateChunk8<scalar_t>(pv, cs, sn);
+#pragma unroll
+        for (int h = 0; h < HP; ++h) {
+          if (h0 + h < num_heads) {
+            *reinterpret_cast<uint4*>(ko0 + h * ko_head_stride +
+                                      kQkNopeHeadDim + laneId * kVecElems) =
+                rotated;
+          }
+        }
+      } else {
+#pragma unroll
+        for (int h = 0; h < HP; ++h) {
+          if (h0 + h < num_heads) {
+            *reinterpret_cast<uint4*>(ko0 + h * ko_head_stride +
+                                      kQkNopeHeadDim + laneId * kVecElems) =
+                pv;
+          }
+        }
+      }
+    }
   } else {
-    int64_t const slot_id = slot_mapping[tokenIdx];
-    if (slot_id >= 0) {
-      uint8_t* row = k_cache +
-                     (slot_id / cache_block_size) * cache_block_stride +
-                     (slot_id % cache_block_size) * cache_token_stride;
-      writeDsMlaCache<scalar_t, APPLY_ROPE>(
-          row, kv_c + tokenIdx * kv_c_tok_stride,
-          k_pe + tokenIdx * k_pe_tok_stride, laneId, rope_cache);
+    int64_t const heavyIdx = globalWarpIdx - lightWarps;
+    if (heavyIdx >= heavyWarps) return;
+    int const tokenIdx0 = heavyIdx * kHeavyTokens;
+    bool valid[kHeavyTokens];
+    uint8_t* row[kHeavyTokens];
+    const scalar_t* kvc[kHeavyTokens];
+    const scalar_t* pe[kHeavyTokens];
+    const float* rope_cache[kHeavyTokens];
+#pragma unroll
+    for (int t = 0; t < kHeavyTokens; ++t) {
+      rope_cache[t] = nullptr;
+    }
+#pragma unroll
+    for (int t = 0; t < kHeavyTokens; ++t) {
+      int const tokenIdx = tokenIdx0 + t;
+      int64_t const slot_id =
+          (tokenIdx < num_tokens) ? slot_mapping[tokenIdx] : -1;
+      valid[t] = slot_id >= 0;
+      if (valid[t]) {
+        row[t] = k_cache +
+                 (slot_id / cache_block_size) * cache_block_stride +
+                 (slot_id % cache_block_size) * cache_token_stride;
+        kvc[t] = kv_c + tokenIdx * kv_c_tok_stride;
+        pe[t] = k_pe + tokenIdx * k_pe_tok_stride;
+        if constexpr (APPLY_ROPE) {
+          rope_cache[t] =
+              cos_sin_cache + position_ids[tokenIdx] * kQkRopeHeadDim;
+        }
+      }
+    }
+    bool allValid = true;
+#pragma unroll
+    for (int t = 0; t < kHeavyTokens; ++t) {
+      allValid = allValid && valid[t];
+    }
+    if (allValid) {
+      writeDsMlaCacheMulti<scalar_t, APPLY_ROPE, kHeavyTokens>(
+          row, kvc, pe, laneId, rope_cache);
+    } else {
+#pragma unroll
+      for (int t = 0; t < kHeavyTokens; ++t) {
+        if (valid[t]) {
+          writeDsMlaCache<scalar_t, APPLY_ROPE>(row[t], kvc[t], pe[t], laneId,
+                                                rope_cache[t]);
+        }
+      }
     }
   }
 
@@ -817,6 +1106,22 @@ template <typename KernelT, typename... Args>
 static void launchPdl(KernelT kernel, int num_tokens, int num_heads,
                       cudaStream_t stream, Args... args) {
   launchPdlSlots(kernel, num_tokens, num_heads + 1, 1, 0, stream, args...);
+}
+
+template <typename KernelT, typename... Args>
+static void launchPdlDsMla(KernelT kernel, int num_tokens, int num_heads,
+                           cudaStream_t stream, Args... args) {
+  int const lightOrders = (num_heads + kHeadsPerLightWarp - 1) /
+                          kHeadsPerLightWarp;
+  int64_t const lightWarps =
+      static_cast<int64_t>(num_tokens) * lightOrders;
+  int64_t const heavyWarps =
+      (num_tokens + kTokensPerHeavyWarp - 1) /
+      kTokensPerHeavyWarp;
+  int64_t const totalWarps = lightWarps + heavyWarps;
+  TORCH_CHECK(totalWarps <= INT32_MAX, "ds_mla insert grid too large");
+  launchPdlSlots(kernel, static_cast<int>(totalWarps), 1, 1, 0, stream,
+                 args...);
 }
 
 void checkBfloat16Support(torch::headeronly::ScalarType dtype) {
@@ -1014,7 +1319,7 @@ void fused_kimi_k3_mla_key_concat_ds_mla_insert(
   VLLM_DISPATCH_HALF_TYPES(
       dt, "fused_kimi_k3_mla_key_concat_ds_mla_insert", [&] {
         auto launch = [&](auto kernel) {
-          kk3::launchPdl(
+          kk3::launchPdlDsMla(
               kernel, num_tokens, num_heads, stream,
               reinterpret_cast<scalar_t*>(q.mutable_data_ptr()), q.stride(0),
               q.stride(1),
@@ -1482,8 +1787,8 @@ void fused_kimi_k3_mla_decode_q_concat_kv_cache_fp8_insert(
                 3);
           } else {
             launch(kk3::fusedKimiK3MLADecodeQConcatKVCacheKernel<scalar_t, true,
-                                                                 true, false>,
-                   1);
+                                                              true, false>,
+                1);
           }
         }
       });

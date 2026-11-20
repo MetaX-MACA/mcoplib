@@ -1,16 +1,12 @@
 {
     "device_id": 0,
-    "device_name": [
-        "MetaX C500",
-        "MetaX C600-UL",
-        "Metax C600-U"
-    ],
-    "num_layers": 63,
+    "device_name": ["MetaX C500", "MetaX C600-UL", "Metax C600-U"],
+    "num_layers": [7, 21, 63],
     "page_size": 16,
     "head_dim": 128,
     "num_heads": 8,
     "total_pages": 1024,
-    "copy_pages": 256,
+    "copy_pages": [16, 64, 256, 512],
     "dtype": "float16",
     "seed": 42,
     "samples": 100

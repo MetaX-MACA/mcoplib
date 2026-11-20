@@ -173,7 +173,7 @@ def main():
                             desc = (f"{dtype_name} ({T},{d}) limit={limit} "
                                     f"alpha={alpha} beta={beta} step4={step4}")
                             if not (cos >= COS_TH):  # NaN-sensitive
-                                failures.append((f"mcop {desc}", cos))
+                                failures.append((f"mcoplib {desc}", cos))
                             if step4 and alpha == 1.0 and beta == 0.0:
                                 tsim = _cosine(_triton_ref(gate, up, limit), expected)
                                 tri_checks += 1
@@ -253,7 +253,7 @@ def main():
 
     all_failures = failures + tri_failures
     if all_failures:
-        print(f"\nFAIL: {len(failures)} / {cases} mcop cases below {COS_TH} "
+        print(f"\nFAIL: {len(failures)} / {cases} mcoplib cases below {COS_TH} "
               f"(+{len(tri_failures)} triton cross-checks):")
         for desc, cos in all_failures[:40]:
             print(f"  {desc}: cos={cos:.6f}")

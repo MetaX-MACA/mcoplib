@@ -1,0 +1,21 @@
+{
+    "device_id": 0,
+    "device_name": ["MetaX C500", "MetaX C600-UL", "MetaX C600-U"],
+    "test_cases": [
+        {"mode": "flat", "dtype": "float16", "activation": "silu", "d": 64, "num_tokens": 7},
+        {"mode": "flat", "dtype": "bfloat16", "activation": "gelu", "d": 64, "num_tokens": 7},
+        {"mode": "flat", "dtype": "float16", "activation": "gelu_tanh", "d": 513, "num_tokens": 67},
+        {"mode": "flat", "dtype": "bfloat16", "activation": "silu_no_mul", "d": 32, "num_tokens": 7},
+        {"mode": "flat", "dtype": "float16", "activation": "gelu_no_mul", "d": 64, "num_tokens": 67},
+        {"mode": "flat", "dtype": "bfloat16", "activation": "gelu_tanh_no_mul", "d": 513, "num_tokens": 7},
+        {"mode": "flat", "dtype": "float16", "activation": "relu2_no_mul", "d": 32, "num_tokens": 1},
+        {"mode": "batched", "dtype": "float16", "activation": "silu", "d": 32, "num_experts": 4, "max_num_tokens": 7},
+        {"mode": "batched", "dtype": "bfloat16", "activation": "gelu", "d": 64, "num_experts": 4, "max_num_tokens": 7},
+        {"mode": "batched", "dtype": "float16", "activation": "silu_with_clamp", "d": 513, "num_experts": 4, "max_num_tokens": 7, "clamp_limit": 1.0},
+        {"mode": "batched", "dtype": "bfloat16", "activation": "silu_with_clamp", "d": 64, "num_experts": 4, "max_num_tokens": 7, "clamp_limit": 7.0},
+        {"mode": "batched", "dtype": "float16", "activation": "swiglustep", "d": 513, "num_experts": 4, "max_num_tokens": 7, "clamp_limit": 3.0},
+        {"mode": "batched", "dtype": "bfloat16", "activation": "situ", "d": 64, "num_experts": 4, "max_num_tokens": 7, "situ_beta": 1.5, "situ_linear_beta": 0.0},
+        {"mode": "batched", "dtype": "float16", "activation": "situ", "d": 64, "num_experts": 4, "max_num_tokens": 7, "situ_beta": 1.0, "situ_linear_beta": 2.0}
+    ],
+    "samples": 100
+}

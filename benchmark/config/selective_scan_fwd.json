@@ -12,5 +12,5 @@
     "has_delta_bias": [true],
     "delta_softplus": [true],
     "scan_chunks": [1, 3],
-    "samples": 1000
+    "samples": 100
 }

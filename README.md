@@ -76,7 +76,7 @@ pip3 install mcoplib-0.1.0+maca3.0.0.8.torch2.6-cp310-cp310-linux_x86_64.whl
 ```
 ## mcoplib CV Op Kernel 编译打包
 ```shell
-#切换到源码目录（~/mcOplib/gerrit_mcoplib/mcoplib_dev/mcoplib）, 执行一下命令
+#切换到源码目录（~/mcoplib/gerrit_mcoplib/mcoplib_dev/mcoplib）, 执行一下命令
 source env.sh
 cd /path/source/code/dir/mcoplib/op/cv/
 #执行命令 配置 + 构建
@@ -109,11 +109,11 @@ root@lt-srv-10-2-182-63:~/mcoplib# tree
     `-- libmcoplib_cv.so
 ```
 
-### Mcoplib  cv Op kernel 测试
+### mcoplib  cv Op kernel 测试
 ```shell
 #mcoplib cv op kernel测试需要先安装mcoplib_cv-0.2.0-Linux.deb包, deb包安装后会/opt/maca-ai/mcoplib目录下存在mcoplib cv库及头文件
 dpkg -i mcoplib_cv-0.2.0-Linux.deb
-#切换到源码目录（~/mcOplib/gerrit_mcoplib/mcoplib_dev/mcoplib）, 执行一下命令
+#切换到源码目录（~/mcoplib/gerrit_mcoplib/mcoplib_dev/mcoplib）, 执行一下命令
 source env.sh
 cd  /path/source/code/dir/mcoplib/unit_test/cpp
 mkdir build
@@ -149,7 +149,6 @@ export BUILD_VLLM_SUBMODULE=OFF  BUILD_SGLANG_SUBMODULE=OFF BUILD_LMDEPLOY_SUBMO
 ```
 ## 算子说明书
 [算子说明书](./docs/mcoplib算子说明书.md)
-
 [算子说明书网页版](./docs/mcoplib%20Operator%20Manual%20%28Web%20Version%29/index.html)
 
 ## mcoplib 分支及对应的vllm && sglang 版本
@@ -163,7 +162,7 @@ export BUILD_VLLM_SUBMODULE=OFF  BUILD_SGLANG_SUBMODULE=OFF BUILD_LMDEPLOY_SUBMO
 | release/v0.4.12 | 0.27.0 | 0.5.17 | sglang 使用 MACA 3.9.0，VLLM release 使用 MACA 3.8.2 |
 | release/v0.4.13 | 0.28.0 | 0.5.17 | |
 | release/v0.4.14 | 0.29.0 | 0.5.19 | |
-| release/v0.4.15 | 0.30.0 | 0.5.21 | |
+| release/v0.4.15 | 0.30.0（not ready） | 0.5.19 | |
 ## 动态控制算子入参信息终端输出或参数dump到本地磁盘
 ### 一、功能概述
 
@@ -202,7 +201,7 @@ export MCOP_DEBUG_FILTER=all            # 指定功能 要调试哪些算子
 trace/dump两个开关用 `1` / `ON` / `on` 表示打开
 filter开关 `MCOP_DEBUG_FILTER` 详解
 
-​```bash
+```bash
 export MCOP_DEBUG_FILTER=all                  # 所有算子
 export MCOP_DEBUG_FILTER=fused_rope           # 函数名包含 "fused_rope" 的算子（子串匹配）
 export MCOP_DEBUG_FILTER=fused_rope,rms_norm  # 多个，逗号分隔，前后空格会被去掉
@@ -480,17 +479,14 @@ Traceback (most recent call last):
 - from mcoplib.op import fused_silu_mul_dq_mask_quant_fp8_nopack，ImportError: /opt/conda/lib/python3.10/site-packages/mcoplib/op.cpython-310-x86_64-linux-gnu.so: undefined symbol: _ZN3c104cuda29c10_cuda_check_implementationEiPKcS2_jb
     解答：这是因为mcoplib 要求torch2.10版本， 安装的包也是torch2.10编译出来的， 如果在torch 2.8上进行安装时，就会报错，请保证安装的环境与编译的环境一致。
 ## Release
-### Release 0.4.15
-- support sglang  0.5.21 op
-- support for vllm 0.30.0  op kernels
+### Release 0.4.16
+- support sglang  0.5.22 op
+- support for vllm 0.32.0  op kernels
 
 #### Op New
-- add masked_moe_activation
-- add cp_gather_and_upconvert_nvfp4_kv_cache
-- add hisparse_gather_compact
-- add hisparse_gather_plan
-- add hisparse_resolve_residency
-- add hisparse_invalidate_written_slots
+- add moe_prepare_scatter
+- add fused_deepseek_v4_kv_rope_insert
+- add mnnvl_multimem_reduce_scatter
 
 #### Op Optimization
 - optimize single_grouped_topk kernel for GLM-5.1 prefill
@@ -507,22 +503,19 @@ Traceback (most recent call last):
 - fix topk_sigmoid / topk_softmax accuracy error
 
 #### Op Update
-- update kimi_k3_attn_res
-- update batched_moe_align_block_size
-- update situ_and_mul_quant
-- update masked_situ_and_mul
-- update situ_and_mul
-- update cp_gather_and_upconvert_fp8_kv_cache
-- update dsv3_fused_a_gemm
+- update moe_align_block_size
 - update fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert
-- update fused_kimi_k3_mla_decode_q_concat_kv_cache_fp8_insert
-- update fused_kimi_k3_mla_decode_q_concat_kv_cache_insert
+- update fused_minimax_m3_qknorm_rope_kv_insert
+- update hisparse_resolve_residency
+- update cp_gather_and_upconvert_fp8_kv_cache
+- update cp_gather_cache
+- update gather_and_maybe_dequant_cache
+- update fused_kimi_k3_mla_key_concat_ds_mla_insert
 - update persistent_topk
-- update top_k_per_row_decode
-- update fused_qk_norm_rope
+- update concat_and_cache_mla
 
 #### Common
-- update vLLM kernels to v0.30.0 baseline
+- update vLLM kernels to v0.32.0 baseline
 - fix custom op torch.compile error under sglang piecewise graph
 
 ## Authors and acknowledgment

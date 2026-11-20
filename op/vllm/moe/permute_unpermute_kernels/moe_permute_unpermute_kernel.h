@@ -60,12 +60,12 @@ class MacaKeyValueSorter {
   int num_bits_;
 };
 
-void computeExpertFirstTokenOffset(
-    const int* sorted_indices,
-    int total_indices,
-    int num_experts,
-    int64_t* expert_first_token_offset,
-    cudaStream_t stream);
+void computeExpertOffsetsAndInverse(int const* sorted_indices,
+                                    int const total_indices,
+                                    int const num_experts,
+                                    int64_t* expert_first_token_offset,
+                                    int const* sorted_rows, int* inverse,
+                                    cudaStream_t stream);
 
 template <typename Sorter>
 void sortAndScanExpert(
@@ -80,7 +80,7 @@ void sortAndScanExpert(
     int k,
     Sorter& sorter,
     void* workspace,
-    cudaStream_t stream);
+    cudaStream_t stream, int* inverse = nullptr);
 
 template <typename T>
 void expandInputRowsKernelLauncher(

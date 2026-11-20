@@ -21,7 +21,9 @@ K=V=128 launches use these specializations:
 Other launches use ``chunk_gated_delta_rule_fwd_kernel_h_blockdim64``.
 """
 
+import ctypes
 import functools
+import os
 from typing import Any, Callable, Optional, Tuple
 
 import torch
@@ -30,6 +32,27 @@ import triton.language as tl
 
 
 CHUNK_SIZE = 64
+
+
+@functools.lru_cache(maxsize=None)
+def _get_maca_arch(device_index: int) -> Optional[str]:
+    """Query the MACA ISA per logical device; unknown devices fail closed."""
+    try:
+        if triton.runtime.driver.active.get_current_target().backend != "maca":
+            return None
+        runtime = ctypes.CDLL(os.path.join(
+            os.environ.get("MACA_PATH", "/opt/maca"), "lib", "libmcruntime.so"))
+        query = runtime.mcExtDeviceGetAttribute
+        query.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_int]
+        query.restype = ctypes.c_int
+        major, minor = ctypes.c_int(), ctypes.c_int()
+        if query(ctypes.byref(major), 6, device_index) != 0:
+            return None
+        if query(ctypes.byref(minor), 7, device_index) != 0:
+            return None
+        return f"xcore{major.value:02d}{minor.value:02d}"
+    except (OSError, AttributeError, RuntimeError):
+        return None
 
 
 @functools.lru_cache(maxsize=None)
@@ -792,6 +815,63 @@ def _launch_chunk_gated_delta_rule_fwd_h(
     if device_index is None:
         device_index = torch.cuda.current_device()
 
+    # C500 T64/H64: the generic BV32/two-warp tile reduces the state
+    # footprint versus the BV64 tail-free path. Other platforms keep their
+    # existing specialization and launch configuration.
+    if (
+        B == 1 and T == 64 and N == 1 and NT == 1
+        and H == Hg == 64 and K == V == 128
+        and block_v == 64 and num_warps == 4 and num_stages == 1
+        and use_exp2 and g is None and gk is not None and v_new is not None
+        and cu_seqlens is not None
+        and initial_state.shape == (64, 64, 128, 128)
+        and initial_state.dtype == gk.dtype == torch.float32
+        and k.dtype == w.dtype == u.dtype == h.dtype == v_new.dtype == torch.bfloat16
+        and k.is_contiguous() and w.is_contiguous() and u.is_contiguous()
+        and gk.is_contiguous() and initial_state.is_contiguous()
+        and _get_maca_arch(device_index) in ("xcore1000", "xcore1008")
+    ):
+        block_v, num_warps = 32, 2
+
+    # Further C500 ticket configurations: smaller generic tiles for short
+    # sequences, and BV32 for the measured H8 multi-sequence contracts.
+    # Select the configuration here; apply it only in the ISA-specific branch.
+    c500_ticket_config = None
+    if (
+        B == 1 and H == Hg and H in (8, 64) and K == V == 128
+        and block_v == 64 and num_warps == 4 and num_stages == 1
+        and use_exp2 and g is None and gk is not None and v_new is not None
+        and cu_seqlens is not None
+        and initial_state.shape == (307 if H == 8 else 64, H, 128, 128)
+        and initial_state.dtype == gk.dtype == torch.float32
+        and k.dtype == w.dtype == u.dtype == h.dtype == v_new.dtype == torch.bfloat16
+        and initial_state_indices.dtype == cu_seqlens.dtype == torch.int32
+        and chunk_offsets.dtype == torch.int64
+        and k.is_contiguous() and w.is_contiguous() and u.is_contiguous()
+        and gk.is_contiguous() and initial_state.is_contiguous()
+    ):
+        if H == 8:
+            if N == 1 and NT == 1 and T in (1, 4, 17, 19):
+                c500_ticket_config = (16, 4)
+            elif (T, N, NT) in (
+                (8192, 2, 128), (8192, 3, 128), (8192, 4, 128),
+                (8164, 3, 128), (8130, 4, 128), (8170, 4, 128),
+                (5056, 2, 79), (8177, 2, 128), (8141, 2, 128),
+                (8133, 2, 128), (8148, 2, 128), (8149, 2, 128),
+                (5092, 2, 80),
+            ):
+                c500_ticket_config = (32, 4)
+        elif N == 1 and NT == 1 and T in (1, 13, 17, 19, 36, 41, 49):
+            c500_ticket_config = (32, 2)
+
+    use_c500_h8_tailfree_bv32 = False
+    if (
+        c500_ticket_config is not None
+        and _get_maca_arch(device_index) in ("xcore1000", "xcore1008")
+    ):
+        block_v, num_warps = c500_ticket_config
+        use_c500_h8_tailfree_bv32 = H == 8 and N > 1
+
     # On C500, the packed H=12 production family benefits from the fused K=128
     # operand path at BV=32. C600-U regresses on that path, so it and unmeasured
     # devices retain the generic BV=64 kernel.
@@ -899,14 +979,13 @@ def _launch_chunk_gated_delta_rule_fwd_h(
         )
         return
 
-    # Tail-free K=V=128 specialization. Restricted to the exact contract that
-    # was measured (gk-only, BV=64, four warps, one stage) and to launches
-    # where every sequence length is a whole number of chunks; every other
-    # launch keeps the general kernel unchanged.
+    # Tail-free K=V=128 specialization: the retained BV64 configuration, or
+    # the ISA-gated C500 H8 BV32 configuration above. Both use four warps and
+    # one stage, and require whole chunks in every sequence.
     use_k128_tailfree = (
         K == 128
         and V == 128
-        and block_v == 64
+        and (block_v == 64 or use_c500_h8_tailfree_bv32)
         and num_warps == 4
         and num_stages == 1
         and g is None

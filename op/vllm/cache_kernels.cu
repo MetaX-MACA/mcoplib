@@ -6,6 +6,7 @@
 
 #include "cuda_utils.h"
 #include "cuda_compat.h"
+#include "core/utils.hpp"
 #include "dispatch_utils.h"
 #include "quantization/vectorization_utils.cuh"
 #if !defined(USE_ROCM) && defined(ENABLE_NVFP4_SM100) && ENABLE_NVFP4_SM100
@@ -19,6 +20,7 @@
 #include <cassert>
 #include <map>
 #include <cfloat>
+#include <type_traits>
 #include <cstdlib>
 #include <vector>
 
@@ -75,7 +77,9 @@ void swap_blocks(torch::Tensor& src, torch::Tensor& dst,
 namespace {
 // ROCm hipMemcpyBatchAsync faults for count > 8192 (MI350X/gfx950), so chunk
 // at that ceiling.
+#if defined(USE_ROCM)
 constexpr int64_t kRocmDefaultMaxBatchDescriptors = 8192;
+#endif
 
 constexpr const char* kMaxBatchDescriptorsEnv =
     "VLLM_KV_OFFLOAD_MAX_BATCH_DESCRIPTORS";
@@ -757,16 +761,20 @@ __global__ void concat_and_cache_ds_mla_kernel(
   scalar_t* kv_cache_16bit =
       reinterpret_cast<scalar_t*>(&kv_cache[dst_idx_start]);
 
-  // The last warp handles the RoPE part
+  // Zero the reserved RoPE tail for NoPE rows.
   if (threadIdx.x >= 64) {
     // Each thread handles two elements of RoPE
     const int8_t pe_idx_start = (threadIdx.x - 64) * 2;
-    const int64_t src_idx = token_idx * k_pe_stride + pe_idx_start;
-    // Vectorized load of two 16-bit values, performed as one 32-bit load
-    const int32_t vals = *reinterpret_cast<const int32_t*>(&k_pe[src_idx]);
     // RoPE values start after the packed 8-bit NoPE values and the
     // 32-bit scales
     const int64_t dst_idx = kv_lora_rank / 2 + 8 + pe_idx_start;
+    if (pe_dim == 0) {
+      *reinterpret_cast<int32_t*>(&kv_cache_16bit[dst_idx]) = 0;
+      return;
+    }
+    const int64_t src_idx = token_idx * k_pe_stride + pe_idx_start;
+    // Vectorized load of two 16-bit values, performed as one 32-bit load
+    const int32_t vals = *reinterpret_cast<const int32_t*>(&k_pe[src_idx]);
     // Vectorized store of two 16-bit values, performed as one 32-bit store
     *reinterpret_cast<int32_t*>(&kv_cache_16bit[dst_idx]) = vals;
     return;
@@ -796,8 +804,9 @@ __global__ void concat_and_cache_ds_mla_kernel(
     max_abs = fmaxf(max_abs, VLLM_SHFL_XOR_SYNC_WIDTH(max_abs, offset, 16));
   }
 
-  // Compute the scale for the tile
- float tile_scale = fmaxf(max_abs / kFp8ScaleDivisor, FLT_MIN);
+  // Both SM90 and SM100 readers preserve power-of-two fp32 scales exactly.
+  float tile_scale = fmaxf(max_abs / kFp8ScaleDivisor, 1e-4f);
+  tile_scale = exp2f(ceilf(log2f(tile_scale)));
 
   // The first lane of each half-warp writes the scale to kv_cache
   if ((lane_idx == 0) || (lane_idx == 16)) {
@@ -807,7 +816,7 @@ __global__ void concat_and_cache_ds_mla_kernel(
   }
 
   // Now all threads in the block scale and write their elements
-  // NoPE data is packed in the first kv_lora_rank/2 bytes (first 256 bytes)
+  // NoPE data occupies the first kv_lora_rank bytes (512 bytes).
   const int64_t dst_idx_base = dst_idx_start + (threadIdx.x * 8);
 
   uint8_t result[8];
@@ -832,8 +841,8 @@ __global__ void indexer_k_quant_and_cache_kernel(
     const int quant_block_size,                // quantization block size
     const int cache_block_size,                // cache block size
     const int cache_block_stride,  // stride for each block in kv_cache
-
-    const bool use_ue8m0  // use ue8m0 scale format
+    const bool use_ue8m0,    // use ue8m0 scale format
+    const bool use_mx_scale  // store the ue8m0 scale as packed MX bytes
 ) {
   constexpr int VEC_SIZE = 4;
   const int64_t token_idx = blockIdx.x;
@@ -849,12 +858,16 @@ __global__ void indexer_k_quant_and_cache_kernel(
     return;
   }
 
-  float2 k_val = (reinterpret_cast<const float2*>(
-      k))[(token_idx * head_dim + head_dim_idx) / VEC_SIZE];
-  scalar_t* k_val_ptr = reinterpret_cast<scalar_t*>(&k_val);
+  using load_t = std::conditional_t<sizeof(scalar_t) == 2, float2, float4>;
+  load_t k_val = reinterpret_cast<const load_t*>(k)[
+      (token_idx * head_dim + head_dim_idx) / VEC_SIZE];
+  const scalar_t* k_val_ptr = reinterpret_cast<const scalar_t*>(&k_val);
+  float k_val_f32[VEC_SIZE];
   float amax = 0.0f;
+#pragma unroll
   for (int i = 0; i < VEC_SIZE; i++) {
-    amax = fmaxf(amax, fabsf(float(k_val_ptr[i])));
+    k_val_f32[i] = to_float(k_val_ptr[i]);
+    amax = fmaxf(amax, fabsf(k_val_f32[i]));
   }
 
   // Reduced amax
@@ -868,22 +881,42 @@ __global__ void indexer_k_quant_and_cache_kernel(
 
   float scale = fmaxf(amax, 1e-4) / kFp8ScaleDivisor;
 
-  if (use_ue8m0) {
+  // MX stores only exponent bytes: quantization must use that same scale.
+  if (use_ue8m0 || use_mx_scale) {
     scale = exp2f(ceilf(log2f(scale)));
   }
 
   const int64_t dst_offset = block_idx * cache_block_stride +
                              block_offset * head_dim + head_dim_idx;
-  for (int i = 0; i < VEC_SIZE; i++) {
-    kv_cache[dst_offset + i] =
-        fp8::scaled_convert<cache_t, scalar_t, kv_dt>(k_val_ptr[i], scale);
+
+  if (use_ue8m0 || use_mx_scale) {
+#pragma unroll
+    for (int i = 0; i < VEC_SIZE; i++) {
+      k_val_f32[i] *= __builtin_mxc_rcpf(scale);
+    }
+  } else {
+    // Reciprocal multiplication can change FP8 midpoint rounding for FP32 scales.
+#pragma unroll
+    for (int i = 0; i < VEC_SIZE; i++) {
+      k_val_f32[i] /= scale;
+    }
   }
+  const uint32_t packed = rc_pack4_fp8_e4m3(
+      k_val_f32[0], k_val_f32[1], k_val_f32[2], k_val_f32[3]);
+  *reinterpret_cast<uint32_t*>(&kv_cache[dst_offset]) = packed;
   if (threadIdx.x == 0) {
     const int64_t dst_scale_idx =
         block_idx * cache_block_stride +
         cache_block_size * head_dim +
         (block_offset * head_dim + head_dim_idx) * 4 / quant_block_size;
-    reinterpret_cast<float*>(kv_cache)[dst_scale_idx / 4] = scale;
+
+    if (use_mx_scale) {
+      // One UE8M0 byte per 32 elements, all equal to the shared scale's.
+      reinterpret_cast<uint32_t*>(kv_cache)[dst_scale_idx / 4] =
+          ((__float_as_uint(scale) >> 23) & 0xFF) * 0x01010101u;
+    } else {
+      reinterpret_cast<float*>(kv_cache)[dst_scale_idx / 4] = scale;
+    }
   }
 }
 
@@ -953,8 +986,7 @@ __global__ void cp_gather_indexer_k_quant_cache_kernel(
   }
   __syncthreads();
 
-  for (int iter = 0; iter < cuda_utils::ceil_div(batch_size, int(blockDim.x));
-       iter++) {
+  for (int iter = 0; iter < div_ceil(batch_size, int(blockDim.x)); iter++) {
     int tid = iter * blockDim.x + threadIdx.x;
     if (tid < batch_size) {
       const int seq_start = cu_seq_lens[tid];
@@ -1261,7 +1293,8 @@ void concat_and_cache_mla(
   const bool is_nvfp4_ds_mla = kv_cache_dtype == "nvfp4_ds_mla";
   if (kv_cache_dtype == "fp8_ds_mla") {
     TORCH_CHECK(kv_lora_rank == 512, "kv_lora_rank must be 512 for fp8_ds_mla");
-    TORCH_CHECK(pe_dim == 64, "pe_dim must be 64 for fp8_ds_mla");
+    STD_TORCH_CHECK(pe_dim == 64 || pe_dim == 0,
+                    "pe_dim must be 64 or 0 for fp8_ds_mla");
     TORCH_CHECK(kv_cache.size(2) == 656 / kv_cache.itemsize(),
                 "kv_cache.size(2) must be 656 bytes for fp8_ds_mla");
     TORCH_CHECK(kv_c.itemsize() == 2,
@@ -1540,7 +1573,7 @@ __device__ __forceinline__ bool map_gather_page_task(
     const int32_t source_begin = seq_starts == nullptr ? 0 : seq_starts[req_id];
     const int32_t first_block = source_begin / block_size;
     const int32_t num_pages =
-        cuda_utils::ceil_div(source_begin + seq_len, block_size) - first_block;
+        div_ceil(source_begin + seq_len, block_size) - first_block;
     if (relative_page < num_pages) {
       page.req_id = req_id;
       page.logical_block = first_block + relative_page;
@@ -1714,8 +1747,7 @@ void gather_and_maybe_dequant_cache(
   const int64_t dst_entry_stride = dst.stride(0);
   const int32_t page_threads = num_tokens >= (1 << 20) ? 128 : 256;
   const int32_t required_blocks =
-      cuda_utils::ceil_div(static_cast<int32_t>(num_tokens), block_size) +
-      2 * num_reqs;
+      div_ceil(static_cast<int32_t>(num_tokens), block_size) + 2 * num_reqs;
   const dim3 grid(required_blocks);
   const dim3 block(page_threads);
 
@@ -1994,7 +2026,7 @@ void cp_gather_cache(
 
   const int32_t num_reqs = static_cast<int32_t>(batch_size);
   const int32_t required_blocks =
-      cuda_utils::ceil_div(total_tokens, block_size) + 2 * num_reqs;
+      div_ceil(total_tokens, block_size) + 2 * num_reqs;
   const dim3 grid(required_blocks);
   const dim3 block(256);
 
@@ -2137,8 +2169,8 @@ void cp_gather_and_upconvert_fp8_kv_cache(
       seq_starts.has_value() ? seq_starts.value().const_data_ptr<int32_t>()
                              : nullptr;
 
-  const int required_blocks = cuda_utils::ceil_div(total_tokens, block_size) +
-                              2 * static_cast<int32_t>(batch_size);
+  const int required_blocks =
+      div_ceil(total_tokens, block_size) + 2 * static_cast<int32_t>(batch_size);
   vllm::cp_gather_and_upconvert_fp8_kv_cache_page<<<
       required_blocks, block_size_threads, 0, stream>>>(
       src_ptr, reinterpret_cast<__nv_bfloat16*>(dst.data_ptr()),
@@ -2259,7 +2291,7 @@ void cp_gather_and_upconvert_nvfp4_kv_cache(
           reinterpret_cast<KV_T*>(k.data_ptr()),                        \
           reinterpret_cast<CACHE_T*>(kv_cache.data_ptr()),              \
           slot_mapping.data_ptr<int64_t>(), head_dim, quant_block_size, \
-          cache_block_size, cache_block_stride, use_ue8m0);
+          cache_block_size, cache_block_stride, use_ue8m0, use_mx_scale);
 
 void indexer_k_quant_and_cache(
     torch::Tensor& k,             // [num_tokens, head_dim]
@@ -2272,14 +2304,35 @@ void indexer_k_quant_and_cache(
   int cache_block_size = kv_cache.size(1);
   //int cache_stride = kv_cache.size(2);
   int64_t cache_block_stride = kv_cache.stride(0);
+  bool use_mx_scale = scale_fmt == "mxfp8";
   bool use_ue8m0 = scale_fmt == "ue8m0";
+  STD_TORCH_CHECK(!use_mx_scale || (head_dim == 128 && quant_block_size == 128),
+                  "mxfp8 scales require head_dim == quant_block_size == 128");
 
   TORCH_CHECK(k.device() == kv_cache.device(),
               "k and kv_cache must be on the same device");
   TORCH_CHECK(k.device() == slot_mapping.device(),
               "k and slot_mapping must be on the same device");
-  TORCH_CHECK(head_dim % quant_block_size == 0,
-              "head_dim must be divisible by quant_block_size");
+  TORCH_CHECK(quant_block_size == 128,
+              "indexer quant_block_size must be 128 (32 lanes x 4 values)");
+  TORCH_CHECK(head_dim > 0 && head_dim % quant_block_size == 0,
+              "head_dim must be a positive multiple of quant_block_size");
+  TORCH_CHECK(k.is_cuda() && k.is_contiguous(),
+              "k must be a contiguous CUDA tensor");
+  TORCH_CHECK(kv_cache.scalar_type() == at::kByte && kv_cache.dim() == 3 &&
+                  kv_cache.size(2) >= head_dim + head_dim * 4 / quant_block_size &&
+                  kv_cache.stride(2) == 1 &&
+                  kv_cache.stride(1) == kv_cache.size(2) &&
+                  cache_block_stride >= cache_block_size * kv_cache.size(2) &&
+                  cache_block_stride % 4 == 0,
+              "kv_cache must be a byte cache with packed data/scales and aligned pages");
+  TORCH_CHECK(slot_mapping.scalar_type() == at::kLong &&
+                  slot_mapping.is_contiguous() && slot_mapping.numel() == num_tokens,
+              "slot_mapping must contain one contiguous int64 entry per token");
+  TORCH_CHECK(cache_block_size > 0, "cache block size must be positive");
+  if (num_tokens == 0) {
+    return;
+  }
 
   constexpr int vec_size = 4;
   dim3 grid(num_tokens, (head_dim + quant_block_size * vec_size - 1) /

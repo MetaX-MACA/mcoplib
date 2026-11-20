@@ -78,6 +78,9 @@ struct TopKTransformParams {
 // threshold bin. The fp16 detour costs a few cycles but the much smaller
 // threshold-bin candidate set more than pays for it.
 __device__ __forceinline__ auto convert_to_uint8(float x) -> uint8_t {
+  const uint32_t raw = __float_as_uint(x);
+  if ((raw & 0x7FFFFFFFu) > 0x7F800000u) return 255;
+  if ((raw & 0x7FFFFFFFu) == 0) x = 0.0f;
   __half h = __float2half_rn(x);
   uint16_t bits = __half_as_ushort(h);
   uint16_t key = (bits & 0x8000) ? static_cast<uint16_t>(~bits) : static_cast<uint16_t>(bits | 0x8000);
@@ -85,8 +88,7 @@ __device__ __forceinline__ auto convert_to_uint8(float x) -> uint8_t {
 }
 
 __device__ __forceinline__ auto convert_to_uint32(float x) -> uint32_t {
-  uint32_t bits = __float_as_uint(x);
-  return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
+  return topk_v1_hist4096::convert_to_uint32_v2(x);
 }
 
 __device__ __forceinline__ int32_t page_to_indices(
@@ -233,6 +235,13 @@ __device__ void radix_topk(
   __syncthreads();
 
   const auto threshold_bin = s_threshold_bin_id;
+  // A coarse FP16 bin can contain arbitrarily many distinct FP32 values.
+  // Never truncate it to the staging capacity before exact refinement.
+  if (s_histogram[threshold_bin] - s_histogram[threshold_bin + 1] > kStagingSize) {
+    __syncthreads();
+    topk_v1_hist4096::exact_radix_topk<TopK>(input, output, length, s_input_idx_flat);
+    return;
+  }
   remain_topk -= s_histogram[threshold_bin + 1];
   if (remain_topk == 0) {
     for (uint32_t idx = tx; idx < vec4_prefix; idx += BLOCK_SIZE) {
@@ -497,17 +506,8 @@ void topk_transform_v1_interface(
               ::cudaGetErrorString(capture_query));
 
   bool use_hist4096;
-  if (capture_status != cudaStreamCaptureStatusNone) {
-    use_hist4096 = static_cast<uint64_t>(scores.size(1)) <= kHist4096MaxLen;
-  } else {
-    int32_t max_seq_len_host = 0;
-    auto seq_lens_cpu = seq_lens.cpu();
-    const auto* seq_lens_ptr = seq_lens_cpu.data_ptr<int32_t>();
-    for (int64_t i = 0; i < B; ++i) {
-      if (seq_lens_ptr[i] > max_seq_len_host) max_seq_len_host = seq_lens_ptr[i];
-    }
-    use_hist4096 = static_cast<uint32_t>(max_seq_len_host) <= kHist4096MaxLen;
-  }
+  use_hist4096 = static_cast<uint64_t>(scores.size(1)) <= kHist4096MaxLen;
+
 
   // SMEM-size branching for the radix path (seq_len > 16384):
   //   - 64K-smem chips (C500/C280): dynamic smem capped at ~32KB by MACA

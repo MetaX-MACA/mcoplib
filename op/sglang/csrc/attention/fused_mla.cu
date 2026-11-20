@@ -16,7 +16,7 @@
 // 对q做rotary_emb，对latent_cache做rms_normal，更新latent_cache和kv_a，之后对latent_cache做rotary_emb。
 // 所有的cos_sin_cache都是float.
 int64_t fused_mla_RMS_rotary_emb(
-    torch::Tensor& q, // [3201, 128, 129] bf16
+    torch::Tensor& q, // [3201, 128, 192] bf16
     torch::Tensor& latent_cache, // [3201, 576], dtype=bf16
     torch::Tensor& cos_sin_cache, // [max, 64], dtype=float
     torch::Tensor& positions, // [bs], dtype=int64
@@ -53,19 +53,21 @@ int64_t fused_mla_RMS_rotary_emb(
     #define LAUNCH_FUSED_MLA_RMS_ROTARY_EMB(NUM_LOCAL_HEADS, KV_LORA_RANK, QK_NOPE_HEAD_DIM, QK_ROPE_HEAD_DIM)  \
         else if (q_len > 0 && num_local_heads == NUM_LOCAL_HEADS && kv_lora_rank == KV_LORA_RANK &&             \
             qk_nope_head_dim == QK_NOPE_HEAD_DIM && qk_rope_head_dim == QK_ROPE_HEAD_DIM) {                     \
-                fused_mla::fused_mla_RMS_rotary_emb<scalar_t, NUM_LOCAL_HEADS, KV_LORA_RANK,                         \
-                    QK_NOPE_HEAD_DIM, QK_ROPE_HEAD_DIM><<<grid, block, 0, at::cuda::getCurrentCUDAStream(dev)>>>(   \
-                    q_len,                                                                                          \
-                    (nv_bfloat16*)(q.data_ptr<at::BFloat16>()),                                                            \
-                    (nv_bfloat16*)(latent_cache.data_ptr<at::BFloat16>()),                                                 \
-                    (const float*)(cos_sin_cache.data_ptr<float>()),                                                \
-                    (const int64_t*)(positions.data_ptr()),                                                         \
-                    (const nv_bfloat16*)(norm_weight.data_ptr<at::BFloat16>()),                                            \
-                    (nv_bfloat16*)(kv_a.data_ptr<at::BFloat16>()));                                                        \
+                fused_mla::fused_mla_RMS_rotary_emb<scalar_t, NUM_LOCAL_HEADS, KV_LORA_RANK,             \
+                    QK_NOPE_HEAD_DIM, QK_ROPE_HEAD_DIM><<<grid, block, 0, at::cuda::getCurrentCUDAStream(dev)>>>(\
+                    q_len,                                                                                      \
+                    (nv_bfloat16*)(q.data_ptr<at::BFloat16>()),                                                 \
+                    (nv_bfloat16*)(latent_cache.data_ptr<at::BFloat16>()),                                      \
+                    (const float*)(cos_sin_cache.data_ptr<float>()),                                            \
+                    (const int64_t*)(positions.data_ptr()),                                                     \
+                    (const nv_bfloat16*)(norm_weight.data_ptr<at::BFloat16>()),                                 \
+                    (nv_bfloat16*)(kv_a.data_ptr<at::BFloat16>()));                                             \
             }
-            
 
-    dim3 grid = dim3(q_len*num_local_heads/4 + (q_len+3)/4, 1, 1);
+    const int lanes_per_head = qk_rope_head_dim * 2 / 16; 
+    const int heads_per_block = 256  / lanes_per_head;
+    const int blocks_per_token = (num_local_heads + heads_per_block - 1) / heads_per_block;
+    dim3 grid = dim3((int64_t)q_len * blocks_per_token + (q_len + 3) / 4, 1, 1);
     dim3 block = dim3(256, 1, 1);
     using scalar_t = nv_bfloat16;
     if (false) {

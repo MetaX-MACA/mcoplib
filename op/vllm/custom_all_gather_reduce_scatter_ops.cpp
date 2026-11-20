@@ -19,6 +19,10 @@ TORCH_LIBRARY_FRAGMENT(_C_custom_ar, custom_ag_rs) {
   custom_ag_rs.def(
       "mnnvl_lamport_reduce_scatter(int fa, Tensor inp, Tensor! out, int "
       "local_buffer, int epoch_buffer, int stage_sz_bytes) -> ()");
+  custom_ag_rs.def(
+      "mnnvl_multimem_reduce_scatter(int fa, Tensor inp, Tensor! out, int "
+      "local_buffer, int multicast_buffer, int stage_sz_bytes, int "
+      "block_limit) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(_C_custom_ar, CUDA, custom_ag_rs) {
@@ -26,4 +30,5 @@ TORCH_LIBRARY_IMPL(_C_custom_ar, CUDA, custom_ag_rs) {
   custom_ag_rs.impl("mnnvl_lamport_all_gather", torch::kCUDA, &mnnvl_lamport_all_gather);
   custom_ag_rs.impl("custom_reduce_scatter", torch::kCUDA, &custom_reduce_scatter);
   custom_ag_rs.impl("mnnvl_lamport_reduce_scatter", torch::kCUDA, &mnnvl_lamport_reduce_scatter);
+  custom_ag_rs.impl("mnnvl_multimem_reduce_scatter", torch::kCUDA, &mnnvl_multimem_reduce_scatter);
 }

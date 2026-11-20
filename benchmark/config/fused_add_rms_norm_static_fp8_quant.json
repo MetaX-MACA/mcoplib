@@ -5,5 +5,7 @@
     "n": 8192,
     "k": 128,
     "dtype": "bfloat16",
-    "samples": 1000
+    "samples": 100,
+    "batch_size": [1, 64, 512, 4096],
+    "hidden_size": [2048, 4096, 7168]
 }

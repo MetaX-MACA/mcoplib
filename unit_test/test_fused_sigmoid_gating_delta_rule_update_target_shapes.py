@@ -1,10 +1,15 @@
-"""Correctness and performance coverage for the production KDA verify shapes.
+"""Correctness and performance coverage for named production KDA verify sets.
+
+GLM5.3-flash contains T12/N2 and T6/N1 (136 captures each, 50/50 weight),
+with packed QKV token stride 24576 and six cached states per sequence.
+Run its packed-layout correctness checks with ``pytest -q <this file>
+-k GLM5.3-flash``.
 
 Pytest runs correctness only.  Run the same-process strategy benchmark with::
 
     CUDA_VISIBLE_DEVICES=8 python \
       unit_test/test_fused_sigmoid_gating_delta_rule_update_target_shapes.py \
-      --benchmark
+      --benchmark --shape-set GLM5.3-flash
 
 The benchmark intentionally times the allocating public-wrapper contract: the
 output, and the optimized strategy's private gate buffers, are allocated inside
@@ -47,15 +52,17 @@ class ShapeCase:
     key_dim: int = K_DIM
     value_dim: int = V_DIM
     cache_slots: int = CACHE_SLOTS
+    count: int = 1
 
 
-CASES = (
+GLM53_FLASH_CASES = (
     ShapeCase(
         name="t12_n2",
         total_tokens=12,
         cu_seqlens=(0, 6, 12),
         h0_indices=(0, 1),
         intermediate_state_indices=(2, 3),
+        count=136,
     ),
     ShapeCase(
         name="t6_n1",
@@ -65,8 +72,13 @@ CASES = (
         # The captured tensor has shape [2], although N == 1.  Only element 0
         # is consumed; retaining the second value reproduces that contract.
         intermediate_state_indices=(2, -1),
+        count=136,
     ),
 )
+
+SHAPE_SETS = {"GLM5.3-flash": GLM53_FLASH_CASES}
+# Preserve the existing target-shape entry point for callers importing CASES.
+CASES = GLM53_FLASH_CASES
 
 MULTI_SEQUENCE_CASES = (
     ShapeCase(
@@ -389,7 +401,8 @@ def reference(inputs: Inputs) -> tuple[torch.Tensor, dict[int, torch.Tensor]]:
     ):
         state_slot = inputs.spec.h0_indices[sequence]
         cache_slot = inputs.spec.intermediate_state_indices[sequence]
-        state = inputs.h0_source[state_slot].clone()
+        state = (inputs.h0_source[state_slot].clone() if state_slot >= 0
+                 else torch.zeros_like(inputs.h0_source[0]))
         states = []
         for token in range(bos, eos):
             gate = LOWER_BOUND * torch.sigmoid(
@@ -405,7 +418,8 @@ def reference(inputs: Inputs) -> tuple[torch.Tensor, dict[int, torch.Tensor]]:
                 state * (q[token] * (K**-0.5))[:, None, :], dim=-1
             )
             states.append(state.clone())
-        expected_cache[cache_slot] = torch.stack(states)
+        if cache_slot >= 0:
+            expected_cache[cache_slot] = torch.stack(states)
     return output, expected_cache
 
 
@@ -464,8 +478,15 @@ def test_target_verify_shapes(spec: ShapeCase, strategy: str) -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a MACA/CUDA GPU")
-@pytest.mark.parametrize("spec", CASES, ids=lambda spec: spec.name)
-def test_target_verify_packed_qkv_strides(spec: ShapeCase) -> None:
+@pytest.mark.parametrize(
+    "shape_set,spec",
+    [pytest.param(name, spec, id=f"{name}-{spec.name}")
+     for name, cases in SHAPE_SETS.items() for spec in cases],
+)
+@pytest.mark.parametrize("strategy", ("original", "auto"))
+def test_target_verify_packed_qkv_strides(
+    shape_set: str, spec: ShapeCase, strategy: str
+) -> None:
     inputs = make_inputs(spec, torch.device("cuda:0"), packed_qkv=True)
     expected_token_stride = 3 * spec.qk_heads * spec.key_dim
     assert inputs.q.stride() == (
@@ -476,8 +497,30 @@ def test_target_verify_packed_qkv_strides(spec: ShapeCase) -> None:
     )
     assert inputs.k.stride() == inputs.q.stride()
     assert inputs.v.stride() == inputs.q.stride()
-    assert not inputs.q.is_contiguous()
-    assert_correct(inputs, "auto")
+    for tensor in (inputs.q, inputs.k, inputs.v):
+        assert not tensor.is_contiguous()
+    # Check the captured payload contract before launching either path. In N=1,
+    # intermediate_state_indices deliberately retains its captured shape [2].
+    assert inputs.A_log.shape == (1, 1, 64, 1)
+    assert inputs.a.shape == (1, spec.total_tokens, 8192)
+    assert inputs.a.stride(1) == 8192
+    assert inputs.dt_bias.shape == (8192,)
+    assert inputs.b.shape == (1, spec.total_tokens, 64)
+    assert inputs.b.stride(1) == 64
+    assert inputs.h0_source.shape == (7, 64, 128, 128)
+    assert inputs.h0_source.stride(0) == 1048576
+    assert inputs.h0_indices.shape == (spec.total_tokens // 6,)
+    assert inputs.cu_seqlens.shape == (spec.total_tokens // 6 + 1,)
+    assert inputs.intermediate_states_buffer.shape == (7, 6, 64, 128, 128)
+    assert inputs.intermediate_state_indices.shape == (2,)
+    assert inputs.q.dtype == inputs.k.dtype == inputs.v.dtype == torch.bfloat16
+    assert inputs.a.dtype == inputs.b.dtype == torch.bfloat16
+    assert inputs.A_log.dtype == inputs.dt_bias.dtype == torch.float32
+    assert inputs.h0_source.dtype == inputs.intermediate_states_buffer.dtype == torch.float32
+    assert inputs.h0_indices.dtype == inputs.cu_seqlens.dtype == torch.int32
+    assert inputs.intermediate_state_indices.dtype == torch.int32
+    assert spec in SHAPE_SETS[shape_set]
+    assert_correct(inputs, strategy)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a MACA/CUDA GPU")
@@ -564,8 +607,11 @@ def run_benchmark(args: argparse.Namespace) -> None:
     device = torch.device(args.device)
     torch.cuda.set_device(device)
     strategies = tuple(item.strip() for item in args.strategies.split(",") if item.strip())
+    cases = SHAPE_SETS[args.shape_set]
+    total_count = sum(spec.count for spec in cases)
     weighted_medians = {strategy: 0.0 for strategy in strategies}
-    for spec in CASES:
+    print(f"Shape set: {args.shape_set}; captured cases={total_count}")
+    for spec in cases:
         # Reproduce views from the captured [B, T, 3, H, D] QKV payload.
         inputs = make_inputs(spec, device, packed_qkv=True)
         # Correctness is a hard gate before timing every strategy.
@@ -584,7 +630,7 @@ def run_benchmark(args: argparse.Namespace) -> None:
         for strategy in strategies:
             values = samples[strategy]
             median = statistics.median(values)
-            weighted_medians[strategy] += 0.5 * median
+            weighted_medians[strategy] += (spec.count / total_count) * median
             print(
                 f"  {strategy:>12}: samples_us={[round(v, 3) for v in values]} "
                 f"median={median:.3f} range={min(values):.3f}-{max(values):.3f} "
@@ -592,7 +638,7 @@ def run_benchmark(args: argparse.Namespace) -> None:
             )
 
     baseline = weighted_medians["original"]
-    print("\n50/50 weighted median latency:")
+    print(f"\n{args.shape_set} capture-weighted median latency:")
     for strategy in strategies:
         latency = weighted_medians[strategy]
         print(f"  {strategy:>12}: {latency:.3f} us, speedup={baseline / latency:.3f}x")
@@ -602,6 +648,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--benchmark", action="store_true")
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--shape-set", choices=tuple(SHAPE_SETS), default="GLM5.3-flash")
     parser.add_argument(
         "--strategies", default="original,single_opt,dual_opt,auto"
     )

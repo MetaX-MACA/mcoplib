@@ -36,6 +36,16 @@ class Case:
 
 
 @dataclass(frozen=True)
+class GLM53FlashCase:
+    name: str
+    dim: int
+    tokens: int
+    cache_lines: int
+    requests: int
+    launches: int
+
+
+@dataclass(frozen=True)
 class Result:
     tp: int
     tokens: int
@@ -54,6 +64,53 @@ CASES = [
     for tp in (8, 4)
     for tokens in (2048, 4096, 8192, 16384)
 ]
+
+# C500 trace 中 _causal_conv1d_fwd_kernel 的全部 tensor-shape variants。
+GLM53_FLASH_CASES = (
+    GLM53FlashCase("decode_t64_d24576_r1", 24576, 64, 64, 1, 321708),
+    GLM53FlashCase("prefill_t8192_d3072_r1", 3072, 8192, 307, 1, 29920),
+    GLM53FlashCase("prefill_t8192_d3072_r2", 3072, 8192, 307, 2, 2720),
+    GLM53FlashCase("short_t17_d3072_r1", 3072, 17, 307, 1, 1632),
+    GLM53FlashCase("short_t1_d3072_r1", 3072, 1, 307, 1, 1360),
+    GLM53FlashCase("prefill_t3072_d3072_r1", 3072, 3072, 307, 1, 816),
+    GLM53FlashCase("short_t19_d3072_r1", 3072, 19, 307, 1, 544),
+    GLM53FlashCase("prefill_t8192_d3072_r4", 3072, 8192, 307, 4, 544),
+    GLM53FlashCase("prefill_t8192_d3072_r3", 3072, 8192, 307, 3, 544),
+    GLM53FlashCase("prefill_t8164_d3072_r3", 3072, 8164, 307, 3, 272),
+    GLM53FlashCase("prefill_t8130_d3072_r4", 3072, 8130, 307, 4, 272),
+    GLM53FlashCase("prefill_t8170_d3072_r4", 3072, 8170, 307, 4, 272),
+    GLM53FlashCase("prefill_t5056_d3072_r2", 3072, 5056, 307, 2, 272),
+    GLM53FlashCase("prefill_t7168_d3072_r1", 3072, 7168, 307, 1, 272),
+    GLM53FlashCase("prefill_t8177_d3072_r2", 3072, 8177, 307, 2, 272),
+    GLM53FlashCase("prefill_t8141_d3072_r2", 3072, 8141, 307, 2, 272),
+    GLM53FlashCase("prefill_t8133_d3072_r2", 3072, 8133, 307, 2, 272),
+    GLM53FlashCase("prefill_t8148_d3072_r2", 3072, 8148, 307, 2, 272),
+    GLM53FlashCase("prefill_t8149_d3072_r2", 3072, 8149, 307, 2, 272),
+    GLM53FlashCase("prefill_t4672_d3072_r1", 3072, 4672, 307, 1, 272),
+    GLM53FlashCase("short_t4_d3072_r1", 3072, 4, 307, 1, 272),
+    GLM53FlashCase("prefill_t2985_d3072_r1", 3072, 2985, 307, 1, 272),
+    GLM53FlashCase("prefill_t5092_d3072_r2", 3072, 5092, 307, 2, 272),
+    GLM53FlashCase("short_t1_d24576_r1", 24576, 1, 64, 1, 136),
+    GLM53FlashCase("short_t17_d24576_r1", 24576, 17, 64, 1, 136),
+    GLM53FlashCase("short_t19_d24576_r1", 24576, 19, 64, 1, 68),
+    GLM53FlashCase("short_t41_d24576_r1", 24576, 41, 64, 1, 34),
+    GLM53FlashCase("short_t36_d24576_r1", 24576, 36, 64, 1, 34),
+    GLM53FlashCase("short_t13_d24576_r1", 24576, 13, 64, 1, 34),
+    GLM53FlashCase("short_t49_d24576_r1", 24576, 49, 64, 1, 34),
+)
+SHAPE_SETS = {"GLM5.3-flash": GLM53_FLASH_CASES}
+
+# 主 decode、主 prefill 和非对齐尾块；其余 shape 由 catalog test 锁定。
+GLM53_FLASH_UNIT_CASES = tuple(
+    case
+    for case in GLM53_FLASH_CASES
+    if case.name
+    in {
+        "decode_t64_d24576_r1",
+        "prefill_t8192_d3072_r1",
+        "short_t19_d3072_r1",
+    }
+)
 
 
 def _optimization_kwargs() -> dict[str, int]:
@@ -75,13 +132,22 @@ def _request_lengths(tokens: int) -> list[int]:
     return lengths
 
 
-def _make_strided_x(dim: int, tokens: int, device: torch.device) -> torch.Tensor:
-    """Create (dim, tokens) BF16 input with stride (1, 4 * dim).
+def _make_strided_x(
+    dim: int,
+    tokens: int,
+    device: torch.device,
+    token_stride_multiplier: int = 4,
+) -> torch.Tensor:
+    """Create BF16 input with stride (1, token_stride_multiplier * dim).
 
     This matches a transposed q/k/v view taken from a fused buffer whose
-    per-token row contains four ``dim``-wide regions.
+    per-token row contains ``token_stride_multiplier`` ``dim``-wide regions.
     """
-    fused = torch.empty((tokens, 4 * dim), device=device, dtype=torch.bfloat16)
+    fused = torch.empty(
+        (tokens, token_stride_multiplier * dim),
+        device=device,
+        dtype=torch.bfloat16,
+    )
     fused.normal_(mean=0.0, std=0.5)
     return fused[:, :dim].transpose(0, 1)
 
@@ -429,4 +495,95 @@ def test_optimized_short_sequences_and_initial_state(activation: str | None) -> 
         )
         torch.testing.assert_close(
             optimized_states[state_id], legacy_states[state_id], rtol=0, atol=0
+        )
+
+
+def test_glm53_flash_shape_catalog() -> None:
+    cases = SHAPE_SETS["GLM5.3-flash"]
+    assert len(cases) == 30
+    assert sum(case.launches for case in cases) == 364072
+    assert len({case.name for case in cases}) == len(cases)
+    for case in cases:
+        assert case.dim in (3072, 24576)
+        assert case.cache_lines == (307 if case.dim == 3072 else 64)
+        assert 1 <= case.requests <= case.tokens
+
+
+@pytest.mark.parametrize(
+    "case", GLM53_FLASH_UNIT_CASES, ids=lambda case: case.name
+)
+def test_glm53_flash_target_shapes(case: GLM53FlashCase) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("causal_conv1d_fwd requires a CUDA device")
+
+    torch.manual_seed(53)
+    device = torch.device("cuda")
+    base_length, remainder = divmod(case.tokens, case.requests)
+    seq_lens = [
+        base_length + (request_id < remainder)
+        for request_id in range(case.requests)
+    ]
+    x = _make_strided_x(
+        case.dim, case.tokens, device, token_stride_multiplier=1
+    )
+    weight = torch.randn(
+        (case.dim, KERNEL_WIDTH), device=device, dtype=torch.float32
+    ) * 0.25
+    initial_states = torch.randn(
+        (case.cache_lines, case.dim, KERNEL_WIDTH - 1),
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    query_start_loc = torch.tensor(
+        [0, *torch.tensor(seq_lens).cumsum(0).tolist()],
+        device=device,
+        dtype=torch.int32,
+    )
+    cache_indices = torch.arange(
+        case.requests, device=device, dtype=torch.int32
+    )
+    has_initial_state = torch.ones(
+        case.requests, device=device, dtype=torch.bool
+    )
+
+    assert x.shape == (case.dim, case.tokens)
+    assert x.stride() == (1, case.dim)
+    assert weight.shape == (case.dim, KERNEL_WIDTH)
+    assert initial_states.shape == (
+        case.cache_lines,
+        case.dim,
+        KERNEL_WIDTH - 1,
+    )
+    assert query_start_loc.shape == (case.requests + 1,)
+
+    expected, expected_states = _reference_with_state(
+        x,
+        weight,
+        None,
+        query_start_loc,
+        initial_states,
+        cache_indices,
+        has_initial_state,
+        "silu",
+    )
+    actual_states = initial_states.clone()
+    actual = causal_conv1d_fwd(
+        x=x,
+        weight=weight,
+        bias=None,
+        conv_states=actual_states,
+        query_start_loc=query_start_loc,
+        seq_lens_cpu=seq_lens,
+        cache_indices=cache_indices,
+        has_initial_state=has_initial_state,
+        activation="silu",
+        validate_data=True,
+        **_optimization_kwargs(),
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+    for state_id in cache_indices.tolist():
+        torch.testing.assert_close(
+            actual_states[state_id], expected_states[state_id], rtol=0, atol=0
         )

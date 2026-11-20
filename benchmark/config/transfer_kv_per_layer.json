@@ -2,10 +2,10 @@
     "device_id": 0,
     "device_name": ["MetaX C500", "MetaX C600-UL", "Metax C600-U"],
     "total_pool_blocks": 65536,
-    "num_blocks_to_copy": 16384,
-    "elements_per_block": 4096,
+    "num_blocks_to_copy": [1024, 4096, 16384, 65536],
+    "elements_per_block": [1024, 2048, 4096],
     "block_quota": 256,
     "num_warps_per_block": 4,
     "dtype": "float16",
-    "samples": 1000
+    "samples": 100
 }

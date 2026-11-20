@@ -3,6 +3,8 @@
 #include <torch/extension.h>
 #include <torch/torch.h>
 #include <cub/cub.cuh>
+#include <maca_fp8.h>
+#include <type_traits>
 #include "../kernel/utils.h"
 #include "mcoplib_ops_params_info.hpp"
 #include "mcoplib_ops_params_dump.hpp"
@@ -12,9 +14,42 @@ int ceil_div(int x, int y) {
     return (x + y - 1) / y;
 }
 
-template<typename scalar_t, int VPT, int SRC_PER_BLOCK>
+template<typename in_t>
+__device__ __forceinline__ float to_float(const in_t x, const float scale) {
+    if constexpr (std::is_same_v<in_t, __maca_bfloat16>) {
+        return __bfloat162float(x);
+    } else if constexpr (std::is_same_v<in_t, int8_t>) {
+        return static_cast<float>(x) * scale;
+    } else if constexpr (std::is_same_v<in_t, __maca_fp8_e4m3>) {
+        return static_cast<float>(x) * scale;
+    }
+}
+
+template<typename in_t, int VPT>
+__device__ __forceinline__ void vec_to_float(
+    const AlignedArrayI4<in_t, VPT>& v, float (&f)[VPT], const float scale)
+{
+    static_assert(VPT % 2 == 0, "VPT must be even");
+    if constexpr (std::is_same_v<in_t, __maca_bfloat16>) {
+        const __maca_bfloat162* v2 = reinterpret_cast<const __maca_bfloat162*>(v.data);
+        #pragma unroll
+        for (int i = 0; i < VPT/2; ++i) {
+            f[2*i    ] = __bfloat162float(v2[i].x);
+            f[2*i + 1] = __bfloat162float(v2[i].y);
+        }
+    } else if constexpr (std::is_same_v<in_t, int8_t>) {
+        #pragma unroll
+        for (int i = 0; i < VPT; ++i) f[i] = static_cast<float>(v.data[i]) * scale;
+    } else if constexpr (std::is_same_v<in_t, __maca_fp8_e4m3>) {
+        #pragma unroll
+        for (int i = 0; i < VPT; ++i) f[i] = static_cast<float>(v.data[i]) * scale;
+    }
+}
+
+template<typename in_t, typename scalar_t, int VPT, int SRC_PER_BLOCK>
 __global__ void moe_gather_bijective_kernel(
-    const scalar_t* __restrict__ input,
+    const in_t*     __restrict__ input,
+    const float*    __restrict__ input_scale,
     const int*      __restrict__ token_offset,
     const float*    __restrict__ weight,
     const scalar_t* __restrict__ residual,
@@ -26,7 +61,8 @@ __global__ void moe_gather_bijective_kernel(
     const int       hidden_size,
     const int       D)
 {
-    using VecType = AlignedArrayI4<scalar_t, VPT>;
+    using InVecType = AlignedArrayI4<in_t, VPT>;
+    using VecType   = AlignedArrayI4<scalar_t, VPT>;
 
     const int src_base = blockIdx.x * SRC_PER_BLOCK;
     const int col      = threadIdx.x * VPT;
@@ -39,16 +75,18 @@ __global__ void moe_gather_bijective_kernel(
     // Hoist ALL source-row vector loads up front so the SRC_PER_BLOCK global
     // reads have no mutual address/data dependency and can all be in flight at
     // once (memory-level parallelism == SRC_PER_BLOCK). Then compute + store.
-    VecType v[SRC_PER_BLOCK];
-    float   w[SRC_PER_BLOCK];
-    int     dst[SRC_PER_BLOCK];
+    InVecType v[SRC_PER_BLOCK];
+    float     w[SRC_PER_BLOCK];
+    int       dst[SRC_PER_BLOCK];
+    float     sc[SRC_PER_BLOCK];
     #pragma unroll
     for (int s = 0; s < SRC_PER_BLOCK; ++s) {
         if (s < nvalid) {
             const int src_row = src_base + s;
             w[s]   = weight[src_row];
+            if constexpr (std::is_same_v<in_t, int8_t> || std::is_same_v<in_t, __maca_fp8_e4m3>) sc[s] = input_scale[src_row];
             dst[s] = token_offset[src_row];
-            v[s]   = *reinterpret_cast<const VecType*>(
+            v[s]   = *reinterpret_cast<const InVecType*>(
                          input + src_row * hidden_size + col);
         }
     }
@@ -57,14 +95,14 @@ __global__ void moe_gather_bijective_kernel(
     for (int s = 0; s < SRC_PER_BLOCK; ++s) {
         if (s >= nvalid) break;
 
-        __maca_bfloat162* v2 = reinterpret_cast<__maca_bfloat162*>(&v[s]);
-        const float ws = w[s];
-
         float acc[VPT];
-        #pragma unroll
-        for (int i = 0; i < VPT/2; ++i) {
-            acc[2*i    ] = __bfloat162float(v2[i].x) * ws;
-            acc[2*i + 1] = __bfloat162float(v2[i].y) * ws;
+        if constexpr (std::is_same_v<in_t, int8_t> || std::is_same_v<in_t, __maca_fp8_e4m3>) {
+            vec_to_float<in_t, VPT>(v[s], acc, sc[s] * w[s]);
+        } else {
+            const float ws = w[s];
+            vec_to_float<in_t, VPT>(v[s], acc, sc[s]);
+            #pragma unroll
+            for (int i = 0; i < VPT; ++i) acc[i] *= ws;
         }
 
         const int d = dst[s];
@@ -102,16 +140,17 @@ __global__ void build_dst_info_kernel(
     const int step = gridDim.x * blockDim.x;
     for (int d = tid; d < D; d += step) {
         const int   dst  = scatter_token_id[d];
-        const float w    = src_weight[d];
+        float       w    = src_weight[d];
         const int   slot = atomicAdd(count + dst, 1);
         int2 pack = { d, __float_as_int(w) };
         dst_info[dst * topk + slot] = pack;
     }
 }
 
-template<typename scalar_t, int VPT, int TOPK, bool IS_SWIZZLE>
+template<typename in_t, typename scalar_t, int VPT, int TOPK, bool IS_SWIZZLE>
 __global__ void moe_gather_reverse_kernel(
-    const scalar_t* __restrict__ input,
+    const in_t*     __restrict__ input,
+    const float*    __restrict__ input_scale,
     const int2*     __restrict__ dst_info,
     const scalar_t* __restrict__ residual,
     scalar_t*       __restrict__ output,
@@ -121,7 +160,8 @@ __global__ void moe_gather_reverse_kernel(
     const int       res_row_stride,
     const int64_t   hidden_size)
 {
-    using VecType = AlignedArrayI4<scalar_t, VPT>;
+    using InVecType = AlignedArrayI4<in_t, VPT>;
+    using VecType   = AlignedArrayI4<scalar_t, VPT>;
     int dst_row = blockIdx.x;
     if constexpr (IS_SWIZZLE) {
         const int TILE = 2;
@@ -144,13 +184,19 @@ __global__ void moe_gather_reverse_kernel(
         const int2  info    = my_info[k];
         const int   src_row = info.x;
         const float w       = __int_as_float(info.y);
+        float sc = 1.0f;
+        if constexpr (std::is_same_v<in_t, int8_t> || std::is_same_v<in_t, __maca_fp8_e4m3>) sc = input_scale[src_row];
 
-        VecType v = *reinterpret_cast<const VecType*>(input + src_row * hidden_size + col);
-        __maca_bfloat162* v2 = reinterpret_cast<__maca_bfloat162*>(&v);
-        #pragma unroll
-        for (int i = 0; i < VPT/2; ++i) {
-            acc[2*i    ] += __bfloat162float(v2[i].x) * w;
-            acc[2*i + 1] += __bfloat162float(v2[i].y) * w;
+        InVecType v = *reinterpret_cast<const InVecType*>(input + src_row * hidden_size + col);
+        float f[VPT];
+        if constexpr (std::is_same_v<in_t, int8_t> || std::is_same_v<in_t, __maca_fp8_e4m3>) {
+            vec_to_float<in_t, VPT>(v, f, sc * w);
+            #pragma unroll
+            for (int i = 0; i < VPT; ++i) acc[i] += f[i];
+        } else {
+            vec_to_float<in_t, VPT>(v, f, sc);
+            #pragma unroll
+            for (int i = 0; i < VPT; ++i) acc[i] += f[i] * w;
         }
     }
 
@@ -175,9 +221,10 @@ __global__ void moe_gather_reverse_kernel(
     *reinterpret_cast<VecType*>(output + dst_row * hidden_size + col) = out_v;
 }
 
-template<typename scalar_t>
+template<typename in_t, typename scalar_t>
 __global__ void moe_gather_reverse_kernel_generic(
-    const scalar_t* __restrict__ input,
+    const in_t*     __restrict__ input,
+    const float*    __restrict__ input_scale,
     const int2*     __restrict__ dst_info,
     const scalar_t* __restrict__ residual,
     scalar_t*       __restrict__ output,
@@ -202,7 +249,9 @@ __global__ void moe_gather_reverse_kernel_generic(
             const int2  info    = my_info[k];
             const int   src_row = info.x;
             const float w       = __int_as_float(info.y);
-            acc += __bfloat162float(input[src_row * hidden_size + idx]) * w;
+            float sc = 1.0f;
+            if constexpr (std::is_same_v<in_t, int8_t> || std::is_same_v<in_t, __maca_fp8_e4m3>) sc = input_scale[src_row];
+            acc += to_float<in_t>(input[src_row * hidden_size + idx], sc) * w;
         }
 
         if (has_res) {
@@ -213,9 +262,10 @@ __global__ void moe_gather_reverse_kernel_generic(
     }
 }
 
-template<typename scalar_t>
+template<typename in_t, typename scalar_t>
 void launch_moe_gather(
-    const scalar_t* input,
+    const in_t*     input,
+    const float*    input_scale,
     const int*      scatter_token_id,
     const float*    src_weight,
     const scalar_t* residual,
@@ -267,8 +317,8 @@ void launch_moe_gather(
 
         const int grid = ceil_div(D, spb);
         #define LAUNCH_BIJ(SPB) \
-            moe_gather_bijective_kernel<scalar_t, VPT, SPB><<<grid, block, 0, stream>>>( \
-                input, scatter_token_id, src_weight, residual, output, \
+            moe_gather_bijective_kernel<in_t, scalar_t, VPT, SPB><<<grid, block, 0, stream>>>( \
+                input, input_scale, scatter_token_id, src_weight, residual, output, \
                 res_scale, res_token_start, res_end, res_row_stride, hidden_size, D)
         switch (spb) {
             case 8: LAUNCH_BIJ(8); break;
@@ -299,12 +349,12 @@ void launch_moe_gather(
         const int block = hidden_size / VPT;
         #define LAUNCH(TK) \
             if (num_tokens % 2048 == 0) { \
-                moe_gather_reverse_kernel<scalar_t, VPT, TK, true><<<num_tokens, block, 0, stream>>>( \
-                    input, info_ptr, residual, output, \
+                moe_gather_reverse_kernel<in_t, scalar_t, VPT, TK, true><<<num_tokens, block, 0, stream>>>( \
+                    input, input_scale, info_ptr, residual, output, \
                     res_scale, res_token_start, res_end, res_row_stride, hidden_size); \
             } else { \
-                moe_gather_reverse_kernel<scalar_t, VPT, TK, false><<<num_tokens, block, 0, stream>>>( \
-                    input, info_ptr, residual, output, \
+                moe_gather_reverse_kernel<in_t, scalar_t, VPT, TK, false><<<num_tokens, block, 0, stream>>>( \
+                    input, input_scale, info_ptr, residual, output, \
                     res_scale, res_token_start, res_end, res_row_stride, hidden_size); \
             }
 
@@ -323,9 +373,9 @@ void launch_moe_gather(
     block = ((block + 31) / 32) * 32;
     if (block == 0) block = 32;
 
-    moe_gather_reverse_kernel_generic<scalar_t>
+    moe_gather_reverse_kernel_generic<in_t, scalar_t>
         <<<num_tokens, block, 0, stream>>>(
-            input, info_ptr, residual, output,
+            input, input_scale, info_ptr, residual, output,
             res_scale, res_token_start, res_end, res_row_stride,
             hidden_size, topk);
 }
@@ -336,37 +386,72 @@ void moe_gather(at::Tensor scatter_tokens,
                 at::Tensor convergent_tokens,
                 c10::optional<at::Tensor> residual_tokens = c10::nullopt,
                 double res_scale = 1.0,
-                int64_t res_token_start = 0)
+                int64_t res_token_start = 0,
+                c10::optional<at::Tensor> scatter_tokens_scale = c10::nullopt)
 {
-    DEBUG_TRACE_PARAMS(scatter_tokens, scatter_token_id, scatter_tokens_weight, convergent_tokens, residual_tokens, res_scale, res_token_start);
-    DEBUG_DUMP_PARAMS(scatter_tokens, scatter_token_id, scatter_tokens_weight, convergent_tokens, residual_tokens, res_scale, res_token_start);
+    DEBUG_TRACE_PARAMS(scatter_tokens, scatter_token_id, scatter_tokens_weight, convergent_tokens, residual_tokens, res_scale, res_token_start, scatter_tokens_scale);
+    DEBUG_DUMP_PARAMS(scatter_tokens, scatter_token_id, scatter_tokens_weight, convergent_tokens, residual_tokens, res_scale, res_token_start, scatter_tokens_scale);
 
     const int hidden_size = scatter_tokens.size(-1);
     const int D           = scatter_tokens.numel() / hidden_size;
     const int num_tokens  = convergent_tokens.size(0);
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    if (scatter_tokens.dtype() != at::ScalarType::BFloat16) {
-        TORCH_CHECK(false, "Only float16, bfloat16 are supported");
+    const auto in_dtype = scatter_tokens.scalar_type();
+    const bool is_quant = in_dtype == at::ScalarType::Char ||
+                          in_dtype == at::ScalarType::Float8_e4m3fn;
+    TORCH_CHECK(in_dtype == at::ScalarType::BFloat16 || is_quant,
+                "moe_gather: scatter_tokens must be bfloat16, int8 or float8_e4m3fn, got ", in_dtype);
+    TORCH_CHECK(convergent_tokens.scalar_type() == at::ScalarType::BFloat16,
+                "moe_gather: convergent_tokens must be bfloat16");
+    TORCH_CHECK(scatter_tokens_weight.scalar_type() == at::ScalarType::Float,
+                "moe_gather: scatter_tokens_weight must be float32");
+
+    // Per scatter-row dequant scale: x_float = x_q * scale[row].  It is folded
+    // into the routing weight inside the kernels.
+    const float* scale_ptr = nullptr;
+    if (scatter_tokens_scale.has_value()) {
+        const auto& sc = *scatter_tokens_scale;
+        TORCH_CHECK(sc.scalar_type() == at::ScalarType::Float,
+                    "moe_gather: scatter_tokens_scale must be float32");
+        TORCH_CHECK(sc.is_contiguous(), "moe_gather: scatter_tokens_scale must be contiguous");
+        TORCH_CHECK(sc.numel() == D,
+                    "moe_gather: scatter_tokens_scale must have one value per scatter token (",
+                    D, "), got ", sc.numel());
+        scale_ptr = sc.data_ptr<float>();
     }
+    TORCH_CHECK(!is_quant || scale_ptr != nullptr,
+                "moe_gather: scatter_tokens_scale is required for int8/fp8 scatter_tokens");
 
     const __maca_bfloat16* res_ptr = nullptr;
     int res_len = 0;
     if (residual_tokens.has_value()) {
+        TORCH_CHECK(residual_tokens->scalar_type() == at::ScalarType::BFloat16,
+                    "moe_gather: residual_tokens must be bfloat16");
         res_ptr = reinterpret_cast<__maca_bfloat16*>(residual_tokens->data_ptr<at::BFloat16>());
         res_len = residual_tokens->size(0);
     }
 
     auto int_opts = at::TensorOptions().dtype(at::kInt).device(scatter_tokens.device());
+    auto* out_ptr = reinterpret_cast<__maca_bfloat16*>(convergent_tokens.data_ptr<at::BFloat16>());
 
-    launch_moe_gather<__maca_bfloat16>(
-        reinterpret_cast<__maca_bfloat16*>(scatter_tokens.data_ptr<at::BFloat16>()),
-        scatter_token_id.data_ptr<int>(),
-        scatter_tokens_weight.data_ptr<float>(),
-        res_ptr,
-        reinterpret_cast<__maca_bfloat16*>(convergent_tokens.data_ptr<at::BFloat16>()),
-        static_cast<float>(res_scale),
-        static_cast<int>(res_token_start),
-        res_len,
-        num_tokens, hidden_size, D, stream, int_opts);
+    #define LAUNCH_GATHER(IN_T)                                              \
+        launch_moe_gather<IN_T, __maca_bfloat16>(                            \
+            reinterpret_cast<const IN_T*>(scatter_tokens.data_ptr()),        \
+            scale_ptr,                                                       \
+            scatter_token_id.data_ptr<int>(),                                \
+            scatter_tokens_weight.data_ptr<float>(),                         \
+            res_ptr, out_ptr,                                                \
+            static_cast<float>(res_scale),                                   \
+            static_cast<int>(res_token_start),                               \
+            res_len,                                                         \
+            num_tokens, hidden_size, D, stream, int_opts)
+
+    if (in_dtype == at::ScalarType::BFloat16) {
+        LAUNCH_GATHER(__maca_bfloat16);
+    } else if (in_dtype == at::ScalarType::Char) {
+        LAUNCH_GATHER(int8_t);
+    } else {
+        LAUNCH_GATHER(__maca_fp8_e4m3);
+    }
 }

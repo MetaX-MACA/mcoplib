@@ -379,5 +379,186 @@ def main() -> None:
     print(f"Peak effective bandwidth: {peak:.1f} GB/s  (single-die target 1300)")
 
 
+def _strict_keys(values: torch.Tensor) -> torch.Tensor:
+    """CPU FP32 ordering keys: all NaNs rank highest; signed zeros tie."""
+    assert values.device.type == "cpu" and values.dtype == torch.float32
+    bits = values.contiguous().view(torch.int32).to(torch.int64) & 0xFFFFFFFF
+    magnitude = bits & 0x7FFFFFFF
+    bits = torch.where(magnitude == 0, 0, bits)
+    return torch.where(
+        magnitude > 0x7F800000,
+        0xFFFFFFFF,
+        torch.where(
+            (bits & 0x80000000) != 0,
+            (~bits) & 0xFFFFFFFF,
+            bits | 0x80000000,
+        ),
+    )
+
+
+def _strict_check(cpu, lens, out, width, context) -> None:
+    """Validate each row independently, including page IDs, ties and padding."""
+    lens = tuple(int(n) for n in lens)
+    assert cpu.shape == (len(lens), width), (context, "score shape")
+    assert out.shape == (len(lens), TOPK), (context, "output shape")
+    assert out.dtype == torch.int32, (context, "output dtype")
+    result = out.cpu().to(torch.int64)
+    for row, length in enumerate(lens):
+        assert 0 <= length <= width, (context, row, "invalid length")
+        values = result[row]
+        count = min(length, TOPK)
+        valid = values != -1
+        assert int(valid.sum()) == count, (context, row, "selection count")
+        assert bool((values[count:] == -1).all()), (context, row, "padding")
+        selected_pages = values[:count]
+        # An injective, nonidentity mapping makes row/index mixups observable.
+        delta = selected_pages - row * width * 17 - 97
+        assert bool((delta.remainder(17) == 0).all()), (context, row, "page mapping")
+        indices = delta // 17
+        assert bool(((indices >= 0) & (indices < length)).all()), (
+            context, row, "selection outside valid prefix"
+        )
+        assert indices.unique().numel() == count, (context, row, "duplicate selection")
+        if length <= TOPK:
+            assert torch.equal(indices, torch.arange(length, dtype=torch.int64)), (
+                context, row, "short-row order"
+            )
+            continue
+        # Never use GPU floating-point topk as an oracle: its NaN/signed-zero
+        # behavior need not match the radix kernel. Only boundary ties may vary.
+        row_keys = _strict_keys(cpu[row, :length])
+        selected = torch.sort(row_keys[indices]).values
+        expected = torch.sort(torch.topk(row_keys, TOPK, sorted=False).values).values
+        assert torch.equal(selected, expected), (context, row, "wrong key multiset")
+
+
+def _strict_inputs(bs, width, lens, distribution, strided=False):
+    """Return CPU scores and device score/lengths/pages/output/cu for either API."""
+    lens = tuple(int(n) for n in lens)
+    assert len(lens) == bs and all(0 <= n <= width for n in lens)
+    assert bs * width * 17 + 97 < 2**31, "page IDs must fit int32"
+    generator = torch.Generator(device="cpu").manual_seed(1947 + width + bs)
+    if distribution == "zero":
+        cpu = torch.zeros((bs, width), dtype=torch.float32)
+    elif distribution in ("random", "negative"):
+        cpu = torch.randn((bs, width), generator=generator, dtype=torch.float32)
+        if distribution == "negative":
+            cpu.abs_().neg_().sub_(0.125)
+    elif distribution == "dense":
+        bits = torch.arange(width, dtype=torch.int32).remainder_(100000)
+        bits.add_(0x3F800000)
+        cpu = bits.view(torch.float32).repeat(bs, 1)
+    elif distribution == "ranks":
+        cpu = torch.randperm(width, generator=generator).float().repeat(bs, 1)
+    elif distribution == "special":
+        # Both NaN signs, infinities, subnormals and signed zeros, plus +/-1.
+        bits = torch.tensor(
+            [0, -2147483648, 1, -2147483647, 0x7F800000, -0x800000,
+             0x7FC00001, -0x3FFFFF, 0x3F800000, -0x40800000],
+            dtype=torch.int32,
+        )
+        cpu = bits.repeat((bs * width + bits.numel() - 1) // bits.numel())
+        cpu = cpu[:bs * width].view(torch.float32).reshape(bs, width)
+    else:
+        raise AssertionError(distribution)
+    for row, length in enumerate(lens):
+        cpu[row, length:] = float("nan")  # Padding must never participate.
+    storage = torch.empty(
+        (bs, width + 3 if strided else width), dtype=torch.float32, device="cuda"
+    )
+    score = storage[:, 1:width + 1] if strided else storage
+    score.copy_(cpu)
+    lengths = torch.tensor(lens, dtype=torch.int32, device="cuda")
+    page_storage = torch.empty(
+        (bs, width + 5 if strided else width), dtype=torch.int32, device="cuda"
+    )
+    pages = page_storage[:, 2:width + 2] if strided else page_storage
+    # Broadcast a single row, rather than allocating a second full page table.
+    columns = torch.arange(width, dtype=torch.int32, device="cuda")
+    pages.copy_(columns.mul_(17).add_(97)[None, :])
+    pages.add_(torch.arange(bs, dtype=torch.int32, device="cuda")[:, None] * width * 17)
+    out = torch.full((bs, TOPK), -777, dtype=torch.int32, device="cuda")
+    cu = torch.arange(bs + 1, dtype=torch.int32, device="cuda")
+    return cpu, score, lengths, pages, out, cu
+
+
+def _strict_launch(score, lengths, out, pages, cu) -> None:
+    torch.ops.sgl_kernel.fast_topk_transform_fused.default(
+        score, lengths, out, pages, cu, None
+    )
+
+
+def _strict_run(bs, width, lens, distribution, strided=False, graph=False) -> None:
+    lens = tuple(int(n) for n in lens)
+    cpu, score, lengths, pages, out, cu = _strict_inputs(
+        bs, width, lens, distribution, strided=strided
+    )
+    context = (bs, width, lens, distribution, strided, graph)
+
+    def launch():
+        _strict_launch(score, lengths, out, pages, cu)
+
+    launch()
+    torch.cuda.synchronize()
+    _strict_check(cpu, lens, out, width, context)
+    if graph:
+        capture = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(capture):
+            launch()
+        for replay in range(3):
+            new_lens = tuple(max(0, n - replay * 7) for n in lens)
+            for row, length in enumerate(new_lens):
+                cpu[row, :length] = cpu[row, :length].flip(0)
+                cpu[row, length:] = float("nan")
+            score.copy_(cpu)
+            lengths.copy_(torch.tensor(new_lens, dtype=torch.int32))
+            out.fill_(-777)
+            capture.replay()
+            torch.cuda.synchronize()
+            _strict_check(cpu, new_lens, out, width, (context, "replay", replay))
+
+
+STRICT_SPLITK_CASES = tuple(
+    (bs, width, distribution)
+    for width in (1048576, 1048640)
+    for bs in (1, 6)
+    for distribution in ("zero", "random", "negative", "dense", "ranks", "special")
+)
+STRICT_RAGGED_CASES = tuple(
+    (width, lens)
+    for width in (1048576, 1048640)
+    for lens in (
+        (0, 1, 2047, 2048, 2049, 4096),
+        (width, width - 1, width // 2, 4096, 3000, 0),
+    )
+)
+STRICT_FALLBACK_CASES = tuple(
+    (bs, width)
+    for bs in (1, 6)
+    for width in (2049, 4096, 66551, 107520)
+)
+
+
+@pytest.mark.parametrize("bs,width,distribution", STRICT_SPLITK_CASES)
+@torch.inference_mode()
+def test_topk_transform_decode_strict_splitk(bs, width, distribution) -> None:
+    _strict_run(
+        bs, width, (width,) * bs, distribution,
+        strided=(distribution == "dense"), graph=(distribution == "ranks"),
+    )
+
+
+@pytest.mark.parametrize("width,lens", STRICT_RAGGED_CASES)
+@torch.inference_mode()
+def test_topk_transform_decode_strict_ragged(width, lens) -> None:
+    _strict_run(6, width, lens, "random", strided=True)
+
+
+@pytest.mark.parametrize("bs,width", STRICT_FALLBACK_CASES)
+@torch.inference_mode()
+def test_topk_transform_decode_strict_fallback(bs, width) -> None:
+    _strict_run(bs, width, (width,) * bs, "random")
+
+
 if __name__ == "__main__":
     main()

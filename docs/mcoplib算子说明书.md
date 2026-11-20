@@ -1,1683 +1,6 @@
-## 1. fused_bias_dropout
+# vLLM
 
-### 支持的产品型号
-
-- Metax C500/C550/C588/C600
-### 接口原型
-```python
-def fused_bias_dropout(
-    input: at::Tensor,
-    residual: at::Tensor,
-    dropout_prob: float
-) -> at::Tensor
-```
-### 功能描述
-fused_bias_dropout 算子是面向 GPU 优化的融合计算算子，将残差逐元素相加与 dropout 操作合并执行，减少 GPU 显存的读写开销，常用于大语言模型的训练和推理（当前版本中 dropout 功能暂未实现，仅支持 dropout_prob=0.0 的场景）
-- 计算公式：
-当前版本中，fused_bias_dropout 算子仅支持 dropout_prob=0.0
-
-$$
-\text{output}[i_1, i_2, ..., i_n] = \text{input}[i_1, i_2, ..., i_n] + \text{residual}[i_1, i_2, ..., i_n]
-$$
-
-其中：
-- $\text{input}$ ：输入张量，形状记为 $S = (s_1, s_2, ..., s_n)$ ， $n$ 为张量维度数
-- $\text{residual}$ ：残差张量，形状与 $\text{input}$ 完全一致（即 $S = (s_1, s_2, ..., s_n)$ ），用于与输入张量执行逐元素相加
-- $\text{output}$ ：输出张量，形状与 $\text{input}$ 完全一致（即 $S = (s_1, s_2, ..., s_n)$ ），存储逐元素相加的结果
-- $[i_1, i_2, ..., i_n]$ ：张量任意位置的多维索引，满足 $0 \leq i_k < s_k$ （ $k = 1, 2, ..., n$ ），覆盖张量所有元素
-- $+$ ：逐元素加法运算符号
-### 参数说明
-
-- **input** (at:: Tensor, 入参): 基础输入张量，用于参与逐元素相加运算，形状需与 residual 完全一致
-- **residual** (at:: Tensor, 入参): 残差/偏置张量，用于与 input 执行逐元素相加，形状、数据类型需与 input 完全匹配
-- **dropout_prob** (float, 入参): dropout 随机丢弃概率，当前版本仅支持取值为 0.0
-### 返回值
-
-at::Tensor: 输出张量，形状与 input、residual 完全一致，存储 input 与 residual 逐元素相加的结果（当前无 dropout 处理）
-### 约束与调用
-
-- 所有张量必须位于 CUDA 设备上
-- input 与 residual 的形状、数据类型必须完全一致
-- dropout_prob 仅支持取值为 0.0，非 0 值的 dropout 功能暂未实现
-- 支持的数据类型：float16（at::ScalarType::Half）、bfloat16（at::ScalarType::BFloat16）
-- 当 input 的元素总数为 8 的倍数时，算子会启用更高效的向量化处理路径
-### 调用示例
-```python
-import torch
-import mcoplib.op as op
-# 设置计算设备
-device = "cuda"
-# 定义张量形状
-batch_size = 8
-seq_len = 512
-hidden_size = 4096
-# 创建输入张量：需保证input和residual形状、数据类型完全一致
-input_tensor = torch.randn(
-    batch_size, seq_len, hidden_size,
-    dtype=torch.float16,
-    device=device,
-    requires_grad=True  
-)
-residual_tensor = torch.randn_like(input_tensor)  
-# 调用fused_bias_dropout算子
-dropout_prob = 0.0
-output_tensor = op.fused_bias_dropout(input_tensor, residual_tensor, dropout_prob)
-print("fused_bias_dropout computation completed")
-print(f"Input shape: {input_tensor.shape}")
-print(f"Residual shape: {residual_tensor.shape}")
-print(f"Output shape: {output_tensor.shape}")
-print(f"Data type: {output_tensor.dtype}")
-```
-## 2. fused_rope_fwd
-### 支持的产品型号
-- Metax C500/C550/C588/C600
-### 接口原型
-```python
-def fused_rope_fwd(
-    qkv: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    indexes: Optional[torch.Tensor] = None,
-    force_bf16_attn: bool = False
-) -> torch.Tensor
-```
-### 功能描述
-fused_rope_fwd 算子实现 RoPE 旋转位置编码的前向计算，是 Transformer 模型中位置编码的核心操作之一。该算子融合了 QKV 张量中 Query（Q）与 Key（K）的旋转逻辑，通过 cos、sin 张量对 Q、K 进行旋转变换，最终输出处理后的 QKV 张量。
-- 计算公式：
-  对 $QKV$ 张量中的 Query（ $Q$ ）和 Key（ $K$ ）分别执行旋转位置编码变换，核心公式如下：
-
-$$
-  \begin{cases}
-  q'_0 = q_0 \cdot \cos(\theta) - q_1 \cdot \sin(\theta) \\
-  q'_1 = q_0 \cdot \sin(\theta) + q_1 \cdot \cos(\theta) \\
-  k'_0 = k_0 \cdot \cos(\theta) - k_1 \cdot \sin(\theta) \\
-  k'_1 = k_0 \cdot \sin(\theta) + k_1 \cdot \cos(\theta)
-  \end{cases}
-$$
-
-  其中：
-- $qkv \in \mathbb{R}^{\text{seq} \times \text{qkv\\_num} \times \text{num\\_head} \times \text{head\\_dim}}$ ：输入的 $QKV$ 融合张量
-- $q_0, q_1 \in \mathbb{R}^{\text{seq} \times \text{num\\_head} \times \text{head\\_dim\\_half}}$ ： $Q$ 张量在 $\text{head\\_dim}$ 维度拆分后的两部分（ $\text{head\\_dim\\_half} = \text{head\\_dim}/2$ ）
-- $k_0, k_1 \in \mathbb{R}^{\text{seq} \times \text{num\\_head} \times \text{head\\_dim\\_half}}$ ： $K$ 张量在 $\text{head\\_dim}$ 维度拆分后的两部分
-- $\cos (\theta), \sin (\theta) \in \mathbb{R}^{\text{seq} \times \text{head\\_dim\\_half}}$ ：对应位置的余弦、正弦位置编码张量
-- $\text{seq}$ ：序列长度， $\text{qkv\\_num}$ ： $Q/K/V$ 的数量（通常为 $3$ ）， $\text{num\\_head}$ ：注意力头数， $\text{head\\_dim}$ ：单头维度
-  变换后合并结果并更新至原 $QKV$ 张量：
-
-$$
-  \text{qkv}[..., :\text{head\\_dim\\_half}] = q'_0, \quad \text{qkv}[..., \text{head\\_dim\\_half}:] = q'_1
-$$
-
-
-
-$$
-  \text{qkv}[..., :\text{head\\_dim\\_half}] = k'_0, \quad \text{qkv}[..., \text{head\\_dim\\_half}:] = k'_1
-$$
-
-### 参数说明
-- **qkv** (torch.Tensor, 入参/出参): 输入的 QKV 融合张量，形状为[seq, qkv_num, num_head, head_dim]，处理后的结果直接写入该张量并作为返回值
-- **cos** (torch.Tensor, 入参): RoPE 对应的余弦值张量，其第二维度需与 head_dim 的一半（head_dim_half）匹配
-- **sin** (torch.Tensor, 入参): RoPE 对应的正弦值张量，维度要求与 cos 完全一致
-- **indexes** (Optional[torch.Tensor], 入参): 可选的序列索引张量，数据类型需为 long，若传入则用于定位当前序列对应的 cos/sin 值
-- **force_bf16_attn** (bool, 入参): 是否强制使用 bfloat16 精度执行计算，默认值为 False
-### 返回值
-返回处理后的 QKV 张量（与输入 qkv 为同一张量，结果已直接写入）
-### 约束与调用
-- 所有输入张量必须部署在 CUDA 设备上
-- 输入张量需满足内存连续性要求
-- 支持的数据类型：float16（Half）、bfloat16
-- qkv 维度约束：seq=qkv.size (0)、qkv_num=qkv.size (1)、num_head=qkv.size (2)、head_dim=qkv.size (3)，且 head_dim=2*cos.size (1)
-- 若传入 indexes，其数据类型必须为 at::scalar_type::long
-### 调用示例
-```python
-import torch
-import mcoplib.op as op
-device = "cuda"
-# 定义张量维度
-seq = 4096  # qkv.size(0)
-qkv_num = 4  # qkv.size(1)
-num_head = 64  # qkv.size(2)
-head_dim = 128  # qkv.size(3)
-head_dim_half = head_dim // 2  # 64，对应cos.size(1)
-# 创建输入张量
-qkv = torch.randn(seq, qkv_num, num_head, head_dim, dtype=torch.float16, device=device)
-cos = torch.randn(seq, head_dim_half, dtype=torch.float16, device=device)
-sin = torch.randn(seq, head_dim_half, dtype=torch.float16, device=device)
-# 可选的indexes张量
-indexes = torch.randint(0, seq, (seq,), dtype=torch.long, device=device)
-# 若不需要indexes，可设为None：indexes = None
-# 调用fused_rope_fwd算子
-output_qkv = op.fused_rope_fwd(
-    qkv,
-    cos,
-    sin,
-    indexes,
-    False
-)
-print("fused_rope_fwd computation completed")
-print(f"Output QKV shape: {output_qkv.shape}")  # 应与输入qkv形状一致
-```
-## 3. fused_rope_bwd
-### 支持的产品型号
-- Metax C500/C550/C588/C600
-### 接口原型
-```python
-def fused_rope_bwd(
-    qkv: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    indexes: Optional[torch.Tensor] = None,
-    force_bf16_attn: bool = False
-) -> torch.Tensor
-```
-### 功能描述
-fused_rope_bwd 算子实现 RoPE（旋转位置编码）的反向传播计算，对应 fused_rope_fwd 的梯度回传逻辑。该算子通过 cos、sin 张量对 QKV 梯度张量执行反向旋转变换，完成梯度的反向传播处理
-- 计算公式：
-  对 $QKV$ 梯度张量中的 Query 梯度（ $\nabla q$ ）和 Key 梯度（ $\nabla k$ ）执行反向旋转变换，核心公式如下：
-
-$$
-  \begin{cases}
-  \nabla q'_0 = \nabla q_0 \cdot \cos(\theta) + \nabla q_1 \cdot \sin(\theta) \\
-  \nabla q'_1 = -\nabla q_0 \cdot \sin(\theta) + \nabla q_1 \cdot \cos(\theta) \\
-  \nabla k'_0 = \nabla k_0 \cdot \cos(\theta) + \nabla k_1 \cdot \sin(\theta) \\
-  \nabla k'_1 = -\nabla k_0 \cdot \sin(\theta) + \nabla k_1 \cdot \cos(\theta)
-  \end{cases}
-$$
-
-  其中：
-- $\nabla \text{qkv} \in \mathbb{R}^{\text{seq} \times \text{qkv\\_num} \times \text{num\\_head} \times \text{head\\_dim}}$ ：输入的 $QKV$ 融合梯度张量
-- $\nabla q_0, \nabla q_1 \in \mathbb{R}^{\text{seq} \times \text{num\\_head} \times \text{head\\_dim\\_half}}$ ： $\nabla q$ 在 $\text{head\\_dim}$ 维度拆分后的两部分
-- $\nabla k_0, \nabla k_1 \in \mathbb{R}^{\text{seq} \times \text{num\\_head} \times \text{head\\_dim\\_half}}$ ： $\nabla k$ 在 $\text{head\\_dim}$ 维度拆分后的两部分
-- $\cos (\theta), \sin (\theta) \in \mathbb{R}^{\text{seq} \times \text{head\\_dim\\_half}}$ ：对应位置的余弦、正弦位置编码张量（与前向一致）
-- $\text{seq}$ ：序列长度， $\text{qkv\\_num}$ ： $Q/K/V$ 的数量， $\text{num\\_head}$ ：注意力头数， $\text{head\\_dim}$ ：单头维度
-  变换后合并结果并更新至原 $QKV$ 梯度张量：
-
-$$
-  \nabla \text{qkv}[..., :\text{head\\_dim\\_half}] = \nabla q'_0, \quad \nabla \text{qkv}[..., \text{head\\_dim\\_half}:] = \nabla q'_1
-$$
-
-
-
-$$
-  \nabla \text{qkv}[..., :\text{head\\_dim\\_half}] = \nabla k'_0, \quad \nabla \text{qkv}[..., \text{head\\_dim\\_half}:] = \nabla k'_1
-$$
-
-### 参数说明
-- **qkv** (torch.Tensor, 入参/出参): 输入的 QKV 梯度张量，形状为[seq, qkv_num, num_head, head_dim]；处理后的梯度结果直接写入该张量并作为返回值
-- **cos** (torch.Tensor, 入参): RoPE 对应的余弦值张量，其第二维度需与 head_dim 的一半（head_dim_half）匹配
-- **sin** (torch.Tensor, 入参): RoPE 对应的正弦值张量，维度要求与 cos 完全一致
-- **indexes** (Optional[torch.Tensor], 入参): 可选的序列索引张量，数据类型需为 long，若传入则用于定位当前序列对应的 cos/sin 值
-- **force_bf16_attn** (bool, 入参): 是否强制使用 bfloat16 精度执行计算，默认值为 False
-### 返回值
-返回处理后的 QKV 梯度张量，与输入`qkv 为同一张量，结果已直接写入
-### 约束与调用
-- 所有输入张量必须部署在 CUDA 设备上
-- 输入张量需满足内存连续性要求
-- 支持的数据类型：float16（Half）、bfloat16
-- qkv 维度约束：seq=qkv.size (0)、qkv_num=qkv.size (1)、num_head=qkv.size (2)、head_dim=qkv.size (3)，且`ead_dim = 2 * cos.size (1)
-- 若传入 indexes，其数据类型必须为 at::scalar_type::long
-### 调用示例
-```python
-import torch
-import mcoplib.op as op
-device = "cuda"
-# 定义与前向一致的张量维度
-seq = 4096
-qkv_num = 4
-num_head = 64
-head_dim = 128
-head_dim_half = head_dim // 2
-# 创建反向传播的输入张量
-qkv_grad = torch.randn(seq, qkv_num, num_head, head_dim, dtype=torch.float16, device=device)
-# 复用前向的cos/sin
-cos = torch.randn(seq, head_dim_half, dtype=torch.float16, device=device)
-sin = torch.randn(seq, head_dim_half, dtype=torch.float16, device=device)
-# 可选的indexes张量
-indexes = torch.randint(0, seq, (seq,), dtype=torch.long, device=device)
-# 调用fused_rope_bwd算子
-output_qkv_grad = op.fused_rope_bwd(
-    qkv_grad,
-    cos,
-    sin,
-    indexes,
-    False
-)
-print("fused_rope_bwd computation completed")
-print(f"Output QKV gradient shape: {output_qkv_grad.shape}")
-```
-## 4. fused_bias_swiglu_fwd
-### 支持的产品型号
-- Metax C500/C550/C588/C600
-### 接口原型
-```python
-def fused_bias_swiglu_fwd(
-    input: at::Tensor
-) -> at::Tensor
-```
-### 功能描述
-fused_bias_swiglu_fwd 算子实现融合 Bias 的 SwiGLU 激活前向计算，是大模型（Transformer 类）中高效处理中间特征的算子。算子将张量沿最后一个维度分成两部分，并行计算 SwiGLU 激活，拆分后第一部分与 sigmoid (拆分后第二部分) 相乘，并通过算子融合减少内存读写开销
-- 计算公式：
-
-$$
-  \sigma(z) = \frac{1}{1 + e^{-z}}
-$$
-
-
-
-$$
-  x_1 = \text{input}[..., :d] + b_1
-$$
-
-
-
-$$
-  x_2 = \text{input}[..., d:] + b_2
-$$
-
-
-
-$$
-  \text{output} = x_1 \odot \sigma(x_2)
-$$
-
-  其中：
-- $\text{input} \in \mathbb{R}^{N \times M \times 2d}$ 是 CUDA 设备上的半精度（half/bfloat16）连续张量， $N$ 为 batch 维度， $M$ 为序列长度维度
-- $d = \frac{\text{input.size (-1)}}{2}$ ，即输入最后一维长度的 1/2（hidden_size 的 1/2）
-- $x_1$ 是输入张量沿最后一维拆分的前半部分， $x_2$ 是拆分的后半部分
-- $b_1, b_2$ 为对应维度的偏置项（当前实现中暂未启用，默认为 0）
-- $\sigma (z)$ 是 sigmoid 激活函数
-- $\odot$ 表示逐元素乘法
-- $\text{output} \in \mathbb{R}^{N \times M \times d}$ 是输出张量，与输入同设备、同数据类型
-### 参数说明
-- **input** (at:: Tensor, 入参): 前向计算的原始输入张量，用于执行融合 Bias 的 SwiGLU 激活计算。最后一维长度需为偶数，用于拆分为两等份，形状通常为「N×M×2d」（N 为 batch 维度、M 为序列长度维度、d 为 hidden_size 的 1/2）。
-### 返回值
-at::Tensor: 前向计算输出张量，与输入 input 同设备、同数据类型；形状为「N×M×d」（最后一维长度为 input 的 1/2），存储 input 经 SwiGLU 激活（拆分后前半部分×sigmoid (拆分后后半部分)）计算后的结果。
-### 约束与调用
-- 所有张量必须位于 CUDA 设备上
-- input 张量需为连续内存
-- input 最后一维长度必须为偶数，需拆分为两等份用于 SwiGLU 计算
-- 支持的数据类型：float16（at::ScalarType::Half）和 bfloat16（at::ScalarType::BFloat16）
-- 当 input 的元素总数为 8 的倍数时，算子会启用更高效的向量化批量处理
-- 偏置项（b1、b2）当前实现暂未启用，默认按 0 参与计算
-### 调用示例
-```python
-import torch
-import mcoplib.op as op
-# 设置计算设备
-device = "cuda"
-# 定义张量形状
-batch_size = 8
-seq_len = 512
-hidden_size = 4096 
-# 创建前向输入张量
-input_tensor = torch.randn(
-    batch_size, seq_len, hidden_size,
-    dtype=torch.float16,
-    device=device,
-    requires_grad=True
-)
-# 调用fused_bias_swiglu_fwd算子
-output_tensor = op.fused_bias_swiglu_fwd(input_tensor)
-print("fused_bias_swiglu_fwd computation completed")
-print(f"Input shape: {input_tensor.shape}")
-print(f"Output shape: {output_tensor.shape}") 
-print(f"Data type: {output_tensor.dtype}")
-print(f"Device: {output_tensor.device}")
-```
-## 5. fused_bias_swiglu_bwd
-### 支持的产品型号
-- Metax C500/C550/C588/C600
-### 接口原型
-```python
-def fused_bias_swiglu_bwd(
-    input: at::Tensor,
-    grad_output: at::Tensor
-) -> at::Tensor
-```
-### 功能描述
-fused_bias_swiglu_bwd 算子实现 SwiGLU 激活对应的反向梯度计算，是大模型训练中保障梯度传播的关键算子。算子接收前向计算的原始输入张量和输出梯度张量，通过 CUDA 多线程并行，结合链式法则推导输入梯度，利用原输入计算 sigmoid 导数并与输出梯度相乘，输出与原输入维度一致的半精度梯度张量，为模型参数更新提供支撑
-- 计算公式：
-
-$$
-  \sigma(z) = \frac{1}{1 + e^{-z}}
-$$
-
-
-
-$$
-  \sigma'(z) = \sigma(z) \cdot (1 - \sigma(z))
-$$
-
-
-
-$$
-  x_1 = \text{input}[..., :d] + b_1
-$$
-
-
-
-$$
-  x_2 = \text{input}[..., d:] + b_2
-$$
-
-
-
-$$
-  \nabla x_1 = G \odot \sigma(x_2)
-$$
-
-
-
-$$
-  \nabla x_2 = G \odot x_1 \odot \sigma'(x_2)
-$$
-
-
-
-$$
-  \nabla \text{input} = \text{concat}(\nabla x_1, \nabla x_2, \text{dim}=-1)
-$$
-
-  其中：
-- $\text{input} \in \mathbb{R}^{N \times M \times 2d}$ 是前向计算的原始输入张量（CUDA 设备、半精度、连续）
-- $G \in \mathbb{R}^{N \times M \times d}$ 是前向输出张量对应的梯度张量（与输入同设备、同数据类型）
-- $d = \frac{\text{input.size (-1)}}{2}$ ，与前向计算中 $d$ 的定义一致
-- $x_1, x_2$ 是输入张量沿最后一维拆分的两部分， $b_1, b_2$ 为偏置项（暂未启用，默认为 0）
-- $\sigma (z)$ 是 sigmoid 函数， $\sigma' (z)$ 是 sigmoid 函数的导数
-- $\nabla x_1$ 是拆分前半部分 $x_1$ 的梯度， $\nabla x_2$ 是拆分后半部分 $x_2$ 的梯度
-- $\odot$ 表示逐元素乘法， $\text{concat}(\cdot, \cdot, \text{dim}=-1)$ 表示沿最后一维拼接
-- $\nabla \text{input} \in \mathbb{R}^{N \times M \times 2d}$ 是输出的输入梯度张量，与原始输入 $\text{input}$ 维度、设备、数据类型完全一致
-### 参数说明
-- **input** (at:: Tensor, 入参): 前向计算时的原始输入张量，用于反向梯度推导的基础数据，需连续内存，形状为[N×M×2d]，与前向计算的 input 完全一致
-- **grad_output** (at:: Tensor, 入参): 前向输出张量对应的梯度张量，用于传递反向传播的梯度信号, 需与 input 同设备、同数据类型且为连续内存. 形状与前向输出张量形状一致，最后一维长度为 input 的 1/2
-### 返回值
-at::Tensor: 输入梯度输出张量，与原始输入 input 同设备、同数据类型、同形状[N×M×2d], 存储通过链式法则推导的 input 对应的梯度值，为模型参数更新提供支撑
-### 约束与调用
-- 所有张量必须位于 CUDA 设备上，且 input 与 grad_output 需在同一设备
-- input 和 grad_output 均需为连续内存，数据类型必须完全一致，仅支持 float16、bfloat16
-- input 最后一维长度必须是 grad_output 最后一维长度的 2 倍，与前向计算的拆分逻辑匹配
-- 当 grad_output 的元素总数为 8 的倍数时，算子会启用更高效的向量化批量处理
-- 偏置项（b1、b2）当前实现暂未启用，梯度计算中默认按偏置为 0 推导
-### 调用示例
-```python
-import torch
-import mcoplib.op as op
-# 设置计算设备
-device = "cuda"
-# 定义张量形状
-batch_size = 8
-seq_len = 512
-hidden_size = 4096  
-output_hidden_size = hidden_size // 2  
-# 先执行前向计算
-input_tensor = torch.randn(
-    batch_size, seq_len, hidden_size,
-    dtype=torch.float16,
-    device=device,
-    requires_grad=True
-)
-forward_output = fused_bias_swiglu_fwd(input_tensor)
-# 创建输出梯度张量
-grad_output = torch.randn_like(forward_output)
-# 调用fused_bias_swiglu_bwd算子
-grad_input = op.fused_bias_swiglu_bwd(input_tensor, grad_output)
-print("fused_bias_swiglu_bwd computation completed")
-print(f"Original input shape: {input_tensor.shape}")
-print(f"Grad output shape: {grad_output.shape}")
-print(f"Input gradient shape: {grad_input.shape}")  
-print(f"Data type: {grad_input.dtype}")
-print(f"Device: {grad_input.device}")
-```
-## 6. fused_repeat_kv_fwd
-### 支持的产品型号
-- Metax C500/C550/C588/C600
-### 接口原型
-```python
-def fused_repeat_kv_fwd(
-    input: at::Tensor,
-    q_num_head: int,
-    kv_num_head: int,
-    head_dim: int
-) -> at::Tensor
-```
-### 功能描述
-fused_repeat_kv_fwd 是多查询注意力和组查询注意力场景下的前向融合算子，该算子将数量较少的 KV 头，重复扩展至与查询头相同的数量，同时拆分出 Q、K、V 三类张量，通过 CUDA 核融合操作替代 PyTorch 原生的多步操作，提升计算与内存访问效率
-- 计算公式：
-输入张量形状：
-
-$$
-\text{input} \in \mathbb{R}^{\text{seq} \times \text{bs} \times \text{partition} \times (\text{q\\_num\\_head} + 2 \cdot \text{kv\\_num\\_head}) \cdot \text{head\\_dim}}
-$$
-
-输出张量形状：
-
-$$
-\text{output} \in \mathbb{R}^{\text{seq} \times \text{bs} \times 3 \times \text{q\\_num\\_head} \times \text{head\\_dim}}
-$$
-
-拆分输入为 Q、K、V 分量：
-
-$$
-\begin{cases}
-\text{Q}_{\text{input}} = \text{input}[..., :\text{q\\_num\\_head} \cdot \text{head\\_dim}] \\
-\text{K}_{\text{input}} = \text{input}[..., \text{q\\_num\\_head} \cdot \text{head\\_dim} : (\text{q\\_num\\_head} + \text{kv\\_num\\_head}) \cdot \text{head\\_dim}] \\
-\text{V}_{\text{input}} = \text{input}[..., (\text{q\\_num\\_head} + \text{kv\\_num\\_head}) \cdot \text{head\\_dim} :]
-\end{cases}
-$$
-
-KV 头重复次数：
-
-$$
-\text{repeat} = \frac{\text{q\\_num\\_head}}{\text{kv\\_num\\_head}}
-$$
-
-重复 KV 分量至匹配 Q 头数：
-
-$$
-\begin{cases}
-\text{K}_{\text{repeated}} = \text{repeat}(\text{K}_{\text{input}}, \text{dim}=3, \text{repeats}=\text{repeat}) \\
-\text{V}_{\text{repeated}} = \text{repeat}(\text{V}_{\text{input}}, \text{dim}=3, \text{repeats}=\text{repeat})
-\end{cases}
-$$
-
-映射至输出张量：
-
-$$
-\begin{cases}
-\text{output}[..., 0, :, :] = \text{reshape}(\text{Q}_{\text{input}}, [\text{seq}, \text{bs}, \text{q\\_num\\_head}, \text{head\\_dim}]) \\
-\text{output}[..., 1, :, :] = \text{reshape}(\text{K}_{\text{repeated}}, [\text{seq}, \text{bs}, \text{q\\_num\\_head}, \text{head\\_dim}]) \\
-\text{output}[..., 2, :, :] = \text{reshape}(\text{V}_{\text{repeated}}, [\text{seq}, \text{bs}, \text{q\\_num\\_head}, \text{head\\_dim}])
-\end{cases}
-$$
-
-其中：
-- $\text{seq}$ 是序列长度
-- $\text{bs}$ 是 batch 大小
-- $\text{partition}$ 是张量在头维度的分片数
-- $\text{q\\_num\\_head}$ 是查询头总数
-- $\text{kv\\_num\\_head}$ 是键/值头总数
-- $\text{head\\_dim}$ 是单个注意力头的维度
-- $\text{repeat}$ 是 KV 头需要重复的次数
-### 参数说明
-- **input** (at:: Tensor, 入参): 合并的 QKV 输入张量，形状为`[seq, bs, partition, (q_num_head+2*kv_num_head)*head_dim]`
-- **q_num_head** (int, 入参): 查询头总数，需为 kv_num_head 的整数倍, 保证 KV 头可均匀重复扩展
-- **kv_num_head** (int, 入参): 键/值头总数，与 q_num_head 配合确定 KV 头的重复次数
-- **head_dim** (int, 入参): 单个注意力头的维度，用于计算输入/输出张量的维度大小
-### 返回值
-返回拆分并重复后的 QKV 张量（at::Tensor），形状为`[seq, bs, 3, q_num_head, head_dim]`，其中第 2 维的 3 分别对应 Q、K、V 三个分量
-### 约束与调用
-- 所有输入张量必须位于 CUDA 设备上
-- 输入张量需为 4 维连续存储的张量
-- 支持的数据类型：仅 float16（Half）、bfloat16
-- 查询头数 q_num_head 必须是 KV 头数 kv_num_head 的整数倍
-- partition 参数需为合法分片数
-- 输入/输出的维度需匹配，输入：`[seq, bs, partition, (q_num_head+kv_num_head*2)*head_dim]`，输出：`[seq, bs, 3, q_num_head, head_dim]`）
-### 调用示例
-```python
-import torch
-import mcoplib.op as op
-device = "cuda"
-# 定义算子参数
-seq_len = 4096       
-batch_size = 2       
-partition = 2       
-q_num_head = 128     
-kv_num_head = 8      
-head_dim = 128      
-dtype = torch.bfloat16  
-# 计算输入张量形状：
-input_dim = (q_num_head // partition + 2 * (kv_num_head // partition)) * head_dim
-qkv_input = torch.randn(
-    seq_len, batch_size, partition, input_dim,
-    dtype=dtype, device=device
-)
-# 调用fused_repeat_kv_fwd算子
-output_fwd = op.fused_repeat_kv_fwd(
-    qkv_input,
-    q_num_head=q_num_head,
-    kv_num_head=kv_num_head,
-    head_dim=head_dim
-)
-print("fused_repeat_kv_fwd computation completed")
-print(f"输入张量形状: {qkv_input.shape}")
-print(f"输出张量形状: {output_fwd.shape}") 
-```
-## 7. fused_repeat_kv_bwd
-### 支持的产品型号
-- Metax C500/C550/C588/C600
-### 接口原型
-```python
-def fused_repeat_kv_bwd(
-    input: at::Tensor,
-    q_num_head: int,
-    kv_num_head: int,
-    partition: int
-) -> at::Tensor
-```
-### 功能描述
-fused_repeat_kv_bwd 是 fused_repeat_kv_fwd 对应的反向传播算子，用于多查询注意力和组查询注意力场景下的梯度传递，该算子将前向扩展后的 KV 头维度对应的输出梯度累加汇总回原始 KV 头数量对应的输入梯度形状，实现自动微分的链式法则逻辑，通过 CUDA 核融合提升反向计算效率
-- 计算公式：
-输入张量形状（前向输出梯度）：
-
-$$
-\text{input} \in \mathbb{R}^{\text{seq} \times \text{bs} \times 3 \times \text{q\\_num\\_head} \times \text{head\\_dim}}
-$$
-
-输出张量形状（前向输入梯度）：
-
-$$
-\text{output} \in \mathbb{R}^{\text{seq} \times \text{bs} \times \text{partition} \times \frac{(\text{q\\_num\\_head} + 2 \cdot \text{kv\\_num\\_head}) \cdot \text{head\\_dim}}{\text{partition}}}
-$$
-
-拆分输入为 Q、K、V 梯度分量：
-
-$$
-\begin{cases}
-\text{Q}_{\text{grad}} = \text{input}[..., 0, :, :] \\
-\text{K}_{\text{grad}} = \text{input}[..., 1, :, :] \\
-\text{V}_{\text{grad}} = \text{input}[..., 2, :, :]
-\end{cases}
-$$
-
-KV 头重复次数（与前向一致）：
-
-$$
-\text{repeat} = \frac{\text{q\\_num\\_head}}{\text{kv\\_num\\_head}}
-$$
-
-累加 KV 梯度至原始头数：
-
-$$
-\begin{cases}
-\text{K}_{\text{grad\\_agg}} = \text{sum}\left( 
-    \text{reshape}(\text{K}_{\text{grad}}, [\text{seq}, \text{bs}, \text{repeat}, \text{kv\\_num\\_head}, \text{head\\_dim}]), 
-    \text{dim}=2 
-\right) \\
-\text{V}_{\text{grad\\_agg}} = \text{sum}\left( 
-    \text{reshape}(\text{V}_{\text{grad}}, [\text{seq}, \text{bs}, \text{repeat}, \text{kv\\_num\\_head}, \text{head\\_dim}]), 
-    \text{dim}=2 
-\right)
-\end{cases}
-$$
-
-将各梯度分量展平为 2D（最后一维合并）：
-
-$$
-\text{Q}_{\text{grad\\_flat}} = \text{reshape}(\text{Q}_{\text{grad}}, [\text{seq}, \text{bs}, \text{q\\_num\\_head} \cdot \text{head\\_dim}])
-$$
-
-
-
-$$
-\text{K}_{\text{grad\\_agg\\_flat}} = \text{reshape}(\text{K}_{\text{grad\\_agg}}, [\text{seq}, \text{bs}, \text{kv\\_num\\_head} \cdot \text{head\\_dim}])
-$$
-
-
-
-$$
-\text{V}_{\text{grad\\_agg\\_flat}} = \text{reshape}(\text{V}_{\text{grad\\_agg}}, [\text{seq}, \text{bs}, \text{kv\\_num\\_head} \cdot \text{head\\_dim}])
-$$
-
-拼接展平后的梯度分量（沿最后一维）：
-
-$$
-\text{concat\\_grad} = \text{concat}(\text{Q}_{\text{grad\\_flat}}, \text{K}_{\text{grad\\_agg\\_flat}}, \text{V}_{\text{grad\\_agg\\_flat}}, \text{dim}=-1)
-$$
-
-分片输出梯度（还原为输入张量的形状）：
-
-$$
-\text{output} = \text{reshape}(\text{concat\\_grad}, [
-    \text{seq}, \text{bs}, \text{partition}, \\
-    \frac{(\text{q\\_num\\_head} + 2 \cdot \text{kv\\_num\\_head}) \cdot \text{head\\_dim}}{\text{partition}}
-])
-$$
-
-约束条件：
-
-$$
-(\text{q\\_num\\_head} + 2 \cdot \text{kv\\_num\\_head}) \cdot \text{head\\_dim} \quad \text{必须能被} \quad \text{partition} \quad \text{整除}
-$$
-
-其中：
-- $\text{seq}$ 是序列长度
-- $\text{bs}$ 是 batch 大小
-- $\text{partition}$ 是张量在头维度的分片数（用于张量并行）
-- $\text{q\\_num\\_head}$ 是查询头总数
-- $\text{kv\\_num\\_head}$ 是键/值头总数
-- $\text{head\\_dim}$ 是单个注意力头的维度
-- $\text{repeat}$ 是 KV 头在前向过程中重复的次数（必须为整数）
-- $\text{concat\\_grad}$ 是拼接后的梯度张量（展平状态）
-- $\text{K}_{\text{grad\\_agg}}$ 、 $\text{V}_{\text{grad\\_agg}}$ 是累加后的 KV 梯度（还原至原始 KV 头数）
-- $\text{Q}_{\text{grad\\_flat}}$ 、 $\text{K}_{\text{grad\\_agg\\_flat}}$ 、 $\text{V}_{\text{grad\\_agg\\_flat}}$ 是各梯度展平后的中间变量
-### 参数说明
-- **input** (at:: Tensor, 入参): 前向输出张量的梯度，形状为[seq, bs, 3, q_num_head, head_dim]，与 fused_repeat_kv_fwd 的输出形状一致
-- **q_num_head** (int, 入参): 查询头总数，需为 kv_num_head 的整数倍，与前向算子保持一致
-- **kv_num_head** (int, 入参): 键/值头总数，用于确定梯度累加的分组数量
-- **partition** (int, 入参): 张量在头维度的分片数，用于张量并行，需满足`(q_num_head+2*kv_num_head)*head_dim` 能被其整除
-### 返回值
-返回前向输入张量的梯度（at::Tensor），形状为`[seq, bs, partition, (q_num_head+2*kv_num_head)*head_dim/partition]`，与 `fused_repeat_kv_fwd` 的输入形状匹配
-### 约束与调用
-- 所有输入张量必须位于 CUDA 设备上
-- 输入张量需为 5 维连续存储的张量
-- 支持的数据类型：仅 float16（Half）、bfloat16
-- 查询头数 q_num_head 必须是 KV 头数 kv_num_head 的整数倍
-- 输入张量的最后一维维度需与 head_dim 匹配
-- 输出张量的维度由输入维度与 partition 参数计算生成，需满足 `(q_num_head+kv_num_head*2)*head_dim/partition` 的合法性
-- 输入/输出的维度需匹配，输入：`[seq, bs, partition, (q_num_head+kv_num_head*2)*head_dim]`，输出：`[seq, bs, partition, (q_num_head+kv_num_head*2)*head_dim/partition]`
-### 调用示例
-```python
-import torch
-import mcoplib.op as op
-device = "cuda"
-# 复用fused_repeat_kv_fwd的参数配置
-seq_len = 4096
-batch_size = 2
-partition = 2
-q_num_head = 128
-kv_num_head = 8
-head_dim = 128
-dtype = torch.bfloat16
-# 先获取fused_repeat_kv_fwd的输出（作为反向算子的输入）
-fwd_output = torch.randn(
-    seq_len, batch_size, 3, q_num_head, head_dim,
-    dtype=dtype, device=device
-)
-# 调用fused_repeat_kv_bwd算子
-output_bwd = op.fused_repeat_kv_bwd(
-    fwd_output,
-    q_num_head,
-    kv_num_head,
-    partition
-)
-print("fused_repeat_kv_bwd computation completed")
-print(f"输入张量形状: {fwd_output.shape}")
-print(f"输出张量形状: {output_bwd.shape}")  
-```
-## 8. fused_gelu_fwd
-### 支持的产品型号
-- Metax C500/C550/C588/C600
-### 接口原型
-```python
-def fused_gelu_fwd(
-    input: torch.Tensor,
-    bias: torch.Tensor
-) -> torch.Tensor
-```
-### 功能描述
-fused_gelu_fwd 算子实现了加偏置和 GELU 激活的融合计算操作。该算子首先将偏置张量按 input 的 hidden 维度对应叠加到输入张量上，随后对叠加结果应用 GELU 激活函数。融合操作减少了中间结果的内存读写次数，提升计算效率，常用于神经网络激活层前的偏置叠加与激活组合流程。
-- 计算公式：
-加偏置操作：  
-
-$$
-T_{b, s, h} = \text{input}_{b, s, h} + \text{bias}_h
-$$
-
-GELU 激活操作，标准正态分布累积分布函数近似：  
-
-$$
-\text{output}_{b, s, h} = T_{b, s, h} \cdot 0.5 \cdot \left(1 + \text{erf}\left(\frac{T_{b, s, h}}{\sqrt{2}}\right)\right)
-$$
-
-其中：  
-- $\text{input} \in \mathbb{R}^{B \times S \times H}$ 为输入张量（ $B$=batchsize， $S$=序列长度， $H$=hidden 维度）；  
-- $\text{bias} \in \mathbb{R}^H$ 为偏置张量，通过广播机制匹配 $\text{input}$ 的 $H$ 维度；  
-- $T$ 为加偏置后的中间张量（形状与 $\text{input}$ 一致）；  
-- $\text{erf}(\cdot)$ 为误差函数；  
-- $\text{output} \in \mathbb{R}^{B \times S \times H}$ 为最终输出张量，形状与 $\text{input}$ 一致。  
-### 参数说明
-- **input** (torch.Tensor, 入参): 待处理的输入张量，需进行加偏置与 GELU 激活计算
-- **bias** (torch.Tensor, 入参): 偏置张量，形状需匹配 input 的 hidden 维度
-### 返回值
-返回 torch.Tensor 类型的输出张量，形状与 input 完全一致，存储计算结果
-### 约束与调用
-- 所有张量必须位于 CUDA 设备上
-- input 需包含 hidden 维度
-- bias 的形状需与 input 的 hidden 维度匹配
-- 支持的数据类型：float32, float16, bfloat16
-### 调用示例
-```python
-import torch
-import mcoplib.op as op
-device = "cuda"
-# 参数配置
-batch_size = 2
-seq_len = 1024
-hidden_size = 768  
-dtype = torch.bfloat16 
-# 创建输入张量
-input = torch.randn(
-    batch_size, seq_len, hidden_size,
-    dtype=dtype, device=device
-)
-bias = torch.randn(
-    hidden_size,  
-    dtype=dtype, device=device
-)
-# 调用fused_gelu_fwd算子
-output_fwd = op.fused_gelu_fwd(input, bias)
-# 验证输出
-print("fused_gelu_fwd computation completed")
-print(f"输入input形状: {input.shape}")
-print(f"输入bias形状: {bias.shape}")
-print(f"输出output_fwd形状: {output_fwd.shape}")
-```
-## 9. fused_gelu_bwd
-### 支持的产品型号
-- Metax C500/C550/C588/C600
-### 接口原型
-```python
-def fused_gelu_bwd(
-    input: torch.Tensor,
-    input1: torch.Tensor,
-    bias: torch.Tensor
-) -> torch.Tensor
-```
-### 功能描述
-fused_gelu_bwd 算子实现了加偏置和 GELU 激活的反向传播融合计算。该算子根据前向计算的输入张量、偏置张量，以及上游传递的梯度张量，计算得到对应前向输入的梯度结果。融合操作减少了反向传播的内存交互开销，提升计算效率，是 fused_gelu_fwd 算子的配套反向算子
-- 计算公式：
-前向加偏置的中间张量：  
-
-$$
-T_{b, s, h} = \text{input}_{b, s, h} + \text{bias}_h
-$$
-
-GELU 函数在 $T$ 处的导数，链式法则中间项：  
-
-$$
-\text{gelu\\_deriv}_{b, s, h} = 0.5 \cdot \left(1 + \text{erf}\left(\frac{T_{b, s, h}}{\sqrt{2}}\right)\right) + \frac{T_{b, s, h}}{\sqrt{2\pi}} \cdot \exp\left(-\frac{T_{b, s, h}^2}{2}\right)
-$$
-
-输入张量 $\text{input}$ 的梯度，链式法则传递上游梯度：  
-
-$$
-\text{output}_{b, s, h} = \text{input1}_{b, s, h} \cdot \text{gelu\\_deriv}_{b, s, h}
-$$
-
-其中：  
-- $\text{input} \in \mathbb{R}^{B \times S \times H}$ 为前向输入张量；  
-- $\text{input1} \in \mathbb{R}^{B \times S \times H}$ 为上游传递的梯度张量（对应前向输出 $\text{output}$ 的梯度）；  
-- $\text{bias} \in \mathbb{R}^H$ 为前向使用的偏置张量；  
-- $T$ 为前向加偏置后的中间张量（形状与 $\text{input}$ 一致）；  
-- $\text{gelu\\_deriv}$ 为 GELU 函数在 $T$ 处的导数张量（形状与 $\text{input}$ 一致）；  
-- $\text{output} \in \mathbb{R}^{B \times S \times H}$ 为最终输出张量（对应前向输入 $\text{input}$ 的梯度，形状与 $\text{input}$ 一致）；  
-- $\text{erf}(\cdot)$ 为误差函数， $\exp (\cdot)$ 为指数函数。
-### 参数说明
-- **input** (torch.Tensor, 入参): 前向计算时的输入张量
-- **input1** (torch.Tensor, 入参): 上游传递的梯度张量，对应 fused_gelu_fwd 输出的梯度
-- **bias** (torch.Tensor, 入参): 前向计算时使用的偏置张量，形状需匹配 input 的 hidden 维度
-### 返回值
-返回 torch.Tensor 类型的输出张量，形状与 input 完全一致，存储对应前向输入的梯度计算结果
-### 约束与调用
-- 所有张量必须位于 CUDA 设备上
-- input 与 input1 的形状必须完全相同
-- bias 的形状需与 input 的 hidden 维度匹配
-- 支持的数据类型：float32, float16, bfloat16
-### 调用示例
-```python
-import torch
-import mcoplib.op as op
-device = "cuda"
-# 复用fused_gelu_fwd的参数配置
-batch_size = 2
-seq_len = 1024
-hidden_size = 768
-dtype = torch.bfloat16
-# 创建输入张量
-input = torch.randn( 
-    batch_size, seq_len, hidden_size,
-    dtype=dtype, device=device
-)
-input1 = torch.randn( 
-    batch_size, seq_len, hidden_size,
-    dtype=dtype, device=device
-)
-bias = torch.randn(  
-    hidden_size,
-    dtype=dtype, device=device
-)
-# 调用fused_gelu_bwd算子
-output_bwd = op.fused_gelu_bwd(input, input1, bias)
-# 验证输出
-print("fused_gelu_bwd computation completed")
-print(f"前向input形状: {input.shape}")
-print(f"上游梯度input1形状: {input1.shape}")
-print(f"输出output_bwd形状: {output_bwd.shape}")
-```
-## 10. moe_swiglu_dynamic_quantize
-### 支持的产品型号
-- Metax C500/C550/C588/C600
-### 接口原型
-```python
-def moe_swiglu_dynamic_quantize(
-    scatter_tokens: torch.Tensor,
-    smooth_scale: torch.Tensor,
-    experts_tokens_start: torch.Tensor,
-    experts_tokens_count: torch.Tensor,
-    y: torch.Tensor,
-    per_tokens_scale: torch.Tensor,
-    total_experts_num: int
-) -> None
-```
-### 功能描述
-moe_swiglu_dynamic_quantize 算子实现混合专家（MoE）架构下 SwigLU 计算的动态量化逻辑。该算子针对分散的 tokens 数据，结合各专家对应的 tokens 分布信息（起始位置、数量）与平滑缩放因子，执行动态量化处理，输出量化后的结果张量及每个 token 对应的缩放因子，以此提升 MoE 模块的计算效率并降低内存开销。
-- 计算公式：
-对于第 $k$ 个专家（ $k \in \{0, 1, ..., K-1\}$ ， $K = \text{total\\_experts\\_num}$ ）：
-
-$$
-X_k = \text{scatter\\_tokens}[s_k : s_k + c_k, :]
-$$
-
-其中：
-- $s_k = \text{experts\\_tokens\\_start}[k]$ ：第 $k$ 个专家的 tokens 在 $\text{scatter\\_tokens}$ 中的起始索引
-- $c_k = \text{experts\\_tokens\\_count}[k]$ ：第 $k$ 个专家包含的 tokens 数量
-平滑缩放处理，对专家 $k$ 的 tokens 子集应用平滑缩放因子：
-
-$$
-X_k' = X_k \odot S_k
-$$
-
-其中：
-- $S_k = \text{smooth\\_scale}[k, :] \in \mathbb{R}^D$ （ $D = \text{hidden\\_size}$ 为隐藏层维度）
-- $\odot$ 表示逐元素乘法（ $S_k$ 广播至 $X_k$ 的形状 $[c_k, D]$ ）
-逐 token 动态缩放因子计算，对于 $X_k'$ 中的第 $i$ 个 token $x'_i \in \mathbb{R}^D$ （ $i \in \{0, 1, ..., c_k-1\}$ ），计算其缩放因子：
-
-$$
-\text{scale}_i = \max_{j=1..D} |x'_{i,j}|
-$$
-
-动态量化输出，将缩放后的 token 值归一化到缩放因子范围内，得到量化结果：
-
-$$
-y_{s_k + i, :} = \frac{x'_{i, :}}{\text{scale}_i}
-$$
-
-同时记录该 token 对应的缩放因子：
-
-$$
-\text{per\\_tokens\\_scale}[s_k + i] = \text{scale}_i
-$$
-
-融合操作的单步表达式：
-
-$$
-\text{moe\\_swiglu\\_dynamic\\_quantize}(\text{scatter\\_tokens}, \text{smooth\\_scale}, \text{experts\\_tokens\\_start}, \text{experts\\_tokens\\_count}, K) = \left( y, \text{per\\_tokens\\_scale} \right)
-$$
-
-其中，
-- $K = \text{total\\_experts\\_num}$ ：混合专家架构的专家总数
-- $\text{scatter\\_tokens} \in \mathbb{R}^{N \times D}$ ：所有专家的分散 tokens 集合（ $N$ 为总 token 数）
-- $D = \text{hidden\\_size}$ ：tokens 的隐藏层维度
-- $y \in \mathbb{R}^{N \times D}$ ：量化后的输出张量（结果写入出参）
-- $\text{per\\_tokens\\_scale} \in \mathbb{R}^N$ ：每个 token 对应的动态缩放因子（结果写入出参）
-### 参数说明
-- **scatter_tokens** (torch.Tensor, 入参): 分散的 tokens 输入张量，形状为[总 token 数, hidden_size]，存储待量化的 MoE tokens 数据
-- **smooth_scale** (torch.Tensor, 入参): 平滑缩放因子张量，形状为[total_experts_num, hidden_size]，用于 SwigLU 计算中的缩放调整
-- **experts_tokens_start** (torch.Tensor, 入参): 各专家对应的 tokens 起始位置张量，形状为[total_experts_num]，标记每个专家的 tokens 在 scatter_tokens 中的起始索引
-- **experts_tokens_count** (torch.Tensor, 入参): 各专家对应的 tokens 数量张量，形状为[total_experts_num]，标记每个专家包含的 tokens 数量
-- **y** (torch.Tensor, 出参): 量化后的输出张量，形状与 scatter_tokens 一致（[总 token 数, hidden_size]），存储动态量化后的结果
-- **per_tokens_scale** (torch.Tensor, 出参): 每个 token 对应的缩放因子张量，形状为[总 token 数]，存储动态量化过程中每个 token 对应的缩放系数
-- **total_experts_num** (int, 入参): 混合专家架构中的专家总数量
-### 返回值
-无返回值，量化结果直接写入出参张量 y，每个 token 的缩放因子直接写入出参张量 per_tokens_scale 中
-### 约束与调用
-- 所有输入/输出张量必须位于 CUDA 设备上
-- 输入张量需满足连续存储约束
-- scatter_tokens 的维度需为 2 维, 总 token 数×hidden_size
-- experts_tokens_start、experts_tokens_count 的长度必须与 total_experts_num 一致
-- 支持的数据类型：float16、bfloat16、float32, 对应代码中类型转换逻辑支持的类型
-- smooth_scale 的形状需匹配[total_experts_num, hidden_size]，与 scatter_tokens 的 hidden_size 维度一致
-### 调用示例
-```python
-import torch
-import mcoplib.op as op
-device = "cuda"
-# 定义参数
-total_experts_num = 8  
-num_tokens = 2048    
-hidden_size = 4096     
-# 输入张量：scatter_tokens（待量化的token特征）
-scatter_tokens = torch.randn(
-    num_tokens, hidden_size,
-    dtype=torch.float16, 
-    device=device, 
-    requires_grad=True
-)
-# 输入张量：smooth_scale（量化的平滑缩放系数）
-smooth_scale = torch.randn(
-    total_experts_num, 3, hidden_size//2, 2,
-    dtype=torch.float32,
-    device=device,
-    requires_grad=True
-)
-# 元数据：每个专家的token数量（experts_token_count）
-experts_token_count = torch.randint(
-    low=1, high=10,
-    size=(total_experts_num,),
-    dtype=torch.int32,
-    device=device
-)
-# 确保总token数不超过num_tokens，调整最后一个专家的count
-experts_token_count[-1] = num_tokens - experts_token_count[:-1].sum()
-# 元数据：每个专家的token起始索引（experts_token_start）
-experts_token_start = torch.zeros_like(experts_token_count)
-for i in range(1, total_experts_num):
-    experts_token_start[i] = experts_token_start[i-1] + experts_token_count[i-1]
-# 输出张量：量化后的token（y）
-y = torch.empty(
-    num_tokens, hidden_size//2,
-    dtype=torch.int8,
-    device=device
-)
-# 输出张量：每个token的量化缩放系数（per_tokens_scale）
-per_tokens_scale = torch.empty(
-    num_tokens, hidden_size//2,
-    dtype=torch.float32,
-    device=device
-)
-# 调用moe_swiglu_dynamic_quantize算子
-op.moe_swiglu_dynamic_quantize(
-    scatter_tokens=scatter_tokens,
-    smooth_scale=smooth_scale,
-    experts_token_start=experts_token_start,
-    experts_token_count=experts_token_count,
-    y=y,
-    per_tokens_scale=per_tokens_scale,
-    total_experts_num=total_experts_num
-)
-print("moe_swiglu_dynamic_quantize computation completed")
-print(f"Output y shape: {y.shape}, data type: {y.dtype}")
-print(f"Output per_tokens_scale shape: {per_tokens_scale.shape}, data type: {per_tokens_scale.dtype}")
-```
-## 11. moe_softmax_topk
-### 支持的产品型号
-- Metax C500/C550/C588/C600
-### 接口原型
-```python
-def moe_softmax_topk(
-    topk_weights: torch.Tensor,
-    topk_indices: torch.Tensor,
-    gating_output: torch.Tensor,
-    pre_softmax: bool
-) -> None
-```
-### 功能描述
-moe_softmax_topk 算子实现混合专家（MoE）架构下 gating 网络输出的 Top-K Softmax 处理逻辑。该算子接收 gating 网络的输出张量，根据 pre_softmax 标记判断是否对输入执行 Softmax 计算，随后筛选出每个 token 对应的 Top-K 个专家的权重与索引，最终将结果写入指定的输出张量，为 MoE 架构的专家选择环节提供核心的 Top-K 专家信息。
-- 计算公式
-对于第 $k$ 个专家（ $k \in \{0, 1, ..., K-1\}$ ，其中 $K = \text{total\\_experts\\_num}$ ），从输入张量 scatter_tokens 中提取属于该专家的 tokens 子集 $X_k$ ：
-
-$$
-X_k = \text{scatter\\_tokens}[s_k : s_k + c_k, :]
-$$
-
-其中：
-- $s_k = \text{experts\\_tokens\\_start}[k]$ ：第 $k$ 个专家的 tokens 在 scatter_tokens 中的起始索引。
-- $c_k = \text{experts\\_tokens\\_count}[k]$ ：第 $k$ 个专家包含的 tokens 数量。
-- 提取后， $X_k$ 的形状为 $[c_k, D]$ ，其中 $D = \text{hidden\\_size}$ 是隐藏层维度。
-对提取出的专家 $k$ 的 tokens 子集 $X_k$ 应用平滑缩放因子 $S_k$ ：
-
-$$
-X_k' = X_k \odot S_k
-$$
-
-其中：
-- $S_k = \text{smooth\\_scale}[k, :] \in \mathbb{R}^D$ ：第 $k$ 个专家的平滑缩放因子，其形状为 $[D]$ 。
-- $\odot$ ：表示逐元素（element-wise）乘法。由于 $S_k$ 的形状为 $[D]$ ，它会被广播（broadcast）到与 $X_k$ 相同的形状 $[c_k, D]$ 后再进行乘法运算。
-- 运算后， $X_k'$ 的形状仍为 $[c_k, D]$ 。
-对于 $X_k'$ 中的第 $i$ 个 token（ $i \in \{0, 1, ..., c_k-1\}$ ），即向量 $x'_i \in \mathbb{R}^D$ ，计算其动态缩放因子 $\text{scale}_i$ ：
-
-$$
-\text{scale}_i = \max_{j=1..D} |x'_{i,j}|
-$$
-
-其中 $x'_{i, j}$ 是向量 $x'_i$ 的第 $j$ 个元素。 $\text{scale}_i$ 是该 token 在所有维度上绝对值的最大值。
-使用计算出的缩放因子 $\text{scale}_i$ 对 token $x'_i$ 进行量化，并将结果写入输出张量 y 的对应位置。同时，记录该 token 的缩放因子。
-量化输出：
-
-$$
-y_{s_k + i, :} = \frac{x'_{i, :}}{\text{scale}_i}
-$$
-
-这个操作将 $x'_i$ 的每个元素值归一化到 $[-1, 1]$ 的范围内（假设原始数据为浮点型）。结果写入 y 中从索引 $s_k + i$ 开始的行。
-记录缩放因子：
-
-$$
-\text{per\\_tokens\\_scale}[s_k + i] = \text{scale}_i
-$$
-
-将计算出的 $\text{scale}_i$ 存入 per_tokens_scale 张量的对应位置，以便后续可能的反量化操作。
-算子对所有专家（从 $k=0$ 到 $k=K-1$ ）重复上述步骤 1 到步骤 4。最终，y 张量将包含所有量化后的 tokens，per_tokens_scale 张量将包含每个 token 对应的缩放因子。
-整个过程可以概括为：
-
-$$
-(\text{y}, \text{per\\_tokens\\_scale}) = \text{moe\\_swiglu\\_dynamic\\_quantize}(\text{scatter\\_tokens}, \text{smooth\\_scale}, \text{experts\\_tokens\\_start}, \text{experts\\_tokens\\_count}, K)
-$$
-
-其中：
-- $\text{scatter\\_tokens} \in \mathbb{R}^{N \times D}$ ：输入，所有专家的 tokens 分散存储， $N$ 为总 token 数。
-- $\text{y} \in \mathbb{R}^{N \times D}$ ：输出，量化后的 tokens，与 scatter_tokens 形状相同。
-- $\text{per\\_tokens\\_scale} \in \mathbb{R}^N$ ：输出，每个 token 对应的动态缩放因子。
-### 参数说明
-- **topk_weights** (torch.Tensor, 出参): 输出的 Top-K 专家权重张量，形状为[num_tokens, topk]，存储每个 token 对应的 Top-K 专家的归一化权重
-- **topk_indices** (torch.Tensor, 出参): 输出的 Top-K 专家索引张量，形状为[num_tokens, topk]，存储每个 token 对应的 Top-K 专家在所有专家中的索引
-- **gating_output** (torch.Tensor, 入参): gating 网络的原始输出张量，形状为[num_tokens, num_experts]，存储每个 token 对应所有专家的原始评分
-- **pre_softmax** (bool, 入参): 布尔标记，若为 True 表示 gating_output 是未经过 Softmax 的 logits，需先执行 Softmax 计算；若为 False 则认为 gating_output 已完成 Softmax 归一化
-### 返回值
-无返回值，Top-K 专家的权重与索引结果直接写入出参张量 topk_weights、topk_indices 中
-### 约束与调用
-- 所有输入/输出张量必须位于 CUDA 设备上
-- 输入/输出张量需满足连续存储（contiguous）约束
-- gating_output 需为 2 维张量，维度为[num_tokens, num_experts], num_tokens 为 token 总数，num_experts 为专家总数
-- topk_weights 与 topk_indices 需为 2 维张量，维度为[num_tokens, topk], topk 为需筛选的专家数量
-- 支持的数据类型：float16、bfloat16、float32, 对应代码中 scalar_t 模板支持的浮点类型
-- pre_softmax 需为合法布尔值，用于区分 gating_output 是否已执行 Softmax
-### 调用示例
-```python
-import torch
-import mcoplib.op as op
-# 定义设备
-device = "cuda"
-# 定义参数
-num_tokens = 1000  
-num_experts = 8   
-topk = 2           
-# 创建输入张量
-gating_output = torch.randn(num_tokens, num_experts, dtype=torch.float32, device=device)
-# 创建输出张量（预先分配内存）
-topk_weights = torch.empty(num_tokens, topk, dtype=torch.float32, device=device)
-topk_indices = torch.empty(num_tokens, topk, dtype=torch.int32, device=device)
-# 是否需要对 gating_output 进行 softmax
-pre_softmax = True
-# 调用 moe_softmax_topk 算子
-op.moe_softmax_topk(
-    topk_weights,
-    topk_indices,
-    gating_output,
-    pre_softmax
-)
-# 输出结果信息
-print("moe_softmax_topk computation completed.")
-print(f"Number of tokens: {num_tokens}")
-print(f"Number of experts: {num_experts}")
-print(f"Top-k: {topk}")
-print(f"pre_softmax: {pre_softmax}")
-print(f"Shape of topk_weights: {topk_weights.shape}")
-print(f"Shape of topk_indices: {topk_indices.shape}")
-# 打印部分结果示例
-print("\nSample topk_weights (first 2 tokens):")
-print(topk_weights[:2])
-print("\nSample topk_indices (first 2 tokens):")
-print(topk_indices[:2])
-```
-## 12. rms_norm_dynamic_per_token_quant
-### 支持的产品型号
-- Metax C500/C550/C588/C600
-### 接口原型
-```python
-def rms_norm_dynamic_per_token_quant(
-    out: torch.Tensor,
-    input: torch.Tensor,
-    weight: torch.Tensor,
-    smooth_scale: torch.Tensor,
-    scales: torch.Tensor,
-    var_epsilon: float,
-    after_res: torch.Tensor,
-    after_norm: torch.Tensor,
-    residual: Optional[torch.Tensor] = None
-) -> None
-```
-### 功能描述
-rms_norm_dynamic_per_token_quant 算子是融合逐 Token 动态量化的 RMS 归一化算子，支持可选残差连接. 该算子先对输入张量做残差融合（若有残差），再通过 RMS 归一化、权重缩放实现特征标准化，最后通过逐 Token 动态量化生成 int8 输出张量, 同时输出残差融合中间结果、归一化中间结果和逐 Token 量化缩放因子，减少内存交互开销，提升大模型推理效率
-- 计算公式：
-残差连接（可选）, 若输入 residual 不为 None，计算残差融合结果, 否则直接沿用输入张量：  
-
-$$
-\text{after\\_res}_{b,s,h} = 
-\begin{cases} 
-\text{input}_{b,s,h} + \text{residual}_{b,s,h}, & \text{residual} \neq \text{None} \\
-\text{input}_{b,s,h}, & \text{residual} = \text{None}
-\end{cases}
-$$
-
-其中： $\text{after\\_res} \in \mathbb{R}^{B \times S \times H}$ ， $B$ 为 batch size， $S$ 为序列长度， $H$ 为单个 Token 的特征维度。
-逐 Token 计算平方和, 对 after_res 的每个 Token（即每个 $(b, s)$ 位置），计算特征维度上的平方和：  
-
-$$
-\text{sum\\_sq}_{b,s} = \sum_{h=0}^{H-1} \text{after\\_res}_{b,s,h}^2
-$$
-
-其中： $\text{sum\\_sq} \in \mathbb{R}^{B \times S}$ 。
-逐 Token 计算平方均值, 将平方和除以特征维度 $H$ ，得到每个 Token 的平方均值：  
-
-$$
-\text{mean\\_sq}_{b,s} = \frac{\text{sum\\_sq}_{b,s}}{H}
-$$
-
-其中： $\text{mean\\_sq} \in \mathbb{R}^{B \times S}$ 。
-计算逐 Token RMS 值, 为避免除零，给平方均值加上数值稳定小量 var_epsilon 后开根号，得到每个 Token 的 RMS（Root Mean Square）值：  
-
-$$
-\text{rms}_{b,s} = \sqrt{\text{mean\\_sq}_{b,s} + \text{var\\_epsilon}}
-$$
-
-其中： $\text{rms} \in \mathbb{R}^{B \times S}$ ， $\text{var\\_epsilon} > 0$ （通常取 $10^{-6}$ ）。
-逐 Token 量化缩放因子, 计算每个 Token 的缩放因子（用于后续量化），即 RMS 值的倒数：  
-
-$$
-\text{scales}_{b,s} = \frac{1}{\text{rms}_{b,s}}
-$$
-
-其中： $\text{scales} \in \mathbb{R}^{B \times S}$ （需保留该张量用于后续反量化）。
-RMS 归一化, 将 after_res 除以逐 Token 的 RMS 值（通过广播匹配维度），实现逐 Token 的 RMS 归一化：  
-
-$$
-\text{normed}_{b,s,h} = \frac{\text{after\\_res}_{b,s,h}}{\text{rms}_{b,s}}
-$$
-
-其中： $\text{normed} \in \mathbb{R}^{B \times S \times H}$ （ $\text{rms}$ 通过`unsqueeze (-1)`扩展为 $B \times S \times 1$ ，与 $\text{after\\_res}$ 广播）。
-权重与平滑缩放, 用 weight（特征维度权重）和 smooth_scale（特征维度平滑因子）对归一化结果做缩放，得到最终归一化中间结果：  
-
-$$
-\text{after\\_norm}_{b,s,h} = \text{normed}_{b,s,h} \cdot \text{weight}_h \cdot \text{smooth\\_scale}_h
-$$
-
-其中： $\text{weight} \in \mathbb{R}^H$ ， $\text{smooth\\_scale} \in \mathbb{R}^H$ （均通过广播匹配 $B \times S \times H$ 维度）。
-逐 Token 动态量化, 将 after_norm 按逐 Token 的 scales 缩放到 int8 范围（ $-128 \sim 127$ ）: 
-
-$$
-\text{out}_{b,s,h} = \text{clamp}\left( \text{round}\left( \text{after\\_norm}_{b,s,h} \cdot \text{scales}_{b,s} \right), -128, 127 \right)
-$$
-
-其中： $\text{out} \in \mathbb{Z}^{B \times S \times H}$ （int8 类型），round () 为四舍五入函数，clamp () 为区间限制函数。
-### 参数说明
-- **out** (torch.Tensor, 出参): 动态量化后的输出张量，数据类型为 int8，形状与 input 一致（B×S×H）
-- **input** (torch.Tensor, 入参): 原始输入张量，形状为 B×S×H，支持数据类型为 float16/bfloat16
-- **weight** (torch.Tensor, 入参): 特征维度的缩放权重张量，形状为 H，支持数据类型为 float16/bfloat16
-- **smooth_scale** (torch.Tensor, 入参): 特征维度的平滑缩放因子张量，形状为 H，支持数据类型为 float16/bfloat16
-- **scales** (torch.Tensor, 出参): 逐 Token 的量化缩放因子张量，形状为 B×S，数据类型为 float32（保证量化精度）
-- **var_epsilon** (float, 入参): 数值稳定小量，用于避免 RMS 计算中出现除零或数值溢出（通常取 10^-6）
-- **after_res** (torch.Tensor, 出参): 残差连接后的中间张量，形状与 input 一致（B×S×H），数据类型与 input 相同
-- **after_norm** (torch.Tensor, 出参): 权重缩放后的归一化中间张量，形状与 input 一致（B×S×H），数据类型与 input 相同
-- **residual** (Optional[torch.Tensor], 入参): 可选残差张量，形状需与 input 完全一致（B×S×H），支持数据类型为 float16/bfloat16；若为 None，则不进行残差连接
-### 返回值
-该算子无返回值，所有输出（量化结果、中间结果、缩放因子）均通过指定的出参张量（out、scales、after_res、after_norm）返回。
-### 约束与调用
-- 所有输入/出参张量必须位于 CUDA 设备上
-- input、after_res、after_norm、out 的形状必须完全一致
-- weight、smooth_scale 的形状必须与 input 的最后一维匹配
-- scales 的形状必须与 input 的前两维匹配；
-- 若 residual 不为 None，其形状必须与 input 完全一致。
-- input、weight、smooth_scale、residual、after_res、after_norm 支持 float16/bfloat16，out 必须为 int8 类型，scales 必须为 float32 类型
-- var_epsilon`必须为正数，否则会导致 RMS 计算数值不稳定或除零错误。
-### 调用示例
-```python
-import torch
-import mcoplib.op as op
-# 定义运行设备
-device = "cuda"
-#定义算子所需的参数
-B = 4
-S = 128
-H = 4096 
-#创建输入张量
-input_tensor = torch.randn(B, S, H, dtype=torch.float16, device=device)
-weight = torch.randn(H, dtype=torch.float16, device=device)
-smooth_scale = torch.randn(H, dtype=torch.float16, device=device)
-residual = torch.randn(B, S, H, dtype=torch.float16, device=device)
-#创建输出张量
-out = torch.empty(B, S, H, dtype=torch.int8, device=device)
-scales = torch.empty(B, S, dtype=torch.float32, device=device)
-after_res = torch.empty(B, S, H, dtype=torch.float16, device=device)
-after_norm = torch.empty(B, S, H, dtype=torch.float16, device=device)
-var_epsilon = 1e-6 
-op.rms_norm_dynamic_per_token_quant(
-    out,
-    input_tensor,
-    weight,
-    smooth_scale,
-    scales,
-    var_epsilon,
-    after_res,
-    after_norm,
-    residual 
-)
-print("rms_norm_dynamic_per_token_quant computation completed.")
-print(f"Output tensor 'out' shape: {out.shape}, dtype: {out.dtype}")
-print(f"Scales tensor shape: {scales.shape}, dtype: {scales.dtype}")
-print(f"After-residual tensor shape: {after_res.shape}")
-print(f"After-normalization tensor shape: {after_norm.shape}")
-```
-## 13. head_rms_norm
-### 支持的产品型号
-- Metax C500/C550/C588/C600
-### 接口原型
-```python
-def head_rms_norm(
-    out: torch.Tensor,
-    hidden_states: torch.Tensor,
-    weight: torch.Tensor,
-    var_epsilon: float,
-    head_offset: int,
-    head_norm: int
-) -> None
-```
-### 功能描述
-head_rms_norm 算子是针对多头注意力机制优化的 RMS（Root Mean Square）归一化算子，该算子将输入的多头隐藏状态按 Head 维度拆分，对每个 Head 单独执行 RMS 归一化和权重缩放，最后将结果拼接输出，避免跨 Head 的归一化干扰，提升注意力机制的计算效率和模型性
-- 计算公式：
-多头隐藏状态拆分，设输入 hidden_states 的形状为 $B \times S \times N \times D$ （ $B$=batch size， $S$=序列长度， $N$=总 Head 数， $D$=单个 Head 的特征维度），或展平形状 $B \times S \times (N \times D)$ 。算子首先按 Head 维度拆分，得到单个 Head 的隐藏状态张量：  
-
-$$
-\text{head\\_hidden}_{b,s,:} = \text{hidden\\_states}_{b,s,\text{head\\_idx} \times D : (\text{head\\_idx}+1) \times D}
-$$
-
-其中： $\text{head\\_idx}$ 为当前处理的 Head 索引（范围 $0 \sim N-1$ ）， $\text{head\\_hidden} \in \mathbb{R}^{B \times S \times D}$ 。
-对每个 Head 的隐藏状态，在特征维度（ $D$ 维）上计算平方和：  
-
-$$
-\text{sum\\_sq}_{b,s} = \sum_{d=0}^{D-1} \text{head\\_hidden}_{b,s,d}^2
-$$
-
-其中： $\text{sum\\_sq} \in \mathbb{R}^{B \times S}$ 。
-将平方和除以特征维度 $D$ ，得到每个 Token（ $b, s$ 位置）在该 Head 下的平方均值：  
-
-$$
-\text{mean\\_sq}_{b,s} = \frac{\text{sum\\_sq}_{b,s}}{D}
-$$
-
-其中： $\text{mean\\_sq} \in \mathbb{R}^{B \times S}$ 。
-为避免除零，给平方均值加上数值稳定小量 var_epsilon 后开根号，得到每个 Token 的 RMS 值：  
-
-$$
-\text{rms}_{b,s} = \sqrt{\text{mean\\_sq}_{b,s} + \text{var\\_epsilon}}
-$$
-
-其中： $\text{rms} \in \mathbb{R}^{B \times S}$ ， $\text{var\\_epsilon} > 0$ （通常取 $10^{-6}$ ）。
-将该 Head 的隐藏状态除以其 RMS 值，通过广播匹配维度，实现归一化：  
-
-$$
-\text{normed}_{b,s,d} = \frac{\text{head\\_hidden}_{b,s,d}}{\text{rms}_{b,s}}
-$$
-
-其中： $\text{normed} \in \mathbb{R}^{B \times S \times D}$ （ $\text{rms}$ 扩展为 $B \times S \times 1$ 后与 $\text{head\\_hidden}$ 广播）。
-获取当前 Head 对应的权重，head_offset 定位，对归一化结果做缩放：  
-
-$$
-\text{scaled}_{b,s,d} = \text{normed}_{b,s,d} \times \text{weight}_{\text{head\\_idx},d}
-$$
-
-其中： $\text{weight} \in \mathbb{R}^{N \times D}$ （ $N$ 为总 Head 数）， $\text{scaled} \in \mathbb{R}^{B \times S \times D}$ 。
-将所有 Head 的缩放后结果按原 Head 顺序拼接，得到最终输出张量：  
-
-$$
-\text{out}_{b,s,:} = \text{concat}\left( \text{scaled}_{\text{head\\_idx}=0}, \text{scaled}_{\text{head\\_idx}=1}, \dots, \text{scaled}_{\text{head\\_idx}=N-1} \right)
-$$
-
-其中： $\text{out} \in \mathbb{R}^{B \times S \times (N \times D)}$ ，与输入 hidden_states 形状一致）
-### 参数说明
-- **out** (torch.Tensor, 出参): 多头归一化后的输出张量，形状与 hidden_states 一致，支持数据类型为 float16/bfloat16
-- **hidden_states** (torch.Tensor, 入参): 多头注意力的隐藏状态张量，支持数据类型为 float16/bfloat16
-- **weight** (torch.Tensor, 入参): 分 Head 的权重张量，支持数据类型为 float16/bfloat16
-- **var_epsilon** (float, 入参): 数值稳定小量，用于避免 RMS 计算中除零或数值溢出
-- **head_offset** (int, 入参): 当前处理的 Head 在 weight 中的起始偏移索引，用于定位目标 Head 的权重
-- **head_norm** (int, 入参): 多头注意力的总 Head 数，用于拆分和拼接多头张量
-### 返回值
-该算子无返回值，返回类型为 None，归一化后的结果通过出参张量 out 返回。
-### 约束与调用
-- 所有输入/出参张量必须位于 CUDA 设备上
-- out 与 hidden_states 的形状必须完全一致，weight`的形状必须为 N×D（N=head_norm，D=单个 Head 的特征维度）
-- 若`hidden_states 为展平形状 B×S×(N×D)，则 N×D 必须等于其最后一维的大小；若为未展平形状 B×S×N×D，则其第三维必须等于 N（head_norm），第四维必须等于 D
-- hidden_states、weight、out 支持 float16/bfloat16，不支持 float32
-- head_offset 必须为非负整数，且满足 0≤head_offset<head_norm
-- var_epsilon 必须为正数，否则会导致 RMS 计算数值不稳定
-### 调用示例
-```python
-import torch
-import mcoplib.op as op
-# 定义运行设备
-device = "cuda"
-# 定义算子所需的参数
-B = 4  
-S = 128  
-N = 32  
-D = 128  
-# 创建输入张量
-hidden_states = torch.randn(B, S, N * D, dtype=torch.float16, device=device)
-weight = torch.randn(N, D, dtype=torch.float16, device=device)
-# 创建输出张量
-out = torch.empty(B, S, N * D, dtype=torch.float16, device=device)
-# 其他参数
-var_epsilon = 1e-6
-head_offset = 0  
-head_norm = N   
-# 调用 head_rms_norm 算子
-op.head_rms_norm(
-    out,
-    hidden_states,
-    weight,
-    var_epsilon,
-    head_offset,
-    head_norm
-)
-print("head_rms_norm computation completed.")
-print(f"Output tensor 'out' shape: {out.shape}, dtype: {out.dtype}")
-```
-## 14. rms_norm
-### 支持的产品型号
-- Metax C500/C550/C588/C600
-### 接口原型
-```python
-def rms_norm(
-    out: torch.Tensor,
-    input: torch.Tensor,
-    weight: torch.Tensor,
-    var_epsilon: float,
-    after_res: Optional[torch.Tensor] = None,
-    residual: Optional[torch.Tensor] = None,
-    rms_div: bool
-) -> None
-```
-### 功能描述
-rms_norm 算子是基础 RMS（Root Mean Square）归一化算子，支持可选残差连接与两种归一化计算方式，该算子先通过残差连接融合输入与残差张量（若有），再对融合结果计算 RMS 归一化，最后通过权重缩放生成输出，同时支持将残差融合中间结果存入 after_res（可选），并通过 rms_div 参数灵活切换归一化计算逻辑（除法/乘法），适配不同硬件效率需求。
-- 计算公式：
-残差连接（可选），若输入 residual 不为 None，计算残差融合结果；否则直接沿用输入张量 input，若 after_res 为非 None 张量，则将融合结果存入 after_res：  
-
-$$
-\text{after\\_res}_{b,s,h} = 
-\begin{cases} 
-\text{input}_{b,s,h} + \text{residual}_{b,s,h}, & \text{residual} \neq \text{None} \\
-\text{input}_{b,s,h}, & \text{residual} = \text{None}
-\end{cases}
-$$
-
-其中： $\text{after\\_res} \in \mathbb{R}^{B \times S \times H}$ （ $B$=batch size， $S$=序列长度， $H$=特征维度），若`after_res`为 None 则仅在内部使用该融合结果。
-对残差融合后的张量（记为 $X$ ，即 $\text{after\\_res}$ 或内部融合结果），在**特征维度（ $H$ 维）** 计算每个 $(b, s)$ 位置的平方和：  
-
-$$
-\text{sum\\_sq}_{b,s} = \sum_{h=0}^{H-1} X_{b,s,h}^2
-$$
-
-其中： $\text{sum\\_sq} \in \mathbb{R}^{B \times S}$ 。
-将平方和除以特征维度 $H$ ，得到每个 $(b, s)$ 位置的平方均值：  
-
-$$
-\text{mean\\_sq}_{b,s} = \frac{\text{sum\\_sq}_{b,s}}{H}
-$$
-
-其中： $\text{mean\\_sq} \in \mathbb{R}^{B \times S}$ 。
-为避免除零，给平方均值加上数值稳定小量 var_epsilon 后开根号，得到每个 $(b, s)$ 位置的 RMS 值：  
-
-$$
-\text{rms}_{b,s} = \sqrt{\text{mean\\_sq}_{b,s} + \text{var\\_epsilon}}
-$$
-
-其中： $\text{rms} \in \mathbb{R}^{B \times S}$ ， $\text{var\\_epsilon} > 0$ （通常取 $10^{-6}$ ）。
-根据 rms_div 参数选择归一化计算方式（核心差异为“除法”或“乘法”，乘法更适配硬件指令优化）：  
-- 当 $\text{rms\\_div} = \text{True}$ （除法模式）：  
-
-$$
-  \text{normed}_{b,s,h} = \frac{X_{b,s,h}}{\text{rms}_{b,s}}
-$$
-
-- 当 $\text{rms\\_div} = \text{False}$ （乘法模式，硬件友好）：  
-
-$$
-  \text{normed}_{b,s,h} = X_{b,s,h} \cdot \frac{1}{\text{rms}_{b,s}}
-$$
-
-  其中： $\text{normed} \in \mathbb{R}^{B \times S \times H}$ （ $\text{rms}$ 通过`unsqueeze (-1)`扩展为 $B \times S \times 1$ ，与 $X$ 广播匹配）。
-  将归一化结果乘以特征维度的权重 weight，最终结果存入 out：  
-
-$$
-\text{out}_{b,s,h} = \text{normed}_{b,s,h} \cdot \text{weight}_h
-$$
-
-其中： $\text{weight} \in \mathbb{R}^H$ （通过广播匹配 $B \times S \times H$ 维度）。
-### 参数说明
-- **out** (torch.Tensor, 出参): 归一化后的输出张量，形状与 input 完全一致（B×S×H），支持数据类型为 float16/bfloat16
-- **input** (torch.Tensor, 入参): 原始输入张量，形状为 B×S×H，支持数据类型为 float16/bfloat16
-- **weight** (torch.Tensor, 入参): 特征维度的缩放权重张量，形状为 H，支持数据类型为 float16/bfloat16
-- **var_epsilon** (float, 入参): 数值稳定小量，用于避免 RMS 计算中除零或数值溢出（通常取 10^-6）
-- **after_res** (Optional[torch.Tensor], 出参): 可选残差融合中间结果张量，形状与 input 一致（B×S×H），数据类型与 input 相同；若为 None，则不保存该中间结果
-- **residual** (Optional[torch.Tensor], 入参): 可选残差张量，形状需与 input 完全一致（B×S×H），支持数据类型为 float16/bfloat16；若为 None，则不进行残差连接
-- **rms_div** (bool, 入参): 归一化计算模式开关：True 表示“除以 RMS 值”，False 表示“乘以 RMS 倒数”，后者更适配硬件指令，效率更高
-### 返回值
-该算子无返回值（返回类型为 None），核心归一化结果通过出参 out 返回，如果需要残差融合中间结果，通过 after_res 返回
-### 约束与调用
-- 所有输入/出参张量必须位于 CUDA 设备上
-- out、input、after_res、residual 的形状必须完全一致（B×S×H），weight 的形状必须与 input 的最后一维（特征维度 H）匹配，input、weight、out、after_res（若有）、residual（若有）仅支持 float16/bfloat16，不支持 float32
-- var_epsilon 必须为正数，否则会导致 RMS 计算数值不稳定，rms_div 必须为布尔值
-### 调用示例
-```python
-import torch
-import mcoplib.op as op
-# 定义运行设备
-device = "cuda"
-# 1. 定义算子所需的参数
-B = 4 
-S = 128  
-H = 4096  
-# 创建输入张量
-input_tensor = torch.randn(B, S, H, dtype=torch.float16, device=device)
-weight = torch.randn(H, dtype=torch.float16, device=device)
-residual = torch.randn(B, S, H, dtype=torch.float16, device=device)
-# 创建输出张量和可选的中间结果张量
-out = torch.empty(B, S, H, dtype=torch.float16, device=device)
-after_res = torch.empty(B, S, H, dtype=torch.float16, device=device)
-# 其他参数
-var_epsilon = 1e-6
-rms_div = False 
-# 调用 rms_norm 算子
-op.rms_norm(
-    out,
-    input_tensor,
-    weight,
-    var_epsilon,
-    after_res,   
-    residual,      
-    rms_div
-)
-print("rms_norm computation completed.")
-print(f"Output tensor 'out' shape: {out.shape}, dtype: {out.dtype}")
-print(f"After-residual tensor shape: {after_res.shape}")
-```
-## 15. all_reduce_max
-### 支持的产品型号
-- Metax C500/C550/C588/C600
-### 接口原型
-```python
-def all_reduce_max(
-    input: torch.Tensor,
-    output: torch.Tensor
-) -> None
-```
-### 功能描述
-all_reduce_max 算子是基于 CUDA 实现的执行最大规约操作的算子，针对`bfloat16`类型张量，为每个 token 执行规约操作，支持向量化访存加速
-- 计算公式：
-
-$$
-    \text{all\\_reduce\\_max}(\mathbf{X}) = \left[ \max_{j=1}^D X_{i,j} \right]_{i=1}^N
-$$
-
-  其中：
-- $\mathbf{X} \in \mathbb{R}^{N \times D}$ 是输入张量（形状为 [num_tokens, hidden_size]）
-- $\text{all\\_reduce\\_max}(\mathbf{X}) \in \mathbb{R}^N$ 是输出张量（形状为 [num_tokens]）
-- $V \in \mathbb{R}^{B \times H_k \times D \times S}$ 是分页值缓存
-- $N$ 是 token 数量，对应代码中的 $\text{num\\_tokens}$
-- $D$ 是隐藏维度，对应代码中的 $\text{hidden\\_size}$
-- $X_{i, j}$ 表示输入张量 $\mathbf{X}$ 中第 $i$ 个 token 对应的第 $j$ 个隐藏维度元素
-    **主要功能包括**：
-- 基于 CUDA 实现张量聚合计算，支持求和与最大值两种核心操作
-- 适配分布式计算场景自动选择向量版或普通版 CUDA 核函数
-- 通过线程协同，完成跨设备/进程的张量元素聚合，保障数据一致
-### 参数说明
-- **input** (torch.Tensor, 入参): 输入张量，需位于 CUDA 设备上，形状为[num_tokens, hidden_size]，数据类型仅支持 bfloat16，存储待归约的 bfloat16 数据
-- **output** (torch.Tensor, 出参): 输出张量，需位于 CUDA 设备上，形状为[num_tokens]，用于存储每个 token 对应的 hidden_size 维度的求和结果
-### 返回值
-无返回值，结果直接写入输出张量 output 中
-### 约束与调用
-- 所有输入/输出张量必须位于 CUDA 设备上
-- 仅兼容 bfloat16 数据类型
-- 输入张量为连续存储的 2D 张量，形状固定为[num_tokens, hidden_size]
-- 根据 hidden_size 是否对齐自动选择是否使用向量化加速
-### 调用示例
-```python
-import torch
-import mcoplib.op as op
-device = "cuda"
-# 定义参数
-num_tokens = 4096
-hidden_size = 4096
-dtype = torch.bfloat16
-error_threshold = 1e-3  # 误差阈值
-# 创建输入/输出张量
-input_tensor = torch.randn((num_tokens, hidden_size), dtype=dtype, device=device)
-output_tensor = torch.zeros(num_tokens, dtype=dtype, device=device)
-op.all_reduce_max(input_tensor, output_tensor)
-# 简单精度检查：用PyTorch原生函数做基准对比
-standard_output = torch.max(input_tensor, dim=1).values 
-max_error = torch.max(torch.abs(output_tensor - standard_output)).item()  
-is_correct = max_error < error_threshold 
-print("all_reduce_max computation completed")
-print(f"Input shape: {output_tensor.shape}, Output shape: {output_tensor.shape}")
-print(f"\nPrecision check: {'PASSED' if is_correct else 'FAILED'}")
-print(f"Maximum absolute error: {max_error:.6f} (threshold: {error_threshold})")
-print(f"\nFirst 5 results comparison:")
-print(f"Operator output: {output_tensor[:5].cpu()}")
-print(f"Standard output: {standard_output[:5].cpu()}")
-```
-## 16. all_reduce_sum
-### 支持的产品型号
-- Metax C500/C550/C588/C600
-### 接口原型
-```python
-def all_reduce_sum(
-    input: torch.Tensor,
-    output: torch.Tensor
-) -> None
-```
-### 功能描述
-all_reduce_sum 算子是基于 CUDA 实现的执行求和规约操作的算子，针对`bfloat16`类型张量，为每个 token 执行 hidden_size 维度的求和规约，支持向量化访存加速
-- 计算公式：
-
-$$
-    \text{all\\_reduce\\_sum}(\mathbf{X}) = \left[ \sum_{j=1}^D X_{i,j} \right]_{i=1}^N
-$$
-
-  其中：
-- $\mathbf{X} \in \mathbb{R}^{N \times D}$ 是输入张量（形状为 [num_tokens, hidden_size]）
-- $\text{all\\_reduce\\_sum}(\mathbf{X}) \in \mathbb{R}^N$ 是输出张量（形状为 [num_tokens]）
-- $N$ 是 token 数量，对应代码中的 $\text{num\\_tokens}$
-- $D$ 是隐藏维度，对应代码中的 $\text{hidden\\_size}$
-- $X_{i, j}$ 表示输入张量 $\mathbf{X}$ 中第 $i$ 个 token 对应的第 $j$ 个隐藏维度元素
-    **主要功能包括：**
-- 基于 CUDA 实现张量聚合计算，支持求和的核心规约操作
-- 适配分布式计算场景自动选择向量版或普通版 CUDA 核函数
-- 通过线程协同完成计算，结合向量化访存优化提升执行效率
-### 参数说明
-- **input** (torch.Tensor, 入参): 输入张量，需位于 CUDA 设备上，形状为[num_tokens, hidden_size]，数据类型仅支持 bfloat16，存储待归约的 bfloat16 数据
-- **output** (torch.Tensor, 出参): 输出张量，需位于 CUDA 设备上，形状为[num_tokens]，用于存储每个 token 对应的 hidden_size 维度的求和结果
-### 返回值
-无返回值，结果直接写入输出张量 output 中
-### 约束与调用
-- 所有输入/输出张量必须位于 CUDA 设备上
-- 仅兼容 bfloat16 数据类型
-- 输入张量为连续存储的 2D 张量，形状固定为[num_tokens, hidden_size]
-- 根据 hidden_size 是否对齐自动选择是否使用向量化加速
-### 调用示例
-```python
-import torch
-import mcoplib.op as op
-# 设置设备
-device = "cuda"
-# 定义参数
-num_tokens = 4096
-hidden_size = 4096
-dtype = torch.bfloat16
-error_threshold = 1e-3  
-# 创建输入/输出张量
-input_tensor = torch.randn((num_tokens, hidden_size), dtype=dtype, device=device)
-output_tensor = torch.zeros(num_tokens, dtype=dtype, device=device)  # 输出是num_tokens长度的向量
-# 调用目标算子
-op.all_reduce_sum(input_tensor, output_tensor)
-# 简单精度检查：用PyTorch原生sum做基准对比
-standard_output = torch.sum(input_tensor, dim=1) 
-max_error = torch.max(torch.abs(output_tensor - standard_output)).item()  
-is_correct = max_error < error_threshold 
-# 打印结果
-print("all_reduce_sum computation completed")
-print(f"Input shape: {input_tensor.shape}, Output shape: {output_tensor.shape}")
-print(f"\nPrecision check: {'PASSED' if is_correct else 'FAILED'}")
-print(f"Maximum absolute error: {max_error:.6f} (threshold: {error_threshold})")
-print(f"\nFirst 5 results comparison:")
-print(f"Operator output: {output_tensor[:5].cpu()}")
-print(f"Standard output: {standard_output[:5].cpu()}")
-```
-## 17. moe_gather
-### 支持的产品型号
-- Metax C500/C550/C588/C600
-### 接口原型
-```python
-def moe_gather(
-    scatter_tokens: torch.Tensor,
-    scatter_tokens_offset: torch.Tensor,
-    convergent_tokens: torch.Tensor
-) -> None
-```
-### 功能描述
-moe_gather 算子实现混合专家（MoE）架构中的令牌聚合操作，将分散存储的专家输出令牌（scatter_tokens），按照偏移信息（scatter_tokens_offset）汇聚到目标张量（convergent_tokens）中，用于完成 MoE 模型中不同专家输出的令牌整合流程
-- 计算公式
-
-$$
-  \text{convergent\\_tokens}[\text{offset}_i, :] = \text{scatter\\_tokens}[i, :] \quad (i = 0, 1, ..., \text{num\\_tokens} - 1)
-$$
-
-  其中：
-- $i$ ：分散令牌的索引，范围为 $[0, \text{num\\_tokens} - 1]$
-- $\text{num\\_tokens}$ ：分散令牌的总数，即 $\text{scatter\\_tokens}$ 的第一维长度（ $\text{scatter\\_tokens.size}(0)$ ）
-- $\text{hidden\\_size}$ ：令牌的隐藏层维度，即 $\text{scatter\\_tokens}$ 的第二维长度（ $\text{scatter\\_tokens.size}(1)$ ）
-- $\text{offset}_i$ ：第 $i$ 个分散令牌对应的聚合位置偏移，即 $\text{scatter\\_tokens\\_offset}[i]$ ，需满足 $0 \leq \text{offset}_i < \text{convergent\\_tokens.size}(0)$ （聚合后令牌数）
-- $\text{scatter\\_tokens}[i, :]$ ：第 $i$ 个分散令牌的完整向量（维度为 $[\text{hidden\\_size}]$ ）
-- $\text{convergent\\_tokens}[\text{offset}_i, :]$ ：聚合后张量中对应偏移位置的令牌向量（维度为 $[\text{hidden\\_size}]$ ）
-  算子核心逻辑为按偏移索引的逐行赋值，实现分散令牌到聚合张量的定向汇聚，且保持令牌内部的维度结构不变
-### 参数说明
-- **scatter_tokens** (torch.Tensor, 入参): 分散的专家输出令牌张量，形状为`[num_tokens, hidden_size]`，存储待聚合的令牌数据
-- **scatter_tokens_offset** (torch.Tensor, 入参): 令牌聚合偏移张量，形状为`[num_tokens]`，存储每个分散令牌对应的目标聚合位置偏移信息
-- **convergent_tokens** (torch.Tensor, 出参): 聚合后的令牌张量，形状通常为`[聚合后令牌数, hidden_size]`，存储最终的令牌聚合结果
-### 返回值
-无返回值，聚合结果直接写入出参 convergent_tokens 中
-### 约束与调用
-- 所有输入、输出张量必须位于 CUDA 设备上
-- 支持的数据类型：float16、bfloat16
-- scatter_tokens 的元素总数需为 hidden_size 的整数倍，即 num_tokens = scatter_tokens.numel () / hidden_size
-- scatter_tokens_offset 的长度需与 scatter_tokens 的 num_tokens 维度一致
-- 输入张量需满足连续存储的内存布局要求
-### 调用示例
-```python
-import torch
-import mcoplib.op as op
-device = "cuda"
-# 定义参数
-num_tokens = 128 
-hidden_size = 512  
-convergent_num_tokens = 64  
-# 创建输入张量
-scatter_tokens = torch.randn(num_tokens, hidden_size, dtype=torch.bfloat16, device=device)
-scatter_tokens_offset = torch.randint(0, convergent_num_tokens, (num_tokens,),dtype=torch.int32,device=device)
-# 创建输出张量
-convergent_tokens = torch.empty(convergent_num_tokens, hidden_size, dtype=torch.bfloat16, device=device)
-# 调用moe_gather算子
-op.moe_gather(
-    scatter_tokens,
-    scatter_tokens_offset,
-    convergent_tokens
-)
-print("MoE gather computation completed")
-print(f"Scatter tokens shape: {scatter_tokens.shape}")
-print(f"Scatter tokens offset shape: {scatter_tokens_offset.shape}")
-print(f"Convergent tokens shape: {convergent_tokens.shape}")
-```
-
-
-## 18. concat_and_cache_mla_grouped
+## 1. concat_and_cache_mla_grouped
 
 ### 支持的产品型号
 
@@ -1838,1983 +161,7 @@ print(f"slot_mapping shape: {slot_mapping.shape}, dtype: {slot_mapping.dtype}")
 print(f"block_size: {block_size}, block_stride: {block_stride}, entry_stride: {entry_stride}")
 ```
 
-
-
-## 19. store_kv_cache_cuda_interface
-### 支持的产品型号
-- Metax C500/C550/C588/C600
-### 接口原型
-```python
-def store_kv_cache_cuda_interface(
-    packed_qkv: torch.Tensor,
-    q_lens: torch.Tensor,
-    accum_q_lens: torch.Tensor,
-    cache_lens: torch.Tensor,
-    cache_slot_ids: torch.Tensor,
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
-    k_scale: torch.Tensor,
-    v_scale: torch.Tensor,
-    batch_size: int,
-    q_head_num: int,
-    kv_head_num: int
-) -> None
-```
-### 功能描述
-store_kv_cache_cuda_interface 算子实现了 CUDA 端 KV 缓存的存储操作：基于序列长度、缓存槽位等信息，将打包好的 packed_qkv 数据分发并存储到对应的 K 缓存与 V 缓存中，同时结合缩放张量完成数据处理。该算子常用于大模型推理的 KV 缓存管理，可减少内存交互、提升缓存写入效率。
-- 计算公式
-
-$$
-\text{k\\_cache}[b, h_k, \text{cache\\_slot\\_ids}[i], d] = \text{packed\\_K}[i, h_q, d] \times \text{k\\_scale}[h_k]
-$$
-
-
-
-$$
-\text{v\\_cache}[b, h_k, \text{cache\\_slot\\_ids}[i], d] = \text{packed\\_V}[i, h_q, d] \times \text{v\\_scale}[h_k]
-$$
-
-packed_qkv 为打包的 Q/K/V 复合张量，首先拆分出参与缓存写入的 K、V 分量（Q 分量不写入 KV 缓存）：
-
-$$
-\text{packed\\_K} = \text{packed\\_qkv}[..., 0:d_k],\quad \text{packed\\_V} = \text{packed\\_qkv}[..., d_k:2d_k]
-$$
-
-其中单头特征维度 $d_k$ 满足：
-
-$$
-d_k = \frac{\text{packed\\_qkv}.\text{size}(-1)}{3}
-$$
-
-（packed_qkv 最后一维维度为 $3d_k$ ，分别对应 Q、K、V 各占 $d_k$ 维度）
-查询头（ $h_q$ ）与 KV 头（ $h_k$ ）的映射关系（适配 GQA/MQA 配置）：
-
-$$
-h_k = h_q \times \frac{\text{kv\\_head\\_num}}{\text{q\\_head\\_num}}
-$$
-
-其中：
-- $h_q \in [0, \text{q\\_head\\_num}-1]$ ：查询头索引
-- $h_k \in [0, \text{kv\\_head\\_num}-1]$ ：KV 头索引
-MQA 是 GQA 的特例（ $\text{kv\\_head\\_num}=1$ ），此时所有查询头映射到同一个 KV 头。
-对于第 $b$ 个 batch（ $b \in [0, \text{batch\\_size}-1]$ ），其对应的 token 索引范围由累积长度和查询长度确定：
-
-$$
-i \in [\text{accum\\_q\\_lens}[b], \text{accum\\_q\\_lens}[b] + \text{q\\_lens}[b])
-$$
-
-所有 batch 的 token 总数满足：
-
-$$
-\sum_{b=0}^{\text{batch\\_size}-1} \text{q\\_lens}[b] = \text{packed\\_K}.\text{size}(0) = \text{packed\\_V}.\text{size}(0)
-$$
-
-cache_slot_ids 的元素值需满足缓存长度边界约束：
-
-$$
-0 \leq \text{cache\\_slot\\_ids}[i] < \text{k\\_cache}.\text{size}(2)
-$$
-
-且单 batch 缓存写入后长度需匹配：
-
-$$
-\text{cache\\_lens}[b] + \text{q\\_lens}[b] = \max(\text{cache\\_slot\\_ids}[i \in \text{batch}_b]) + 1
-$$
-
-其中：
-- $b$ ：批维度索引， $b \in \mathbb{Z}, 0 \leq b < \text{batch\\_size}$
-- $h_q$ ：查询头维度索引， $h_q \in \mathbb{Z}, 0 \leq h_q < \text{q\\_head\\_num}$
-- $h_k$ ：KV 头维度索引， $h_k \in \mathbb{Z}, 0 \leq h_k < \text{kv\\_head\\_num}$
-- $d$ ：单头特征维度索引， $d \in \mathbb{Z}, 0 \leq d < d_k$
-- $i$ ：packed_K/packed_V 的 token 维度索引， $i \in \mathbb{Z}, 0 \leq i < T$ （ $T$ 为总 token 数）
-- $d_k$ ：单头特征维度（键/值头维度）， $d_k = \frac{\text{模型总特征维度}}{\text{q\\_head\\_num}}$
-- $\text{packed\\_K} \in \mathbb{R}^{T \times \text{q\\_head\\_num} \times d_k}$ ：拆解后的键数据张量
-- $\text{packed\\_V} \in \mathbb{R}^{T \times \text{q\\_head\\_num} \times d_k}$ ：拆解后的值数据张量
-- $\text{k\\_cache} \in \mathbb{R}^{\text{batch\\_size} \times \text{kv\\_head\\_num} \times L_{\text{max}} \times d_k}$ ：K 缓存张量（ $L_{\text{max}}$ 为缓存最大长度）
-- $\text{v\\_cache} \in \mathbb{R}^{\text{batch\\_size} \times \text{kv\\_head\\_num} \times L_{\text{max}} \times d_k}$ ：V 缓存张量
-- $\text{cache\\_slot\\_ids} \in \mathbb{Z}^T$ ：缓存槽位索引张量（指定每个 token 写入缓存的位置）
-- $\text{k\\_scale} \in \mathbb{R}^{\text{kv\\_head\\_num}}$ ：K 缓存数据缩放张量（支持广播至 $\mathbb{R}^{1 \times \text{kv\\_head\\_num} \times 1 \times 1}$ ）
-- $\text{v\\_scale} \in \mathbb{R}^{\text{kv\\_head\\_num}}$ ：V 缓存数据缩放张量（支持广播至 $\mathbb{R}^{1 \times \text{kv\\_head\\_num} \times 1 \times 1}$ ）
-### 参数说明
-- **packed_qkv** (torch.Tensor, 入参): 打包后的     QKV 数据张量，是待写入缓存的源数据
-- **q_lens** (torch.Tensor, 入参): 查询序列长度的张量，用于确定数据的序列维度范围
-- **accum_q_lens** (torch.Tensor, 入参): 累积的 Q 序列长度张量，用于定位数据在 packed_qkv 中的偏移
-- **cache_lens** (torch.Tensor, 入参): 缓存当前长度的张量，用于确定缓存的写入起始位置
-- **cache_slot_ids** (torch.Tensor, 入参): 缓存槽位 ID 的张量，用于指定数据写入的缓存槽位
-- **k_cache** (torch.Tensor, 入参/出参): K 缓存张量，计算后会被写入对应的 KV 数据
-- **v_cache** (torch.Tensor, 入参/出参): V 缓存张量，计算后会被写入对应的 KV 数据
-- **k_scale** (torch.Tensor, 入参): K 数据的缩放张量，用于对写入 K 缓存的数据做缩放处理
-- **v_scale** (torch.Tensor, 入参): V 数据的缩放张量，用于对写入 V 缓存的数据做缩放处理
-- **batch_size** (int, 入参): 批处理大小，对应数据的批维度规模
-- **q_head_num** (int, 入参): 查询头的数量，对应模型中查询注意力头的维度配置
-- **kv_head_num** (int, 入参): KV 头的数量，对应模型中 KV 注意力头的维度配置
-### 返回值
-无返回值，计算结果直接写入 k_cache 与 v_cache 张量中。
-### 约束与调用
-- 所有输入张量（packed_qkv、q_lens、accum_q_lens、cache_lens、cache_slot_ids、k_cache、v_cache、k_scale、v_scale）必须位于 CUDA 设备上
-- 数值型张量 packed_qkv、k_cache、v_cache、k_scale、v_scale）支持 float16、bfloat16, 整型张量 q_lens、accum_q_lens、cache_lens、cache_slot_ids 支持 int32、int64
-- batch_size、q_head_num、kv_head_num 必须为正整数，且 q_head_num 需为 kv_head_num 的整数倍（符合大模型 KV 注意力头映射逻辑）
-- q_lens、accum_q_lens、cache_lens 的张量长度需与 batch_size 一致
-- cache_slot_ids 的元素总数需匹配 packed_qkv 中待写入缓存的 token 总数，且其元素值需小于 k_cache/v_cache 缓存长度维度的最大值
-- k_cache 与 v_cache 的维度需匹配 kv_head_num 配置，且二者形状完全一致（如 k_cache.shape = v_cache.shape = (batch_size, kv_head_num, cache_max_len, head_dim)，head_dim 为单头特征维度）
-- packed_qkv 的元素总数需满足：packed_qkv.numel () = sum (q_lens) * q_head_num * head_dim（head_dim 为单头特征维度，与 kv_head_num、模型总特征维度适配）
-- k_scale、v_scale 的形状需与 k_cache/v_cache 的头维度兼容（如 k_scale.shape = (kv_head_num,) 或 (1, kv_head_num, 1, 1)），支持广播计算
-- 所有输入张量需满足连续存储（contiguous）的内存布局要求
-- k_cache、v_cache 需具备可写权限，且内存空间足够容纳本次写入的 KV 缓存数据
-### 调用示例
-```python
-import torch
-import mcoplib.op as op
-# 定义运行设备
-device = "cuda"
-# 定义算子所需的参数
-batch_size = 4
-q_head_num = 32
-kv_head_num = 8      
-head_dim = 128
-seq_len = 128        
-total_tokens = batch_size * seq_len
-max_cache_size = 4096 
-#  关键修正点 
-# 1. 创建输入张量
-# 必须显式展开 Head 维度，使 shape 变为 [Total_Tokens, Num_Heads, Head_Dim]
-# 这样算子读取 size(2) 时才能得到正确的 128 (head_dim)，而不是 6144 (hidden_dim)
-num_all_heads = q_head_num + 2 * kv_head_num  # 32 + 8 + 8 = 48
-packed_qkv = torch.randn(total_tokens, num_all_heads, head_dim, dtype=torch.float16, device=device)
-# 
-# q_lens: 保持 int32
-q_lens = torch.full((batch_size,), seq_len, dtype=torch.int32, device=device)
-# accum_q_lens: 保持 int32
-accum_q_lens = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
-accum_q_lens[1:] = torch.cumsum(q_lens, dim=0)
-# cache_lens: 保持 int32
-cache_lens = torch.randint(0, 100, (batch_size,), dtype=torch.int32, device=device)
-# cache_slot_ids: 保持 int32，一维扁平索引
-cache_slot_ids = torch.randperm(max_cache_size, device=device)[:total_tokens].to(torch.int32)
-# 2. 创建输出/Cache张量
-# 保持 int8 (量化存储)
-k_cache = torch.zeros(max_cache_size, kv_head_num, head_dim, dtype=torch.int8, device=device)
-v_cache = torch.zeros(max_cache_size, kv_head_num, head_dim, dtype=torch.int8, device=device)
-k_scale = torch.ones(max_cache_size, kv_head_num, dtype=torch.float32, device=device)
-v_scale = torch.ones(max_cache_size, kv_head_num, dtype=torch.float32, device=device)
-# 为了确保能捕捉到异步错误，加入同步操作
-torch.cuda.synchronize()
-print("Calling store_kv_cache_cuda_interface...")
-# 3. 调用算子
-op.store_kv_cache_cuda_interface(
-    packed_qkv,
-    q_lens,
-    accum_q_lens,
-    cache_lens,
-    cache_slot_ids,
-    k_cache,      
-    v_cache,      
-    k_scale,
-    v_scale,
-    batch_size,
-    q_head_num,
-    kv_head_num
-)
-# 再次同步，确保算子真正执行完毕且无报错
-torch.cuda.synchronize()
-print("store_kv_cache_cuda_interface computation completed successfully.")
-print(f"Packed QKV shape: {packed_qkv.shape}")
-print(f"K Cache shape: {k_cache.shape}")
-```
-## 20. moe_scatter_dynamic_quant
-### 支持的产品型号
-- Metax C500/C550/C588/C600
-### 接口原型
-```python
-def moe_scatter_dynamic_quant(
-    hidden_status: torch.Tensor,
-    selected_experts: torch.Tensor,
-    moe_weights: torch.Tensor,
-    smooth_scale: torch.Tensor,
-    scatter_tokens: torch.Tensor,
-    scatter_per_token_scale: torch.Tensor,
-    scatter_tokens_offset: torch.Tensor,
-    experts_token_count: torch.Tensor,
-    experts_token_start: torch.Tensor,
-    experts_per_rank: int,
-    shared_experts_per_rank: int,
-    shared_tokens_per_sp: int
-) -> None
-```
-### 功能描述
-moe_scatter_dynamic_quant 算子实现了混合专家 MoE 模型中 token 到对应专家的分散分配操作。该算子结合 token 选中的专家索引、权重等信息，将输入隐藏状态张量的 token 特征分散到各专家对应的存储区域，并同步处理缩放因子、token 偏移量、专家 token 计数等辅助信息，减少 MoE 层中数据搬运的开销，提升计算效率，常用于 MoE 架构的模型推理或训练流程
-- 计算公式
-
-$$
-\text{scatter\\_tokens}[e, t, :] = \text{dequantize}\left(\text{quantize}\left(\text{hidden\\_status}[i, :] \times \text{moe\\_weights}[i, e] \times \text{smooth\\_scale}[i], s_q^{(i,e)}\right), s_q^{(i,e)}\right)
-$$
-
-
-
-$$
-\text{scatter\\_per\\_token\\_scale}[e, t] = s_q^{(i,e)} \times \text{moe\\_weights}[i, e] \times \text{smooth\\_scale}[i]
-$$
-
-
-
-$$
-\text{experts\\_token\\_count}[e] = \sum_{i=0}^{N-1} \mathbb{I}\left(\text{selected\\_experts}[i] = e\right)
-$$
-
-
-
-$$
-\text{experts\\_token\\_start}[e] = \sum_{e'=0}^{e-1} \text{experts\\_token\\_count}[e']
-$$
-
-
-
-$$
-\text{scatter\\_tokens\\_offset}[e] = \text{experts\\_token\\_start}[e]
-$$
-
-动态量化缩放因子计算：
-
-$$
-s_q^{(i,e)} = \frac{\max\left(|\text{hidden\\_status}[i, :] \times \text{moe\\_weights}[i, e] \times \text{smooth\\_scale}[i]|\right)}{127}
-$$
-
-量化/反量化操作定义：
-
-$$
-\text{quantize}(x, s) = \text{clip}\left(\lfloor \frac{x}{s} \rfloor, -128, 127\right) \quad (\text{int8动态量化})
-$$
-
-
-
-$$
-\text{dequantize}(x_q, s) = x_q \times s \quad (\text{int8反量化})
-$$
-
-其中：
-- $i$ : 全局 token 索引， $i \in [0, N-1]$ ，其中 $N$ 为输入总 token 数量
-- $e$ : 专家索引， $e \in [0, E_{\text{rank}}-1]$ ，其中 $E_{\text{rank}} = \text{experts\\_per\\_rank}$ （单 rank 专家数）
-- $t$ : 专家 $e$ 内的局部 token 索引， $t \in [0, C_e-1]$ ，其中 $C_e = \text{experts\\_token\\_count}[e]$ （专家 $e$ 分配到的 token 数）
-- $\text{hidden\\_status}[i, :] \in \mathbb{R}^{D}$ : 第 $i$ 个 token 的浮点型隐藏状态张量， $D$ 为特征维度
-- $\text{selected\\_experts}[i] \in \mathbb{N}$ : 第 $i$ 个 token 选中的目标专家索引
-- $\text{moe\\_weights}[i, e] \in \mathbb{R}$ : 第 $i$ 个 token 对应专家 $e$ 的权重系数
-- $\text{smooth\\_scale}[i] \in \mathbb{R}$ : 第 $i$ 个 token 的数值平滑缩放因子
-- $s_q^{(i, e)} \in \mathbb{R}$ : 第 $i$ 个 token 分配到专家 $e$ 时的动态量化缩放因子（int8 量化）
-- $\mathbb{I}(\cdot)$ : 指示函数，条件为真时返回 1，否则返回 0
-- $E_{\text{shared}} = \text{shared\\_experts\\_per\\_rank}$ : 单 rank 部署的共享专家数量
-- $T_{\text{shared}} = \text{shared\\_tokens\\_per\\_sp}$ : 单个共享专家支持的最大 token 数量
-- $\text{clip}(\cdot, a, b)$ : 裁剪函数，将输入值限制在 $[a, b]$ 范围内
-- $\lfloor \cdot \rfloor$ : 向下取整函数
-对于共享专家 $e \in [E_{\text{rank}} - E_{\text{shared}}, E_{\text{rank}} - 1]$ ，需满足 token 数量上限约束：
-
-$$
-\text{experts\\_token\\_count}[e] \leq T_{\text{shared}}
-$$
-
-### 参数说明
-- **hidden_status** (torch.Tensor, 入参): MoE 层的输入 token 隐藏状态张量，存储待分配的 token 特征数据
-- **selected_experts** (torch.Tensor, 入参): 每个 token 对应的选中专家索引张量，指定 token 需分配到的目标专家
-- **moe_weights** (torch.Tensor, 入参): 每个 token 对应选中专家的权重张量，用于对 token 特征进行加权
-- **smooth_scale** (torch.Tensor, 入参): 数值平滑缩放因子张量，用于提升 token 特征计算的稳定性
-- **scatter_tokens** (torch.Tensor, 入参/出参): 输出张量，存储分散到各专家后的 token 特征数据
-- **scatter_per_token_scale** (torch.Tensor, 入参/出参): 输出张量，存储每个分散后 token 对应的缩放因子
-- **scatter_tokens_offset** (torch.Tensor, 入参/出参): 输出张量，存储各专家对应的 token 在 scatter_tokens 中的起始偏移位置
-- **experts_token_count** (torch.Tensor, 入参/出参): 输出张量，存储每个专家实际分配到的 token 数量
-- **experts_token_start** (torch.Tensor, 入参/出参): 输出张量，存储每个专家对应的 token 在 scatter_tokens 中的起始位置索引
-- **experts_per_rank** (int, 入参): 单个计算设备（rank）上部署的专家数量
-- **shared_experts_per_rank** (int, 入参): 单个计算设备（rank）上部署的共享专家数量
-- **shared_tokens_per_sp** (int, 入参): 每个共享专家支持处理的最大 token 数量
-### 返回值
-无返回值，计算结果直接写入 scatter_tokens、scatter_per_token_scale 等输出型张量中
-### 约束与调用
-- 所有张量必须部署在 CUDA 设备上
-- selected_experts 中的专家索引需在当前设备的专家数量范围内，不超出 experts_per_rank 等参数定义的范围
-- scatter_tokens、experts_token_count 等输出张量需提前分配足够的内存空间
-- 支持的数据类型：float16、bfloat16、float32，需与 hidden_status 的张量类型保持一致
-### 调用示例
-```python
-import torch
-import mcoplib.op as op
-device = "cuda"
-batch_size = 4                
-seq_len = 64                  
-hidden_dim = 4096             
-topk = 2                    
-experts_per_rank = 8          
-shared_experts_per_rank = 2  
-shared_tokens_per_sp = 1024  
-total_tokens = batch_size * seq_len 
-total_expert_tokens = total_tokens * topk
-#创建输入数据
-hidden_status = torch.randn(
-    total_tokens, hidden_dim,
-    dtype=torch.bfloat16, device=device
-)
-selected_experts = torch.randint(
-    0, experts_per_rank, (total_tokens, topk),
-    dtype=torch.int32, device=device
-)
-moe_weights = torch.softmax(
-    torch.randn(total_tokens, topk, dtype=torch.float32, device=device),
-    dim=-1
-)
-smooth_scale = torch.randn(
-    hidden_dim, dtype=torch.float32, device=device
-)
-scatter_tokens = torch.randint(
--128, 127, (total_expert_tokens, hidden_dim),
-    dtype=torch.int8, device=device
-)
-scatter_per_token_scale = torch.randn(
-    total_expert_tokens, dtype=torch.float32, device=device
-)
-scatter_tokens_offset = torch.randint(
--128, 127, (total_expert_tokens,),
-    dtype=torch.int32, device=device
-)
-experts_token_count = torch.full(
-    (experts_per_rank,), total_expert_tokens // experts_per_rank,
-    dtype=torch.int32, device=device
-)
-remainder = total_expert_tokens % experts_per_rank
-experts_token_count[:remainder] += 1  
-experts_token_start = torch.cumsum(
-    torch.cat([torch.tensor([0], dtype=torch.int32, device=device), experts_token_count[:-1]]),
-    dim=0
-).to(torch.int32)
-# 调用算子
-op.moe_scatter_dynamic_quant(
-    hidden_status,
-    selected_experts,
-    moe_weights,
-    smooth_scale,
-    scatter_tokens,
-    scatter_per_token_scale,
-    scatter_tokens_offset,
-    experts_token_count,
-    experts_token_start,
-    experts_per_rank,
-    shared_experts_per_rank,
-    shared_tokens_per_sp
-)
-print("MOE scatter dynamic quant computation completed")
-print(f"hidden_status shape: {hidden_status.shape}, dtype: {hidden_status.dtype}")
-print(f"selected_experts shape: {selected_experts.shape}, dtype: {selected_experts.dtype}")
-print(f"moe_weights shape: {moe_weights.shape}, dtype: {moe_weights.dtype}")
-print(f"experts_token_count shape: {experts_token_count.shape}, sum: {experts_token_count.sum().item()}")
-print(f"experts_token_start shape: {experts_token_start.shape}, last start: {experts_token_start[-1].item()}")
-print(f"Static params: experts_per_rank={experts_per_rank}, shared_experts_per_rank={shared_experts_per_rank}, shared_tokens_per_sp={shared_tokens_per_sp}")
-```
-
-
-
-
-
-## 21. scale_dynamic_quant
-
-### 支持的产品型号
-
-- Metax C500/C550/C588/C600
-
-### 接口原型
-
-```python
-def scale_dynamic_quant(
-    hidden_states: torch.Tensor,
-    smooth_scales: torch.Tensor,
-    dst_dtype: torch.dtype = torch.int8
-) -> tuple[torch.Tensor, torch.Tensor]
-```
-
-### 功能描述
-
-scale_dynamic_quant 算子实现了动态量化与尺度计算的融合操作。该算子首先基于输入的 hidden_states 和 smooth_scales 计算量化尺度 scales，然后将 hidden_states 量化到指定的目标数据类型（默认 int8）。这种融合操作可减少中间变量存储，提高量化过程的计算效率，常用于神经网络中张量的动态量化场景
-
-- 计算公式：
-
-$$
-  \text{scales} = \frac{\max(|\text{hidden\\_states}|, \epsilon)}{\text{qmax} \times \text{smooth\\_scales}}
-$$
-
-
-
-$$
-  \text{quantized\\_tensor} = \text{clip}\left(\text{round}\left(\frac{\text{hidden\\_states}}{\text{scales}}\right), \text{qmin}, \text{qmax}\right)
-$$
-
-  其中：
-
-- $\text{hidden\\_states} \in \mathbb{R}^{B \times S \times D}$ 是输入隐藏状态张量， $B$ 为批次大小， $S$ 为序列长度， $D$ 为特征维度
-- $\text{smooth\\_scales} \in \mathbb{R}^{D}$ 是平滑尺度张量（与特征维度对齐）
-- $\text{scales} \in \mathbb{R}^{D}$ 是计算得到的量化尺度张量（与特征维度对齐）
-- $\text{quantized\\_tensor} \in \mathbb{Z}^{B \times S \times D}$ 是量化后的整数张量，数据类型由 $\text{dst\\_dtype}$ 指定
-- $\epsilon$ 是数值稳定性参数（默认取 $10^{-8}$ ），避免分母为 0
-- $\text{qmin}$ 和 $\text{qmax}$ 是目标数据类型 $\text{dst\\_dtype}$ 的取值范围边界：
-- 若 $\text{dst\\_dtype} = \text{int8}$ ，则 $\text{qmin} = -128$ ， $\text{qmax} = 127$
-- 其他整数类型按对应 dtype 的固有范围确定
-- $\max (|\text{hidden\\_states}|)$ 表示对 $\text{hidden\\_states}$ 在 $B \times S$ 维度上取绝对值后的最大值（按特征维度 $D$ 独立计算）
-- $\text{round}(\cdot)$ 表示四舍五入取整操作
-- $\text{clip}(\cdot, \text{qmin}, \text{qmax})$ 表示将数值裁剪到 $\text{qmin}$ 和 $\text{qmax}$ 之间，确保符合目标 dtype 范围
-	补充说明：
-- 当 $\text{smooth\\_scales}$ 为标量时，自动广播为 $\mathbb{R}^{D}$ 维度（所有特征维度使用相同平滑系数）
-- 量化尺度计算采用"特征维度独立"策略，每个特征维度对应一个独立的量化尺度
-- 输入 $\text{hidden\\_states}$ 的数据类型支持 $\text{float16}$ 、 $\text{bfloat16}$ 、 $\text{float32}$ ，计算过程中统一转换为 $\text{float32}$ 进行精度保证
-
-### 参数说明
-
-- **hidden_states** (torch.Tensor, 入参): 输入的隐藏状态张量，为量化的原始数据
-- **smooth_scales** (torch.Tensor, 入参): 平滑尺度张量，用于辅助计算量化尺度
-- **dst_dtype** (torch.dtype, 入参, 可选): 目标量化数据类型，默认值为 torch.int8
-
-### 返回值
-
-返回一个元组 (torch.Tensor, torch.Tensor)，其中：
-
-- 第一个元素为量化后的张量，数据类型为 dst_dtype
-- 第二个元素为计算得到的量化尺度张量 scales
-
-### 约束与调用
-
-- 所有张量必须位于 CUDA 设备上
-- 输入 hidden_states 支持的数据类型：float16、bfloat16、float32
-- 目标数据类型 dst_dtype 通常为整数类型（如 int8）
-- smooth_scales 的形状需与 hidden_states 的相关维度匹配，以确保尺度计算的有效性
-
-### 调用示例
-
-```Python
-import torch
-import mcoplib.op as op
-device = "cuda"
-# 定义参数
-batch_size = 8          
-seq_len = 1024          
-hidden_dim = 4096      
-dst_dtype = torch.int8 
-# 创建输入张量
-hidden_states = torch.randn(batch_size, seq_len, hidden_dim, dtype=torch.bfloat16, device=device)
-smooth_scales = torch.randn(hidden_dim, dtype=torch.float32, device=device)  # 特征维度对齐的平滑尺度
-# 调用scale_dynamic_quant算子
-quantized_hidden_states, scales = op.scale_dynamic_quant(
-    hidden_states=hidden_states,
-    smooth_scales=smooth_scales,
-    dst_dtype=dst_dtype
-)
-# 打印执行结果
-print("Scale dynamic quantization computation completed")
-print(f"Quantized hidden states shape: {quantized_hidden_states.shape}, dtype: {quantized_hidden_states.dtype}")
-print(f"Computed scales shape: {scales.shape}, dtype: {scales.dtype}")
-```
-
-## 22. rotary_pos_emb_forward
-
-### 支持的产品型号
-
-- Metax C500/C550/C588/C600
-
-### 接口原型
-
-```python
-def rotary_pos_emb_forward(
-    input: torch.Tensor,
-    sin: torch.Tensor,
-    cos: torch.Tensor,
-    cumsum_len: torch.Tensor,
-    batch_size: int,
-    cut_head_dim: int = 0
-) -> torch.Tensor
-```
-
-### 功能描述
-
-rotary_pos_emb_forward 算子实现旋转位置编码的前向计算，结合输入张量、预计算的正弦/余弦位置编码张量，以及批次样本的累积长度信息，对输入进行旋转位置编码处理，用于增强 Transformer 类模型中序列的位置信息表示。
-
-- 计算公式：
-
-$$
-  \text{rotary\\_pos\\_emb\\_forward}(\mathbf{X}, \sin, \cos, \text{cumsum\\_len}, B, D_{cut}) = \mathbf{X}'
-$$
-
-  其中 $\mathbf{X}'$ 的元素计算遵循旋转位置编码（RoPE）规则：
-
-$$
-  \begin{cases}
-  x'_{b,l,h,d} = x_{b,l,h,d}, & d < D_{cut} \\
-  x'_{b,l,h,2m} = x_{b,l,h,2m} \cdot \cos(\theta_{m, pos_{b,l}}) - x_{b,l,h,2m+1} \cdot \sin(\theta_{m, pos_{b,l}}), & d = 2m \geq D_{cut} \\
-  x'_{b,l,h,2m+1} = x_{b,l,h,2m} \cdot \sin(\theta_{m, pos_{b,l}}) + x_{b,l,h,2m+1} \cdot \cos(\theta_{m, pos_{b,l}}), & d = 2m+1 \geq D_{cut}
-  \end{cases}
-$$
-
-  位置编码的角度参数定义为：
-
-$$
-  \theta_{m, pos} = \frac{pos}{10000^{2m/D'}}, \quad D' = D - D_{cut}
-$$
-
-  批次中第 $b$ 个样本第 $l$ 个位置的绝对位置：
-
-$$
-  pos_{b,l} = \text{cumsum\\_len}[b] + l
-$$
-
-  其中：
-
-- $\mathbf{X} \in \mathbb{R}^{B \times L \times H \times D}$ 是输入张量（ $B$ 为批次大小， $L$ 为序列长度， $H$ 为注意力头数， $D$ 为头维度）
-- $\sin \in \mathbb{R}^{L_{max} \times D'/2}$ 是预计算的正弦位置编码张量（ $L_{max}$ 为最大序列长度）
-- $\cos \in \mathbb{R}^{L_{max} \times D'/2}$ 是预计算的余弦位置编码张量
-- $\text{cumsum\\_len} \in \mathbb{Z}^B$ 是批次中各样本的累积长度张量，用于确定局部位置的绝对偏移
-- $D_{cut} \in \mathbb{N}$ 是裁剪的头维度长度，默认值为 0
-- $D'$ 是参与旋转编码的有效头维度长度
-- $pos_{b, l}$ 是第 $b$ 个样本第 $l$ 个位置的绝对序列位置
-- $\theta_{m, pos}$ 是位置 $pos$ 下第 $m$ 组维度对的旋转角度
-
-### 参数说明
-
-- **input** (torch.Tensor, 入参): 待施加旋转位置编码的输入张量
-- **sin** (torch.Tensor, 入参): 预计算的正弦位置编码张量
-- **cos** (torch.Tensor, 入参): 预计算的余弦位置编码张量
-- **cumsum_len** (torch.Tensor, 入参): 批次中各样本的累积长度张量，用于确定每个样本的局部序列位置
-- **batch_size** (int, 入参): 输入数据的批次大小
-- **cut_head_dim** (int, 入参，默认 0): 需裁剪的头维度长度，仅对裁剪后的剩余头维度执行旋转编码
-
-### 返回值
-
-torch.Tensor，经过旋转位置编码处理后的输出张量
-
-### 约束与调用
-
-- 所有张量必须位于 CUDA 设备上
-- cut_head_dim 的值必须小于输入张量的头维度长度
-- 支持的数据类型：float16、bfloat16、float32
-- cumsum_len 需与批次内各样本的长度信息匹配
-
-### 调用示例
-
-```python
-import torch
-import mcoplib.op
-device = "cuda"
-# 定义参数
-batch_size = 4  
-seq_len = 64    
-num_heads = 32  
-head_dim = 128  
-cut_head_dim = 32 
-max_seq_len = 2048  
-# 计算参与旋转编码的有效头维度
-effective_head_dim = head_dim - cut_head_dim
-assert effective_head_dim % 2 == 0, "Effective head dimension must be even for RoPE"
-# 创建输入张量
-input_tensor = torch.randn(batch_size, seq_len, num_heads, head_dim, dtype=torch.float16, device=device)
-# 创建预计算的sin/cos位置编码张量
-sin = torch.randn(max_seq_len, effective_head_dim // 2, dtype=torch.float16, device=device)
-cos = torch.randn(max_seq_len, effective_head_dim // 2, dtype=torch.float16, device=device)
-# 创建批次累积长度张量
-cumsum_len = torch.tensor([0, 512, 1024, 1536], dtype=torch.int64, device=device)
-# 调用rotary_pos_emb_forward算子
-output = op.rotary_pos_emb_forward(
-    input_tensor,
-    sin,
-    cos,
-    cumsum_len,
-    batch_size,
-    cut_head_dim
-)
-# 打印结果信息
-print("Rotary position embedding forward computation completed")
-print(f"Input tensor shape: {input_tensor.shape}")
-print(f"Output tensor shape: {output.shape}")
-print(f"Output tensor dtype: {output.dtype}")
-```
-
-## 23. rotary_pos_emb_backward
-
-### 支持的产品型号
-
-- Metax C500/C550/C588/C600
-
-### 接口原型
-
-```python
-def rotary_pos_emb_backward(
-    input: torch.Tensor,
-    sin: torch.Tensor,
-    cos: torch.Tensor,
-    cumsum_len: torch.Tensor,
-    batch_size: int,
-    cut_head_dim: int = 0
-) -> torch.Tensor
-```
-
-### 功能描述
-
-rotary_pos_emb_backward 算子实现旋转位置编码的反向传播计算，基于前向过程的输入、正弦/余弦位置编码及累积长度信息，计算对应输入的梯度，用于模型训练中的反向梯度传递
-
-- 计算公式：
-
-$$
-  \text{rotary\\_pos\\_emb\\_backward}(\mathbf{G}, \sin, \cos, \text{cumsum\\_len}, B, D_{cut}) = \nabla \mathbf{X}
-$$
-
-  其中梯度 $\nabla \mathbf{X}$ 的元素由输出梯度 $\mathbf{G}$ 反向推导得到：
-
-$$
-  \begin{cases}
-  \nabla x_{b,l,h,d} = g_{b,l,h,d}, & d < D_{cut} \\
-  \nabla x_{b,l,h,2m} = g_{b,l,h,2m} \cdot \cos(\theta_{m, pos_{b,l}}) + g_{b,l,h,2m+1} \cdot \sin(\theta_{m, pos_{b,l}}), & d = 2m \geq D_{cut} \\
-  \nabla x_{b,l,h,2m+1} = -g_{b,l,h,2m} \cdot \sin(\theta_{m, pos_{b,l}}) + g_{b,l,h,2m+1} \cdot \cos(\theta_{m, pos_{b,l}}), & d = 2m+1 \geq D_{cut}
-  \end{cases}
-$$
-
-  角度参数 $\theta_{m, pos}$ 和绝对位置 $pos_{b, l}$ 的定义与前向过程一致：
-
-$$
-  \theta_{m, pos} = \frac{pos}{10000^{2m/D'}}, \quad pos_{b,l} = \text{cumsum\\_len}[b] + l, \quad D' = D - D_{cut}
-$$
-
-  其中：
-
-- $\mathbf{G} \in \mathbb{R}^{B \times L \times H \times D}$ 是旋转编码输出的梯度张量（即损失函数对前向输出 $\mathbf{X}'$ 的梯度）
-- $\nabla \mathbf{X} \in \mathbb{R}^{B \times L \times H \times D}$ 是损失函数对前向输入 $\mathbf{X}$ 的梯度张量（算子返回值）
-- $\sin \in \mathbb{R}^{L_{max} \times D'/2}$ 是与前向过程一致的预计算正弦位置编码张量
-- $\cos \in \mathbb{R}^{L_{max} \times D'/2}$ 是与前向过程一致的预计算余弦位置编码张量
-- $\text{cumsum\\_len} \in \mathbb{Z}^B$ 是与前向过程一致的批次累积长度张量
-- $B \in \mathbb{N}$ 是批次大小（与前向过程一致）
-- $D_{cut} \in \mathbb{N}$ 是裁剪的头维度长度（与前向过程一致）
-- $D'$ 是参与旋转编码的有效头维度长度
-- $pos_{b, l}$ 是第 $b$ 个样本第 $l$ 个位置的绝对序列位置
-- $\theta_{m, pos}$ 是位置 $pos$ 下第 $m$ 组维度对的旋转角度
-- $g_{b, l, h, d}$ 是梯度张量 $\mathbf{G}$ 在 $(b, l, h, d)$ 位置的元素
-- $\nabla x_{b, l, h, d}$ 是梯度张量 $\nabla \mathbf{X}$ 在 $(b, l, h, d)$ 位置的元素
-
-### 参数说明
-
-- **input** (torch.Tensor, 入参): 反向传播中待计算梯度的输入张量，通常为前向输出的梯度张量
-- **sin** (torch.Tensor, 入参): 预计算的正弦位置编码张量，与前向过程使用的张量一致
-- **cos** (torch.Tensor, 入参): 预计算的余弦位置编码张量，与前向过程使用的张量一致
-- **cumsum_len** (torch.Tensor, 入参): 批次中各样本的累积长度张量，与前向过程使用的张量一致
-- **batch_size** (int, 入参): 输入数据的批次大小，与前向过程的批次大小一致
-- **cut_head_dim** (int, 入参，默认 0): 需裁剪的头维度长度，与前向过程的裁剪长度一致
-
-### 返回值
-
-torch.Tensor，经过反向传播计算得到的梯度张量
-
-### 约束与调用
-
-- 所有张量必须位于 CUDA 设备上
-- cut_head_dim 的值必须小于输入张量的头维度长度
-- 支持的数据类型：float16、bfloat16、float32
-- 所有参数（sin、cos、cumsum_len 等）需与前向过程对应的参数保持一致
-
-### 调用示例
-
-```python
-import torch
-import mcoplib.op as op
-device = "cuda"
-# 定义参数（与前向保持一致）
-batch_size = 4
-seq_len = 64
-num_heads = 32
-head_dim = 128
-cut_head_dim = 32
-max_seq_len = 2048
-# 计算参与旋转编码的有效头维度
-effective_head_dim = head_dim - cut_head_dim
-assert effective_head_dim % 2 == 0, "Effective head dimension must be even for RoPE"
-# 创建反向传播的输入张量（前向输出的梯度）：[batch_size, seq_len, num_heads, head_dim]
-grad_input = torch.randn(batch_size, seq_len, num_heads, head_dim, dtype=torch.float16, device=device)
-# 创建与前向一致的sin/cos位置编码张量：[max_seq_len, effective_head_dim//2]
-sin = torch.randn(max_seq_len, effective_head_dim // 2, dtype=torch.float16, device=device)
-cos = torch.randn(max_seq_len, effective_head_dim // 2, dtype=torch.float16, device=device)
-# 创建与前向一致的批次累积长度张量：[batch_size]
-cumsum_len = torch.tensor([0, 512, 1024, 1536], dtype=torch.int64, device=device)
-# 调用rotary_pos_emb_backward算子
-grad_output = op.rotary_pos_emb_backward(
-    grad_input,
-    sin,
-    cos,
-    cumsum_len,
-    batch_size,
-    cut_head_dim
-)
-# 打印结果信息
-print("Rotary position embedding backward computation completed")
-print(f"Gradient input shape: {grad_input.shape}")
-print(f"Gradient output shape: {grad_output.shape}")
-print(f"Gradient output dtype: {grad_output.dtype}")
-```
-
-## 24. fused_add_rms_norm_dynamic_per_token_quant_padding_output
-
-### 支持的产品型号
-
-- Metax C500/C550/C588/C600
-
-### 接口原型
-
-```python
-def fused_add_rms_norm_dynamic_per_token_quant_padding_output(
-    output: torch.Tensor,         
-    output_rms:torch.Tensor,
-    output_quant_int8: torch.Tensor,  
-    out_scales: torch.Tensor,     
-    input: torch.Tensor,          
-    residual: torch.Tensor,       
-    weight: torch.Tensor,       
-    pad_size: int,                
-    epsilon: float             
-) -> None
-```
-
-### 功能描述
-
-add_rms_norm_dynamic_per_token_quant_padding_output 算子实现带 RMS 归一化、残差连接的动态逐 Token 量化计算与输出填充。该算子先对输入执行 RMS 归一化，结合残差与权重完成运算，再基于每个 Token 的激活特征动态生成量化缩放因子并执行量化，对输出进行填充适配，用于需要填充场景的高效量化推理加速。
-
-- 计算公式：
-
-$$
-  \hat{Y} = \text{Quant}\left( (X \cdot W) + R, \frac{\max_{d}|(X \cdot W + R)_{n,d}| + \epsilon}{Q_{\text{max}}} \right)
-$$
-
-  其中 $\text{Quant}(x, S_n)$ 表示按缩放因子 $S_n$ 对 $x$ 执行量化操作
-  矩阵乘加和残差连接：
-
-$$
-  P_{n,d} = (X_n \cdot W_d) + R_{n,d}
-$$
-
-  向量优化：
-
-$$
-  \mathbf{P}_{n,v} = (X_{n,v} \odot W_v) + R_{n,v}
-$$
-
-  计算 Token 级最大激活幅度：
-
-$$
-  M_n = \max_{d \in [1,D]} |P_{n,d}|
-$$
-
-  计算 Token 级缩放因子：
-
-$$
-  S_n = \frac{M_n + \epsilon}{Q_{\text{max}}}
-$$
-
-  浮点数量化为整数：
-
-$$
-  \hat{Y}_{n,d} = \text{round}\left( \text{clamp}\left( \frac{P_{n,d}}{S_n}, -Q_{\text{max}}, Q_{\text{max}} \right) \right)
-$$
-
-  其中：
-
-- $X \in \mathbb{R}^{N \times D}$ 是输入 Token 特征张量（ $N$=num_tokens， $D$=hidden_size）
-- $W \in \mathbb{R}^{D \times D}$ 是隐藏层权重张量
-- $R \in \mathbb{R}^{N \times D}$ 是残差连接张量，维度与输入一致
-- $P \in \mathbb{R}^{N \times D}$ 是乘加+残差后的中间结果张量
-- $\mathbf{P}_{n, v}$ 是向量优化版中间结果（ $v$ 为向量索引，向量长度 $L$=vec_len）
-- $X_n$ 是输入第 $n$ 个 Token 的特征向量（ $1 \times D$ ）， $W_d$ 是权重第 $d$ 列向量（ $D \times 1$ ）
-- $X_{n, v}/W_v/R_{n, v}$ 是长度为 $L$ 的向量， $\odot$ 表示逐元素乘法， $\cdot$ 表示向量点积
-- $M_n$ 是第 $n$ 个 Token 中间结果的最大绝对值（块内归约得到）
-- $S \in \mathbb{R}^N$ 是 Token 级动态量化缩放因子张量
-- $Q_{\text{max}}$ 是量化类型最大值
-- $\epsilon$ 是防止除零的小值（默认 $10^{-6}$ ）
-- $\hat{Y} \in \mathbb{Z}^{N \times D}$ 是量化后的输出张量（整数类型）
-- $\text{clamp}(x, a, b)$ 表示将 $x$ 截断到 $[a, b]$ 范围， $\text{round}(x)$ 表示四舍五入取整
-	算子优化目标：
-
-$$
-  \min_{\hat{Y}} \sum_{n=1}^N \sum_{d=1}^D \left| P_{n,d} - \hat{Y}_{n,d} \cdot S_n \right|^2
-$$
-
-  量化误差约束：
-
-$$
-  \max_{n,d} \left| P_{n,d} - \hat{Y}_{n,d} \cdot S_n \right| \leq Q_{\text{max}} \cdot \epsilon
-$$
-
-  其中 $\hat{Y}_{n, d} \cdot S_n$ 是量化结果的反量化值，约束量化前后的最大绝对误差不超过阈值。
-  **主要功能包括：**
-
-- 基于 CUDA 实现 RMS 归一化预处理，稳定输入特征数值范围
-- 支持残差连接与矩阵乘加融合计算，保留原始特征并完成线性变换
-- 实现动态逐 Token 量化，基于激活最大绝对值生成专属缩放因子
-- 提供输出填充适配能力，满足固定维度或边界对齐的推理场景
-- 结合向量化访存与线程协同优化，提升 CUDA 核函数执行效率
-
-### 参数说明
-
-- **input** (torch.Tensor, 入参): 形状为[num_tokens, hidden_size]，存储待处理的 Token 特征张量
-- **weight** (torch.Tensor, 入参): 形状为[hidden_size, hidden_size]，存储隐藏层权重张量
-- **residual** (torch.Tensor, 入参): 形状为[num_tokens, hidden_size]，存储残差连接张量
-- **epsilon** (float, 入参): 标量，防止计算 RMS 归一化时除零的极小值
-- **pad_size** (int, 入参): 标量，输出张量的填充尺寸，用于对齐输出维度
-
-### 返回值
-
-无返回值，结果直接写到输出张量 output 中，输出张量包含：output, output_rms, output_quant_int8, out_scales 和 residual
-
-- **output**：形状为[num_tokens, hidden_size + pad_size]，数据类型为 bfloat16，存储 RMS 归一化+矩阵乘加+残差后的中间结果张量
-- **output_rms**：形状为 [num_tokens, hidden_size]，数据类型为 bfloat16，存储输入张量经过 RMS 归一化后的中间结果张量
-- **output_quant_int8**：形状为[num_tokens, hidden_size + pad_size]，数据类型为 int8，存储动态逐 Token 量化后的输出张量
-- **out_scales**：形状为[num_tokens]，数据类型为 float，存储每个 Token 对应的量化缩放因子
-	residual：保持不变
-
-### 约束与调用
-
-- 所有张量必须位于 CUDA 设备上
-- 输入张量仅支持 bfloat16，输出张量：output_quant_int8 为 int8，out_scale 为 float，output 为 bfloat16
-- 张量形状约束：input 与 residual 形状需一致为[num_tokens, hidden_size]，weight 形状需为[hidden_size, hidden_size]，与 input 的特征维度匹配
-- pad_size 必须为非负整数，epsilon 必须为正数
-- 仅支持 int8 动态逐 Token 量化，不支持其他量化位宽
-
-### 调用示例
-
-```python
-import torch
-import mcoplib.op as op
-device = "cuda"
-# 1. 定义维度
-batch_size = 1      # 或者是 num_tokens 的维度，视具体实现而定
-seq_len = 128
-hidden_size = 4096
-pad_size = 0        # 根据业务需求设置，通常为0或者对齐所需的padding
-epsilon = 1e-6      # RMS Norm 的 epsilon
-# 2. 准备输入数据 (Inputs)
-# 注意：residual 通常需要与 input 形状一致
-input_tensor = torch.randn(batch_size, seq_len, hidden_size, dtype=torch.bfloat16, device=device)
-residual = torch.randn(batch_size, seq_len, hidden_size, dtype=torch.bfloat16, device=device)
-weight = torch.randn(hidden_size, dtype=torch.bfloat16, device=device) # RMS Norm Gamma
-# 3. 准备输出容器 (Outputs)
-# output: BF16 (用于存放非量化的 Add 结果，或者 Padding Output)
-output = torch.empty_like(input_tensor)
-# output_rms: BF16 (RMS Norm 后的结果)
-output_rms = torch.empty_like(input_tensor)
-# output_quant_int8: Int8 (量化结果)
-output_quant_int8 = torch.empty(batch_size, seq_len, hidden_size, dtype=torch.int8, device=device)
-# out_scales: Float32
-out_scales = torch.empty(batch_size, seq_len, 1, dtype=torch.float32, device=device)
-# 4. 调用算子 (修改顺序)
-print("Calling fused_add_rms_norm_dynamic_per_token_quant_padding_output...")
-# 这里的关键修改是：将 Int8 张量作为第一个参数传入
-op.fused_add_rms_norm_dynamic_per_token_quant_padding_output(
-    output_quant_int8,      # [Arg 0] 此时传入 Int8，满足 "Expected output.dtype() == kInt8"
-    output_rms,             # [Arg 1] RMS 输出 (BF16)
-    output,                 # [Arg 2] 剩下的这个 BF16 输出放在这里 (原签名中的 output_quant_int8 位置)
-    out_scales,             # [Arg 3] Scales
-    input_tensor,           # [Arg 4] Input
-    residual,               # [Arg 5] Residual
-    weight,                 # [Arg 6] Weight
-    pad_size,               # [Arg 7] Pad Size
-    epsilon                 # [Arg 8] Epsilon
-)
-torch.cuda.synchronize()
-print("Call successful.")
-print(f"Quantized Output Shape: {output_quant_int8.shape}")
-```
-
-## 25. rms_norm_dynamic_per_token_quant_custom
-
-### 支持的产品型号
-
-- Metax C500/C550/C588/C600
-
-### 接口原型
-
-```python
-def rms_norm_dynamic_per_token_quant_custom(
-    out: torch.Tensor,
-    input: torch.Tensor,
-    weight: torch.Tensor,
-    scales: torch.Tensor,
-    var_epsilon: float,
-    scale_ub: Optional[torch.Tensor] = None,
-    residual: Optional[torch.Tensor] = None
-) -> None
-```
-
-### 功能描述
-
-rms_norm_dynamic_per_token_quant_custom 算子实现了 RMS 归一化与动态逐 token 量化的融合操作。该算子首先对输入（可选叠加残差）进行 RMS 归一化计算，过程中引入动态逐 token 尺度调整，结合量化尺度参数完成量化操作，最终将结果输出到指定张量，通过融合计算减少内存交互，提升处理效率，适用于量化场景下的 Transformer 模型层。
-
-- 计算公式：
-
-$$
-  \text{input\\_merged} =
-  \begin{cases}
-  \text{input} + \text{residual}, & \text{residual} \neq \text{None} \\
-  \text{input}, & \text{residual} = \text{None}
-  \end{cases}
-$$
-
-  
-
-$$
-  \text{rms} = \sqrt{\frac{1}{D} \sum_{d=1}^D \text{input\\_merged}_{(\cdot, d)}^2 + \text{var\\_epsilon}}
-$$
-
-  
-
-$$
-  \text{scale\\_dynamic} =
-  \begin{cases}
-  \text{scales}, & \text{scale\\_ub} = \text{None} \\
-  \min(\text{scales}, \text{scale\\_ub}), & \text{scale\\_ub} \neq \text{None}
-  \end{cases}
-$$
-
-  
-
-$$
-  \text{out} = \frac{\text{input\\_merged}}{\text{rms}} \odot \text{weight} \odot \text{scale\\_dynamic}
-$$
-
-  其中：
-
-- $\text{input} \in \mathbb{R}^{B \times L \times D}$ 是输入张量， $B$ 为批次大小， $L$ 为序列长度， $D$ 为特征维度（hidden_size）
-- $\text{residual} \in \mathbb{R}^{B \times L \times D}$ （可选）是残差张量，与 input 形状一致，用于元素级叠加
-- $\text{input\\_merged} \in \mathbb{R}^{B \times L \times D}$ 是输入与残差叠加后的中间张量
-- $\text{weight} \in \mathbb{R}^D$ 是 RMS 归一化的权重张量，沿特征维度缩放
-- $\text{var\\_epsilon} \in \mathbb{R}^+$ 是数值稳定性参数，避免均方根计算时分母为零（通常取 $10^{-6}$ 量级）
-- $\text{scales} \in \mathbb{R}^{B \times L}$ 是动态逐 token 量化尺度张量，为每个 token 提供独立的量化尺度
-- $\text{scale\\_ub} \in \mathbb{R}^{B \times L}$ （可选）是尺度上界张量，约束动态尺度的最大值
-- $\text{scale\\_dynamic} \in \mathbb{R}^{B \times L}$ 是经过上界约束后的最终动态量化尺度
-- $\text{rms} \in \mathbb{R}^{B \times L}$ 是输入合并张量的均方根值，沿特征维度 $D$ 计算
-- $\text{out} \in \mathbb{R}^{B \times L \times D}$ 是最终输出张量，存储量化后的 RMS 归一化结果
-- $\odot$ 表示元素级乘法（Hadamard 积），维度不匹配时自动广播（如 $D$ 维 $\text{weight}$ 广播至 $B \times L \times D$ ， $B \times L$ 维 $\text{scale\\_dynamic}$ 广播至 $B \times L \times D$ ）
-- $D$ 需满足对齐约束（如 $D \% 4 = 0$ ），以保证 CUDA 设备上的计算效率
-
-### 参数说明
-
-- **out** (torch.Tensor, 出参): 输出张量，用于存储最终的量化归一化结果
-- **input** (torch.Tensor, 入参): 输入张量，为待进行 RMS 归一化和量化的原始数据
-- **weight** (torch.Tensor, 入参): 权重张量，用于 RMS 归一化过程中的缩放调整，形状与归一化维度匹配
-- **scales** (torch.Tensor, 入参): 量化尺度张量，用于动态逐 token 量化的尺度计算
-- **var_epsilon** (float, 入参): 数值稳定性参数，用于避免 RMS 计算中分母为零，通常取极小正值（如 1e-6）
-- **scale_ub** (Optional[torch.Tensor], 入参): 尺度上界张量，可选参数，用于约束动态尺度的上限范围
-- **residual** (Optional[torch.Tensor], 入参): 残差张量，可选参数，若存在则先与 input 叠加后再进行后续计算
-
-### 返回值
-
-无返回值，计算结果直接写入 out 张量中
-
-### 约束与调用
-
-- 所有张量必须位于 CUDA 设备上
-- 张量需满足连续性要求（
-- 支持的数据类型：float16、bfloat16、float32
-- 当 residual 存在时，其形状需与 input 匹配以支持元素级相加
-- hidden_size 需与输入张量的特征维度匹配，且需满足向量对齐要求, 如代码中提到的 hidden_size % 4 == 0 等对齐约束
-
-### 调用示例
-
-```Python
-import torch
-import mcoplib.op as op
-device = "cuda"
-# 1. 定义维度
-batch_size = 1
-seq_len = 128
-hidden_size = 4096
-epsilon = 1e-6
-# 2. 准备输入数据
-# input: [Batch, Seq, Hidden]
-input_tensor = torch.randn(batch_size, seq_len, hidden_size, dtype=torch.bfloat16, device=device)
-# weight: [Hidden] (RMS Norm 的 Gamma 参数)
-weight = torch.randn(hidden_size, dtype=torch.bfloat16, device=device)
-# 3. 准备输出容器
-# out: 根据函数名含有 "quant"，且是第一个参数，通常这里存放 Int8 结果
-out = torch.empty(batch_size, seq_len, hidden_size, dtype=torch.int8, device=device)
-# scales: 注释说是 [num_tokens]，即 [Batch * Seq] 或者 [Batch, Seq]
-# 为了保险，我们创建与 Batch, Seq 对应的形状。Float32 是量化 scale 的标准类型。
-scales = torch.empty(batch_size, seq_len, dtype=torch.float32, device=device)
-# 4. 准备可选参数 (Optional Arguments)
-# 如果不需要 residual 或 scale_ub，直接传 None
-# 如果需要 residual，通常需要传入一个形状与 input 相同的 Tensor
-residual = None 
-# residual = torch.randn_like(input_tensor) # 如果需要测试 residual add
-scale_ub = None
-# 5. 调用算子
-print("Calling rms_norm_dynamic_per_token_quant_custom...")
-# 确保内存连续
-if not input_tensor.is_contiguous(): input_tensor = input_tensor.contiguous()
-if not weight.is_contiguous(): weight = weight.contiguous()
-# 参数顺序必须严格对应 C++ 签名：
-# (out, input, weight, scales, epsilon, scale_ub, residual)
-op.rms_norm_dynamic_per_token_quant_custom(
-    out,            # at::Tensor& out
-    input_tensor,   # at::Tensor const& input
-    weight,         # at::Tensor const& weight
-    scales,         # at::Tensor& scales
-    epsilon,        # double const var_epsilon
-    scale_ub,       # c10::optional<at::Tensor> scale_ub
-    residual        # c10::optional<at::Tensor> residual
-)
-torch.cuda.synchronize()
-print("Call successful.")
-print(f"Output (Int8) shape: {out.shape}")
-print(f"Scales shape: {scales.shape}")
-# 简单验证一下数据是否被写入 (不全为0)
-print(f"Output max val: {out.max().item()}, Output min val: {out.min().item()}")
-```
-
-## 26. recv_from_attention_node_post_process
-
-### 支持的产品型号
-
-- Metax C500/C550/C588/C600
-
-### 接口原型
-
-```python
-def recv_from_attention_node_post_process(
-    hidden_status: torch.Tensor,
-    topk_ids: torch.Tensor,
-    topk_weights: torch.Tensor,
-    ori_index: torch.Tensor,
-    new_index: torch.Tensor,
-    deep_hidden_status: torch.Tensor,
-    deeper_topk_weights: torch.Tensor,
-    expert_cnt: torch.Tensor,
-    valid_idx_size: torch.Tensor,
-    begin_expert_id: int,
-    num_local_experts: int,
-    max_index_size: int,
-    work_count: int
-) -> None
-```
-
-### 功能描述
-
-recv_from_attention_node_post_process 算子实现了从注意力节点接收数据后的后处理操作。该算子主要处理注意力机制输出的 topk 结果，包含索引和权重，通过索引映射更新隐藏状态和深层隐藏状态，并结合专家分配信息（起始专家 ID、本地专家数量等）完成专家相关的计数与权重处理，常用于混合专家模型 MoE 中注意力模块与专家模块的衔接流程
-
-- 计算公式
-
-$$
-\text{new\\_index}[i] = \text{ori\\_index}[\text{topk\\_ids}[i]] \quad (0 \leq i < \text{valid\\_idx\\_size})
-$$
-
-
-
-$$
-\text{expert\\_cnt}[e] = \text{expert\\_cnt}[e] + \sum_{i=0}^{\text{valid\\_idx\\_size}-1} \mathbb{I}\left(
-    \text{topk\\_ids}[i] \in [\text{begin\\_expert\\_id} + e \cdot \text{max\\_index\\_size}, \text{begin\\_expert\\_id} + (e+1) \cdot \text{max\\_index\\_size} - 1]
-\right)
-$$
-
-
-
-$$
-\text{hidden\\_status}[j] = \text{hidden\\_status}[j] + \sum_{i=0}^{\text{valid\\_idx\\_size}-1} \text{topk\\_weights}[i] \cdot \text{hidden\\_status}[\text{new\\_index}[i]]
-$$
-
-
-
-$$
-\text{deeper\\_topk\\_weights}[i] = \text{deeper\\_topk\\_weights}[i] \cdot \text{topk\\_weights}[i] \cdot \frac{1}{\text{work\\_count}}
-$$
-
-
-
-$$
-\text{deep\\_hidden\\_status}[j] = \text{deep\\_hidden\\_status}[j] + \sum_{i=0}^{\text{valid\\_idx\\_size}-1} \text{deeper\\_topk\\_weights}[i] \cdot \text{hidden\\_status}[\text{new\\_index}[i]]
-$$
-
-其中：
-
-- $\text{hidden\\_status} \in \mathbb{R}^{M \times D_h}$ ：隐藏状态张量， $M$ 为序列维度， $D_h$ 为隐藏层特征维度
-- $\text{topk\\_ids} \in \mathbb{Z}^{K \times 1}$ ：注意力机制输出的 topk 索引张量， $K$ 为 topk 候选数量
-- $\text{topk\\_weights} \in \mathbb{R}^{K \times 1}$ ：注意力机制输出的 topk 权重张量
-- $\text{ori\\_index} \in \mathbb{Z}^{T \times 1}$ ：原始索引映射张量， $T$ 为总索引数量
-- $\text{new\\_index} \in \mathbb{Z}^{K \times 1}$ ：映射后的新索引张量
-- $\text{deep\\_hidden\\_status} \in \mathbb{R}^{M \times D_{dh}}$ ：深层隐藏状态张量， $D_{dh}$ 为深层隐藏层特征维度
-- $\text{deeper\\_topk\\_weights} \in \mathbb{R}^{K \times 1}$ ：更深层 topk 权重张量
-- $\text{expert\\_cnt} \in \mathbb{Z}^{E \times 1}$ ：专家计数张量， $E$ 为本地专家总数（ $E = \text{num\\_local\\_experts}$ ）
-- $\text{valid\\_idx\\_size} \in \mathbb{Z}$ ：有效索引数量（标量），满足 $0 < \text{valid\\_idx\\_size} \leq \text{max\\_index\\_size}$
-- $\text{begin\\_expert\\_id} \in \mathbb{Z}$ ：起始专家 ID（标量）
-- $\text{num\\_local\\_experts} \in \mathbb{Z}$ ：本地专家数量（标量）
-- $\text{max\\_index\\_size} \in \mathbb{Z}$ ：单专家最大索引容量（标量）
-- $\text{work\\_count} \in \mathbb{Z}$ ：工作任务计数（标量），用于权重归一化
-- $\mathbb{I}(\cdot)$ ：指示函数，满足条件时取值为 1，否则为 0
-- $e$ ：专家索引，满足 $0 \leq e < \text{num\\_local\\_experts}$
-- $i$ ：索引遍历维度，满足 $0 \leq i < \text{valid\\_idx\\_size}$
-- $j$ ：隐藏状态序列维度，满足 $0 \leq j < M$
-	补充约束公式：
-
-$$
-\text{valid\\_idx\\_size} \leq \text{max\\_index\\_size}, \quad \text{begin\\_expert\\_id} + \text{num\\_local\\_experts} \leq E_{\text{total}}
-$$
-
-其中 $E_{\text{total}}$ 为全局专家总数。
-
-### 参数说明
-
-- **hidden_status** (torch.Tensor, 入参/出参): 输入的隐藏状态张量，经后处理后会被更新
-- **topk_ids** (torch.Tensor, 入参): 注意力机制输出的 topk 索引张量，存储选中的候选索引
-- **topk_weights** (torch.Tensor, 入参): 注意力机制输出的 topk 权重张量，对应 topk_ids 的权重值
-- **ori_index** (torch.Tensor, 入参): 原始索引张量，用于索引映射的原始标识
-- **new_index** (torch.Tensor, 入参/出参): 新索引张量，存储映射后的索引，会被更新
-- **deep_hidden_status** (torch.Tensor, 入参/出参): 深层隐藏状态张量，经后处理后会被更新
-- **deeper_topk_weights** (torch.Tensor, 入参/出参): 更深层的 topk 权重张量，会被更新
-- **expert_cnt** (torch.Tensor, 入参/出参): 专家计数张量，记录各专家的处理数量，会被更新
-- **valid_idx_size** (torch.Tensor, 入参): 有效索引大小张量，存储有效索引的数量
-- **begin_expert_id** (int, 入参): 起始专家 ID，标识当前处理的专家起始编号
-- **num_local_experts** (int, 入参): 本地专家数量，当前节点包含的专家总数
-- **max_index_size** (int, 入参): 最大索引大小，限制索引的最大长度
-- **work_count** (int, 入参): 工作计数，标识当前处理的任务数量
-
-### 返回值
-
-无返回值，计算结果直接写入 hidden_status、new_index、deep_hidden_status、deeper_topk_weights、expert_cnt 等张量中
-
-### 约束与调用
-
-- 所有张量必须位于 CUDA 设备上
-- 支持的数据类型：float16、bfloat16、float32
-- valid_idx_size 的值必须小于等于 max_index_size
-- topk_ids 的范围必须在有效索引范围内
-- begin_expert_id 与 num_local_experts 需匹配，确保专家 ID 不越界
-- 所有张量需满足连续性要求，最后维度连续
-
-### 调用示例
-
-```Python
-import torch
-import mcoplib.op as op
-device = "cuda"
-# 定义核心参数
-seq_dim = 1024             
-hidden_dim = 4096      
-topk_size = 64            
-total_index_size = 8192     
-num_local_experts = 8    
-begin_expert_id = 0        
-max_index_size = 1024    
-work_count = 4            
-valid_idx_size_val = 50     
-# 创建输入/输出张量
-hidden_status = torch.randn(seq_dim, hidden_dim, dtype=torch.float16, device=device)
-topk_ids = torch.randint(0, total_index_size, (topk_size,), dtype=torch.int64, device=device)
-topk_weights = torch.randn(topk_size, dtype=torch.float16, device=device)
-ori_index = torch.randint(0, total_index_size, (total_index_size,), dtype=torch.int64, device=device)
-new_index = torch.empty(topk_size, dtype=torch.int64, device=device)
-deep_hidden_status = torch.randn(seq_dim, hidden_dim, dtype=torch.float16, device=device)
-deeper_topk_weights = torch.randn(topk_size, dtype=torch.float16, device=device)
-expert_cnt = torch.zeros(num_local_experts, dtype=torch.int64, device=device)
-valid_idx_size = torch.tensor([valid_idx_size_val], dtype=torch.int64, device=device)
-# 调用recv_from_attention_node_post_process算子
-op.recv_from_attention_node_post_process(
-    hidden_status,
-    topk_ids,
-    topk_weights,
-    ori_index,
-    new_index,
-    deep_hidden_status,
-    deeper_topk_weights,
-    expert_cnt,
-    valid_idx_size,
-    begin_expert_id,
-    num_local_experts,
-    max_index_size,
-    work_count
-)
-# 打印执行完成提示及关键张量信息
-print("recv_from_attention_node_post_process computation completed")
-print(f"Hidden status shape: {hidden_status.shape}")
-print(f"New index shape: {new_index.shape}")
-print(f"Expert count shape: {expert_cnt.shape}")
-print(f"Valid index size: {valid_idx_size.item()}")
-```
-
-## 27. send_to_attention_node_pre_process
-
-### 支持的产品型号
-
-- Metax C500/C550/C588/C600
-
-### 接口原型
-
-```python
-def send_to_attention_node_pre_process(
-    moe_hidden_status: torch.Tensor,
-    deep_topk_weights: torch.Tensor,
-    ori_index: torch.Tensor,
-    new_index: torch.Tensor,
-    output: torch.Tensor,
-    valid_idx_size: torch.Tensor,
-    max_index_size: const int
-) -> None
-```
-
-### 功能描述
-
-send_to_attention_node_pre_process 算子主要用于为将数据发送至注意力节点做预处理操作。该算子涉及混合专家模型的隐藏状态、深度 TopK 权重以及索引（原始索引与新索引）的处理，通过计算有效张量维度、验证数据类型等操作，为后续注意力节点的计算准备输入输出数据，确保数据格式与规模符合处理要求。
-
-- 计算公式：
-
-$$
-\text{output}[i] = 
-\begin{cases} 
-\text{moe\\_hidden\\_status}[\text{new\\_index}[i]] \times \text{deep\\_topk\\_weights}[\text{new\\_index}[i]], & 0 \leq i < \text{valid\\_idx\\_size}[0] \text{ 且 } \text{new\\_index}[i] < \text{max\\_index\\_size} \\
-0, & \text{其他情况}
-\end{cases}
-$$
-
-其中：
-
-- $\text{moe\\_hidden\\_status} \in \mathbb{R}^{M \times D_h}$ 是混合专家模型的隐藏状态张量， $M$ 为隐藏状态的样本数量， $D_h$ 为隐藏状态的特征维度
-- $\text{deep\\_topk\\_weights} \in \mathbb{R}^{M \times 1}$ 是深度 TopK 选择的权重张量， $M$ 与 $\text{moe\\_hidden\\_status}$ 的样本数量一致
-- $\text{ori\\_index} \in \mathbb{Z}^{I}$ 是原始索引张量， $I$ 为索引总数，元素为非负整数，表征数据的原始位置
-- $\text{new\\_index} \in \mathbb{Z}^{I}$ 是新索引张量，维度与 $\text{ori\\_index}$ 完全一致，满足索引映射关系：
-
-$$
-  \text{new\\_index}[i] = \text{ori\\_index}[i] - \min(\text{ori\\_index}) \quad (0 \leq i < \text{valid\\_idx\\_size}[0])
-$$
-
-- $\text{output} \in \mathbb{R}^{\text{max\\_index\\_size} \times D_h}$ 是预处理输出张量，第一维度由最大索引大小约束，第二维度与 $\text{moe\\_hidden\\_status}$ 的特征维度一致
-- $\text{valid\\_idx\\_size} \in \mathbb{Z}^{1}$ 是有效索引大小张量，仅包含一个标量元素（记为 $V = \text{valid\\_idx\\_size}[0]$ ），表示参与有效计算的索引数量
-- $\text{max\\_index\\_size} \in \mathbb{Z}^+$ 是最大索引大小，为正整数，用于约束索引的合法范围，满足：
-
-$$
-  V \leq \text{max\\_index\\_size}
-$$
-
-### 参数说明
-
-- **moe_hidden_status** (at::Tensor, 入参): 混合专家模型的隐藏状态张量，作为预处理的输入数据之一
-- **deep_topk_weights** (at::Tensor, 入参): 深度 TopK 选择的权重张量，参与预处理过程中的权重相关计算
-- **ori_index** (at::Tensor, 入参): 原始索引张量，用于记录数据的原始位置信息
-- **new_index** (at::Tensor, 入参): 新索引张量，用于记录数据经过处理后的新位置信息
-- **output** (at::Tensor, 出参): 预处理后的输出张量，存储预处理的结果
-- **valid_idx_size** (at::Tensor, 入参): 有效索引大小张量，记录有效索引的数量信息
-- **max_index_size** (const int, 入参): 最大索引大小，用于约束索引的范围
-
-### 返回值
-
-无返回值，预处理结果直接写入 output 张量中
-
-### 约束与调用
-
-- 所有张量需位于 CUDA 设备上
-- 仅支持可 blittable 类型的数据（ blittable 类型指可直接在设备间进行内存拷贝的数据类型）
-- 张量的维度与规模需匹配计算需求，如 moe_hidden_status 的大小需与索引规模、权重规模相适配
-- 输入张量需保证连续性或符合特定的内存布局要求（根据底层设备计算需求）
-
-### 调用示例
-
-```Python
-import torch
-import mcoplib.op as op
-# 定义运行设备
-device = "cuda"
-# 定义算子所需的参数
-num_local_experts = 8  # 专家数量
-num_tokens = 128       # Token 数量
-hidden_size = 4096     # Hidden Dimension
-max_index_size = num_tokens * 2 # Grid size
-# 1. 创建输入张量
-# moe_hidden_status: [Experts, Tokens, Hidden]
-# 必须是 BFloat16
-moe_hidden_status = torch.randn(num_local_experts, num_tokens, hidden_size, dtype=torch.bfloat16, device=device)
-# deepep_topk_weights: [Experts * Tokens]
-# 必须是 Float32
-deepep_topk_weights = torch.randn(num_local_experts * num_tokens, dtype=torch.float32, device=device)
-#  关键修正点开始 
-# 构造 new_index: [max_index_size, 2]
-# 第0列是 Expert Index，必须小于 num_local_experts (8)
-# 第1列是 Token Index，必须小于 num_tokens (128)
-new_index_col0 = torch.randint(0, num_local_experts, (max_index_size, 1), dtype=torch.int32, device=device)
-new_index_col1 = torch.randint(0, num_tokens, (max_index_size, 1), dtype=torch.int32, device=device)
-new_index = torch.cat([new_index_col0, new_index_col1], dim=1).contiguous()
-# 构造 ori_index: [max_index_size, 2]
-# Kernel 中使用了 ori_index[... + 1] 作为 output 的 row index
-# 所以第1列必须小于 num_tokens (output 的第0维)
-ori_index_col0 = torch.randint(0, num_local_experts, (max_index_size, 1), dtype=torch.int32, device=device)
-ori_index_col1 = torch.randint(0, num_tokens, (max_index_size, 1), dtype=torch.int32, device=device)
-ori_index = torch.cat([ori_index_col0, ori_index_col1], dim=1).contiguous()
-#  关键修正点结束 
-# valid_idx_size: 实际要处理的任务数量
-# 必须 <= max_index_size
-valid_idx_size = torch.tensor([num_tokens], dtype=torch.int32, device=device)
-# 2. 创建输出张量
-# output: [Tokens, Hidden]
-output = torch.zeros(num_tokens, hidden_size, dtype=torch.bfloat16, device=device)
-# 同步以捕获之前的异步错误
-torch.cuda.synchronize()
-print("Calling send_to_attention_node_pre_process...")
-# 3. 调用算子
-op.send_to_attention_node_pre_process(
-    moe_hidden_status,    # Input (BFloat16)
-    deepep_topk_weights,  # Input (Float32)
-    ori_index,            # Input (Int32)
-    new_index,            # Input (Int32)
-    output,               # Output (BFloat16)
-    valid_idx_size,       # Input (Int32 scalar tensor)
-    max_index_size        # Int scalar
-)
-# 再次同步确保完成
-torch.cuda.synchronize()
-print("send_to_attention_node_pre_process computation completed successfully.")
-print(f"MoE Hidden Status shape: {moe_hidden_status.shape}")
-print(f"Output shape: {output.shape}")
-```
-
-## 28. fused_silu_mul_dq_mask_quant
-
-### 支持的产品型号
-
-- Metax C500/C550/C588/C600
-
-### 接口原型
-
-```python
-def fused_silu_mul_dq_mask_quant(
-    out:torch.Tensor,
-    input:torch.Tensor,
-    mask:torch.Tensor
-) -> None
-```
-
-### 功能描述
-
-fused_silu_mul_dq_mask_quant 算子是一个针对 MoE 结构优化的高性能融合算子。该算子主要用于处理门控激活函数（SwiGLU）计算、专家掩码（Masking）应用以及动态量化和数据打包。算子接收包含 Gate 和 Up 投影的输入张量，计算 SiLU 激活与逐元素乘法，应用专家掩码将无效专家的输出置零，然后计算每行的最大绝对值以生成量化 Scale，最后将数据量化为 int8 格式并进行打包，以便后续的矩阵乘法（GEMM）计算。
-
-- 计算公式：
-
-$$
-\text{temp\\_h}[i] = (\text{SiLU}(\text{input}[i]_{0:D_h}) \odot \text{input}[i]_{D_h:2D_h}) \odot \text{mask}[i]
-$$
-
-
-
-$$
-\text{scale}[i] = \frac{\max_{j}(|\text{temp\\_h}[i, j]|)}{127.0}
-$$
-
-
-
-$$
-\text{out}[i, j] = \text{Clamp}\left(\text{Round}\left(\frac{temp\_h[i, j]}{\text{scale}[i]}\right), -128, 127\right)
-$$
-
-其中：
-
-- $\text{input} \in \mathbb{R}^{N \times 2D_h}$ 是输入张量， $N$ 为 Token 数量， $2D_h$ 为两倍的隐藏层维度（包含 Gate 和 Up 两部分投影）
-- $\text{mask} \in \mathbb{R}^{N \times 1}$ 是专家掩码张量，用于指示 Token 是否激活对应专家，支持广播
-- $\text{temp\\_h} \in \mathbb{R}^{N \times D_h}$ 是激活与掩码后的中间状态张量
-- $\text{scale} \in \mathbb{R}^{N}$ 是行级量化缩放因子（在内部计算，通常用于量化过程）
-- $\text{out} \in \mathbb{Z}^{N \times D_h}$ 是量化后的输出张量，数据类型为 int8
-- $\odot$ 表示逐元素乘法
-- $\text{SiLU}(x) = \frac{x}{1 + e^{-x}}$ 是激活函数
-
-### 参数说明
-
-- **out** (at::Tensor, 出参): 输出张量，存储量化及打包后的结果，数据类型通常为 int8。
-- **input** (at::Tensor, 入参): 输入张量，形状通常为 [num_tokens, 2 * hidden_size]，包含 Gate 和 Up 的投影结果。
-- **mask** (at::Tensor, 入参): 掩码张量，用于指示 Token 与专家的对应关系，形状需与 batch/token 维度广播兼容。
-
-### 返回值
-
-无返回值，计算结果直接写入输出张量 out 中
-
-### 约束与调用
-
-- 输入张量必须位于 CUDA 设备上。
-- input 的最后一维必须是 hidden\_size 的两倍（用于 SwiGLU split）。
-- out 张量需预先分配足够的内存空间以存储量化后的数据。
-- mask 的维度必须与 input 的 token 维度匹配或可广播。
-- 仅支持连续内存布局的张量。
-
-### 调用示例
-
-```python
-import torch
-import mcoplib.op as op
-device = "cuda"
-# 定义张量维度
-num_tokens = 128
-hidden_size = 4096
-input_dim = hidden_size * 2
-# 创建输入张量
-input_tensor = torch.randn(num_tokens, input_dim, dtype=torch.float16, device=device)
-mask = torch.ones(num_tokens, 1, dtype=torch.float16, device=device)
-out = torch.empty(num_tokens, hidden_size, dtype=torch.int8, device=device)
-# 调用fused_silu_mul_dq_mask_quant算子
-op.fused_silu_mul_dq_mask_quant(
-    out,
-    input_tensor,
-    mask
-)
-print("fused_silu_mul_dq_mask_quant computation completed")
-print(f"Output shape: {out.shape}")
-```
-
-## 29. fused_silu_mul_dq_reorder_quant
-
-### 支持的产品型号
-
-- Metax C500/C550/C588/C600
-
-### 接口原型
-
-```python
-def fused_silu_mul_dq_reorder_quant(
-    out: torch.Tensor,
-    scale: torch.Tensor,
-    input: torch.Tensor,
-    reorder_topk_ids: torch.Tensor,
-    w2_scale: torch.Tensor,
-    start_expert_id: int64_t,
-    end_expert_id: int64_t
-) -> None
-```
-
-### 功能描述
-
-fused_silu_mul_dq_reorder_quant 算子实现了 SiLU 激活函数、乘法、反量化（dequantization）、量化（quantization）以及基于 TopK 的重排序操作的融合。通过将多个操作融合为一个算子，减少了中间结果的内存读写次数，提升了计算效率，适用于需要高效处理量化模型中多步计算的场景（如 Transformer 模型的专家系统等）
-
-- 计算公式：
-
-$$
-  \text{out}[i] = \text{quant}\left( \text{mul}\left( \text{SiLU}\left( \text{dq}\left( \text{input}[\text{reorder\\_topk\\_ids}[i]] \right) \right), \text{w2\\_scale} \right) \right), \quad \forall i \in [0, L)
-$$
-
-  其中核心基础操作定义：
-
-$$
-  \text{SiLU}(x) = x \cdot \sigma(x) = x \cdot \frac{1}{1 + e^{-x}}
-$$
-
-
-
-$$
-  \text{dq}(x, s) = x \times s \quad (\text{反量化操作，其中缩放因子} \ s=\text{scale})
-$$
-
-
-
-$$
-  \text{mul}(a, b) = a \times b \quad (\text{逐元素乘法操作})
-$$
-
-
-
-$$
-  \text{quant}(y) = \text{clip}\left( \text{round}\left( \frac{y}{\text{quant\\_scale}} \right), \text{quant\\_min}, \text{quant\\_max} \right) \quad (\text{量化操作})
-$$
-
-  计算范围由专家 ID 限定（仅有效专家维度参与计算）：
-
-$$
-  \text{input}_{\text{valid}} = \text{input}[..., e] \quad \text{其中} \ \text{start\\_expert\\_id} \leq e < \text{end\\_expert\\_id}
-$$
-
-  变量说明：
-
-- $\text{input} \in \mathbb{R}^{B \times T \times D \times E}$ ：输入张量，其中 $B$ 为批量大小， $T$ 为序列长度， $D$ 为特征维度， $E$ 为专家总数；
-- $\text{scale} \in \mathbb{R}^{D}$ ：反量化缩放因子张量，用于输入张量的反量化数值校准；
-- $\text{w2\\_scale} \in \mathbb{R}^{D}$ ：权重缩放因子张量，参与乘法阶段的逐元素数值调整；
-- $\text{reorder\\_topk\\_ids} \in \mathbb{Z}^{L}$ ：TopK 重排序索引张量， $L$ 为输出张量总元素数，索引值范围为 $[0, B \times T \times D \times E)$ ；
-- $\text{out} \in \mathbb{Z}^{L}$ （或 $\mathbb{R}^{L}$ ）：输出张量，存储融合操作的最终结果，数据类型由量化策略决定；
-- $\sigma (x) = \frac{1}{1 + e^{-x}}$ ：Sigmoid 激活函数，是 SiLU 操作的核心子函数；
-- $\text{quant\\_scale} \in \mathbb{R}^{+}$ ：量化缩放因子，用于将浮点结果映射为量化值；
-- $\text{quant\\_min} \in \mathbb{Z}$ 、 $\text{quant\\_max} \in \mathbb{Z}$ ：量化值的上下限，用于裁剪超出范围的量化结果；
-- $\text{start\\_expert\\_id} \in \mathbb{Z}$ 、 $\text{end\\_expert\\_id} \in \mathbb{Z}$ ：专家范围边界，满足 $0 \leq \text{start\\_expert\\_id} < \text{end\\_expert\\_id} \leq E$ ， $e$ 为专家维度的索引；
-- $i \in [0, L)$ ：输出张量的元素索引，遍历所有输出元素以完成逐元素计算；
-- $\text{round}(\cdot)$ ：四舍五入函数，将浮点值转换为整数；
-- $\text{clip}(x, \text{min}, \text{max})$ ：裁剪函数，将 $x$ 限制在 $[\text{min}, \text{max}]$ 范围内。
-
-### 参数说明
-
-- **out** (torch.Tensor, 出参): 输出张量，用于存储融合操作的最终结果
-- **scale** (torch.Tensor, 入参): 缩放因子张量，用于量化/反量化过程中的数值调整
-- **input** (torch.Tensor, 入参): 输入张量，作为整个融合操作的原始输入数据
-- **reorder_topk_ids** (torch.Tensor, 入参): 用于重排序的 TopK 索引张量，指定元素的重新排列顺序
-- **w2_scale** (torch.Tensor, 入参): 权重缩放因子张量，参与乘法和量化过程的数值调整
-- **start_expert_id** (int64_t, 入参): 起始专家 ID，用于限定处理的专家范围
-- **end_expert_id** (int64_t, 入参): 结束专家 ID，与 start_expert_id 共同划定处理的专家范围
-
-### 返回值
-
-无返回值，计算结果直接写入 out 张量中
-
-### 约束与调用
-
-- 所有张量必须位于 CUDA 设备上
-- 支持的数据类型需匹配量化/反量化要求（如 float16、bfloat16、float32 等）
-- reorder_topk_ids 的索引值需在有效范围内，且与输入张量的维度匹配
-- start_expert_id 和 end_expert_id 需满足合法范围（0 ≤ start_expert_id < end_expert_id ≤ 专家总数）
-
-### 调用示例
-
-```python
-import torch
-import mcoplib.op as op
-device = "cuda"
-# 定义张量维度
-total_tokens = 1024
-hidden_size = 4096
-num_selected = 512
-input_dim = hidden_size * 2  
-start_expert = 0
-end_expert = 4
-# 创建输入张量
-input_tensor = torch.randn(total_tokens, input_dim, dtype=torch.float32, device=device)
-reorder_ids = torch.randint(0, total_tokens, (num_selected,), dtype=torch.long, device=device)
-w2_scale = torch.ones(1, dtype=torch.float32, device=device)
-out = torch.empty(num_selected, hidden_size, dtype=torch.int8, device=device)
-scale = torch.empty(num_selected, 1, dtype=torch.float32, device=device)
-# 调用fused_silu_mul_dq_reorder_quant算子
-op.fused_silu_mul_dq_reorder_quant(
-    out,
-    scale,
-    input_tensor,
-    reorder_ids,
-    w2_scale,
-    start_expert,
-    end_expert
-)
-print("fused_silu_mul_dq_reorder_quant computation completed")
-print(f"Output shape: {out.shape}")
-```
-
-## 30. gptq_marlin_gemm_legacy
-
-### 支持的产品型号
-
-- Metax C500/C550/C588/C600
-
-### 接口原型
-
-```python
-def gptq_marlin_gemm_legacy(
-    a: torch.Tensor,
-    b_q_weight: torch.Tensor,
-    b_scales: torch.Tensor,
-    g_idx: torch.Tensor,
-    perm: torch.Tensor,
-    workspace: torch.Tensor,
-    num_bits: int,
-    size_m: int,
-    size_n: int,
-    size_k: int,
-    is_k_full: bool,
-    dtype: torch.dtype = torch.bfloat16,
-    use_atomic_cache: bool = True
-) -> torch.Tensor
-```
-
-### 功能描述
-
-gptq_marlin_gemm_legacy 是 gptq_marlin_gemm 的旧版本实现，功能与前者一致，结合 GPTQ 量化的 Marlin 风格矩阵乘法，用于大语言模型量化推理的线性层加速，仅简化了参数，移除了 size_m_tensor 和 sms，适配旧版调用逻辑。
-
-- 计算公式：
-	定义核心变量：
-- 激活矩阵： $A \in \mathbb{R}^{\text{size\\_m} \times \text{size\\_k}}$
-- 量化权重分组块： $B_q^g \in \mathbb{Z}^{\text{group\\_size} \times \text{size\\_n}}$ （ $\text{group\\_size}$ 为分组维度，由 $\text{g\\_idx}$ 决定）
-- 分组缩放因子： $S_g \in \mathbb{R}^{1 \times \text{size\\_n}}$ （第 $g$ 个分组对应的缩放因子）
-	量化权重还原，对每个权重分组 $g$ ，将量化权重块乘以对应缩放因子，还原为浮点权重：
-
-$$
-B^g = B_q^g \cdot S_g
-$$
-
-其中 $B^g \in \mathbb{R}^{\text{group\\_size} \times \text{size\\_n}}$ ，完整权重矩阵 $B$ 是所有分组块的拼接：
-
-$$
-B = \left[ B^1; B^2; \dots; B^{\text{num\\_groups}} \right] \in \mathbb{R}^{\text{size\\_k} \times \text{size\\_n}}
-$$
-
-矩阵乘法，激活矩阵与还原后权重矩阵执行矩阵乘法，得到输出：
-
-$$
-C = A \cdot B
-$$
-
-其中 $C \in \mathbb{R}^{\text{size\\_m} \times \text{size\\_n}}$ ，即算子的返回张量。
-
-### 参数说明
-
-- **a** (torch.Tensor, 入参): 输入激活张量，形状为[size_m, size_k]，需位于 CUDA 设备且为连续张量
-- **b_q_weight** (torch.Tensor, 入参): GPTQ 量化后的权重张量，形状需匹配量化 tile 尺寸要求，需位于 CUDA 设备且为连续张量
-- **b_scales** (torch.Tensor, 入参): 量化权重对应的缩放因子张量，形状与分组量化维度匹配，需位于 CUDA 设备且为连续张量
-- **g_idx** (torch.Tensor, 入参): 分组量化的索引张量，用于定位分组参数，需位于 CUDA 设备且为连续张量
-- **perm** (torch.Tensor, 入参): 维度置换张量，用于维度调整，需位于 CUDA 设备且为连续张量
-- **workspace** (torch.Tensor, 入参): 临时工作空间张量，需满足最小尺寸要求
-- **num_bits** (int, 入参): 量化位数，仅支持 4 或 8 位
-- **size_m** (int, 入参): 输入张量 a 的行数（矩阵乘左矩阵的行数）
-- **size_n** (int, 入参): 输出张量的列数（矩阵乘右矩阵的列数）
-- **size_k** (int, 入参): 矩阵乘的公共维度（左矩阵的列数、右矩阵的行数）
-- **is_k_full** (bool, 入参): 标志 size_k 是否为量化 tile 尺寸的完整倍数
-- **dtype** (torch.dtype, 入参, 默认 torch.bfloat16): 输出张量的数据类型，支持 bfloat16、float16
-- **use_atomic_cache** (bool, 入参, 默认 True): 是否启用原子缓存优化
-
-### 返回值
-
-返回 torch.Tensor 类型的矩阵乘结果，形状为[size_m, size_n]，数据类型为指定的 dtype
-
-### 约束与调用
-
-与 gptq_marlin_gemm 的约束完全一致：
-
-- 所有输入张量需位于 CUDA 设备且连续
-- num_bits 仅支持 4 或 8 位
-- 量化权重形状需匹配 tile 尺寸、workspace 满足最小尺寸
-- 支持 bfloat16、float16 数据类型
-
-### 调用示例
-
-```python
-import torch
-import mcoplib.op as op
-device = "cuda"
-# 定义张量维度
-size_m = 4096 
-size_n = 4096  
-size_k = 4096  
-num_bits = 4  
-is_k_full = True  
-dtype = torch.bfloat16 
-# 创建输入张量a
-a = torch.randn(size_m, size_k, dtype=dtype, device=device).contiguous()
-pack_factor = 32 // num_bits
-b_q_weight = torch.randint(0, 2**num_bits, (size_n, size_k // pack_factor), dtype=torch.int32, device=device).contiguous()
-group_size = 128  
-b_scales = torch.randn(size_k // group_size, size_n, dtype=dtype, device=device).contiguous()
-g_idx = torch.arange(0, size_k, group_size, dtype=torch.int32, device=device).repeat_interleave(group_size)
-g_idx = g_idx[:size_k].contiguous() 
-perm = torch.arange(size_k, dtype=torch.int32, device=device).contiguous() 
-workspace_size = size_m * size_n // 1024
-workspace = torch.empty(workspace_size, dtype=torch.int8, device=device).contiguous()
-output = op.gptq_marlin_gemm_legacy(
-    a=a,
-    b_q_weight=b_q_weight,
-    b_scales=b_scales,
-    g_idx=g_idx,
-    perm=perm,
-    workspace=workspace,
-    num_bits=num_bits,
-    size_m=size_m,
-    size_n=size_n,
-    size_k=size_k,
-    is_k_full=is_k_full,
-    dtype=dtype,
-    use_atomic_cache=True
-)
-print("gptq_marlin_gemm_legacy computation completed")
-print(f"Output shape: {output.shape}") 
-```
-
-## 31. gptq_marlin_gemm
-
-### 支持的产品型号
-
-- Metax C500/C550/C588/C600
-
-### 接口原型
-
-```python
-def gptq_marlin_gemm(
-    a: torch.Tensor,
-    b_q_weight: torch.Tensor,
-    b_scales: torch.Tensor,
-    g_idx: torch.Tensor,
-    perm: torch.Tensor,
-    workspace: torch.Tensor,
-    num_bits: int,
-    size_m_tensor: torch.Tensor,
-    size_m: int,
-    size_n: int,
-    size_k: int,
-    sms: int,
-    is_k_full: bool,
-    dtype: torch.dtype = torch.bfloat16,
-    use_atomic_cache: bool = True
-) -> torch.Tensor
-```
-
-### 功能描述
-
-gptq_marlin_gemm 算子实现了结合 GPTQ 量化的 Marlin 风格高效矩阵乘法，用于大语言模型量化推理中的线性层加速。该算子针对 GPTQ 量化后的权重 b_q_weight，配合缩放因子、分组索引等量化参数，通过 Marlin 的 CUDA 优化内核完成矩阵乘计算，同时支持原子缓存等策略提升计算性能
-
-- 计算公式：
-	定义核心变量：
-- 激活矩阵： $A \in \mathbb{R}^{\text{size\\_m} \times \text{size\\_k}}$
-- 量化权重分组块： $B_q^g \in \mathbb{Z}^{\text{group\\_size} \times \text{size\\_n}}$ （ $\text{group\\_size}$ 为分组维度，由 $\text{g\\_idx}$ 决定）
-- 分组缩放因子： $S_g \in \mathbb{R}^{1 \times \text{size\\_n}}$ （第 $g$ 个分组对应的缩放因子）
-	量化权重还原，对每个权重分组 $g$ ，将量化权重块乘以对应缩放因子，还原为浮点权重：
-
-$$
-B^g = B_q^g \cdot S_g
-$$
-
-其中 $B^g \in \mathbb{R}^{\text{group\\_size} \times \text{size\\_n}}$ ，完整权重矩阵 $B$ 是所有分组块的拼接：
-
-$$
-B = \left[ B^1; B^2; \dots; B^{\text{num\\_groups}} \right] \in \mathbb{R}^{\text{size\\_k} \times \text{size\\_n}}
-$$
-
-矩阵乘法，激活矩阵与还原后权重矩阵执行矩阵乘法，得到输出：
-
-$$
-C = A \cdot B
-$$
-
-其中 $C \in \mathbb{R}^{\text{size\\_m} \times \text{size\\_n}}$ ，即算子的返回张量。
-
-### 参数说明
-
-- **a** (torch.Tensor, 入参): 输入激活张量，形状为[size_m, size_k]，需位于 CUDA 设备且为连续张量
-- **b_q_weight** (torch.Tensor, 入参): GPTQ 量化后的权重张量，形状需匹配量化 tile 尺寸要求，需位于 CUDA 设备且为连续张量
-- **b_scales** (torch.Tensor, 入参): 量化权重对应的缩放因子张量，形状与分组量化维度匹配，需位于 CUDA 设备且为连续张量
-- **g_idx** (torch.Tensor, 入参): 分组量化的索引张量，用于定位分组对应的量化参数，需位于 CUDA 设备且为连续张量
-- **perm** (torch.Tensor, 入参): 维度置换张量，用于权重/激活的维度调整，需位于 CUDA 设备且为连续张量
-- **workspace** (torch.Tensor, 入参): 临时工作空间张量，用于内核计算的临时存储，需满足最小尺寸要求
-- **num_bits** (int, 入参): 量化位数，仅支持 4 或 8 位
-- **size_m_tensor** (torch.Tensor, 入参): size_m 对应的张量形式，用于 CUDA 内核的参数传递
-- **size_m** (int, 入参): 输入张量 a 的行数（矩阵乘左矩阵的行数）
-- **size_n** (int, 入参): 输出张量的列数（矩阵乘右矩阵的列数）
-- **size_k** (int, 入参): 矩阵乘的公共维度（左矩阵的列数、右矩阵的行数）
-- **sms** (int, 入参): 用于 CUDA 内核计算的流多处理器（SM）数量
-- **is_k_full** (bool, 入参): 标志 size_k 是否为量化 tile 尺寸的完整倍数
-- **dtype** (torch.dtype, 入参, 默认 torch.bfloat16): 输出张量的数据类型，支持 bfloat16、float16
-- **use_atomic_cache** (bool, 入参, 默认 True): 是否启用原子缓存优化，提升内核计算效率
-
-### 返回值
-
-返回 torch.Tensor 类型的矩阵乘结果，形状为[size_m, size_n]，数据类型为指定的 dtype
-
-### 约束与调用
-
-- 所有输入张量必须位于 CUDA 设备上，且为连续张量
-- num_bits 仅支持 4 或 8 位量化
-- size_m 需满足小于 FULL_M_BLOCK 或能被 FULL_M_BLOCK 整除
-- 量化权重 b_q_weight 的形状需与 GPTQ 量化的 tile 尺寸匹配（如能被 tile_size 整除）
-- workspace 张量的尺寸需不小于要求的最小工作空间大小
-- 支持的数据类型：bfloat16、float16（half）
-
-### 调用示例
-
-```python
-import torch
-import mcoplib.op as op
-#设置设备
-device = "cuda"
-# 定义张量维度
-size_m = 4096  
-size_n = 4096  
-size_k = 4096  
-num_bits = 4 
-sms = -1      
-is_k_full = True 
-dtype = torch.bfloat16  
-# 创建输入张量a
-a = torch.randn(size_m, size_k, dtype=dtype, device=device).contiguous()
-pack_factor = 32 // num_bits
-b_q_weight = torch.randint(0, 2**num_bits, (size_n, size_k // pack_factor), dtype=torch.int32, device=device).contiguous()
-group_size = 128  
-b_scales = torch.randn(size_k // group_size, size_n, dtype=dtype, device=device).contiguous()
-g_idx = torch.arange(0, size_k, group_size, dtype=torch.int32, device=device).repeat_interleave(group_size)
-g_idx = g_idx[:size_k].contiguous()
-perm = torch.arange(size_k, dtype=torch.int32, device=device).contiguous()
-workspace_size = size_m * size_n // 1024  
-workspace = torch.empty(workspace_size, dtype=torch.int8, device=device).contiguous()
-size_m_tensor = torch.tensor([size_m], dtype=torch.int32, device=device)
-# 调用gptq_marlin_gemm算子
-output = op.gptq_marlin_gemm(
-    a=a,
-    b_q_weight=b_q_weight,
-    b_scales=b_scales,
-    g_idx=g_idx,
-    perm=perm,
-    workspace=workspace,
-    num_bits=num_bits,
-    size_m_tensor=size_m_tensor,
-    size_m=size_m,
-    size_n=size_n,
-    size_k=size_k,
-    sms=sms,
-    is_k_full=is_k_full,
-    dtype=dtype,
-    use_atomic_cache=True
-)
-print("gptq_marlin_gemm computation completed")
-print(f"Output shape: {output.shape}")
-```
-
-## 32. fused_moe_gate_deepseek
-
-### 支持的产品型号
-
-- 支持 CUDA 的 GPU 设备（如 NVIDIA A100、H100 等）
-
-### 接口原型
-
-```python
-def fused_moe_gate_deepseek(
-    gating_outputs: torch.Tensor,
-    correction_bias: torch.Tensor,
-    out_routing_weights: torch.Tensor,
-    out_selected_experts: torch.Tensor,
-    topk: int,
-    renormalize: bool,
-    num_expert_group: int,
-    topk_group: int,
-    num_fused_shared_experts: int,
-    scale_factor: float,
-    moegate_type: Optional[int] = None
-) -> None
-```
-
-### 功能描述
-
-fused_moe_gate_deepseek 是 DeepSeek 混合专家（MoE）模型的融合门控算子，集成了门控输出校正、TopK 专家选择、路由权重计算及重归一化等步骤。该算子通过融合 MoE 门控阶段的多个子操作，减少内存交互开销，提升大模型 MoE 层门控阶段的计算效率，是 MoE 模型推理中的核心门控计算组件。
-
-- 计算公式：
-	输入门控对数概率张量定义, 算子核心输入为 MoE 专家的门控对数概率张量，无额外残差输入：
-
-$$
-    \text{gate\\_logits}_{b,s,e} \in \mathbb{R}^{B \times S \times E}
-$$
-
-    其中： $B$ 为 batch size， $S$ 为序列长度， $E$ 为 MoE 结构的专家总数， $b \in [0, B-1], s \in [0, S-1], e \in [0, E-1]$ 。算子超参包含： $K$ 为激活专家数 $\text{top\\_k}$ （正整数， $K \ll E$ ）， $\epsilon$ 为数值稳定小量（ $\epsilon>0$ ，通常取 $10^{-6}$ ）。
-    逐 Token 筛选 Top-K 门控对数概率与专家索引, 对每个 Token（即每个 $(b, s)$ 位置），在专家维度 $E$ 上筛选出数值最大的 $K$ 个门控对数概率值，同时获取其对应的专家索引：
-
-$$
-    \begin{cases}
-    \text{topk\\_logits}_{b,s,k} = \text{TopK}(\text{gate\\_logits}_{b,s,:}, K) \\
-    \text{topk\\_indices}_{b,s,k} = \text{ArgTopK}(\text{gate\\_logits}_{b,s,:}, K)
-    \end{cases}
-$$
-
-    其中： $\text{topk\\_logits} \in \mathbb{R}^{B \times S \times K}$ ，为筛选后的 Top-K 门控对数概率； $\text{topk\\_indices} \in \mathbb{Z}^{B \times S \times K}$ ，为对应 Top-K 概率的专家编号（整数类型）， $k \in [0, K-1]$ 。
-    逐 Token 数值稳定的 Top-K Softmax 归一化, 为避免指数运算数值溢出，对每个 Token 的 Top-K 门控对数概率做去中心化处理后，执行 Softmax 计算，得到原始专家权重，同时加入稳定小量防止除零：
-
-$$
-    \begin{align}
-    \text{shifted\\_logits}_{b,s,k} &= \text{topk\\_logits}_{b,s,k} - \max_{k'=0}^{K-1}\text{topk\\_logits}_{b,s,k'} \\
-    \text{exp\\_logits}_{b,s,k} &= \exp(\text{shifted\\_logits}_{b,s,k}) \\
-    \text{raw\\_weights}_{b,s,k} &= \frac{\text{exp\\_logits}_{b,s,k}}{\sum_{k'=0}^{K-1}\text{exp\\_logits}_{b,s,k'} + \epsilon}
-    \end{align}
-$$
-
-    其中： $\text{raw\\_weights} \in \mathbb{R}^{B \times S \times K}$ ，为 Softmax 归一化后的原始专家权重，权重取值范围 $[0,1]$ ， $\exp (\cdot)$ 为自然指数函数， $\max (\cdot)$ 为取最大值函数。
-    逐 Token 门控权重归一化校准, 对原始专家权重做二次归一化，保证每个 Token 的激活专家权重之和严格为 1，是 DeepSeek-MoE 门控的核心融合逻辑，进一步提升数值稳定性：
-
-$$
-    \text{gate\\_weights}_{b,s,k} = \frac{\text{raw\\_weights}_{b,s,k}}{\sum_{k'=0}^{K-1}\text{raw\\_weights}_{b,s,k'} + \epsilon}
-$$
-
-    其中： $\text{gate\\_weights} \in \mathbb{R}^{B \times S \times K}$ ，为算子最终输出的专家门控权重，满足 $\sum_{k=0}^{K-1}\text{gate\\_weights}_{b, s, k} \approx 1$ 。
-    算子最终双输出, 该融合算子为**双输出张量**，无额外中间张量输出，最终输出为：
-
-$$
-    \text{outputs} = (\text{gate\\_weights}, \text{topk\\_indices})
-$$
-
-    其中：主输出 $\text{gate\\_weights}$ 为浮点型专家权重，用于后续 MoE 专家输出的加权融合；辅输出 $\text{topk\\_indices}$ 为整型专家索引，用于筛选激活的 MoE 专家计算结果。
-
-### 参数说明
-
-- **gating_outputs** (torch.Tensor, 入参): 门控网络的输出张量，形状通常为（B, num_experts）（B 为批大小，num_experts 为专家总数），支持数据类型为 float16/bfloat16
-- **correction_bias** (torch.Tensor, 入参): 门控输出的校正偏置张量，形状为（num_experts），支持数据类型为 float16/bfloat16
-- **out_routing_weights** (torch.Tensor, 出参): 输出的专家路由权重张量，形状为（B, num_selected_experts）（num_selected_experts 为单样本选中的专家数），数据类型为 float16/bfloat16
-- **out_selected_experts** (torch.Tensor, 出参): 输出的选中专家索引张量，形状为（B, num_selected_experts），数据类型为 int32
-- **topk** (int, 入参): 单样本全局选择的专家数量
-- **renormalize** (bool, 入参): 是否对路由权重执行重归一化的标志位
-- **num_expert_group** (int, 入参): 专家的分组数量
-- **topk_group** (int, 入参): 每个专家分组内选择的专家数量
-- **num_fused_shared_experts** (int, 入参): 融合的共享专家数量
-- **scale_factor** (float, 入参): 路由权重的缩放因子
-- **moegate_type** (Optional[int], 入参): MoE 门控类型标识，仅支持取值 0（DEEPSEEK）或 1（SOFTMAX）；默认值为 0
-
-### 返回值
-
-该算子无返回值，所有输出（路由权重、选中专家索引）均通过指定的出参张量（out_routing_weights、out_selected_experts）返回。
-
-### 约束与调用
-
-- 所有输入/出参张量必须部署在 CUDA 设备上
-- gating_outputs 的形状需与 correction_bias 的形状（num_experts）匹配，即 gating_outputs 最后一维为 num_experts
-- out_routing_weights、out_selected_experts 的形状需为（B, num_selected_experts），其中 num_selected_experts 由 topk、topk_group 等参数共同确定
-- 数据类型约束：gating_outputs、correction_bias 支持 float16/bfloat16；out_routing_weights 支持 float16/bfloat16；out_selected_experts 必须为 int32 类型
-- moegate_type 仅允许取值 0 或 1，传入其他值会触发参数校验错误
-- topk 的取值需符合逻辑约束（如 num_fused_shared_experts>0 时，topk 需为 0），具体以代码内的 TORCH_CHECK 校验规则为准
-- scale_factor 需为有效的浮点数值，用于路由权重的缩放计算
-
-### 调用示例
-
-```python
-import torch
-import mcoplib.op as op
-# 设置计算设备
-device = "cuda"
-# 1. 定义超参数 
-batch_size = 4
-seq_len = 1024
-num_tokens = batch_size * seq_len
-num_experts = 256    
-num_expert_group = 8      
-topk = 8                  
-topk_group = 3           
-num_shared_experts = 0    
-moegate_type = 0     
-# 2. 创建输入张量
-gating_outputs = torch.randn(
-    num_tokens, num_experts,
-    dtype=torch.float16,
-    device=device,
-    requires_grad=True
-)
-# correction_bias: [num_experts], 用于修正 gating 的偏置
-correction_bias = torch.zeros(
-    num_experts,
-    dtype=torch.float16,
-    device=device
-)
-# 3. 预分配输出张量 (根据 C++ 签名，需要传入 output buffer)
-out_routing_weights = torch.empty(
-    num_tokens, topk,
-    dtype=torch.float32,
-    device=device
-)
-# out_selected_experts: [tokens, topk], 索引必须是 int32
-out_selected_experts = torch.empty(
-    num_tokens, topk,
-    dtype=torch.int32,
-    device=device
-)
-# 其他标量参数
-renormalize = True
-scale_factor = 1.0 # 缩放因子，moegate_type=0 时通常配合使用
-# 4. 调用算子
-op.fused_moe_gate_deepseek(
-    gating_outputs,         # 输入：门控分数
-    correction_bias,        # 输入：偏置
-    out_routing_weights,    # 输出：路由权重 (In-place 修改)
-    out_selected_experts,   # 输出：选中专家索引 (In-place 修改)
-    topk,                   # int: TopK 数量
-    renormalize,            # bool: 是否重新归一化
-    num_expert_group,       # int: 专家组数
-    topk_group,             # int: 组内 TopK
-    num_shared_experts,     # int: 共享专家数
-    scale_factor,           # float: 缩放因子
-    moegate_type            # int: Gate 类型 (0=DeepSeek)
-)
-print("fused_moe_gate_deepseek computation completed")
-print(f"Input shape: {gating_outputs.shape}")
-print(f"Output Weights shape: {out_routing_weights.shape}, dtype: {out_routing_weights.dtype}")
-print(f"Output Indices shape: {out_selected_experts.shape}, dtype: {out_selected_experts.dtype}")
-# 结果验证
-print(f"\nExample output (first token):")
-print(f"Selected Experts: {out_selected_experts[0].tolist()}")
-print(f"Routing Weights: {out_routing_weights[0].tolist()}")
-```
-
-## 33. get_cuda_view_from_cpu_tensor
+## 2. get_cuda_view_from_cpu_tensor
 
 ### 支持的产品型号
 
@@ -3912,7 +259,7 @@ if torch.cuda.is_available():
 print(f"Modified CPU Value[0]: {cpu_tensor[0].item():.4f}")
 ```
 
-## 34. paged_attention_v1
+## 3. paged_attention_v1
 
 ### 支持的产品型号
 
@@ -4115,7 +462,7 @@ print("执行成功。")
 print(f"Output Mean: {output.mean().item():.4f}")
 ```
 
-## 35. paged_attention_v2
+## 4. paged_attention_v2
 
 ### 支持的产品型号
 
@@ -4335,7 +682,7 @@ print("执行成功。")
 print(f"Output Mean: {output.mean().item():.4f}")
 ```
 
-## 36. merge_attn_states
+## 5. merge_attn_states
 
 ### 支持的产品型号
 
@@ -4358,7 +705,7 @@ def merge_attn_states(
 ### 功能描述
 
 merge_attn_states 算子实现了 Split-KV（KV 分离）场景下的注意力结果合并逻辑，具体参考了 arXiv: 2501.01005 论文的第 2.2 节。在分块预填充（Chunked Prefill）或混合注意力机制中，该算子用于将前缀（prefix）和后缀（suffix）的局部注意力结果基于其 Log-Sum-Exp (LSE) 值进行加权归约，生成最终的注意力输出。
-该算子通过 CUDA 核心 `merge_attn_states_kernel` 并行执行，利用 128 位向量化加载（Vectorized Load）技术优化内存访问效率。
+该算子通过 CUDA 核函数 `merge_attn_states_kernel` 并行执行，利用 128 位向量化加载（Vectorized Load）技术优化内存访问效率。
 
 - 计算公式：
 	算子通过比较前缀和后缀的 LSE 值来计算归一化权重，并据此融合输出状态。
@@ -4471,306 +818,7 @@ print(f"Output Mean: {output.mean().item():.4f}")
 print(f"Output LSE Mean: {output_lse.mean().item():.4f}")
 ```
 
-## 37. convert_vertical_slash_indexes
-
-### 支持的产品型号
-
-- Metax C500/C550
-
-### 接口原型
-
-```C++
-def convert_vertical_slash_indexes(
-    block_count: torch.Tensor,
-    block_offset: torch.Tensor,
-    column_count: torch.Tensor,
-    column_index: torch.Tensor,
-    q_seqlens: torch.Tensor,
-    kv_seqlens: torch.Tensor,
-    vertical_indexes: torch.Tensor,
-    slash_indexes: torch.Tensor,
-    context_size: int,
-    block_size_M: int,
-    block_size_N: int,
-    causal: bool
-) -> None:
-    pass
-```
-
-### 功能描述
-
-convert_vertical_slash_indexes 算子用于将稀疏注意力机制中的垂直索引和斜线索引转换为适用于块稀疏计算的索引格式。
-该算子在 GPU 上并行处理每个注意力头和查询块，读取预先计算好的垂直模式索引（代表全局重要 Token）和斜线模式索引（代表局部滑动窗口），并将它们合并映射为物理内存中的块偏移量和独立的列索引。
-在计算过程中，算子会根据输入的查询序列长度和键值序列长度动态调整处理范围，同时通过因果参数控制是否应用因果掩码，确保注意力计算不越过当前时间步。对于每个查询块，算法首先确定斜线索引覆盖的 KV 块范围，然后遍历垂直索引，将落在斜线范围内的垂直点合并处理，将范围外的独立垂直点记录为列索引，最终输出每一行对应的有效块数量、块偏移列表以及独立列数量和列索引列表，从而加速后续的块稀疏注意力计算。
-
-- 计算逻辑涉及根据斜线索引 $S_{idx}$ 确定覆盖范围：
-
-$$
-\text{range\\_start} = S_{idx} - \text{BLOCK\\_SIZE\\_M}
-$$
-
-
-
-$$
-\text{range\\_end} = S_{idx}
-$$
-
-其中 $S_{idx}$ 会根据因果关系 causal 进行调整。
-若开启因果掩码，则需确保索引满足 
-
-$$
-S_{idx} \le \text{end\\_m} + (\text{kv\\_seqlen} - \text{q\\_seqlen})
-$$
-
-任何超出该范围的索引将被截断或忽略，从而保证注意力机制只关注到合法的历史信息。
-**主要功能包括：**
-
-- 稀疏索引格式转换：将预计算的垂直模式索引（全局重要 Token）和斜线模式索引（局部滑动窗口）高效映射为适用于块稀疏计算的物理内存块偏移 (`block_offset`) 和独立列索引 (`column_index`)。
-- 动态范围合并与分离：依据块大小 (`block_size_M/N`) 计算斜线索引覆盖范围，自动将落在范围内的垂直点合并处理，并将范围外的垂直点分离为独立列索引，优化后续内存访问。
-- 因果掩码与边界控制：结合动态序列长度 (`q_seqlens`/`kv_seqlens`) 与因果参数 (`causal`)，严格执行 $S_{idx}$ 边界截断逻辑，确保注意力机制不包含非法的前瞻性信息。
-- 并行加速预处理：利用 GPU 并行计算各注意力头及查询块的有效块数量 (`block_count`) 与偏移，通过预先剔除无效块，显著提升后续稀疏 Attention 算子的计算效率。
-
-### 参数说明
-
-- **block_count** (torch.Tensor, 出参): 形状为 `[BATCH, N_HEADS, NUM_ROWS]`，存储每行（Query Block）包含的有效 KV 块数量。
-- **block_offset** (torch.Tensor, 出参): 形状为 `[BATCH, N_HEADS, NUM_ROWS, NNZ_S]`，存储每行对应的有效 KV 块起始索引。
-- **column_count** (torch.Tensor, 出参): 形状为 `[BATCH, N_HEADS, NUM_ROWS]`，存储每行包含的独立垂直列数量。
-- **column_index** (torch.Tensor, 出参): 形状为 `[BATCH, N_HEADS, NUM_ROWS, NNZ_V]`，存储每行对应的独立垂直列索引。
-- **q_seqlens** (torch.Tensor, 入参): 形状为 `[BATCH]`，当前批次中每个样本的 Query 序列长度。
-- **kv_seqlens** (torch.Tensor, 入参): 形状为 `[BATCH]`，当前批次中每个样本的 KV 序列长度。
-- **vertical_indexes** (torch.Tensor, 入参): 形状为 `[BATCH, N_HEADS, NNZ_V]`，预计算的垂直模式索引。
-- **slash_indexes** (torch.Tensor, 入参): 形状为 `[BATCH, N_HEADS, NNZ_S]`，预计算的斜线模式索引。
-- **context_size** (int, 入参): 上下文窗口大小，用于确定总行数。
-- **block_size_M** (int, 入参): Query 维度的块大小。
-- **block_size_N** (int, 入参): KV 维度的块大小。
-- **causal** (bool, 入参): 是否应用因果掩码，True 表示因果注意力，False 表示双向注意力。
-
-### 返回值
-
-无返回值，计算结果直接写入 `block_count`, `block_offset`, `column_count`, `column_index` 张量中。
-
-### 约束与调用
-
-- 所有输入张量必须位于 CUDA 设备上。
-- 输入索引张量的数据类型必须为 `int32`。
-- `NUM_ROWS` 必须等于 `(context_size + block_size_M - 1) / block_size_M`。
-- `NNZ_V` 和 `NNZ_S` 为输入索引张量的最后一维，表示最大的保留稀疏点数。
-- 线程块配置固定为 64 线程，Grid 维度由 Batch、Heads 和 Rows 决定。
-
-### 调用示例
-
-```python
-import torch
-import random
-import mcoplib._C
-# 配置参数
-SEED = 0
-DEVICE = "cuda"
-# 维度设置
-BATCH_SIZE = 2
-NUM_HEADS = 8
-CONTEXT_SIZE = 1024
-BLOCK_SIZE_M = 64
-BLOCK_SIZE_N = 64
-NNZ_V = 32
-NNZ_S = 16
-NUM_ROWS = (CONTEXT_SIZE + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M
-# 初始化环境
-torch.manual_seed(SEED)
-random.seed(SEED)
-torch.set_default_device(DEVICE)
-# ================= 数据准备 =================
-# 1. 创建输入 Tensor
-q_seqlens = torch.randint(1, CONTEXT_SIZE, (BATCH_SIZE,), dtype=torch.int32)
-kv_seqlens = torch.randint(1, CONTEXT_SIZE, (BATCH_SIZE,), dtype=torch.int32)
-# 索引必须有序
-vertical_indexes, _ = torch.sort(torch.randint(0, CONTEXT_SIZE, (BATCH_SIZE, NUM_HEADS, NNZ_V), dtype=torch.int32), dim=-1)
-slash_indexes, _ = torch.sort(torch.randint(0, CONTEXT_SIZE, (BATCH_SIZE, NUM_HEADS, NNZ_S), dtype=torch.int32), dim=-1)
-# 2. 创建输出 Tensor
-block_count = torch.zeros(BATCH_SIZE, NUM_HEADS, NUM_ROWS, dtype=torch.int32)
-block_offset = torch.zeros(BATCH_SIZE, NUM_HEADS, NUM_ROWS, NNZ_S, dtype=torch.int32)
-column_count = torch.zeros(BATCH_SIZE, NUM_HEADS, NUM_ROWS, dtype=torch.int32)
-column_index = torch.zeros(BATCH_SIZE, NUM_HEADS, NUM_ROWS, NNZ_V, dtype=torch.int32)
-# 标量参数
-causal = True
-# ================= 算子执行 =================
-print(f"Running convert_vertical_slash_indexes...")
-print(f"Shapes - Vertical: {vertical_indexes.shape}, Slash: {slash_indexes.shape}")
-if torch.cuda.is_available():
-    torch.cuda.synchronize()
-torch.ops._C.convert_vertical_slash_indexes(
-    block_count,
-    block_offset,
-    column_count,
-    column_index,
-    q_seqlens,
-    kv_seqlens,
-    vertical_indexes,
-    slash_indexes,
-    CONTEXT_SIZE,
-    BLOCK_SIZE_M,
-    BLOCK_SIZE_N,
-    causal
-)
-if torch.cuda.is_available():
-    torch.cuda.synchronize()
-print("执行成功。")
-print(f"Block Count Mean: {block_count.float().mean().item():.4f}")
-print(f"Column Count Mean: {column_count.float().mean().item():.4f}")
-```
-
-## 38. convert_vertical_slash_indexes_mergehead
-
-### 支持的产品型号
-
-- Metax C500/C550
-
-### 接口原型
-
-```C++
-def convert_vertical_slash_indexes_mergehead(
-    block_count: torch.Tensor,
-    block_offset: torch.Tensor,
-    column_count: torch.Tensor,
-    column_index: torch.Tensor,
-    q_seqlens: torch.Tensor,
-    kv_seqlens: torch.Tensor,
-    vertical_indexes: torch.Tensor,
-    slash_indexes: torch.Tensor,
-    vertical_indices_count: torch.Tensor,
-    slash_indices_count: torch.Tensor,
-    context_size: int,
-    block_size_M: int,
-    block_size_N: int,
-    causal: bool
-) -> None:
-    pass
-```
-
-### 功能描述
-
-convert_vertical_slash_indexes_mergehead 算子实现了 MInference 稀疏注意力机制中索引转换的核心步骤（对应论文 Algorithm 4）。该算子负责将稀疏模式中的“垂直线（Vertical）”和“斜线（Slash）”索引转换为用于实际计算的块偏移量（block_offset）和列索引（column_index）。
-与标准版本不同，此 mergehead 版本支持每头（Per-Head）动态的 TopK 配置。它通过 vertical_indices_count 和 slash_indices_count 参数为每个注意力头独立指定有效的索引数量，而不是所有头使用统一的固定 NNZ（非零元素数量）。这允许在多头注意力中根据不同头的稀疏模式特征灵活分配计算资源。
-
-- 索引转换逻辑：
-	算子遍历每个查询块（Q Block），根据 slash_indexes 确定的斜线位置生成连续的 KV 块范围，并将这些范围存储在 block_offset 中；同时，根据 vertical_indexes 确定的垂直线位置生成离散的列索引，存储在 column_index 中。
-- 动态 TopK 机制：
-	在内核执行时，虽然输入张量 vertical_indexes 和 slash_indexes 的物理尺寸由最大缓冲大小 NNZ_V 和 NNZ_S 决定，但实际参与计算的有效索引数量由 per_head_vertical_topkv（对应 vertical_indices_count）和 per_head_slash_topkv（对应 slash_indices_count）控制：
-
-$$
-    \text{Effective\\_NNZ}_V[h] = \text{vertical\\_indices\\_count}[h]
-$$
-
-
-
-$$
-    \text{Effective\\_NNZ}_S[h] = \text{slash\\_indices\\_count}[h]
-$$
-
-    内核循环仅在 0 到 Effective_NNZ 的范围内读取索引，从而实现变长的稀疏模式处理。
-
-- 块与列的计数：
-	算子同时计算并填充 block_count 和 column_count 张量，记录每个 Q 块对应的有效 KV 块数量和离散列数量，供后续的注意力计算内核（如 paged_attention 或类似的稀疏注意力内核）使用，以跳过无效的计算区域。
-	**主要功能包括：**
-- 将垂直和斜线形式的稀疏索引转换为块稀疏（Block-Sparse）格式。
-- 支持 Causal（因果）和 Non-Causal 注意力掩码模式。
-- 支持每头独立的稀疏度配置（MergeHead），允许不同头拥有不同数量的垂直线和斜线索引。
-- 自动处理边界条件，将超出范围的索引截断或转换为填充块。
-- 并行化处理：以 `(N_HEADS, BATCH_SIZE)` 为 Grid，并在 Row 维度上进行线程块划分，利用 GPU 高效执行。
-
-### 参数说明
-
-- **block_count** (torch.Tensor, 出参): 存储每个 Q 块对应的 KV 块数量，形状为 `[BATCH, N_HEADS, NUM_ROWS]`，数据类型需为 int32
-- **block_offset** (torch.Tensor, 出参): 存储斜线模式转换后的 KV 块偏移索引，形状为 `[BATCH, N_HEADS, NUM_ROWS, NNZ_S]`，数据类型需为 int32
-- **column_count** (torch.Tensor, 出参): 存储每个 Q 块对应的离散列数量，形状为 `[BATCH, N_HEADS, NUM_ROWS]`，数据类型需为 int32
-- **column_index** (torch.Tensor, 出参): 存储垂直线模式转换后的离散列索引，形状为 `[BATCH, N_HEADS, NUM_ROWS, NNZ_V]`，数据类型需为 int32
-- **q_seqlens** (torch.Tensor, 入参): 查询序列长度，形状为 `[BATCH]`，数据类型需为 int32
-- **kv_seqlens** (torch.Tensor, 入参): 键值序列长度，形状为 `[BATCH]`，数据类型需为 int32
-- **vertical_indexes** (torch.Tensor, 入参): 垂直线索引，形状为 `[BATCH, N_HEADS, NNZ_V]`，数据类型需为 int32
-- **slash_indexes** (torch.Tensor, 入参): 斜线索引，形状为 `[BATCH, N_HEADS, NNZ_S]`，数据类型需为 int32
-- **vertical_indices_count** (torch.Tensor, 入参): 每个头的有效垂直线索引数量，形状为 `[N_HEADS]`，数据类型需为 int32
-- **slash_indices_count** (torch.Tensor, 入参): 每个头的有效斜线索引数量，形状为 `[N_HEADS]`，数据类型需为 int32
-- **context_size** (int, 入参): 上下文窗口大小，用于计算 `NUM_ROWS`
-- **block_size_M** (int, 入参): Q 维度的块大小（通常为 64）
-- **block_size_N** (int, 入参): KV 维度的块大小（通常为 64）
-- **causal** (bool, 入参): 是否应用因果掩码（True 为 Intra-Attention，False 为 Successor/Encoder-Decoder Attention）
-
-### 返回值
-
-无返回值，计算结果直接写入输出张量 `block_count`, `block_offset`, `column_count`, `column_index` 中
-
-### 约束与调用
-
-- 所有输入 Tensor 必须位于 CUDA 设备上
-- 所有索引相关的 Tensor（包括 count, offset, index）数据类型必须为 `torch.int32` (`int`)
-- `vertical_indexes` 和 `slash_indexes` 的最后一维大小决定了内核中的 `NNZ_V` 和 `NNZ_S` 缓冲区大小，但实际读取量由 `*_indices_count` 控制
-- `block_count` 等输出张量的 `NUM_ROWS` 维度必须等于 `(context_size + block_size_M - 1) // block_size_M`
-- `q_seqlens` 和 `kv_seqlens` 的 batch 维度必须与输入索引张量的 batch 维度一致
-- `vertical_indices_count` 和 `slash_indices_count` 的长度必须等于 `N_HEADS`
-
-### 调用示例
-
-```Python
-import torch
-import mcoplib._C
-# 配置参数
-BATCH_SIZE = 1
-N_HEADS = 4
-CONTEXT_SIZE = 128
-BLOCK_SIZE_M = 64
-BLOCK_SIZE_N = 64
-NNZ_V = 8  # 垂直索引缓冲区大小
-NNZ_S = 8  # 斜线索引缓冲区大小
-DEVICE = "cuda"
-# 计算行数
-NUM_ROWS = (CONTEXT_SIZE + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M
-# 初始化环境
-torch.set_default_device(DEVICE)
-# ================= 数据准备 =================
-# 序列长度
-q_seqlens = torch.tensor([CONTEXT_SIZE] * BATCH_SIZE, dtype=torch.int32)
-kv_seqlens = torch.tensor([CONTEXT_SIZE] * BATCH_SIZE, dtype=torch.int32)
-# 模拟输入的稀疏索引 (Batch, Heads, NNZ)
-vertical_indexes = torch.randint(0, CONTEXT_SIZE, (BATCH_SIZE, N_HEADS, NNZ_V), dtype=torch.int32)
-slash_indexes = torch.randint(0, CONTEXT_SIZE, (BATCH_SIZE, N_HEADS, NNZ_S), dtype=torch.int32)
-# 关键：每头的动态 TopK 计数
-# 假设 Head 0 使用 2 个垂直索引，Head 1 使用 5 个，以此类推
-vertical_indices_count = torch.randint(1, NNZ_V + 1, (N_HEADS,), dtype=torch.int32)
-slash_indices_count = torch.randint(1, NNZ_S + 1, (N_HEADS,), dtype=torch.int32)
-# 分配输出张量
-block_count = torch.zeros((BATCH_SIZE, N_HEADS, NUM_ROWS), dtype=torch.int32)
-column_count = torch.zeros((BATCH_SIZE, N_HEADS, NUM_ROWS), dtype=torch.int32)
-block_offset = torch.zeros((BATCH_SIZE, N_HEADS, NUM_ROWS, NNZ_S), dtype=torch.int32)
-column_index = torch.zeros((BATCH_SIZE, N_HEADS, NUM_ROWS, NNZ_V), dtype=torch.int32)
-causal = True
-# ================= 算子执行 =================
-print(f"Running convert_vertical_slash_indexes_mergehead...")
-if torch.cuda.is_available():
-    torch.cuda.synchronize()
-torch.ops._C.convert_vertical_slash_indexes_mergehead(
-    block_count,
-    block_offset,
-    column_count,
-    column_index,
-    q_seqlens,
-    kv_seqlens,
-    vertical_indexes,
-    slash_indexes,
-    vertical_indices_count,
-    slash_indices_count,
-    CONTEXT_SIZE,
-    BLOCK_SIZE_M,
-    BLOCK_SIZE_N,
-    causal
-)
-if torch.cuda.is_available():
-    torch.cuda.synchronize()
-print("执行成功。")
-print(f"Block Count Max: {block_count.max().item()}")
-print(f"Column Count Max: {column_count.max().item()}")
-```
-
-## 39. silu_and_mul
+## 6. silu_and_mul
 
 ### 支持的产品型号
 
@@ -4871,7 +919,7 @@ expected = torch.nn.functional.silu(x) * y
 print(f"Output Mean: {output_tensor.mean().item():.4f}")
 ```
 
-## 40. silu_and_mul_quant
+## 7. silu_and_mul_quant
 
 ### 支持的产品型号
 
@@ -4974,9 +1022,7 @@ print("执行成功。")
 print(f"Output Mean (cast to float): {output.float().mean().item():.4f}")
 ```
 
-
-
-## 41. mul_and_silu
+## 8. mul_and_silu
 
 ### 支持的产品型号
 
@@ -5089,7 +1135,7 @@ diff = (output_tensor.float() - expected).abs().max()
 print(f"Max Difference: {diff.item():.6f}")
 ```
 
-## 42. gelu_and_mul
+## 9. gelu_and_mul
 
 ### 支持的产品型号
 
@@ -5201,7 +1247,7 @@ diff = (output_tensor - expected).abs().max()
 print(f"Max difference: {diff.item():.6f}")
 ```
 
-## 43. gelu_tanh_and_mul
+## 10. gelu_tanh_and_mul
 
 ### 支持的产品型号
 
@@ -5302,7 +1348,7 @@ print("执行成功。")
 print(f"Output Mean: {output.mean().item():.4f}")
 ```
 
-## 44. fatrelu_and_mul
+## 11. fatrelu_and_mul
 
 ### 支持的产品型号
 
@@ -5417,7 +1463,7 @@ print(f"Max Diff: {diff.item():.6f}")
 print(f"Output Mean: {output.mean().item():.4f}")
 ```
 
-## 45. swigluoai_and_mul
+## 12. swigluoai_and_mul
 
 ### 支持的产品型号
 
@@ -5549,7 +1595,7 @@ print("执行成功。")
 print(f"Output Mean: {output_tensor.mean().item():.4f}")
 ```
 
-## 46. gelu_new
+## 13. gelu_new
 
 ### 支持的产品型号
 
@@ -5587,7 +1633,7 @@ $$
 	算子使用 element-wise（逐元素）方式并行处理数据。通过 activation_kernel 模板和 LAUNCH_ACTIVATION_KERNEL 宏，算子能够自动处理 CUDA 网格（Grid）和块（Block）的维度配置，并支持通过 VLLM_DISPATCH_FLOATING_TYPES 分发多种浮点数据类型。
 	**主要功能包括：**
 - 基于 Tanh 近似的 New GeLU 实现：采用多项式拟合 ($x + 0.044715 x^3$) 结合双曲正切函数 ($\tanh$) 替代标准误差函数，在保持激活精度的同时大幅降低计算开销。
-- 高效的逐元素并行计算：利用 CUDA 核心执行 Element-wise 并行处理，通过 `LAUNCH_ACTIVATION_KERNEL` 宏自动管理网格与线程块配置，实现高吞吐量的激活运算。
+- 高效的逐元素并行计算：利用 CUDA 核函数执行 Element-wise 并行处理，通过 `LAUNCH_ACTIVATION_KERNEL` 宏自动管理网格与线程块配置，实现高吞吐量的激活运算。
 - 多精度数据类型动态分发：借助 `VLLM_DISPATCH_FLOATING_TYPES` 机制，原生支持 FP16、BF16 和 FP32 数据类型，灵活适配不同混合精度模型的推理需求。
 - 精确的数学常数定义：内置 $\sqrt{2/\pi}$ 的高精度近似值 ($0.79788456$)，严格遵循 GeLU 理论公式进行前向计算，保证数值输出的稳定性与准确性。
 
@@ -5643,7 +1689,7 @@ print("执行成功。")
 print(f"Output Mean: {output_tensor.mean().item():.4f}")
 ```
 
-## 47. gelu_fast
+## 14. gelu_fast
 
 ### 支持的产品型号
 
@@ -5677,7 +1723,7 @@ $$
 - $0.044715$ 是用于拟合误差函数的常数系数
 	**主要功能包括：**
 - 对输入张量进行元素级的 GELU 激活计算。
-- 利用 CUDA 架构进行高度并行的浮点运算。
+- 利用 GPU 架构进行高度并行的浮点运算。
 - 支持多种浮点数据类型（FP16, BF16, FP32），通过 `VLLM_DISPATCH_FLOATING_TYPES` 宏进行自动分发。
 - 直接在 GPU 上操作，无需数据回传主机。
 
@@ -5737,7 +1783,7 @@ diff = (output_tensor - ref_output).abs().max()
 print(f"Max difference from torch.nn.functional.gelu(tanh): {diff.item():.6e}")
 ```
 
-## 48. gelu_quick
+## 15. gelu_quick
 
 ### 支持的产品型号
 
@@ -5828,7 +1874,7 @@ print(f"Input Mean: {input_tensor.mean().item():.4f}")
 print(f"Output Mean: {output_tensor.mean().item():.4f}")
 ```
 
-## 49. fused_add_rms_norm
+## 16. fused_add_rms_norm
 
 ### 支持的产品型号
 
@@ -5849,7 +1895,7 @@ def fused_add_rms_norm(
 ### 功能描述
 
 fused_add_rms_norm 算子实现了残差连接相加与 Root Mean Square Layer Normalization (RMS Norm) 的融合操作。该算子是 vLLM 及现代 Transformer 架构中用于加速层归一化计算的关键组件。它将输入的特征张量与残差张量相加，更新残差，并对相加后的结果进行 RMS 归一化。
-此实现针对 GPU 内存延迟进行了优化，特别是在处理 FP16/BF16 数据类型时，通过向量化读写（Vectorized Load/Store）减少全局内存访问次数。算子内部使用 cub:: BlockReduce 进行高效的并行归约计算。
+此实现针对 GPU 内存延迟进行了优化，特别是在处理 FP16/BF16 数据类型时，通过向量化读写（Vectorized Load/Store）减少全局内存访问次数。算子内部使用块级归约（BlockReduce）进行高效的并行归约计算。
 
 - 计算逻辑与公式：
 	算子按顺序执行以下步骤：
@@ -5902,7 +1948,7 @@ $$
 - 原地更新（In-place Update）：直接修改传入的 `input` 张量存储归一化结果，修改 `residual` 张量存储相加后的非归一化结果。
 - 向量化优化：针对 `float16` 和 `bfloat16` 类型，当数据地址对齐（16 字节）且维度满足条件时，自动启用 8 元素宽度的向量化加载和存储（128 位），大幅提升内存吞吐量。
 - 通用性支持：对于不满足向量化条件的场景或 float32 类型，回退到通用的 CUDA 实现，确保功能正确性。
-- 高并发设计：根据 `num_tokens` 动态调整 Block Size（256 或 1024），在处理长序列或大 Batch 时最大化 SM 占用率。
+- 高并发设计：根据 `num_tokens` 动态调整 Block Size（256 或 1024），在处理长序列或大 Batch 时最大化计算单元占用率。
 
 ### 参数说明
 
@@ -5976,7 +2022,7 @@ rms_value = torch.sqrt(input_tensor.pow(2).mean(dim=-1) + EPSILON)
 print(f"Output RMS mean (should be approx 1.0): {rms_value.mean().item():.4f}")
 ```
 
-## 50. apply_repetition_penalties_
+## 17. apply_repetition_penalties_
 
 ### 支持的产品型号
 
@@ -6086,7 +2132,7 @@ print("执行成功。")
 print(f"Sample logit after (Sequence 0, Token 100): {logits[0, 100].item():.4f}")
 ```
 
-## 51. rms_norm_static_fp8_quant
+## 18. rms_norm_static_fp8_quant
 
 ### 支持的产品型号
 
@@ -6163,7 +2209,7 @@ $$
 - `input` 和 `weight` 的数据类型必须一致（通常为 FP16 或 BF16）
 - `scale` 必须是一个包含单个浮点数的 Tensor
 - 算子内部会根据 `input` 的数据类型和 `out` 的 FP8 具体类型（如 E4M3 或 E5M2）进行模板分发
-- 针对大 Token 数场景（`num_tokens`），算子会自动调整 Grid 和 Block 大小以优化 SM 占用率
+- 针对大 Token 数场景（`num_tokens`），算子会自动调整 Grid 和 Block 大小以优化计算单元占用率
 
 ### 调用示例
 
@@ -6211,7 +2257,7 @@ print("执行成功。")
 print(f"Output non-zero count: {out.count_nonzero().item()}")
 ```
 
-## 52. fused_add_rms_norm_static_fp8_quant
+## 19. fused_add_rms_norm_static_fp8_quant
 
 ### 支持的产品型号
 
@@ -6333,7 +2379,7 @@ print(f"Output type: {out_tensor.dtype}")
 print(f"Output shape: {out_tensor.shape}")
 ```
 
-## 53. batched_rotary_embedding
+## 20. batched_rotary_embedding
 
 ### 支持的产品型号
 
@@ -6477,7 +2523,7 @@ print("执行成功。")
 print(f"Query Output Mean: {query.mean().item():.4f}")
 ```
 
-## 54. awq_gemm
+## 21. awq_gemm
 
 ### 支持的产品型号
 
@@ -6601,7 +2647,7 @@ print(f"Output Shape: {output.shape}")
 print(f"Output Mean: {output.mean().item():.4f}")
 ```
 
-## 55. awq_dequantize
+## 22. awq_dequantize
 
 ### 支持的产品型号
 
@@ -6719,7 +2765,7 @@ print("执行成功。")
 print(f"Output Mean: {output.mean().item():.4f}")
 ```
 
-## 56. awq_to_gptq_4bit
+## 23. awq_to_gptq_4bit
 
 ### 支持的产品型号
 
@@ -6837,7 +2883,7 @@ print("执行成功。")
 print(f"Output shape: {output.shape}")
 ```
 
-## 57. custom_all_gather
+## 24. custom_all_gather
 
 ### 支持的产品型号
 
@@ -6937,9 +2983,7 @@ print(f"out shape: {out.shape}, dtype: {out.dtype}")
 print(f"reg_buffer_sz_bytes: {reg_buffer_sz_bytes}")
 ```
 
-
-
-## 58. custom_reduce_scatter
+## 25. custom_reduce_scatter
 
 ### 支持的产品型号
 
@@ -7046,9 +3090,7 @@ print(f"reg_buffer_sz_bytes: {reg_buffer_sz_bytes}")
 
 ### 
 
-
-
-## 59. dsv3_fused_a_gemm
+## 26. dsv3_fused_a_gemm
 
 ### 支持的产品型号
 
@@ -7133,9 +3175,7 @@ output = torch.empty((N_token, hd_out), dtype=torch.bfloat16, device="cuda")
 torch.ops.custom.dsv3_fused_a_gemm(output, mat_a, mat_b, enable_pdl=False)
 ```
 
-
-
-## 60. dsv3_router_gemm
+## 27. dsv3_router_gemm
 
 ### 支持的产品型号
 
@@ -7226,11 +3266,7 @@ ref = (mat_a.float() @ mat_b.float().t())
 print(f"max abs diff vs reference: {(output - ref).abs().max().item():.4f}")
 ```
 
-
-
-
-
-## 61. fp32_router_gemm
+## 28. fp32_router_gemm
 
 ### 支持的产品型号
 
@@ -7299,9 +3335,7 @@ output = torch.empty((num_tokens, num_experts), dtype=torch.float32, device="cud
 torch.ops.custom.fp32_router_gemm(output, mat_a, mat_b)
 ```
 
-
-
-## 62. fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert
+## 29. fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert
 
 ### 支持的产品型号
 
@@ -7455,9 +3489,7 @@ print(f"k_cache shape: {k_cache.shape}, dtype: {k_cache.dtype}")
 print(f"num_tokens_full={num_tokens_full}, num_tokens_insert={num_tokens_insert}")
 ```
 
-
-
-## 63. fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert
+## 30. fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert
 
 ### 支持的产品型号
 
@@ -7642,9 +3674,7 @@ print(f"k_cache shape: {k_cache.shape}, dtype: {k_cache.dtype}")
 print(f"num_tokens_full={num_tokens_full}, num_tokens_insert={num_tokens_insert}")
 ```
 
-
-
-## 64. fused_deepseek_v4_qnorm_rope_kv_rope_insert
+## 31. fused_deepseek_v4_qnorm_rope_kv_rope_insert
 
 ### 支持的产品型号
 
@@ -7835,9 +3865,7 @@ print(f"First slot -> block/offset: "
 - Q-Norm 覆盖每个头的全部 512 维（含 RoPE 尾部）， RoPE 仅作用于尾部 64 维，两者顺序为先归一化后旋转
 - num_tokens_insert < N 的典型场景：chunked prefill 中部分 token 已被 prefix cache 命中，仅新 token 需要写入 KV 缓存
 
-
-
-## 65. fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert
+## 32. fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert
 
 ### 支持的产品型号
 
@@ -8050,9 +4078,7 @@ print(f"KV cache shape: {k_cache.shape}, dtype: {k_cache.dtype}")
 - `slot_mapping` 长度小于 `q_in.size(0)` 的场景（DP padding）：Q-Norm+RoPE 仍对全部 N 行执行（下游 attention 需要完整 Q），KV quant+insert 仅处理前 `slot_mapping.size(0)` 行
 - kernel 会写满 `q_out` 的每个元素（真实头写 Norm+RoPE 结果、padding 头写零），因此输出张量使用 `torch::empty` 分配即可，无需预清零
 
-
-
-## 66. gptq_gemm
+## 33. gptq_gemm
 
 ### 支持的产品型号
 
@@ -8177,7 +4203,7 @@ if torch.cuda.is_available():
 print(f"执行成功。Output Shape: {output.shape}")
 ```
 
-## 67. gptq_shuffle
+## 34. gptq_shuffle
 
 ### 支持的产品型号
 
@@ -8286,7 +4312,7 @@ if torch.cuda.is_available():
 print("执行成功。")
 ```
 
-## 68. static_scaled_fp8_quant
+## 35. static_scaled_fp8_quant
 
 ### 支持的产品型号
 
@@ -8340,7 +4366,7 @@ $$
 - 所有输入张量必须位于 CUDA 设备上
 - 输入 `input` 必须是 2 维张量 (`ndim == 2`)
 - `scale` 张量的元素个数必须为 1 (`scale.numel () == 1`)
-- `output` 张量的数据类型必须符合当前平台的 FP8 标准（例如 NVIDIA GPU 上通常为 `torch.float8_e4m3fn`，ROCm MI300 上可能为 `torch.float8_e4m3fnuz`）
+- `output` 张量的数据类型必须符合当前平台的 FP8 标准
 - 内存布局要求：建议输入张量是连续存储的
 
 ### 调用示例
@@ -8383,7 +4409,7 @@ print("执行成功。")
 print(f"Output type: {output_tensor.dtype}")
 ```
 
-## 69. dynamic_scaled_fp8_quant
+## 36. dynamic_scaled_fp8_quant
 
 ### 支持的产品型号
 
@@ -8490,7 +4516,7 @@ print(f"Calculated Scale: {scale.item()}")
 print(f"Output type: {output_tensor.dtype}")
 ```
 
-## 70. dynamic_per_token_scaled_fp8_quant
+## 37. dynamic_per_token_scaled_fp8_quant
 
 ### 支持的产品型号
 
@@ -8612,7 +4638,7 @@ print(f"Output type: {output_tensor.dtype}")
 print(f"Scales shape: {scales.shape}")
 ```
 
-## 71. static_scaled_int8_quant
+## 38. static_scaled_int8_quant
 
 ### 支持的产品型号
 
@@ -8716,7 +4742,7 @@ print(f"Output type: {output_tensor.dtype}")
 print(f"Output range: [{output_tensor.min()}, {output_tensor.max()}]")
 ```
 
-## 72. dynamic_scaled_int8_quant
+## 39. dynamic_scaled_int8_quant
 
 ### 支持的产品型号
 
@@ -8838,7 +4864,7 @@ print(f"Output type: {output_tensor.dtype}")
 print(f"Scales shape: {scales.shape}")
 ```
 
-## 73. selective_scan_fwd
+## 40. selective_scan_fwd
 
 ### 支持的产品型号
 
@@ -9009,7 +5035,7 @@ print(f"Output Mean (in z): {z.mean().item():.4f}")
 print(f"Final State Mean: {ssm_states.mean().item():.4f}")
 ```
 
-## 74. swap_blocks
+## 41. swap_blocks
 
 ### 支持的产品型号
 
@@ -9116,7 +5142,7 @@ print(f"Diff (Src[0]->Dst[5]): {diff_0_5.item()}")
 print(f"Diff (Src[2]->Dst[1]): {diff_2_1.item()}")
 ```
 
-## 75. copy_blocks
+## 42. copy_blocks
 
 ### 支持的产品型号 
 
@@ -9229,7 +5255,7 @@ print(f"Key Copy Diff (L0, 0->5): {diff_key.item():.4f}")
 print(f"Val Copy Diff (L0, 2->1): {diff_val.item():.4f}")
 ```
 
-## 76. fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_out
+## 43. fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_out
 
 ### 支持的产品型号
 
@@ -9404,9 +5430,7 @@ print(f"position_ids shape: {position_ids.shape}")
 print(f"cos_sin_cache shape: {cos_sin_cache.shape}")
 ```
 
-
-
-## 77. reshape_and_cache
+## 44. reshape_and_cache
 
 ### 支持的产品型号
 
@@ -9563,7 +5587,7 @@ print(f"Check Value Cache at Block {block_idx}, Offset {block_offset}:")
 print(value_cache[block_idx, 0, :, block_offset].mean().item())
 ```
 
-## 78. reshape_and_cache_flash
+## 45. reshape_and_cache_flash
 
 ### 支持的产品型号
 
@@ -9739,7 +5763,7 @@ print(f"Original Value : {original_val:.6f}")
 print(f"Cached Value   : {cached_val:.6f}")
 ```
 
-## 79. concat_and_cache_mla
+## 46. concat_and_cache_mla
 
 ### 支持的产品型号
 
@@ -9856,7 +5880,7 @@ print("执行成功。")
 print(f"Diff: {diff.item()}")
 ```
 
-## 80. convert_fp8
+## 47. convert_fp8
 
 ### 支持的产品型号
 
@@ -9972,11 +5996,7 @@ print(f"Source Mean: {src_fp16.float().mean().item():.4f}")
 print(f"Recovered Mean: {dst_recover.float().mean().item():.4f}")
 ```
 
-
-
-
-
-## 81. gather_and_maybe_dequant_cache
+## 48. gather_and_maybe_dequant_cache
 
 ### 支持的产品型号
 
@@ -10121,7 +6141,7 @@ diff = (dst[0] - src_cache[0, 0]).abs().sum().item()
 print(f"Token 0 Difference: {diff:.6f}")
 ```
 
-## 82. cp_gather_cache
+## 49. cp_gather_cache
 
 ### 支持的产品型号
 
@@ -10263,7 +6283,7 @@ else:
     print(f"验证失败：差异为 {diff}")
 ```
 
-## 83. indexer_k_cache
+## 50. indexer_k_cache
 
 ### 支持的产品型号
 
@@ -10370,7 +6390,7 @@ print("执行成功。")
 print(f"Diff (Token 2 -> Cache[1][0]): {diff.item()}")
 ```
 
-## 84. fused_kda_decode
+## 51. fused_kda_decode
 
 ### 支持的产品型号
 
@@ -10581,9 +6601,7 @@ print(f"state shape: {state.shape}, dtype: {state.dtype}")
 print(f"out shape: {out.shape}, dtype: {out.dtype}")
 ```
 
-
-
-## 85. top_k_per_row_decode
+## 52. top_k_per_row_decode
 
 ### 支持的产品型号
 
@@ -10695,7 +6713,7 @@ print(f"Output Indices Shape: {indices.shape} (Expect: [{NUM_ROWS}, {NEXT_N}])")
 print(f"Sample Output (Row 0, first 10 indices): {indices[0, :10].tolist()}")
 ```
 
-## 86. cp_gather_indexer_k_cache
+## 53. cp_gather_indexer_k_cache
 
 ### 支持的产品型号
 
@@ -10811,7 +6829,7 @@ print("-" * 30)
 print(f"Dst K Shape: {dst_k.shape} (Expect: [{total_tokens}, {HEAD_DIM}])")
 ```
 
-## 87. cp_gather_indexer_k_quant_cache
+## 54. cp_gather_indexer_k_quant_cache
 
 ### 支持的产品型号
 
@@ -10941,7 +6959,7 @@ print(f"Output Dst K Sample (Row 0, first 10): {dst_k[0, :10].tolist()}")
 print(f"Output Dst Scale Shape: {dst_scale.shape}")
 ```
 
-## 88. topk_softmax
+## 55. topk_softmax
 
 ### 支持的产品型号
 
@@ -11039,7 +7057,7 @@ print(f"First Token Indices: {topk_indices[0].tolist()}")
 print(f"First Token Weights: {topk_weights[0].tolist()}")
 ```
 
-## 89. moe_sum
+## 56. moe_sum
 
 ### 支持的产品型号
 
@@ -11133,7 +7151,7 @@ diff = (output_tensor - expected).abs().max()
 print(f"Max difference: {diff.item():.6f}")
 ```
 
-## 90. moe_align_block_size
+## 57. moe_align_block_size
 
 ### 支持的产品型号
 
@@ -11236,7 +7254,7 @@ print(f"Sorted Token IDs (First 64): {sorted_token_ids[:64]}")
 print(f"Num tokens post pad: {num_tokens_post_pad[:NUM_EXPERTS]}")
 ```
 
-## 91. fused_kimi_k3_mla_decode_q_concat_ds_mla_insert
+## 58. fused_kimi_k3_mla_decode_q_concat_ds_mla_insert
 
 ### 支持的产品型号
 
@@ -11405,9 +7423,7 @@ print(f"k_cache shape: {k_cache.shape}, dtype: {k_cache.dtype}")
 print(f"slot_mapping shape: {slot_mapping.shape}, dtype: {slot_mapping.dtype}")
 ```
 
-
-
-## 92. batched_moe_align_block_size
+## 59. batched_moe_align_block_size
 
 ### 支持的产品型号
 
@@ -11532,7 +7548,7 @@ print(f"Total Post-Pad Tokens:    {num_tokens_post_pad.item()}")
 print(f"Sample Sorted IDs (First 10): {sorted_ids[:10].tolist()}")
 ```
 
-## 93. moe_lora_align_block_size
+## 60. moe_lora_align_block_size
 
 ### 支持的产品型号
 
@@ -11696,8223 +7712,7 @@ print(f"Num Tokens Post Pad (Per LoRA): {num_tokens_post_pad.tolist()}")
 print(f"Total tokens aligned: {num_tokens_post_pad.sum().item()}")
 ```
 
-## 94. reshape_and_cache_new
-
-### 支持的产品型号
-
-- Metax C500/C550/C588/C600
-
-### 接口原型
-
-```cpp
-def reshape_and_cache_new(
-    torch::Tensor& key,
-    torch::Tensor& value,
-    torch::Tensor& key_cache,
-    torch::Tensor& value_cache,
-    torch::Tensor& slot_mapping,
-    const std::string& kv_cache_dtype,
-    const double kv_scale,
-    const double v_scale
-) -> None
-```
-
-### 功能描述
-
-reshape_and_cache_new 算子用于 Transformer 注意力机制的 KV 缓存管理：对输入的 key、value 张量进行形状重塑，通过 kv_scale、v_scale 完成缩放处理，再借助 slot_mapping 映射到对应缓存位置，最终将处理结果写入 key_cache 和 value_cache。该算子融合了重塑、缩放、缓存映射流程，减少了内存交互开销，提升了 KV 缓存的存储与访问效率。
-
-### 参数说明
-
-- **key** (torch.Tensor, 入参): 注意力机制的 key 输入张量
-- **value** (torch.Tensor, 入参): 注意力机制的 value 输入张量
-- **key_cache** (torch.Tensor, 入参/出参): 存储处理后 key 的缓存张量，计算结果会写入其中
-- **value_cache** (torch.Tensor, 入参/出参): 存储处理后 value 的缓存张量，计算结果会写入其中
-- **slot_mapping** (torch.Tensor, 入参): 缓存位置映射张量，用于定位 key/value 在缓存中的存储地址
-- **kv_cache_dtype** (std::string, 入参): KV 缓存使用的数据类型描述字符串
-- **kv_scale** (double, 入参): key 与 value 的通用缩放因子
-- **v_scale** (double, 入参): value 张量的额外精细化缩放因子
-
-### 约束与调用
-
-- 所有张量必须部署在目标加速设备（如 CUDA/Metax 硬件）上
-- kv_cache_dtype 需与 key_cache/value_cache 的实际类型一致，支持 float16、bfloat16、float32
-- slot_mapping 的形状需与 key/value、缓存张量的维度匹配，确保映射关系有效
-- key、value 的维度需符合 Transformer 注意力机制中 key/value 的标准形状规范
-- 计算公式：
-
-$$
-  \begin{align*}
-  \text{key}_{\text{reshaped}} &= \text{reshape}(\text{key}, [B, H_k, D, L]) \\
-  \text{value}_{\text{reshaped}} &= \text{reshape}(\text{value}, [B, H_k, D, L]) \\
-  \text{key}_{\text{scaled}} &= \text{key}_{\text{reshaped}} \times \text{kv\\_scale} \\
-  \text{value}_{\text{scaled}} &= \text{value}_{\text{reshaped}} \times \text{kv\\_scale} \times \text{v\\_scale} \\
-  \text{key\\_cache}[\text{slot\\_mapping}] &= \text{key}_{\text{scaled}} \\
-  \text{value\\_cache}[\text{slot\\_mapping}] &= \text{value}_{\text{scaled}}
-  \end{align*}
-$$
-
-  其中：
-
-- $\text{key} \in \mathbb{R}^{B_{\text{in}} \times L_{\text{in}} \times H_k \times D}$ 是输入键张量（重塑前）
-- $\text{value} \in \mathbb{R}^{B_{\text{in}} \times L_{\text{in}} \times H_k \times D}$ 是输入值张量（重塑前）
-- $\text{key}_{\text{reshaped}} \in \mathbb{R}^{B \times H_k \times D \times L}$ 是重塑后的键张量
-- $\text{value}_{\text{reshaped}} \in \mathbb{R}^{B \times H_k \times D \times L}$ 是重塑后的值张量
-- $\text{kv\\_scale} \in \mathbb{R}$ 是 key/value 通用缩放因子（标量）
-- $\text{v\\_scale} \in \mathbb{R}$ 是 value 张量的额外精细化缩放因子（标量）
-- $\text{key}_{\text{scaled}} \in \mathbb{R}^{B \times H_k \times D \times L}$ 是缩放后的键张量
-- $\text{value}_{\text{scaled}} \in \mathbb{R}^{B \times H_k \times D \times L}$ 是缩放后的值张量
-- $\text{slot\\_mapping} \in \mathbb{Z}^{B \times H_k \times D \times L}$ 是缓存位置映射张量，元素为缓存张量的索引（整数型）
-- $\text{key\\_cache} \in \mathbb{R}^{B_{\text{cache}} \times H_k \times D \times L_{\text{cache}}}$ 是键缓存张量
-- $\text{value\\_cache} \in \mathbb{R}^{B_{\text{cache}} \times H_k \times D \times L_{\text{cache}}}$ 是值缓存张量
-- $B_{\text{in}}$ 是输入批次维度， $L_{\text{in}}$ 是输入序列长度维度
-- $B$ 是重塑后批次维度， $H_k$ 是键值头数（kv_head_num）， $D$ 是头维度（head_size）， $L$ 是重塑后序列长度维度
-- $B_{\text{cache}}$ 是缓存批次维度， $L_{\text{cache}}$ 是缓存序列长度维度
-	形状重塑的具体操作（Transformer 标准 KV 张量维度转换）：
-
-$$
-  \text{reshape}(X, [B, H_k, D, L]) = \text{transpose}(\text{view}(X, [B, L, H_k, D]), 1, 2)
-$$
-
-  其中 $X$ 代表 $\text{key}$ 或 $\text{value}$ ， $\text{view}(\cdot)$ 为张量维度重塑操作（不改变数据顺序）， $\text{transpose}(\cdot, 1, 2)$ 为维度转置操作（交换第 1 维和第 2 维，维度索引从 0 开始）。
-  对于 GQA（Grouped Query Attention）配置兼容场景：
-
-$$
-  H_k = \frac{H}{G}
-$$
-
-  其中 $H$ 是查询头数（q_head_num）， $G$ 是 GQA 分组数（MQA 时 $G=H$ ，此时 $H_k=1$ ；Multi-Head Attention 时 $G=1$ ，此时 $H_k=H$ ）。
-
-### 调用示例
-
-```python
-import torch
-import mcoplib.lmdeploy as lmdeploy
-# 设置计算设备
-device = "cuda" if torch.cuda.is_available() else "cpu"
-# 1. 定义维度参数
-num_tokens = 2       # 当前batch的token数量
-num_heads = 32       # 注意力头数
-head_size = 128      # 每个头的维度
-block_size = 16      # PagedAttention的块大小
-num_blocks = 1024    # 预分配的显存块数量
-x = 16 
-assert head_size % x == 0, "head_size must be divisible by x"
-# 2. 创建输入张量 (Key 和 Value)
-key = torch.randn(
-    num_tokens, num_heads, head_size,
-    dtype=torch.float16,
-    device=device
-)
-value = torch.randn_like(key)
-# 3. 创建KV Cache (输出/更新目标)
-# Key Cache 形状: [num_blocks, num_heads, head_size/x, block_size, x]
-key_cache_shape = (num_blocks, num_heads, head_size // x, block_size, x)
-key_cache = torch.zeros(
-    key_cache_shape,
-    dtype=torch.float16,
-    device=device
-)
-# Value Cache 形状: [num_blocks, num_heads, head_size, block_size]
-value_cache_shape = (num_blocks, num_heads, head_size, block_size)
-value_cache = torch.zeros(
-    value_cache_shape,
-    dtype=torch.float16,
-    device=device
-)
-# 4. 创建 Slot Mapping
-slot_mapping = torch.tensor([0, 1], dtype=torch.long, device=device)
-# 5. 其他标量参数
-kv_cache_dtype = "auto"
-kv_scale = 1.0
-v_scale = 1.0
-# 6. 调用算子
-# void reshape_and_cache_new(...)
-lmdeploy.reshape_and_cache_new(
-    key, 
-    value, 
-    key_cache, 
-    value_cache, 
-    slot_mapping, 
-    kv_cache_dtype, 
-    kv_scale, 
-    v_scale
-)
-print("reshape_and_cache_new computation completed")
-print(f"Key Input shape: {key.shape}")
-print(f"Key Cache shape: {key_cache.shape}")
-print(f"Slot Mapping: {slot_mapping}")
-print("Cache updated successfully.")
-```
-
----
-
-## 95. fast_hadamard_transform
-
-### 支持的产品型号
-
-- Metax C500/C550
-
-### 接口原型
-
-```Python
-def fast_hadamard_transform(
-    input: torch.Tensor,
-    scale: float = 1.0
-) -> torch.Tensor:
-    pass
-```
-
-### 功能描述
-
-fast_hadamard_transform 算子用于对输入张量执行快速沃尔什-阿达玛变换（Fast Walsh-Hadamard Transform, FWHT）。这是一种正交、对称且对合的线性变换，通常用于深度学习中的特征混合、随机投影或压缩传感等场景。
-此算子利用分治算法将计算复杂度从 $O (N^2)$ 降低到 $O (N \log N)$ 。
-
-- 操作逻辑：
-	算子接收输入张量 input 和缩放因子 scale。
-	对于输入向量 $x$ ，阿达玛变换 $H_n$ 定义为递归结构：
-
-$$
-    H_n = \begin{pmatrix} H_{n-1} & H_{n-1} \\ H_{n-1} & -H_{n-1} \end{pmatrix}, \quad H_0 = 1
-$$
-
-    计算过程实际上执行了蝴蝶运算（Butterfly Operations）。
-
-**主要功能包括**：
-
-- 对输入张量的最后一个维度进行阿达玛变换。
-- 支持通过 `scale` 参数对输出结果进行缩放。
-- 针对不同维度的输入（ $N=2^k$ ）使用了特定的 CUDA 模板优化，以利用共享内存和 Warp 级并行加速。
-- 支持 FP32、FP16 和 BF16 数据类型。
-
-### 参数说明
-
-- **input** (torch.Tensor, 入参): 输入张量，形状通常为 `[batch_size, dim]` 或 `[..., dim]`。数据类型支持 float32, float16, bfloat16。其中 `dim` 必须是 2 的幂次。
-- **scale** (float, 入参, 可选): 输出结果的缩放因子，默认值为 1.0。通常用于归一化操作。
-
-### 返回值
-
-返回变换后的张量，形状和数据类型与 `input` 相同。
-
-### 约束与调用
-
-- `input` 的最后一个维度（dim）必须是 2 的幂次，且指数范围限制在 $3 \le \log_2 (dim) \le 15$ 之间（即 dim 取值范围为 8 到 32768）。
-- `input` 必须在 GPU 设备上。
-- `input` 的内存布局建议是连续的，以获得最佳性能。
-
-### 调用示例
-
-```Python
-import torch
-import mcoplib.sgl_kernel
-# 配置参数
-SEED = 0
-DEVICE = "cuda"
-DTYPE = torch.float16
-DIM = 1024  # 必须是 2 的幂次，范围 [8, 32768]
-BATCH = 4
-# 初始化环境
-torch.manual_seed(SEED)
-torch.set_default_device(DEVICE)
-# 1. 创建输入 Tensor
-input_tensor = torch.randn((BATCH, DIM), dtype=DTYPE)
-# 2. 算子执行
-# 执行 FHT，scale=1.0
-print(f"Running fast_hadamard_transform...")
-if torch.cuda.is_available():
-    torch.cuda.synchronize()
-output = torch.ops.sgl_kernel.fast_hadamard_transform(
-    input_tensor,
-    1.0
-)
-if torch.cuda.is_available():
-    torch.cuda.synchronize()
-# 验证结果
-# 阿达玛变换的性质：H(H(x)) = N * x
-# 因此再次变换并除以 N 应该还原输入
-output_inverse = torch.ops.sgl_kernel.fast_hadamard_transform(
-    output,
-    1.0 / DIM
-)
-diff = (input_tensor - output_inverse).abs().max()
-print("执行成功。")
-print(f"Input shape: {input_tensor.shape}")
-print(f"Reconstruction Max Diff: {diff.item()}")
-```
-
-## 96. fast_hadamard_transform_12N
-
-### 支持的产品型号
-
-- Metax C500/C550
-
-### 接口原型
-
-```Python
-def fast_hadamard_transform_12N(
-    input: torch.Tensor,
-    scale: float = 1.0
-) -> torch.Tensor:
-    pass
-```
-
-### 功能描述
-
-fast_hadamard_transform_12N 算子是快速沃尔什-阿达玛变换（Fast Walsh-Hadamard Transform, FWHT）的一个特定变体，专门针对维度为 $12 \times 2^k$ 的输入张量进行了优化。
-该算子利用分治算法和专用 CUDA 内核，将计算复杂度从 $O (N^2)$ 降低到 $O (N \log N)$ 。与标准的 FHT 不同，此算子专门处理非 2 的纯幂次维度，将其分解为 12 的倍数与 2 的幂次的组合，适用于某些特定的模型架构（如 Hyena Hierarchy 或特定的注意力机制），这些架构的隐藏层维度通常是 12 的倍数（例如 768, 3072 等）。
-
-- 操作逻辑：
-	算子接收输入张量 input 和缩放因子 scale。
-	它将输入向量视为 $12$ 个大小为 $2^k$ 的块的组合，结合了针对 12 路混合的特定逻辑和针对 $2^k$ 的标准蝴蝶运算。
-	主要功能包括：
-- 对输入张量的最后一个维度执行 specialized 12N 阿达玛变换。
-- 支持通过 `scale` 参数对输出结果进行缩放（通常用于归一化，例如乘以 $1/N$ ）。
-- 利用共享内存交换（Smem Exchange）和 Warp Shuffle 原语最大化内存带宽利用率。
-- 支持 FP32、FP16 和 BF16 数据类型。
-
-### 参数说明
-
-- **input** (torch.Tensor, 入参): 输入张量，形状通常为 `[batch_size, dim]` 或 `[..., dim]`。数据类型支持 float32, float16, bfloat16。其中 `dim` 必须满足 $12 \times 2^k$ 的形式。
-- **scale** (float, 入参, 可选): 输出结果的缩放因子，默认值为 1.0。
-
-### 返回值
-
-返回变换后的张量，形状和数据类型与 `input` 相同。
-
-### 约束与调用
-
-- `input` 的最后一个维度（dim）必须满足公式 $dim = 12 \times 2^k$ ，其中 $k$ 的取值范围为 $[2, 10]$ 。
-- 支持的具体维度包括：48, 96, 192, 384, 768, 1536, 3072, 6144, 12288。
-- 不支持超过 12288 的维度。
-- `input` 必须位于 GPU 设备上。
-- 内存布局要求：建议输入张量是连续存储的。
-
-### 调用示例
-
-```Python
-import torch
-import mcoplib.sgl_kernel
-# 配置参数
-SEED = 0
-DEVICE = "cuda"
-DTYPE = torch.float16
-# 维度设置: 必须满足 12 * 2^k
-# 例如 768 = 12 * 64 (k=6)
-DIM = 768 
-BATCH = 4
-# 初始化环境
-torch.manual_seed(SEED)
-torch.set_default_device(DEVICE)
-# 1. 创建输入 Tensor
-# 形状 [BATCH, DIM]
-input_tensor = torch.randn((BATCH, DIM), dtype=DTYPE)
-# 2. 算子执行
-print(f"Running fast_hadamard_transform_12N...")
-if torch.cuda.is_available():
-    torch.cuda.synchronize()
-# 执行正向变换
-output = torch.ops.sgl_kernel.fast_hadamard_transform_12N(
-    input_tensor,
-    1.0
-)
-if torch.cuda.is_available():
-    torch.cuda.synchronize()
-# 验证结果
-# 阿达玛变换性质: H(H(x)) = N * x
-# 因此再次变换并乘以 1/N 应该还原输入
-output_inverse = torch.ops.sgl_kernel.fast_hadamard_transform_12N(
-    output,
-    1.0 / DIM
-)
-# 计算重构误差
-diff = (input_tensor - output_inverse).abs().max()
-print("执行成功。")
-print(f"Input shape: {input_tensor.shape}")
-print(f"Reconstruction Max Diff: {diff.item()}")
-```
-
-## 97. fast_hadamard_transform_20N
-
-### 支持的产品型号
-
-- Metax C500/C550
-
-### 接口原型
-
-```Python
-def fast_hadamard_transform_20N(
-    input: torch.Tensor,
-    scale: float = 1.0
-) -> torch.Tensor:
-    pass
-```
-
-### 功能描述
-
-fast_hadamard_transform_20N 算子是快速沃尔什-阿达玛变换（Fast Walsh-Hadamard Transform, FWHT）的一个特定变体，专门针对维度为 $20 \times 2^k$ 的输入张量进行了优化。
-该算子利用分治算法和专用 CUDA 内核，将计算复杂度从 $O (N^2)$ 降低到 $O (N \log N)$ 。此算子是为了处理特定模型架构中出现的非 2 的纯幂次维度（例如 1280, 5120 等），通过将维度分解为 20 的倍数与 2 的幂次的组合来执行高效变换。
-
-- 操作逻辑：
-	算子接收输入张量 input 和缩放因子 scale。
-	它将输入向量视为 $20$ 个大小为 $2^k$ 的块的组合，结合了针对 20 路混合的特定逻辑和针对 $2^k$ 的标准蝴蝶运算。
-	主要功能包括：
-- 对输入张量的最后一个维度执行 specialized 20N 阿达玛变换。
-- 支持通过 `scale` 参数对输出结果进行缩放（通常用于归一化，例如乘以 $1/N$ ）。
-- 利用共享内存交换（Smem Exchange）和 Warp Shuffle 原语最大化内存带宽利用率。
-- 支持 FP32、FP16 和 BF16 数据类型。
-
-### 参数说明
-
-- **input** (torch.Tensor, 入参): 输入张量，形状通常为 `[batch_size, dim]` 或 `[..., dim]`。数据类型支持 float32, float16, bfloat16。其中 `dim` 必须满足 $20 \times 2^k$ 的形式。
-- **scale** (float, 入参, 可选): 输出结果的缩放因子，默认值为 1.0。
-
-### 返回值
-
-返回变换后的张量，形状和数据类型与 `input` 相同。
-
-### 约束与调用
-
-- `input` 的最后一个维度（dim）必须满足公式 $dim = 20 \times 2^k$ ，其中 $k$ 的取值范围为 $[2, 10]$ 。
-- 支持的维度范围为 80 到 20480。
-- 具体支持的维度包括：80, 160, 320, 640, 1280, 2560, 5120, 10240, 20480。
-- 不支持超过 20480 的维度。
-- `input` 必须位于 GPU 设备上。
-- 内存布局要求：建议输入张量是连续存储的。
-
-### 调用示例
-
-```Python
-import torch
-import mcoplib.sgl_kernel
-# 配置参数
-SEED = 0
-DEVICE = "cuda"
-DTYPE = torch.float16
-# 维度设置: 必须满足 20 * 2^k
-# 例如 1280 = 20 * 64 (k=6)
-DIM = 1280
-BATCH = 4
-# 初始化环境
-torch.manual_seed(SEED)
-torch.set_default_device(DEVICE)
-# 1. 创建输入 Tensor
-# 形状 [BATCH, DIM]
-input_tensor = torch.randn((BATCH, DIM), dtype=DTYPE)
-# 2. 算子执行
-print(f"Running fast_hadamard_transform_20N...")
-if torch.cuda.is_available():
-    torch.cuda.synchronize()
-# 执行正向变换
-output = torch.ops.sgl_kernel.fast_hadamard_transform_20N(
-    input_tensor,
-    1.0
-)
-if torch.cuda.is_available():
-    torch.cuda.synchronize()
-# 验证结果
-# 阿达玛变换性质: H(H(x)) = N * x
-# 因此再次变换并乘以 1/N 应该还原输入
-output_inverse = torch.ops.sgl_kernel.fast_hadamard_transform_20N(
-    output,
-    1.0 / DIM
-)
-# 计算重构误差
-diff = (input_tensor - output_inverse).abs().max()
-print("执行成功。")
-print(f"Input shape: {input_tensor.shape}")
-print(f"Reconstruction Max Diff: {diff.item()}")
-```
-
-## 98. fast_hadamard_transform_28N
-
-### 支持的产品型号
-
-- Metax C500/C550
-
-### 接口原型
-
-```Python
-def fast_hadamard_transform_28N(
-    input: torch.Tensor,
-    scale: float = 1.0
-) -> torch.Tensor:
-    pass
-```
-
-### 功能描述
-
-fast_hadamard_transform_28N 算子是快速沃尔什-阿达玛变换（Fast Walsh-Hadamard Transform, FWHT）的一个特定变体，专门针对维度为 $28 \times 2^k$ 的输入张量进行了优化。
-该算子利用分治算法和专用 CUDA 内核，将计算复杂度从 $O (N^2)$ 降低到 $O (N \log N)$ 。此算子是为了处理特定模型架构中出现的非 2 的纯幂次维度（例如 1792, 3584, 7168 等），通过将维度分解为 28 的倍数与 2 的幂次的组合来执行高效变换。
-
-- 操作逻辑：
-	算子接收输入张量 input 和缩放因子 scale。
-	它将输入向量视为 $28$ 个大小为 $2^k$ 的块的组合，结合了针对 28 路混合的特定逻辑和针对 $2^k$ 的标准蝴蝶运算。
-	**主要功能包括**：
-- 对输入张量的最后一个维度执行 specialized 28N 阿达玛变换。
-- 支持通过 `scale` 参数对输出结果进行缩放（通常用于归一化，例如乘以 $1/N$ ）。
-- 利用共享内存交换（Smem Exchange）和 Warp Shuffle 原语最大化内存带宽利用率。
-- 支持 FP32、FP16 和 BF16 数据类型。
-
-### 参数说明
-
-- **input** (torch.Tensor, 入参): 输入张量，形状通常为 `[batch_size, dim]` 或 `[..., dim]`。数据类型支持 float32, float16, bfloat16。其中 `dim` 必须满足 $28 \times 2^k$ 的形式。
-- **scale** (float, 入参, 可选): 输出结果的缩放因子，默认值为 1.0。
-
-### 返回值
-
-返回变换后的张量，形状和数据类型与 `input` 相同。
-
-### 约束与调用
-
-- `input` 的最后一个维度（dim）必须满足公式 $dim = 28 \times 2^k$ ，其中 $k$ 的取值范围为 $[2, 10]$ 。
-- 支持的维度范围为 112 到 28672。
-- 具体支持的维度包括：112, 224, 448, 896, 1792, 3584, 7168, 14336, 28672。
-- 不支持超过 28672 的维度。
-- `input` 必须位于 GPU 设备上。
-- 内存布局要求：建议输入张量是连续存储的。
-
-### 调用示例
-
-```Python
-import torch
-import mcoplib.sgl_kernel
-# 配置参数
-SEED = 0
-DEVICE = "cuda"
-DTYPE = torch.float16
-# 维度设置: 必须满足 28 * 2^k
-# 例如 1792 = 28 * 64 (k=6)
-DIM = 1792
-BATCH = 4
-# 初始化环境
-torch.manual_seed(SEED)
-torch.set_default_device(DEVICE)
-# 1. 创建输入 Tensor
-# 形状 [BATCH, DIM]
-input_tensor = torch.randn((BATCH, DIM), dtype=DTYPE)
-# 2. 算子执行
-print(f"Running fast_hadamard_transform_28N...")
-if torch.cuda.is_available():
-    torch.cuda.synchronize()
-# 执行正向变换
-output = torch.ops.sgl_kernel.fast_hadamard_transform_28N(
-    input_tensor,
-    1.0
-)
-if torch.cuda.is_available():
-    torch.cuda.synchronize()
-# 验证结果
-# 阿达玛变换性质: H(H(x)) = N * x
-# 因此再次变换并乘以 1/N 应该还原输入
-output_inverse = torch.ops.sgl_kernel.fast_hadamard_transform_28N(
-    output,
-    1.0 / DIM
-)
-# 计算重构误差
-diff = (input_tensor - output_inverse).abs().max()
-print("执行成功。")
-print(f"Input shape: {input_tensor.shape}")
-print(f"Reconstruction Max Diff: {diff.item()}")
-```
-
-## 99. fast_hadamard_transform_40N
-
-### 支持的产品型号
-
-- Metax C500/C550
-
-### 接口原型
-
-```Python
-def fast_hadamard_transform_40N(
-    input: torch.Tensor,
-    scale: float = 1.0
-) -> torch.Tensor:
-    pass
-```
-
-### 功能描述
-
-fast_hadamard_transform_40N 算子用于对最后一个维度大小为 $40 \times 2^k$ 的输入张量执行快速 Hadamard 变换（Fast Hadamard Transform, FHT）。该算子是针对非 2 的幂次维度的优化实现，专门处理基础块大小为 40 的情况。
-此功能主要应用于以下场景：
-
-1. 随机投影：在大模型或机器学习算法中进行降维或特征混合。
-2. FlashAttention 变体：某些 Attention 机制使用 Hadamard 变换来近似 Hessian 或旋转特征空间。
-
-- 操作逻辑：
-	算子接收输入张量 input，对最后一个维度进行 Hadamard 变换，并应用缩放因子 scale。
-	数学上，Hadamard 变换 $H_N$ 定义为递归结构，该算子特别处理 $N = 40 \times 2^k$ 的情况，利用共享内存交换和特定步幅的各种 Kernel Traits 进行加速。
-	**主要功能包括**：
-- 针对维度 $D \in \{160, 320, \dots, 40960\}$ 的高效 FHT 计算。
-- 支持 float16, bfloat16 和 float32 数据类型。
-- 利用 GPU 共享内存（Shared Memory）进行高效的数据交换和蝶形运算。
-
-### 参数说明
-
-- **input** (torch.Tensor, 入参): 输入张量，形状为 `[..., dim]`。其中最后一个维度 `dim` 必须满足 $dim = 40 \times 2^k$ ，且 $2 \le k \le 10$ （即 dim 范围为 160 到 40960），数据类型为 float16, bfloat16 或 float32
-- **scale** (float, 入参): 输出结果的缩放因子，默认为 1.0
-
-### 返回值
-
-返回变换后的张量，形状和数据类型与 `input` 相同
-
-### 约束与调用
-
-- `input` 的最后一个维度大小必须在支持的列表中：160, 320, 640, 1280, 2560, 5120, 10240, 20480, 40960
-- `input` 必须位于 GPU 设备上
-- 算子针对特定维度进行了模板特化优化，性能远高于通用的矩阵乘法实现
-
-### 调用示例
-
-```Python
-import torch
-import mcoplib.sgl_kernel
-# 配置参数
-SEED = 0
-DEVICE = "cuda"
-DTYPE = torch.float16
-# 维度设置 (必须是 40 * 2^k, 这里取 40 * 2^2 = 160)
-BATCH = 8
-SEQ_LEN = 128
-DIM = 160 
-# 初始化环境
-torch.manual_seed(SEED)
-torch.set_default_device(DEVICE)
-# 1. 创建输入 Tensor
-input_tensor = torch.randn(BATCH, SEQ_LEN, DIM, dtype=DTYPE)
-scale = 1.0 / (DIM ** 0.5)
-# 算子执行
-print(f"Running fast_hadamard_transform_40N...")
-if torch.cuda.is_available():
-    torch.cuda.synchronize()
-output = torch.ops.sgl_kernel.fast_hadamard_transform_40N(
-    input_tensor,
-    scale
-)
-if torch.cuda.is_available():
-    torch.cuda.synchronize()
-print("执行成功。")
-print(f"Input shape: {input_tensor.shape}")
-print(f"Output shape: {output.shape}")
-print(f"Output sample (first 5 elements): {output[0, 0, :5]}")
-```
-
-## 100. mctlass_moe_w4a16_gemm_kernel_mnk
-
-### 支持的产品型号
-
-- Metax C500/C550/C588/C600
-
-### 接口原型
-
-```python
-def mctlass_moe_w4a16_gemm_kernel_mnk(
-    num_valid_tokens: int,
-    N: int,
-    K: int,
-    group: int
-) -> int
-```
-
-### 功能描述
-
-该算子用于计算 **W4A16**（权重 4bit，激活值 16bit）混合精度 MoE GEMM 操作所需的 Kernel M 维度大小（`kernel_size.m`）。它并不执行实际的矩阵乘法运算，而是根据输入的问题规模（Token 数、矩阵维度、专家组数），在 `mctlass` 库中查找匹配的 GEMM Kernel 配置，并返回该配置对应的 M 维度大小，用于后续的资源分配或 Grid 设置。
-
-- 计算公式：
-	先对 4bit 量化权重执行反量化，再执行矩阵乘法（仅计算有效 token）：
-
-$$
-  \begin{align*}
-  &b_{\text{dequant}}[k, m] = \left( b[k, m] - \text{zp}_b[k, m] \right) \times \text{scale}_b[k, m] \\
-  &\text{dst}[i, m] = \sum_{k=0}^{K-1} \text{a}[i, k] \times b_{\text{dequant}}[k, m] \quad (0 \leq i < \text{num\\_valid\\_tokens})
-  \end{align*}
-$$
-
-  若 $i \geq \text{num\\_valid\\_tokens}$ （填充行），则 $\text{dst}[i, :] = 0$ 。
-  其中各张量的线性索引与二维位置的映射关系为：
-
-- 激活张量 $\text{a}$ ：
-
-$$
-    n_a = i \times K + k
-$$
-
-- 权重张量 $b$ ：
-
-$$
-    n_b = k \times M + m
-$$
-
-- 输出张量 $\text{dst}$ ：
-
-$$
-    n_{\text{dst}} = i \times M + m
-$$
-
-    各变量的维度与含义：
-
-- $\text{a} \in \mathbb{T}^{N \times K}$ ：16bit 激活输入张量，数据类型为 $\mathbb{T}$ （如 fp16），有效行范围 $0 \leq i < \text{num\\_valid\\_tokens}$
-- $b \in \mathbb{U}^{K \times M}$ ：4bit 量化的权重张量，数据类型为 $\mathbb{U}$ （如 uint4）
-- $\text{zp}_b \in \mathbb{U}^{K \times M}$ ：权重量化的零点张量，数据类型与 $b$ 一致
-- $\text{scale}_b \in \mathbb{R}^{K \times M}$ ：权重量化的缩放因子张量
-- $\text{dst} \in \mathbb{D}^{N \times M}$ ：输出张量，存储矩阵乘结果，数据类型与 $\text{a}$ 一致
-- $\text{num\\_valid\\_tokens}$ ：实际参与计算的有效激活行数（ $0 \leq \text{num\\_valid\\_tokens} \leq N$ ）
-- $N$ ：激活张量的行数（含填充，用于内存对齐）
-- $K$ ：激活与权重的输入特征维度
-- $M$ ：权重与输出的输出特征维度（由业务场景或 group 参数推导）
-- $\text{group}$ ：权重的分组维度（用于分组 GEMM 并行优化，将 $K$ 划分为 $\text{group}$ 个子维度）
-- $i$ ：激活/输出的行索引，范围 $0 \leq i < N$
-- $k$ ：输入特征维度的索引，范围 $0 \leq k < K$
-- $m$ ：输出特征维度的索引，范围 $0 \leq m < M$
-
-### 参数说明
-
-- **num_valid_tokens** (int, 入参): 有效 Token 的数量（对应 GEMM 中的 M 维度）
-- **N** (int, 入参): 权重矩阵的输出维度 N
-- **K** (int, 入参): 权重矩阵的输入维度 K
-- **group** (int, 入参): 组数量（对应 BatchedGemm 中的 Batch 维度，通常指 Expert 数量）
-
-### 返回值
-
-- **kernel_m** (int): 返回计算得到的 Kernel M 维度大小。如果未找到支持的 Kernel，代码会在 C++ 层打印错误信息，但返回值依赖于 `kernel_size.m()` 的默认状态
-
-### 约束与调用
-
-- 数据类型配置：底层固定配置为 `ElementA=maca_bfloat16` (BF16), `ElementB=uint8_t` (4-bit 权重打包), `ElementC=maca_bfloat16` (BF16)
-- 布局约束：固定配置为 LayoutA=RowMajor, LayoutB=ColumnMajor, LayoutC=RowMajor
-- 内部参数：算子内部硬编码了 `pack_factor = 2` 和 `group_size = 64`
-- 错误处理：输入的参数组合需要在 `mctlass` 中找到对应的 Kernel 实现
-
-### 调用示例
-
-```python
-import torch
-import mcoplib.sgl_moe_fused_w4a16
-# 1. 核心参数设置 (对应 C++ 签名中的四个 int64_t 参数)
-# int64_t num_valid_tokens, int64_t N, int64_t K, int64_t group
-num_valid_tokens = 1024   # 有效 token 数量
-N = 4096                  # 输出维度 N
-K = 2048                  # 输入维度 K
-group = 64                # 组大小 (Group Size)
-# 2. 调用算子
-result = mcoplib.sgl_moe_fused_w4a16.mctlass_moe_w4a16_gemm_kernel_mnk(
-    num_valid_tokens,
-    N,
-    K,
-    group
-)
-# 3. 输出结果
-print("mctlass_moe_w4a16_gemm_kernel_mnk called successfully")
-print(f"Input Params -> Tokens: {num_valid_tokens}, N: {N}, K: {K}, Group: {group}")
-print(f"Output Result (Kernel m size): {result}")
-```
-
-
-
-## 101. lightning_attention_decode
-
-### 支持的产品型号
-
-- Metax C500/C550/C588/C600
-
-### 接口原型
-
-```cpp
-def lightning_attention_decode(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    past_kv: torch.Tensor,
-    output: torch.Tensor,
-    slope_h: float
-) -> None
-```
-
-### 功能描述
-
-实现 Transformer 解码阶段的 Lightning Attention 计算，通过共享内存优化内存访问效率：
-
-1. 将查询（q）、键（k）、值（v）及历史键值缓存（past_kv）加载到共享内存；
-2. 计算注意力权重的缩放因子（ratio）；
-3. 更新历史键值缓存（past_kv）；
-4. 完成注意力加权求和并将结果写入 output 张量。
-	该算子通过内存访问融合与共享内存复用，提升了解码阶段注意力计算的性能。
-
-- 计算公式：
-
-$$
-  \begin{align*}
-  &\text{K}_{\text{total}} = \text{concat}([\text{past\\_kv}_k, K], 2) \\
-  &\text{V}_{\text{total}} = \text{concat}([\text{past\\_kv}_v, V], 2) \\
-  &\text{score} = \frac{Q \cdot \text{K}_{\text{total}}^T}{\sqrt{d_k}} \cdot \frac{1}{1 + \exp(-\text{slope\\_h} \cdot \text{len}(\text{K}_{\text{total}}))} \\
-  &\text{attn\\_weight} = \text{softmax}(\text{score}) \\
-  &\text{output} = \text{attn\\_weight} \cdot \text{V}_{\text{total}} \\
-  &\text{past\\_kv} = \text{concat}([\text{past\\_kv}, \text{concat}([K, V], 3)], 2)
-  \end{align*}
-$$
-
-  其中：
-
-- $Q \in \mathbb{R}^{\text{bs} \times H \times 1 \times d_k}$ 是解码阶段单步查询张量，dtype∈{float16, bfloat16, float32}
-- $K \in \mathbb{R}^{\text{bs} \times H_k \times 1 \times d_k}$ 是解码阶段单步键张量，dtype∈{float16, bfloat16, float32}
-- $V \in \mathbb{R}^{\text{bs} \times H_k \times 1 \times d_v}$ 是解码阶段单步值张量，dtype∈{float16, bfloat16, float32}，通常 $d_v = d_k$
-- $\text{past\\_kv} = (\text{past\\_kv}_k, \text{past\\_kv}_v) \in \mathbb{R}^{\text{bs} \times H_k \times L_{\text{past}} \times (d_k + d_v)}$ 是历史键值缓存张量，dtype∈{float16, bfloat16, float32}，入参/出参
-- $\text{output} \in \mathbb{R}^{\text{bs} \times H \times 1 \times d_v}$ 是注意力计算输出张量，dtype∈{float16, bfloat16, float32}
-- $\text{slope\\_h} \in \mathbb{R}$ 是注意力权重缩放斜率参数
-- $\text{concat}([T_1, T_2], dim)$ 表示沿 $dim$ 维度拼接张量 $T_1$ 和 $T_2$
-- $\text{softmax}(\cdot)$ 表示沿序列维度（第 2 维）的 softmax 归一化操作
-- $\text{len}(\cdot)$ 表示张量沿序列维度的长度计算， $\text{len}(\text{K}_{\text{total}}) = L_{\text{past}} + 1$
-- $\text{bs}$ 是 batch 大小， $H$ 是查询注意力头数， $H_k$ 是键值注意力头数（GQA/MQA 配置下 $H_k \leq H$ ）
-- $d_k$ 是键/查询头维度（head size）， $d_v$ 是值头维度， $L_{\text{past}}$ 是历史序列长度
-- $\cdot^T$ 表示张量在最后两个维度的转置操作， $\cdot$ 表示矩阵乘法（最后两个维度）
-- $\exp (\cdot)$ 表示逐元素指数运算， $\sqrt{\cdot}$ 表示开平方运算
-- $+$ 表示逐元素加法， $\cdot$ （缩放因子与分数的相乘）表示逐元素乘法
-- $[:, a: b]$ 表示张量沿指定维度取 $a$ 到 $b$ 的切片（CUDA 内核中共享内存加载/存储时的索引操作）
-
-### 参数说明
-
-- **q** (torch.Tensor, 入参): 注意力查询张量，需位于 CUDA 设备且为连续张量
-- **k** (torch.Tensor, 入参): 注意力键张量，需位于 CUDA 设备且为连续张量
-- **v** (torch.Tensor, 入参): 注意力值张量，需位于 CUDA 设备且为连续张量
-- **past_kv** (torch.Tensor, 入参/出参): 历史键值对缓存，计算中会更新该缓存，需位于 CUDA 设备且为连续张量
-- **output** (torch.Tensor, 出参): 注意力计算输出张量，结果直接写入此处，需位于 CUDA 设备且为连续张量
-- **slope_h** (float, 入参): 用于计算注意力权重缩放因子的参数
-
-### 返回值
-
-无返回值，变换结果直接写入输出张量中
-
-### 约束与调用
-
-- 所有张量必须部署在 CUDA 设备上
-- 所有张量需为连续（contiguous）张量，否则会触发合法性检查失败
-- 支持的数据类型：float16、bfloat16、float32
-- 线程块大小固定为`THREADS_PER_BLOCK`（代码中定义为 128），网格大小需根据张量的 batch_size、维度动态计算
-
-### 调用示例
-
-```python
-import torch
-import mcoplib.sgl_kernel
-# 设置计算设备
-device = "cuda" if torch.cuda.is_available() else "cpu"
-assert device == "cuda", "lightning_attention_decode仅支持CUDA设备"
-# 核心参数
-bs = 2               
-H = 16               
-Hk = 8               
-dk = 64              
-dv = 64              
-L_past = 10         
-# 1. 构造输入张量
-q = torch.randn(
-    bs, H, 1, dk,
-    dtype=torch.float32, device=device, requires_grad=False
-)
-k = torch.randn(
-    bs, Hk, 1, dk,
-    dtype=torch.float32, device=device, requires_grad=False
-)
-v = torch.randn(
-    bs, Hk, 1, dv,
-    dtype=torch.float32, device=device, requires_grad=False
-)
-past_kv = torch.randn(
-    bs, Hk, L_past, dk + dv,
-    dtype=torch.float32, device=device, requires_grad=False
-)
-output = torch.empty(
-    bs, H, 1, dv,
-    dtype=torch.float32, device=device, requires_grad=False
-)
-slope = torch.tensor(0.1, dtype=torch.float32, device=device)
-new_kv = torch.empty(
-    bs, Hk, L_past + 1, dk + dv,
-    dtype=torch.float32, device=device, requires_grad=False
-)
-# 调用算子
-torch.ops.sgl_kernel.lightning_attention_decode(
-    q=q,
-    k=k,
-    v=v,
-    past_kv=past_kv,
-    slope=slope,
-    output=output,
-    new_kv=new_kv
-)
-# 输出结果
-print("lightning_attention_decode computation completed")
-print(f"Output shape: {output.shape}")
-print(f"Updated new_kv shape: {new_kv.shape}")
-```
-
-## 102. meta_size
-
-### 支持的产品型号
-
-- Metax C500/C550
-
-### 接口原型
-
-```Python
-def meta_size() -> int:
-    pass
-```
-
-### 功能描述
-
-meta_size 算子用于获取 Custom Allreduce 机制所需的元数据（Metadata）缓冲区的大小（以字节为单位）。在分布式推理场景中，自定义 All-Reduce 内核需要一块共享内存区域来进行秩（Rank）之间的同步信号交换和状态管理。
-此功能主要应用于以下场景：
-
-1. 显存分配：在初始化通信器之前，计算需要分配的 IPC 共享内存的总大小（通常为 `meta_size () + max_buffer_size`）。
-2. 偏移量计算：确定数据缓冲区在共享内存块中的起始偏移量。
-
-- 操作逻辑：
-	算子调用底层 C++ 接口，返回预定义的元数据结构体所占用的字节数。
-	该数值是一个固定常量，取决于底层通信协议的设计。
-	**主要功能包括**：
-- 返回用于同步和元数据的显存大小要求。
-- 辅助上层应用进行正确的显存切分和管理。
-
-### 参数说明
-
-无参数
-
-### 返回值
-
-返回一个整数（int），表示元数据缓冲区所需的字节大小
-
-### 约束与调用
-
-- 该算子返回的是静态配置值，不依赖于当前的输入数据
-- 通常在 `CustomAllreduce` 初始化阶段调用
-
-### 调用示例
-
-```Python
-import torch
-import mcoplib.sgl_kernel
-# 配置参数
-# 无需特定配置，直接调用
-# 算子执行
-print(f"Running meta_size...")
-size_in_bytes = torch.ops.sgl_kernel.meta_size()
-# 验证结果
-print("执行成功。")
-print(f"Meta Size required: {size_in_bytes} bytes")
-```
-
-## 103. init_custom_ar
-
-### 支持的产品型号
-
-- Metax C500/C550
-
-### 接口原型
-
-```Python
-def init_custom_ar(
-    meta_ptrs: List[int],
-    rank_data: torch.Tensor,
-    rank: int,
-    full_nvlink: bool
-) -> int:
-    pass
-```
-
-### 功能描述
-
-init_custom_ar 算子用于初始化自定义 All-Reduce（Custom Allreduce）通信器的底层 C++ 状态对象。
-在分布式推理初始化阶段，该算子负责构建用于同步和通信的上下文环境。它接收所有 Rank 的元数据（Meta）缓冲区地址，从而允许内核通过 P2P（Peer-to-Peer）机制在不同 GPU 之间直接读写同步信号，实现低延迟的协同工作。
-**主要功能包括**：
-
-- 创建并初始化 `CustomAllReduce` C++ 对象。
-- 注册用于跨设备同步的共享内存地址（Meta Pointers）。
-- 配置拓扑信息（如 Rank ID 和 NVLink 状态）。
-- 返回状态对象的指针（Handle），供后续的注册和通信操作使用。
-
-### 参数说明
-
-- **meta_ptrs** (List[int], 入参): 包含通信组中所有 Rank 的元数据缓冲区（Meta Buffer）物理地址的列表。
-- 列表长度必须等于 `world_size`。
-- 第 `i` 个元素必须是 Rank `i` 的 Meta Buffer 在当前设备上可见的内存地址（通常通过 IPC 打开句柄获得）。
-- **rank_data** (torch.Tensor, 入参): 用于存储 Rank 相关辅助数据的张量，通常作为临时缓冲区或用于存储拓扑信息。
-- **rank** (int, 入参): 当前进程在通信组中的 Rank ID。
-- **full_nvlink** (bool, 入参): 标志位，指示当前环境是否支持全互联的 NVLink/高速互联拓扑。内核可能会根据此标志选择不同的通信策略。
-
-### 返回值
-
-返回一个整数（int），代表底层 C++ `CustomAllReduce` 状态对象的内存地址（指针）。该值需被妥善保存，并在调用 `register_buffer`、`all_reduce` 和 `dispose` 时传入。
-
-### 约束与调用
-
-- `meta_ptrs` 中的地址必须是有效的，且当前设备必须具有访问这些地址的权限（P2P Access Enabled）。
-- 必须在分布式环境初始化（如 `init_process_group`）之后调用。
-- 返回的指针必须在结束时通过 `dispose` 释放，否则会导致内存泄漏。
-
-### 调用示例
-
-```Python
-import torch
-import mcoplib.sgl_kernel
-# 配置参数
-rank = 0
-world_size = 2
-full_nvlink = True
-device = "cuda"
-# 1. 准备 rank_data 缓冲区
-rank_data = torch.empty(8 * 1024 * 1024, dtype=torch.uint8, device=device)
-# 2. 准备 meta_ptrs
-# 在实际场景中，这通常涉及以下步骤：
-# a. 各 Rank 分配 meta buffer (torch.empty)
-# b. 获取 IPC Handle (cudaIpcGetMemHandle)
-# c. 通过 all_gather 交换 Handle
-# d. 通过 cudaIpcOpenMemHandle 打开 Handle 获取地址
-# 这里为了演示，假设我们已经获取了两个有效的设备指针地址
-fake_meta_ptr_rank0 = 140737488355328
-fake_meta_ptr_rank1 = 140737488355400
-meta_ptrs = [fake_meta_ptr_rank0, fake_meta_ptr_rank1]
-# 算子执行
-print(f"Running init_custom_ar...")
-if torch.cuda.is_available():
-    torch.cuda.synchronize()
-# 初始化并获取状态指针
-state_ptr = torch.ops.sgl_kernel.init_custom_ar(
-    meta_ptrs,
-    rank_data,
-    rank,
-    full_nvlink
-)
-if torch.cuda.is_available():
-    torch.cuda.synchronize()
-# 验证结果
-print(f"初始化完成，State Pointer: {state_ptr}")
-# 后续需调用 dispose(state_ptr) 释放资源
-```
-
-## 104. all_reduce
-
-### 支持的产品型号
-
-- Metax C500/C550
-
-### 接口原型
-
-```Python
-def all_reduce(
-    fa: int,
-    inp: torch.Tensor,
-    out: torch.Tensor,
-    buffer_ptr: int,
-    buffer_size: int
-) -> None:
-    pass
-```
-
-### 功能描述
-
-all_reduce 算子用于在 Custom Allreduce 上下文中执行 out-of-place 的规约操作。该算子通常在 Eager 模式下或缓冲区尚未注册时使用。它利用初始化好的 Custom Allreduce 状态，将本地输入 inp 规约到输出 out，并在此过程中使用临时缓冲区 buffer 进行数据中转。
-此功能主要应用于以下场景：
-
-1. 未注册张量的规约：当输入张量的内存地址未在初始化阶段通过 `init_custom_ar` 或 `register_buffer` 注册时，需要显式传递一个已注册的临时缓冲区 `buffer` 来协助通信。
-2. Eager 模式下的动态规约：在动态图执行模式下，随时对任意张量进行 All-Reduce 操作。
-
-- 操作逻辑：
-	算子首先将输入数据 inp 拷贝到已注册的共享缓冲区 buffer 中。
-	内核利用 P2P 机制直接访问其他 Rank 的 buffer，执行规约计算（如 Sum）。
-	最终结果写回到本地输出 out。
-	**主要功能包括**：
-- 支持未注册张量的高效 All-Reduce。
-- 自动处理数据搬运和同步。
-- 规约操作默认为 Sum。
-
-### 参数说明
-
-- **fa** (int, 入参): Custom Allreduce 的状态指针（Flat Address），由 `init_custom_ar` 返回
-- **inp** (torch.Tensor, 入参): 需要进行规约的本地输入张量
-- **out** (torch.Tensor, 出参): 存储规约结果的输出张量，形状和数据类型需与 `inp` 一致
-- **buffer_ptr** (int, 入参): 当前 Rank 上已注册的临时缓冲区的内存地址指针。该缓冲区的容量必须能够容纳 `inp` 的数据
-- **buffer_size** (int, 入参): 临时缓冲区的大小（以字节为单位），用于边界检查
-
-### 返回值
-
-无返回值，规约结果直接写入 `out` 张量中
-
-### 约束与调用
-
-- `fa` 必须是有效的状态指针
-- `inp` 和 `out` 必须在同一设备上，且数据类型一致
-- `buffer_ptr` 指向的内存区域必须足够大（`>= inp.numel () * inp.element_size ()`），且必须已经通过 `register_buffer` 注册到 `fa` 关联的通信器中
-- 参与通信的所有 Rank 必须同时调用该算子，且输入张量形状一致
-
-### 调用示例
-
-```Python
-import torch
-import mcoplib.sgl_kernel
-# 简单测试，设置GPU数量为2
-world_size = 2 
-rank = 0       # 当前进程依然作为 0 号 rank
-full_nvlink = True 
-# C++ 会检查 fake_ipc_ptrs.size()，现在它等于 2，满足 % 2 == 0
-fake_ipc_ptrs = [0] * world_size 
-device = "cuda"
-rank_data = torch.zeros(1024, dtype=torch.int64, device=device) 
-print("Initializing CustomAllReduce object...")
-try:
-    rank_state_ptr = torch.ops.sgl_kernel.init_custom_ar(
-        fake_ipc_ptrs, 
-        rank_data, 
-        rank, 
-        full_nvlink
-    )
-    print(f"Got valid object pointer: {rank_state_ptr}")
-except Exception as e:
-    print(f"Initialization failed: {e}")
-    exit(1)
-inp = torch.randn(1024, 1024, dtype=torch.float16, device=device)
-out = torch.empty_like(inp)
-required_size = inp.numel() * inp.element_size()
-temp_buffer = torch.empty(required_size, dtype=torch.uint8, device=device)
-print("Running all_reduce...")
-try:
-    torch.ops.sgl_kernel.all_reduce(
-        rank_state_ptr,
-        inp,
-        out,
-        temp_buffer.data_ptr(),
-        temp_buffer.numel()
-    )
-    print("All-Reduce computation completed。")
-except Exception as e:
-    # 单卡无法验证完整功能，等不到 rank 1 的信号
-    print(f"All-Reduce called but no more GPU")
-# 清理
-if hasattr(torch.ops.sgl_kernel, "dispose"):
-    torch.ops.sgl_kernel.dispose(rank_state_ptr)
-```
-
-## 105. lightning_attention_decode
-
-### 支持的产品型号
-
-- Metax C500/C550/C588/C600
-
-### 接口原型
-
-```cpp
-def lightning_attention_decode(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    past_kv: torch.Tensor,
-    output: torch.Tensor,
-    slope_h: float
-) -> None
-```
-
-### 功能描述
-
-实现 Transformer 解码阶段的 Lightning Attention 计算，通过共享内存优化内存访问效率：
-
-1. 将查询（q）、键（k）、值（v）及历史键值缓存（past_kv）加载到共享内存；
-2. 计算注意力权重的缩放因子（ratio）；
-3. 更新历史键值缓存（past_kv）；
-4. 完成注意力加权求和并将结果写入 output 张量。
-	该算子通过内存访问融合与共享内存复用，提升了解码阶段注意力计算的性能。
-
-- 计算公式：
-
-$$
-  \begin{align*}
-  &\text{K}_{\text{total}} = \text{concat}([\text{past\\_kv}_k, K], 2) \\
-  &\text{V}_{\text{total}} = \text{concat}([\text{past\\_kv}_v, V], 2) \\
-  &\text{score} = \frac{Q \cdot \text{K}_{\text{total}}^T}{\sqrt{d_k}} \cdot \frac{1}{1 + \exp(-\text{slope\\_h} \cdot \text{len}(\text{K}_{\text{total}}))} \\
-  &\text{attn\\_weight} = \text{softmax}(\text{score}) \\
-  &\text{output} = \text{attn\\_weight} \cdot \text{V}_{\text{total}} \\
-  &\text{past\\_kv} = \text{concat}([\text{past\\_kv}, \text{concat}([K, V], 3)], 2)
-  \end{align*}
-$$
-
-  其中：
-
-- $Q \in \mathbb{R}^{\text{bs} \times H \times 1 \times d_k}$ 是解码阶段单步查询张量，dtype∈{float16, bfloat16, float32}
-- $K \in \mathbb{R}^{\text{bs} \times H_k \times 1 \times d_k}$ 是解码阶段单步键张量，dtype∈{float16, bfloat16, float32}
-- $V \in \mathbb{R}^{\text{bs} \times H_k \times 1 \times d_v}$ 是解码阶段单步值张量，dtype∈{float16, bfloat16, float32}，通常 $d_v = d_k$
-- $\text{past\\_kv} = (\text{past\\_kv}_k, \text{past\\_kv}_v) \in \mathbb{R}^{\text{bs} \times H_k \times L_{\text{past}} \times (d_k + d_v)}$ 是历史键值缓存张量，dtype∈{float16, bfloat16, float32}，入参/出参
-- $\text{output} \in \mathbb{R}^{\text{bs} \times H \times 1 \times d_v}$ 是注意力计算输出张量，dtype∈{float16, bfloat16, float32}
-- $\text{slope\\_h} \in \mathbb{R}$ 是注意力权重缩放斜率参数
-- $\text{concat}([T_1, T_2], dim)$ 表示沿 $dim$ 维度拼接张量 $T_1$ 和 $T_2$
-- $\text{softmax}(\cdot)$ 表示沿序列维度（第 2 维）的 softmax 归一化操作
-- $\text{len}(\cdot)$ 表示张量沿序列维度的长度计算， $\text{len}(\text{K}_{\text{total}}) = L_{\text{past}} + 1$
-- $\text{bs}$ 是 batch 大小， $H$ 是查询注意力头数， $H_k$ 是键值注意力头数（GQA/MQA 配置下 $H_k \leq H$ ）
-- $d_k$ 是键/查询头维度（head size）， $d_v$ 是值头维度， $L_{\text{past}}$ 是历史序列长度
-- $\cdot^T$ 表示张量在最后两个维度的转置操作， $\cdot$ 表示矩阵乘法（最后两个维度）
-- $\exp (\cdot)$ 表示逐元素指数运算， $\sqrt{\cdot}$ 表示开平方运算
-- $+$ 表示逐元素加法， $\cdot$ （缩放因子与分数的相乘）表示逐元素乘法
-- $[:, a: b]$ 表示张量沿指定维度取 $a$ 到 $b$ 的切片（CUDA 内核中共享内存加载/存储时的索引操作）
-
-### 参数说明
-
-- **q** (torch.Tensor, 入参): 注意力查询张量，需位于 CUDA 设备且为连续张量
-- **k** (torch.Tensor, 入参): 注意力键张量，需位于 CUDA 设备且为连续张量
-- **v** (torch.Tensor, 入参): 注意力值张量，需位于 CUDA 设备且为连续张量
-- **past_kv** (torch.Tensor, 入参/出参): 历史键值对缓存，计算中会更新该缓存，需位于 CUDA 设备且为连续张量
-- **output** (torch.Tensor, 出参): 注意力计算输出张量，结果直接写入此处，需位于 CUDA 设备且为连续张量
-- **slope_h** (float, 入参): 用于计算注意力权重缩放因子的参数
-
-### 返回值
-
-无返回值，变换结果直接写入输出张量中
-
-### 约束与调用
-
-- 所有张量必须部署在 CUDA 设备上
-- 所有张量需为连续（contiguous）张量，否则会触发合法性检查失败
-- 支持的数据类型：float16、bfloat16、float32
-- 线程块大小固定为`THREADS_PER_BLOCK`（代码中定义为 128），网格大小需根据张量的 batch_size、维度动态计算
-
-### 调用示例
-
-```python
-import torch
-import mcoplib.sgl_kernel
-# 设置计算设备
-device = "cuda" if torch.cuda.is_available() else "cpu"
-assert device == "cuda", "lightning_attention_decode仅支持CUDA设备"
-# 核心参数
-bs = 2               
-H = 16               
-Hk = 8               
-dk = 64              
-dv = 64              
-L_past = 10         
-# 1. 构造输入张量
-q = torch.randn(
-    bs, H, 1, dk,
-    dtype=torch.float32, device=device, requires_grad=False
-)
-k = torch.randn(
-    bs, Hk, 1, dk,
-    dtype=torch.float32, device=device, requires_grad=False
-)
-v = torch.randn(
-    bs, Hk, 1, dv,
-    dtype=torch.float32, device=device, requires_grad=False
-)
-past_kv = torch.randn(
-    bs, Hk, L_past, dk + dv,
-    dtype=torch.float32, device=device, requires_grad=False
-)
-output = torch.empty(
-    bs, H, 1, dv,
-    dtype=torch.float32, device=device, requires_grad=False
-)
-slope = torch.tensor(0.1, dtype=torch.float32, device=device)
-new_kv = torch.empty(
-    bs, Hk, L_past + 1, dk + dv,
-    dtype=torch.float32, device=device, requires_grad=False
-)
-# 调用算子
-torch.ops.sgl_kernel.lightning_attention_decode(
-    q=q,
-    k=k,
-    v=v,
-    past_kv=past_kv,
-    slope=slope,
-    output=output,
-    new_kv=new_kv
-)
-# 输出结果
-print("lightning_attention_decode computation completed")
-print(f"Output shape: {output.shape}")
-print(f"Updated new_kv shape: {new_kv.shape}")
-```
-
-## 106. merge_state
-
-### 支持的产品型号
-
-- Metax C500/C550
-
-### 接口原型
-
-```Python
-def merge_state(
-    prefix_output: torch.Tensor,
-    prefix_lse: torch.Tensor,
-    suffix_output: torch.Tensor,
-    suffix_lse: torch.Tensor,
-    output: Optional[torch.Tensor] = None,
-    output_lse: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    pass
-```
-
-### 功能描述
-
-merge_state 算子用于合并两个注意力计算阶段的中间状态（State），通常用于 FlashAttention 机制中的分块并行计算或解码阶段的状态更新。算子接收两组部分计算得到的 Output (Values) 和 LogSumExp (LSE) 数据，基于 LSE 进行加权归一化合并，生成最终的 Output 和更新后的 LSE。
-操作逻辑：
-算子接收前缀状态（Prefix）和后缀状态（Suffix），对每个 token 的每个 head 执行以下计算：
-
-1. 计算全局最大 LSE： $max\_lse = \max (p\_lse, s\_lse)$
-2. 计算归一化分母： $out\_se = \exp (p\_lse - max\_lse) + \exp (s\_lse - max\_lse)$
-3. 更新 LSE： $out\_lse = \log (out\_se) + max\_lse$
-4. 计算加权系数并合并 Output：
-
-$$
-    out = p\_out \cdot \frac{\exp(p\_lse - max\_lse)}{out\_se} + s\_out \cdot \frac{\exp(s\_lse - max\_lse)}{out\_se}
-$$
-
-**主要功能包括：**
-
-- 基于 LogSumExp 的数值稳定性加权合并。
-- 支持 In-place 操作（通过传入 output 张量）。
-- 自动处理 padding 和 head 维度的对齐。
-
-### 参数说明
-
-- **prefix_output** (torch.Tensor, 入参): 前缀部分的 Output 张量，形状为 `[num_tokens, num_heads, head_size]`，数据类型推荐使用 bfloat16（根据报错信息推断，Float/Half 可能未注册）。
-- **prefix_lse** (torch.Tensor, 入参): 前缀部分的 LogSumExp 张量，形状为 `[num_tokens, num_heads]`，数据类型通常为 float32。
-- **suffix_output** (torch.Tensor, 入参): 后缀部分的 Output 张量，形状和数据类型与 `prefix_output` 相同。
-- **suffix_lse** (torch.Tensor, 入参): 后缀部分的 LogSumExp 张量，形状和数据类型与 `prefix_lse` 相同。
-- **output** (Optional[torch.Tensor], 出参): 用于存储合并结果的 Output 张量。如果为 None，则自动创建。
-- **output_lse** (Optional[torch.Tensor], 出参): 用于存储合并结果的 LogSumExp 张量。如果为 None，则自动创建。
-
-### 返回值
-
-返回一个元组 `(output, output_lse)`：
-
-- **output**: 合并后的 Output 张量。
-- **output_lse**: 合并后的 LogSumExp 张量。
-
-### 约束与调用
-
-- 输入张量 `prefix_output` 和 `suffix_output` 的形状必须完全一致。
-- `prefix_lse` 和 `suffix_lse` 的形状必须匹配 `[num_tokens, num_heads]`。
-- 建议 Value 张量使用 `bfloat16`，LSE 张量使用 `float32`。
-- 算子支持 CUDA 设备。
-
-### 调用示例
-
-```Python
-import torch
-import mcoplib.sgl_kernel
-# 配置参数
-SEED = 0
-DEVICE = "cuda"
-# 修复：Half 和 Float 均 dispatch 失败，切换为 bfloat16
-DTYPE_VAL = torch.bfloat16
-DTYPE_LSE = torch.float32
-# 维度设置
-NUM_TOKENS = 4
-NUM_HEADS = 8
-HEAD_SIZE = 128
-# 初始化环境
-torch.manual_seed(SEED)
-torch.set_default_device(DEVICE)
-# 1. 创建输入 Tensors
-# 模拟前缀状态
-prefix_out = torch.randn(NUM_TOKENS, NUM_HEADS, HEAD_SIZE, dtype=DTYPE_VAL)
-prefix_lse = torch.randn(NUM_TOKENS, NUM_HEADS, dtype=DTYPE_LSE)
-# 模拟后缀状态
-suffix_out = torch.randn(NUM_TOKENS, NUM_HEADS, HEAD_SIZE, dtype=DTYPE_VAL)
-suffix_lse = torch.randn(NUM_TOKENS, NUM_HEADS, dtype=DTYPE_LSE)
-# 2. 准备输出 Tensors (可选)
-output = torch.empty_like(prefix_out)
-output_lse = torch.empty_like(prefix_lse)
-# 算子执行
-print(f"Running merge_state with {DTYPE_VAL}...")
-if torch.cuda.is_available():
-    torch.cuda.synchronize()
-# 调用 ops
-torch.ops.sgl_kernel.merge_state(
-    prefix_out,
-    prefix_lse,
-    suffix_out,
-    suffix_lse,
-    output,
-    output_lse
-)
-if torch.cuda.is_available():
-    torch.cuda.synchronize()
-# 验证结果
-print("执行成功。")
-print(f"Output Shape: {output.shape}")
-print(f"Output LSE Shape: {output_lse.shape}")
-print(f"Output Mean: {output.float().mean().item()}")
-```
-
-## 107. merge_state_v2
-
-### 支持的产品型号
-
-- Metax C500/C550
-
-### 接口原型
-
-```Python
-def merge_state_v2(
-    prefix_output: torch.Tensor,
-    prefix_lse: torch.Tensor,
-    suffix_output: torch.Tensor,
-    suffix_lse: torch.Tensor,
-    output: Optional[torch.Tensor] = None,
-    output_lse: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    pass
-```
-
-### 功能描述
-
-merge_state_v2 算子用于合并两个独立注意力计算阶段产生的中间状态（Value 和 LogSumExp）。该算子通常应用于 FlashAttention 的分块解码（Split-K Decoding）、投机采样（Speculative Decoding）中的 Cascade Attention 验证阶段，或者 chunked prefill 场景。它根据两组 LogSumExp (LSE) 的值计算归一化权重，将两组部分的 Output 合并为最终的 Output，并更新全局 LSE。
-操作逻辑：
-算子接收两组状态 $(V_a, S_a)$ 和 $(V_b, S_b)$ ，其中 $V$ 代表 Output， $S$ 代表 LSE。对每个 Head 的每个 Token 执行以下计算：
-
-1. 计算最大 LSE： $m = \max (S_a, S_b)$
-2. 计算归一化因子： $l = \exp (S_a - m) + \exp (S_b - m)$
-3. 计算新的 LSE： $S_{new} = m + \log (l)$
-4. 合并 Output：
-
-$$
-    V_{new} = \frac{V_a \cdot \exp(S_a - m) + V_b \cdot \exp(S_b - m)}{l}
-$$
-
-**主要功能包括**：
-
-- 高效合并 FlashAttention 的中间结果。
-- 保证数值稳定性的 LogSumExp 更新。
-- 支持 In-place 操作以减少显存分配。
-
-### 参数说明
-
-- **prefix_output** (torch.Tensor, 入参): 第一部分（前缀）的 Output 张量，形状为 `[num_tokens, num_heads, head_size]`，数据类型支持 float16 或 bfloat16
-- **prefix_lse** (torch.Tensor, 入参): 第一部分（前缀）的 LogSumExp 张量，形状为 `[num_tokens, num_heads]`，数据类型必须为 float32
-- **suffix_output** (torch.Tensor, 入参): 第二部分（后缀）的 Output 张量，形状和数据类型与 `prefix_output` 相同
-- **suffix_lse** (torch.Tensor, 入参): 第二部分（后缀）的 LogSumExp 张量，形状和数据类型与 `prefix_lse` 相同
-- **output** (Optional[torch.Tensor], 出参): 用于存储合并结果的 Output 张量。如果为 None，算子将创建新张量或复用输入（取决于具体实现逻辑，通常建议显式传入或使用返回值）
-- **output_lse** (Optional[torch.Tensor], 出参): 用于存储合并结果的 LSE 张量。如果为 None，算子将创建新张量
-
-### 返回值
-
-返回一个元组 `(output, output_lse)`，包含合并后的 Output 张量和 LogSumExp 张量
-
-### 约束与调用
-
-- 所有输入张量必须在 CUDA 设备上
-- `prefix_output` 和 `suffix_output` 的形状必须完全一致
-- `prefix_lse` 和 `suffix_lse` 的形状必须完全一致，且匹配 Output 的前两维
-- LSE 张量必须连续（Contiguous）
-- 推荐使用 `bfloat16` 作为 Value 的数据类型以获得最佳性能和精度平衡
-
-### 调用示例
-
-```Python
-import torch
-import mcoplib.sgl_kernel
-# 配置参数
-SEED = 0
-DEVICE = "cuda"
-DTYPE_VAL = torch.bfloat16
-DTYPE_LSE = torch.float32
-# 维度设置
-NUM_TOKENS = 64
-NUM_HEADS = 8
-HEAD_SIZE = 128
-# 初始化环境
-torch.manual_seed(SEED)
-torch.set_default_device(DEVICE)
-# 1. 创建输入 Tensors
-# 模拟前缀 Attention 结果
-prefix_out = torch.randn(NUM_TOKENS, NUM_HEADS, HEAD_SIZE, dtype=DTYPE_VAL)
-prefix_lse = torch.randn(NUM_TOKENS, NUM_HEADS, dtype=DTYPE_LSE)
-# 模拟后缀 Attention 结果
-suffix_out = torch.randn(NUM_TOKENS, NUM_HEADS, HEAD_SIZE, dtype=DTYPE_VAL)
-suffix_lse = torch.randn(NUM_TOKENS, NUM_HEADS, dtype=DTYPE_LSE)
-# 2. 准备输出 Tensors
-output = torch.empty_like(prefix_out)
-output_lse = torch.empty_like(prefix_lse)
-# 算子执行
-print(f"Running merge_state_v2...")
-if torch.cuda.is_available():
-    torch.cuda.synchronize()
-torch.ops.sgl_kernel.merge_state_v2(
-    prefix_out,
-    prefix_lse,
-    suffix_out,
-    suffix_lse,
-    output,
-    output_lse
-)
-if torch.cuda.is_available():
-    torch.cuda.synchronize()
-# 验证结果
-print("执行成功。")
-print(f"Output Mean: {output.float().mean().item()}")
-print(f"Output LSE Mean: {output_lse.mean().item()}")
-```
-
-## 108. fused_add_rmsnorm
-
-### 支持的产品型号
-
-- Metax C500/C550
-
-### 接口原型
-
-```Python
-def fused_add_rmsnorm(
-    input: torch.Tensor,
-    residual: torch.Tensor,
-    weight: torch.Tensor,
-    epsilon: float,
-    enable_pdl: bool = False
-) -> None:
-    pass
-```
-
-### 功能描述
-
-fused_add_rmsnorm 算子将残差连接（Residual Add）与 RMSNorm（Root Mean Square Normalization）操作融合为一个高效的内核。该操作通常用于 Transformer 架构的层级结构中，在每个子层（如 Attention 或 Feed Forward）之后应用。
-操作逻辑：
-
-1. 残差更新：首先将输入 input 与 residual 相加，结果直接原位更新到 residual 张量中。
-
-$$
-    residual \leftarrow input + residual
-$$
-
-2. RMSNorm：然后对更新后的 `residual` 进行 RMSNorm 操作。
-
-- 计算均方根：
-
-$$
-        RMS(x) = \sqrt{\frac{1}{d} \sum_{i=1}^{d} x_i^2 + \epsilon}
-$$
-
-- 归一化并缩放：
-
-$$
-        y = \frac{x}{RMS(x)} \cdot weight
-$$
-
-- 最终结果原位更新到 `input` 张量中。
-	**主要功能包括：**
-- 融合 Add 和 RMSNorm 以减少显存访问次数。
-- 支持 In-place 更新 residual，节省显存。
-- 支持通过 `enable_pdl` 参数开启特定硬件优化。
-
-### 参数说明
-
-- **input** (torch.Tensor, 入参/出参): 输入张量，形状通常为 `[batch_size, seq_len, hidden_size]`。操作后存储 RMSNorm 的结果。数据类型推荐使用 bfloat16。
-- **residual** (torch.Tensor, 入参/出参): 残差张量，形状与 `input` 相同。操作后存储 `input + residual` 的结果。数据类型与 `input` 一致。
-- **weight** (torch.Tensor, 入参): RMSNorm 的权重参数，形状为 `[hidden_size]`。数据类型通常与 `input` 一致。
-- **epsilon** (float, 入参): 数值稳定性常数，通常为 1e-6。
-- **enable_pdl** (bool, 入参): 是否开启 PDL 优化，默认为 False。
-
-### 返回值
-
-无返回值（None）。结果直接写入 `input` 和 `residual` 张量。
-
-### 约束与调用
-
-- `input` 和 `residual` 的形状必须完全一致。
-- `weight` 的大小必须匹配 `input` 的最后一维。
-- 所有输入张量必须在 CUDA 设备上。
-- 数据类型通常要求一致（如均为 bf16）。
-- 建议输入张量是连续存储的。
-
-### 调用示例
-
-```Python
-import torch
-import mcoplib.sgl_kernel
-# 配置参数
-SEED = 0
-DEVICE = "cuda"
-DTYPE = torch.bfloat16  # 使用 bfloat16 避免 Half dispatch 错误
-HIDDEN_SIZE = 4096
-NUM_TOKENS = 128
-EPS = 1e-6
-ENABLE_PDL = False
-# 初始化
-torch.manual_seed(SEED)
-torch.set_default_device(DEVICE)
-# 创建 Tensor
-input_tensor = torch.randn(NUM_TOKENS, HIDDEN_SIZE, dtype=DTYPE)
-residual_tensor = torch.randn(NUM_TOKENS, HIDDEN_SIZE, dtype=DTYPE)
-weight = torch.ones(HIDDEN_SIZE, dtype=DTYPE)
-# 备份
-input_ref = input_tensor.clone()
-residual_ref = residual_tensor.clone()
-# 执行算子
-if torch.cuda.is_available():
-    torch.cuda.synchronize()
-torch.ops.sgl_kernel.fused_add_rmsnorm(
-    input_tensor,
-    residual_tensor,
-    weight,
-    EPS,
-    ENABLE_PDL
-)
-if torch.cuda.is_available():
-    torch.cuda.synchronize()
-# 验证结果
-expected_residual = input_ref + residual_ref
-diff_residual = (residual_tensor - expected_residual).abs().max()
-# 手动计算 RMSNorm (转 float32 计算)
-input_f32 = input_ref.to(torch.float32)
-residual_f32 = residual_ref.to(torch.float32)
-weight_f32 = weight.to(torch.float32)
-expected_residual_f32 = input_f32 + residual_f32
-rstd = torch.rsqrt(expected_residual_f32.pow(2).mean(-1, keepdim=True) + EPS)
-expected_output = (expected_residual_f32 * rstd * weight_f32).to(DTYPE)
-diff_output = (input_tensor - expected_output).abs().max()
-print("执行成功。")
-print(f"Residual Max Diff: {diff_residual.item()}")
-print(f"Output Max Diff: {diff_output.item()}")
-```
-
-## 109. apply_rope_pos_ids_cos_sin_cache
-
-### 支持的产品型号
-
-- Metax C500/C550
-
-### 接口原型
-
-```Python
-def apply_rope_pos_ids_cos_sin_cache(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    q_rope: torch.Tensor,
-    k_rope: torch.Tensor,
-    cos_sin_cache: torch.Tensor,
-    pos_ids: torch.Tensor,
-    interleave: bool = False,
-    enable_pdl: bool = False,
-    cuda_stream: int = 0,
-    v: Optional[torch.Tensor] = None,
-    k_buffer: Optional[torch.Tensor] = None,
-    v_buffer: Optional[torch.Tensor] = None,
-    kv_cache_loc: Optional[torch.Tensor] = None
-) -> None:
-    pass
-```
-
-### 功能描述
-
-apply_rope_pos_ids_cos_sin_cache 算子用于对查询（Query）和键（Key）张量应用旋转位置编码（Rotary Positional Embeddings, RoPE）。该算子利用预计算的 Cosine 和 Sine 缓存表，根据输入的位置 ID 对向量进行旋转。
-此外，该算子支持融合操作：如果提供了 Value 张量以及 KV Cache 的缓冲区（buffer 和 location），它可以在执行 RoPE 的同时，将 Key 和 Value 保存到非连续的 KV Cache 内存中（类似 PagedAttention 的写入过程），从而减少显存读写次数。
-**主要功能包括：**
-
-- RoPE 计算：根据 `pos_ids` 从 `cos_sin_cache` 获取旋转系数，应用到 `q` 和 `k`。
-- KV Cache 写入（可选）：如果提供了 `v`、`k_buffer`、`v_buffer` 和 `kv_cache_loc`，则将 RoPE 后的 Key 和原始 Value 写入指定的 Cache 显存位置。
-- 模式支持：支持交错（Interleaved）模式和普通模式的 RoPE 计算。
-
-### 参数说明
-
-- **q** (torch.Tensor, 入参): 输入的 Query 张量，形状为 `[nnz, num_heads, head_dim]`，数据类型通常为 float16 或 bfloat16。`nnz` 为总 Token 数（Batch x SeqLen）。
-- **k** (torch.Tensor, 入参): 输入的 Key 张量，形状为 `[nnz, num_kv_heads, head_dim]`，数据类型与 `q` 一致。
-- **q_rope** (torch.Tensor, 出参): 输出的经过 RoPE 处理的 Query 张量，形状与 `q` 相同。
-- **k_rope** (torch.Tensor, 出参): 输出的经过 RoPE 处理的 Key 张量，形状与 `k` 相同。
-- **cos_sin_cache** (torch.Tensor, 入参): 预计算的 Cos/Sin 缓存表，形状为 `[max_seq_len, rotary_dim]`。通常前一半为 Cos，后一半为 Sin，或者根据具体实现布局。
-- **pos_ids** (torch.Tensor, 入参): 每个 Token 对应的位置索引，形状为 `[nnz]`，数据类型为 int64。
-- **interleave** (bool, 入参): 是否使用交错模式计算 RoPE。默认为 False。
-- **enable_pdl** (bool, 入参): 是否开启 PDL (Parallel Data Layout) 优化。默认为 False。
-- **cuda_stream** (int, 入参): CUDA 流的整数句柄。通常使用 `torch.cuda.current_stream (). cuda_stream` 获取。
-- **v** (Optional[torch.Tensor], 入参): 输入的 Value 张量（可选），形状为 `[nnz, num_kv_heads, head_dim]`。仅在需要同时保存 KV Cache 时提供。
-- **k_buffer** (Optional[torch.Tensor], 出参): KV Cache 中的 Key 缓冲区（可选），形状通常为 `[num_blocks, block_size, num_kv_heads, head_dim]` 或类似结构。
-- **v_buffer** (Optional[torch.Tensor], 出参): KV Cache 中的 Value 缓冲区（可选）。
-- **kv_cache_loc** (Optional[torch.Tensor], 入参): KV Cache 的写入位置索引（可选），形状为 `[nnz]`。
-
-### 返回值
-
-无返回值。结果直接写入 `q_rope`、`k_rope` 以及可选的 `k_buffer` 和 `v_buffer` 中。
-
-### 约束与调用
-
-- 输入张量 `q` 和 `k` 的最后一维必须是连续的（Contiguous）。
-- 所有 Tensor 必须位于相同的 CUDA 设备上。
-- `q` 和 `k` 的第一维（Token 数）和最后一维（Head Dim）必须相等。
-- 如果启用 KV Cache 保存功能，必须同时提供 `v`、`k_buffer`、`v_buffer` 和 `kv_cache_loc`，且它们的维度必须匹配。
-
-### 调用示例
-
-```Python
-import torch
-import mcoplib.sgl_kernel
-# 配置参数
-SEED = 0
-DEVICE = "cuda"
-# 预防 float16 dispatch 错误，使用 bfloat16
-DTYPE = torch.bfloat16
-NNZ = 10              # 总 Token 数
-NUM_Q_HEADS = 4
-NUM_KV_HEADS = 2
-HEAD_DIM = 128
-ROTARY_DIM = 128      # 旋转维度
-MAX_SEQ_LEN = 1024
-# 初始化环境
-torch.manual_seed(SEED)
-torch.set_default_device(DEVICE)
-# 1. 创建输入 Tensors
-q = torch.randn(NNZ, NUM_Q_HEADS, HEAD_DIM, dtype=DTYPE)
-k = torch.randn(NNZ, NUM_KV_HEADS, HEAD_DIM, dtype=DTYPE)
-# 模拟 Cos/Sin Cache (假设简单布局)
-cos_sin_cache = torch.randn(MAX_SEQ_LEN, ROTARY_DIM, dtype=DTYPE)
-# 生成随机位置 ID
-pos_ids = torch.randint(0, MAX_SEQ_LEN, (NNZ,), dtype=torch.int64)
-# 2. 准备输出 Tensors
-q_rope = torch.empty_like(q)
-k_rope = torch.empty_like(k)
-# 3. 获取 CUDA Stream
-current_stream = torch.cuda.current_stream().cuda_stream
-# 算子执行 (仅 RoPE，不保存 Cache)
-print(f"Running apply_rope_pos_ids_cos_sin_cache with {DTYPE}...")
-if torch.cuda.is_available():
-    torch.cuda.synchronize()
-# 修复：传入 cuda_stream 参数
-torch.ops.sgl_kernel.apply_rope_pos_ids_cos_sin_cache(
-    q,
-    k,
-    q_rope,
-    k_rope,
-    cos_sin_cache,
-    pos_ids,
-    False,           # interleave
-    False,           # enable_pdl
-    current_stream,  # cuda_stream (Fix: 补充此参数)
-    None,   # v
-    None,   # k_buffer
-    None,   # v_buffer
-    None    # kv_cache_loc
-)
-if torch.cuda.is_available():
-    torch.cuda.synchronize()
-# 验证结果
-print("执行成功。")
-print(f"Q_RoPE Shape: {q_rope.shape}")
-print(f"K_RoPE Shape: {k_rope.shape}")
-```
-
-## 110. fused_mla_absorb_rotary_emb
-
-### 支持的产品型号
-
-- Metax C500/C550
-
-### 接口原型
-
-```Python
-def fused_mla_absorb_rotary_emb(
-    q: torch.Tensor,
-    w_kc: torch.Tensor,
-    latent_cache: torch.Tensor,
-    cos_sin_cache: torch.Tensor,
-    positions: torch.Tensor,
-    norm_weight: torch.Tensor,
-    q_input: torch.Tensor,
-    k_input: torch.Tensor,
-    v_input: torch.Tensor,
-    q_len: int,
-    num_local_heads: int,
-    kv_lora_rank: int,
-    qk_rope_head_dim: int,
-    qk_nope_head_dim: int
-) -> int:
-    pass
-```
-
-### 功能描述
-
-fused_mla_absorb_rotary_emb 算子用于 MLA（Multi-Head Latent Attention）机制中的融合计算。该算子将旋转位置编码（RoPE）的应用、权重吸收（Absorb）以及相关的层归一化（LayerNorm）操作融合，用于高效生成用于后续计算的 Query、Key 和 Value 张量。
-此功能主要应用于以下场景：
-
-1. DeepSeek-V2/V3 推理：针对 MLA 架构的特有优化，处理 Latent Cache 到投影后 Q/K/V 的转换。
-2. 显存与计算优化：通过融合多个 element-wise 和 GEMV 操作，减少显存读写次数，提升推理性能。
-
-- 操作逻辑：
-	算子接收原始查询 q、键内容权重 w_kc、潜在缓存 latent_cache 以及位置编码表 cos_sin_cache。
-	算子结合 positions 索引应用 RoPE，并结合 norm_weight 进行归一化处理。
-	最终将计算结果写入输出张量 q_input、k_input 和 v_input。
-	**主要功能包括**：
-- 对 Latent Cache 进行归一化和权重计算。
-- 融合 RoPE 位置编码应用。
-- 按照 MLA 结构输出投影后的 Q、K、V 数据。
-
-### 参数说明
-
-- **q** (torch.Tensor, 入参): 查询张量，形状为 `[q_len, num_local_heads, qk_nope_head_dim + qk_rope_head_dim]`，数据类型为 bfloat16。其中 `q_len` 对应 Batch Size 或当前批次的 Token 总数。
-- **w_kc** (torch.Tensor, 入参): Key-Content 权重张量，形状为 `[num_local_heads, qk_nope_head_dim, kv_lora_rank]`，数据类型为 float32。
-- **latent_cache** (torch.Tensor, 入参): 潜在缓存张量，形状为 `[bs, kv_lora_rank + qk_rope_head_dim]`，数据类型为 bfloat16。
-- **cos_sin_cache** (torch.Tensor, 入参): RoPE 正余弦缓存表，形状为 `[max_position_embeddings, qk_rope_head_dim]`，数据类型为 bfloat16。
-- **positions** (torch.Tensor, 入参): 位置索引张量，形状为 `[bs]`，数据类型为 int64。
-- **norm_weight** (torch.Tensor, 入参): 归一化权重张量，形状为 `[kv_lora_rank]`，数据类型为 float32。
-- **q_input** (torch.Tensor, 出参): Query 输出张量，形状为 `[bs, qk_nope_head_dim, kv_lora_rank + qk_rope_head_dim]`，数据类型为 bfloat16。
-- **k_input** (torch.Tensor, 出参): Key 输出张量，形状为 `[bs, 1, kv_lora_rank + qk_rope_head_dim]`，数据类型为 bfloat16。
-- **v_input** (torch.Tensor, 出参): Value 输出张量，形状为 `[bs, 1, kv_lora_rank]`，数据类型为 bfloat16。
-- **q_len** (int, 入参): 查询长度，必须等于 `q` 张量的第 0 维大小 (`q.size (0)`)。
-- **num_local_heads** (int, 入参): 本地注意力头数。
-- **kv_lora_rank** (int, 入参): KV LoRA 的秩（Rank）大小。
-- **qk_rope_head_dim** (int, 入参): Query/Key 的 RoPE 维度大小。
-- **qk_nope_head_dim** (int, 入参): Query/Key 的非 RoPE 维度大小。
-
-### 返回值
-
-返回 int 类型状态码（通常为 0 表示成功），计算结果直接写入 `q_input`、`k_input` 和 `v_input` 张量中。
-
-### 约束与调用
-
-- 输入 Tensor 必须在 GPU 上。
-- **严格的混合精度要求**：
-- 数据流张量 (`q`, `latent_cache`, `cos_sin_cache`) 必须为 **bfloat16**。
-- 权重参数张量 (`w_kc`, `norm_weight`) 必须为 **float32**。
-- `q.size (0)` 必须严格等于传入的 `q_len` 参数。
-- `positions` 的值不能超出 `cos_sin_cache` 的最大长度。
-
-### 调用示例
-
-```Python
-import torch
-import mcoplib.sgl_kernel
-# 配置参数
-SEED = 0
-DEVICE = "cuda"
-BS = 4
-Q_LEN = 4
-NUM_LOCAL_HEADS = 128
-KV_LORA_RANK = 512
-QK_ROPE_HEAD_DIM = 64
-QK_NOPE_HEAD_DIM = 128
-MAX_POS = 4096
-torch.manual_seed(SEED)
-torch.set_default_device(DEVICE)
-# 1. 创建数据流张量 (BFloat16)
-q = torch.randn((BS, NUM_LOCAL_HEADS, QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM), dtype=torch.bfloat16)
-latent_cache = torch.randn((BS, KV_LORA_RANK + QK_ROPE_HEAD_DIM), dtype=torch.bfloat16)
-cos_sin_cache = torch.randn((MAX_POS, QK_ROPE_HEAD_DIM), dtype=torch.float32)
-# 2. 创建权重张量 
-w_kc = torch.randn(
-    (NUM_LOCAL_HEADS, QK_NOPE_HEAD_DIM, KV_LORA_RANK), 
-    dtype=torch.bfloat16
-)
-norm_weight = torch.randn(
-    (KV_LORA_RANK,), 
-    dtype=torch.bfloat16
-)
-# 3. 创建索引张量 (Int64)
-positions = torch.randint(0, MAX_POS, (BS,), dtype=torch.int64)
-# 4. 创建输出张量 (BFloat16)
-q_input = torch.empty((BS, QK_NOPE_HEAD_DIM, KV_LORA_RANK + QK_ROPE_HEAD_DIM), dtype=torch.bfloat16)
-k_input = torch.empty((BS, 1, KV_LORA_RANK + QK_ROPE_HEAD_DIM), dtype=torch.bfloat16)
-v_input = torch.empty((BS, 1, KV_LORA_RANK), dtype=torch.bfloat16)
-print(f"Running fused_mla_absorb_rotary_emb...")
-if torch.cuda.is_available():
-    torch.cuda.synchronize()
-torch.ops.sgl_kernel.fused_mla_absorb_rotary_emb(
-    q,
-    w_kc,
-    latent_cache,
-    cos_sin_cache,
-    positions,
-    norm_weight,
-    q_input,
-    k_input,
-    v_input,
-    Q_LEN,
-    NUM_LOCAL_HEADS,
-    KV_LORA_RANK,
-    QK_ROPE_HEAD_DIM,
-    QK_NOPE_HEAD_DIM
-)
-if torch.cuda.is_available():
-    torch.cuda.synchronize()
-print("执行成功。")
-```
-
-## 111. copy_to_gpu_no_ce
-
-### 支持的产品型号
-
-- Metax C500/C550
-
-### 接口原型
-
-```Python
-def copy_to_gpu_no_ce(
-    input: torch.Tensor,
-    output: torch.Tensor
-) -> None:
-    pass
-```
-
-### 功能描述
-
-copy_to_gpu_no_ce 算子用于将小型整型数组从 CPU 内存高效复制到 GPU 显存。该算子不使用标准的 DMA 拷贝引擎（Copy Engine），而是通过将数据作为内核参数直接传递给 GPU 内核来实现数据传输。
-此功能主要应用于以下场景：
-
-1. 元数据传输：传输少量的控制信息或形状信息（如 tensor shapes, flags）。
-2. 低延迟同步：避免启动 DMA 引擎带来的额外开销，适用于极小数据量的快速传输。
-
-- 操作逻辑：
-	算子接收源张量 input 和目标张量 output。
-	算子将 input 中的所有元素逐一复制到 output 对应的位置。
-
-$$
-    \forall i, \quad \text{output}[i] \leftarrow \text{input}[i]
-$$
-
-    其中 $i$ 为元素索引。
-
-**主要功能包括**：
-
-- 将 Int32 数据从 CPU 快速复制到 CUDA 设备。
-- 利用内核参数传递机制绕过传统内存拷贝路径。
-- 严格校验数据长度（仅支持特定的固定长度，如 64 或 72）。
-
-### 参数说明
-
-- **input** (torch.Tensor, 入参): 源张量，必须位于 CPU 上。形状为 1D，数据类型必须为 int32，且内存连续。元素数量必须严格等于 64 或 72。
-- **output** (torch.Tensor, 出参): 目标张量，必须位于 CUDA 设备上。形状为 1D，数据类型必须为 int32，且内存连续。元素数量必须与 `input` 一致。
-
-### 返回值
-
-无返回值，操作结果直接写入 `output` 张量中
-
-### 约束与调用
-
-- `input` 必须是 CPU 张量，`output` 必须是 CUDA 张量
-- `input` 和 `output` 的数据类型必须严格为 `torch.int32`
-- `input` 和 `output` 必须是连续的（Contiguous）且为 1 维张量
-- 张量的元素个数（numel）必须严格等于 64 或 72，否则会抛出异常
-
-### 调用示例
-
-```Python
-import torch
-import mcoplib.sgl_kernel
-# 配置参数
-SEED = 0
-N = 64  # 支持 64 或 72
-DEVICE_CPU = "cpu"
-DEVICE_GPU = "cuda"
-DTYPE = torch.int32
-# 初始化环境
-torch.manual_seed(SEED)
-# 1. 创建 CPU 输入 Tensor
-# 数据必须是 int32 类型，长度必须符合约束
-src_data = [i for i in range(N)]
-input_cpu = torch.tensor(src_data, dtype=DTYPE, device=DEVICE_CPU)
-# 2. 创建 GPU 输出 Tensor
-output_gpu = torch.empty_like(input_cpu, device=DEVICE_GPU)
-# 算子执行
-print(f"Running copy_to_gpu_no_ce with N={N}...")
-if torch.cuda.is_available():
-    torch.cuda.synchronize()
-torch.ops.sgl_kernel.copy_to_gpu_no_ce(
-    input_cpu,
-    output_gpu
-)
-if torch.cuda.is_available():
-    torch.cuda.synchronize()
-# 验证结果
-# 将结果拷回 CPU 进行比对
-output_cpu = output_gpu.cpu()
-diff = (input_cpu - output_cpu).abs().sum()
-print("执行成功。")
-print(f"Diff: {diff.item()}")
-```
-
-## 112. concat_mla_k
-
-### 支持的产品型号
-
-- Metax C500/C550
-
-### 接口原型
-
-```Python
-def concat_mla_k(
-    k: torch.Tensor,
-    k_nope: torch.Tensor,
-    k_rope: torch.Tensor
-) -> None:
-    pass
-```
-
-### 功能描述
-
-concat_mla_k 算子用于在多头潜在注意力（MLA）机制中组合生成最终的 Key 张量。该算子将非旋转位置编码部分（Nope）和旋转位置编码部分（RoPE）拼接并存储到目标内存中。
-此功能主要应用于以下场景：
-
-1. MLA 推理：在 DeepSeek 等采用 MLA 架构的模型中，将压缩后的 latent 向量投影出的两部分（pe 和 nope）合并。
-2. 显存布局优化：将分散存储的 Key 组件合并为连续的张量，以便后续 Attention 计算。
-
-- 操作逻辑：
-	算子接收目标张量 k 以及两个源张量 k_nope 和 k_rope。
-	对于每一个 Token 和 Head，算子将 k_nope 复制到 k 的前 128 维，将 k_rope 复制到 k 的后 64 维。其中 k_rope 会在 Head 维度上进行广播。
-
-$$
-    \text{k}[t, h, 0:128] \leftarrow \text{k\\_nope}[t, h, 0:128]
-$$
-
-
-
-$$
-    \text{k}[t, h, 128:192] \leftarrow \text{k\\_rope}[t, 0, 0:64]
-$$
-
-**主要功能包括**：
-
-- 高效拼接 MLA 的 Key 组件。
-- 支持 RoPE 部分的广播机制（所有 Head 共享同一个 RoPE 向量）。
-- 利用向量化加载和存储（int2/int4）优化显存带宽利用率。
-- 自动处理 L2 预取以隐藏访存延迟。
-
-### 参数说明
-
-- **k** (torch.Tensor, 出参): 目标 Key 张量，形状为 `[num_tokens, 128, 192]`，数据类型必须为 `bfloat16`。其中 192 = 128 (Nope) + 64 (RoPE)。
-- **k_nope** (torch.Tensor, 入参): 非 RoPE 部分的 Key 张量，形状为 `[num_tokens, 128, 128]`，数据类型必须为 `bfloat16`。
-- **k_rope** (torch.Tensor, 入参): RoPE 部分的 Key 张量，形状为 `[num_tokens, 1, 64]`，数据类型必须为 `bfloat16`。
-
-### 返回值
-
-无返回值，操作结果直接写入 `k` 张量中
-
-### 约束与调用
-
-- 所有输入输出张量必须在 CUDA 设备上
-- 数据类型严格限制为 `torch.bfloat16`
-- 张量的最后一维必须是连续的（Stride 为 1）
-- 内存地址必须 16 字节对齐
-- 维度约束：Head 数量固定为 128，Nope 维度固定为 128，RoPE 维度固定为 64
-
-### 调用示例
-
-```Python
-import torch
-import mcoplib.sgl_kernel
-# 配置参数
-SEED = 0
-DEVICE = "cuda"
-DTYPE = torch.bfloat16
-# 固定维度参数
-NUM_TOKENS = 16
-NUM_HEADS = 128
-NOPE_DIM = 128
-ROPE_DIM = 64
-TOTAL_DIM = NOPE_DIM + ROPE_DIM
-# 初始化环境
-torch.manual_seed(SEED)
-# 1. 创建输入 Tensor
-# k_nope: [num_tokens, num_heads, nope_dim]
-k_nope = torch.randn((NUM_TOKENS, NUM_HEADS, NOPE_DIM), dtype=DTYPE, device=DEVICE)
-# k_rope: [num_tokens, 1, rope_dim] -> 会被广播
-k_rope = torch.randn((NUM_TOKENS, 1, ROPE_DIM), dtype=DTYPE, device=DEVICE)
-# 2. 创建输出 Tensor
-k_out = torch.empty((NUM_TOKENS, NUM_HEADS, TOTAL_DIM), dtype=DTYPE, device=DEVICE)
-# 算子执行
-print(f"Running concat_mla_k...")
-if torch.cuda.is_available():
-    torch.cuda.synchronize()
-torch.ops.sgl_kernel.concat_mla_k(
-    k_out,
-    k_nope,
-    k_rope
-)
-if torch.cuda.is_available():
-    torch.cuda.synchronize()
-# 验证结果
-# 验证 Nope 部分
-diff_nope = (k_out[..., :NOPE_DIM] - k_nope).abs().sum()
-# 验证 RoPE 部分 (需要手动广播对比)
-k_rope_expanded = k_rope.expand(NUM_TOKENS, NUM_HEADS, ROPE_DIM)
-diff_rope = (k_out[..., NOPE_DIM:] - k_rope_expanded).abs().sum()
-print("执行成功。")
-print(f"Diff Nope: {diff_nope.item()}")
-print(f"Diff RoPE: {diff_rope.item()}")
-```
-
-## 113. concat_mla_absorb_q
-
-### 支持的产品型号
-
-- Metax C500/C550
-
-### 接口原型
-
-```Python
-def concat_mla_absorb_q(
-    q_nope: torch.Tensor,
-    q_rope: torch.Tensor,
-    out: torch.Tensor
-) -> None:
-    pass
-```
-
-### 功能描述
-
-concat_mla_absorb_q 算子用于 Multi-Head Latent Attention (MLA) 的 Query 向量生成阶段。该算子将非旋转位置编码的 Query 部分（Nope）和旋转位置编码的 Query 部分（RoPE）在最后一个维度上进行拼接，生成完整的 Query 张量。
-此功能主要应用于以下场景：
-
-1. MLA Decode/Prefill：在 DeepSeek-V3 等模型架构中，将经过不同投影层得到的 Query 分量合并，以便进行后续的 Attention 计算或矩阵乘法。
-2. 显存拼接优化：替代通用的 `torch.cat`，利用针对特定维度（512+64）优化的 CUDA Kernel 减少显存带宽开销。
-
-- 操作逻辑：
-	算子接收两个源张量 q_nope 和 q_rope，以及目标张量 out。
-	算子将 q_nope 的内容复制到 out 的低位部分，将 q_rope 的内容复制到 out 的高位部分。
-
-$$
-    \text{out}[..., 0:512] \leftarrow \text{q\\_nope}[...]
-$$
-
-
-
-$$
-    \text{out}[..., 512:576] \leftarrow \text{q\\_rope}[...]
-$$
-
-    主要功能包括：
-
-- 针对固定维度（Nope=512, RoPE=64）的高效拼接。
-- 使用向量化加载（int4/int）优化读写性能。
-- 自动展开循环以提高指令级并行度。
-
-### 参数说明
-
-- **q_nope** (torch.Tensor, 入参): Query 的非位置编码部分，形状为 `[Batch, Head, 512]`，数据类型必须为 `bfloat16`。
-- **q_rope** (torch.Tensor, 入参): Query 的旋转位置编码部分，形状为 `[Batch, Head, 64]`，数据类型必须为 `bfloat16`。
-- **out** (torch.Tensor, 出参): 输出张量，形状为 `[Batch, Head, 576]`，数据类型必须为 `bfloat16`。其中 576 = 512 + 64。
-
-### 返回值
-
-无返回值，拼接结果直接写入 `out` 张量中
-
-### 约束与调用
-
-- 所有输入输出张量必须在 CUDA 设备上
-- 数据类型严格限制为 `torch.bfloat16`
-- 张量的维度必须为 3 维
-- `q_nope` 最后一维必须为 512，`q_rope` 最后一维必须为 64，`out` 最后一维必须为 576
-- 内存地址必须 16 字节对齐
-- 最后一维必须是连续的（Stride 为 1）
-
-### 调用示例
-
-```Python
-import torch
-import mcoplib.sgl_kernel
-# 配置参数
-SEED = 0
-DEVICE = "cuda"
-DTYPE = torch.bfloat16
-# 固定维度参数
-BATCH_SIZE = 16
-NUM_HEADS = 128
-DIM_NOPE = 512
-DIM_ROPE = 64
-DIM_OUT = DIM_NOPE + DIM_ROPE
-# 初始化环境
-torch.manual_seed(SEED)
-# 1. 创建输入 Tensor
-q_nope = torch.randn((BATCH_SIZE, NUM_HEADS, DIM_NOPE), dtype=DTYPE, device=DEVICE)
-q_rope = torch.randn((BATCH_SIZE, NUM_HEADS, DIM_ROPE), dtype=DTYPE, device=DEVICE)
-# 2. 创建输出 Tensor
-out = torch.empty((BATCH_SIZE, NUM_HEADS, DIM_OUT), dtype=DTYPE, device=DEVICE)
-# 算子执行
-print(f"Running concat_mla_absorb_q...")
-if torch.cuda.is_available():
-    torch.cuda.synchronize()
-torch.ops.sgl_kernel.concat_mla_absorb_q(
-    q_nope,
-    q_rope,
-    out
-)
-if torch.cuda.is_available():
-    torch.cuda.synchronize()
-# 验证结果 
-expected = torch.cat([q_nope, q_rope], dim=-1)
-diff = (out - expected).abs().sum()
-print("执行成功。")
-print(f"Diff: {diff.item()}")
-```
-
-## 114. fast_topk
-
-### 支持的产品型号
-
-- Metax C500/C550
-
-### 接口原型
-
-```Python
-def fast_topk(
-    values: torch.Tensor,
-    topk: int,
-    dim: int
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    pass
-```
-
-### 功能描述
-
-fast_topk 算子用于高效地从输入张量中选取数值最大的 K 个元素及其索引。该算子针对推理场景中的采样阶段（Sampling）进行了特定优化，能够根据 K 值的不同自动选择最优的计算策略。
-此功能主要应用于以下场景：
-
-1. Greedy Sampling：当 K=1 时（即贪婪解码），算子退化为 Max 规约操作，避免全排序开销，显著降低计算量和显存访问。
-2. Top-K Sampling：当 K>1 时，算子执行标准的 Top-K 筛选。
-
-- 操作逻辑：
-	算子接收输入张量 values、目标数量 topk 和操作维度 dim。
-	当 topk == 1 时，执行最大值查找：
-
-$$
-    \text{output}, \text{indices} = \max(\text{values}, \text{dim})
-$$
-
-    当 topk > 1 时，执行 Top-K 排序：
-
-$$
-    \text{output}, \text{indices} = \text{TopK}(\text{values}, k, \text{dim})
-$$
-
-**主要功能包括**：
-
-- 针对 K=1 的特化路径优化。
-- 支持多维张量的指定维度操作。
-- 返回值包含排序后的数值（Values）和原始位置索引（Indices）。
-
-### 参数说明
-
-- **values** (torch.Tensor, 入参): 输入的分数或概率张量（通常为 Logits），数据类型支持 float16, bfloat16 或 float32。
-- **topk** (int, 入参): 需要保留的最大元素个数。必须大于 0。
-- **dim** (int, 入参): 进行筛选的维度索引。
-
-### 返回值
-
-返回一个包含两个张量的元组 `(output_values, output_indices)`：
-
-- **output_values**: 包含前 K 个最大数值的张量，形状与输入张量在 `dim` 维度上变为 `topk`。
-- **output_indices**: 对应数值在原始张量中的索引，数据类型为 int64。
-
-### 约束与调用
-
-- `values` 必须位于 CUDA 设备上
-- `topk` 必须小于或等于 `values` 在 `dim` 维度的大小
-- 返回的 `output_values` 数据类型与输入一致，`output_indices` 为 int64
-- 建议 `dim` 为最后一维（-1）以获得最佳内存访问性能
-
-### 调用示例
-
-```Python
-import torch
-import mcoplib.sgl_kernel
-# 配置参数
-SEED = 0
-DEVICE = "cuda"
-DTYPE = torch.float32  
-# 维度设置
-BATCH_SIZE = 4
-VOCAB_SIZE = 64000  # 需大于 K
-K = 2048
-# 初始化环境
-torch.manual_seed(SEED)
-torch.set_default_device(DEVICE)
-# 1. 创建分数 Tensor
-score = torch.randn(BATCH_SIZE, VOCAB_SIZE, dtype=DTYPE, device=DEVICE).contiguous()
-# 2. 创建输出 Indices Tensor (测试文件要求为 Int32)
-indices = torch.zeros(BATCH_SIZE, K, dtype=torch.int32, device=DEVICE).contiguous()
-# 3. 创建 Lengths Tensor (长度必须为 Batch Size)
-lengths = torch.full((BATCH_SIZE,), K, dtype=torch.int32, device=DEVICE).contiguous()
-# 算子执行
-print(f"Running fast_topk with K={K}...")
-if torch.cuda.is_available():
-    torch.cuda.synchronize()
-# 注意：C++接口需要4个参数，第4个为 row_starts (optional)，需显式传 None
-torch.ops.sgl_kernel.fast_topk(
-    score,
-    indices,
-    lengths,
-    None
-)
-if torch.cuda.is_available():
-    torch.cuda.synchronize()
-# 验证结果
-print("执行成功。")
-# 验证前将结果转为 int64 以便与 PyTorch 原生算子比较
-# 由于 K=2048 较大，这里只比较前 5 个元素以验证正确性
-ref_values, ref_indices = torch.topk(score, K, dim=1)
-print(f"Output Indices (Batch 0, Top 5): {indices[0, :5].tolist()}")
-print(f"Reference Indices (Batch 0, Top 5): {ref_indices[0, :5].tolist()}")
-```
-
-## 115. fast_topk_transform_fused
-
-### 支持的产品型号
-
-- Metax C500/C550
-
-### 接口原型
-
-```Python
-def fast_topk_transform_fused(
-    score: torch.Tensor,
-    lengths: torch.Tensor,
-    dst_page_table: torch.Tensor,
-    src_page_table: torch.Tensor,
-    cu_seqlens_q: torch.Tensor,
-    row_starts: Optional[torch.Tensor] = None
-) -> None:
-    pass
-```
-
-### 功能描述
-
-fast_topk_transform_fused 算子是 DeepSeek Native Sparse Attention (NSA) 机制中的关键组件，用于根据注意力评分（Gating Score）快速筛选出 Top-K 个最相关的 KV 块，并将这些块的物理索引写入到目标页表中。
-此功能主要应用于以下场景：
-
-1. 稀疏注意力选择：在解码或预填充阶段，根据预测的 block 分数，筛选出每一行（或每个 token）需要关注的 KV block。
-2. 索引转换：将筛选出的逻辑块索引直接映射为物理显存中的 Block ID，供后续的 FlashMLA 或其他注意力算子使用。
-
-- 操作逻辑：
-	算子接收评分张量 score，针对每个查询单元计算分值最高的 K 个块的索引。
-	根据计算出的 Top-K 索引，从源页表 src_page_table 中提取对应的物理块 ID。
-	将提取出的物理块 ID 存入 dst_page_table 中，供后续稀疏计算使用。
-	主要功能包括：
-- 融合了 Top-K 排序与 Gather 操作，减少显存访问开销。
-- 支持变长序列（通过 `cu_seqlens_q` 控制）。
-- 专为稀疏注意力模式下的动态页表构建优化。
-
-### 参数说明
-
-- **score** (torch.Tensor, 入参): 块评分张量，通常包含 Gating 网络输出的 Logits，形状为 `[num_tokens, num_blocks]` 或类似结构，数据类型通常为 float16 或 bfloat16。
-- **lengths** (torch.Tensor, 入参): 指定每个查询需要选择的块数量（即 Top-K 中的 K 值，或者扩展后的序列长度），数据类型为 int32。
-- **dst_page_table** (torch.Tensor, 出参): 目标页表张量，用于存储筛选后的物理块索引，数据类型为 int32。
-- **src_page_table** (torch.Tensor, 入参): 源页表张量，包含所有可用的物理块索引，数据类型为 int32。
-- **cu_seqlens_q** (torch.Tensor, 入参): 查询序列的累积长度数组，用于界定 Batch 中每个请求的边界，数据类型为 int32。
-- **row_starts** (torch.Tensor, 可选入参): 用于 Ragged 布局下的行偏移量指示，如果为 None 则不使用，数据类型为 int32。
-
-### 返回值
-
-无返回值，计算结果直接写入 `dst_page_table` 张量中。
-
-### 约束与调用
-
-- 输入张量必须在 CUDA 设备上。
-- `dst_page_table` 的内存必须预先分配，且大小足以容纳 Top-K 选择后的结果。
-- `lengths`、`src_page_table`、`dst_page_table` 和 `cu_seqlens_q` 的数据类型必须为 int32。
-- 算子假设 `src_page_table` 包含了完整的块映射关系。
-
-### 调用示例
-
-```Python
-import torch
-import mcoplib.sgl_kernel
-# 配置参数
-SEED = 0
-DEVICE = "cuda"
-NUM_TOKENS = 4
-TOPK = 2048
-NUM_ALL_BLOCKS = 4096 
-# 初始化环境
-torch.manual_seed(SEED)
-torch.set_default_device(DEVICE)
-# 1. 准备输入数据
-score = torch.randn(NUM_TOKENS, NUM_ALL_BLOCKS, dtype=torch.float32)
-src_page_table = torch.arange(NUM_TOKENS * NUM_ALL_BLOCKS, dtype=torch.int32).reshape(NUM_TOKENS, NUM_ALL_BLOCKS)
-dst_page_table = torch.zeros(NUM_TOKENS, TOPK, dtype=torch.int32)
-lengths = torch.full((NUM_TOKENS,), TOPK, dtype=torch.int32)
-cu_seqlens_q = torch.arange(NUM_TOKENS + 1, dtype=torch.int32)
-# 2. 算子执行
-print(f"Running fast_topk_transform_fused with TOPK={TOPK}...")
-if torch.cuda.is_available():
-    torch.cuda.synchronize()
-torch.ops.sgl_kernel.fast_topk_transform_fused(
-    score,
-    lengths,
-    dst_page_table,
-    src_page_table,
-    cu_seqlens_q,
-    None 
-)
-if torch.cuda.is_available():
-    torch.cuda.synchronize()
-# 验证结果
-print("执行成功。")
-print(f"DST Page Table Shape: {dst_page_table.shape}")
-print(f"Output Sample (Batch 0, Top 5): {dst_page_table[0, :5].tolist()}")
-```
-
-## 116. fast_topk_transform_ragged_fused
-
-### 支持的产品型号
-
-- Metax C500/C550
-
-### 接口原型
-
-```Python
-def fast_topk_transform_ragged_fused(
-    score: torch.Tensor,
-    lengths: torch.Tensor,
-    output_indices: torch.Tensor,
-    topk_indices_offset: torch.Tensor,
-    row_starts: Optional[torch.Tensor] = None
-) -> None:
-    pass
-```
-
-### 功能描述
-
-fast_topk_transform_ragged_fused 算子是 DeepSeek Native Sparse Attention (NSA) 机制在 Ragged（非分页）模式下的核心组件。它用于根据注意力评分（Gating Score）筛选出 Top-K 个最相关的 KV 块，并将这些逻辑块索引转换为用于 Ragged Attention 计算的平坦化（Flattened）物理索引。
-注意： 该算子为 In-place 操作，需要调用方预先分配用于存储结果的输出张量。
-此功能主要应用于以下场景：
-
-1. 稀疏注意力预填充/解码：在不使用 PagedAttention 而使用 Ragged Buffer 的场景下，根据 Block 分数筛选需要关注的区域。
-2. 索引平坦化：将批次中不同请求选出的 Top-K 块索引，结合偏移量 `topk_indices_offset`，压缩为一维或紧凑的索引张量。
-
-- 操作逻辑：
-	算子接收评分张量 score，针对每个查询单元计算分值最高的 K 个块的逻辑索引。
-	将逻辑索引与 topk_indices_offset 相加，计算出在全局 Ragged KV 存储中的绝对偏移位置。
-	结果直接写入预分配的 output_indices 张量中。
-	**主要功能包括：**
-- 高效的 Top-K 筛选与索引计算融合。
-- 支持 Ragged 内存布局下的动态索引生成。
-- 减少 Python 层面的显存操作开销，加速稀疏注意力计算准备阶段。
-
-### 参数说明
-
-- **score** (torch.Tensor, 入参): 块评分张量，通常包含 Gating 网络输出的 Logits，形状为 `[num_tokens, num_blocks]`，数据类型必须为 float32。
-- **lengths** (torch.Tensor, 入参): 指定每个查询需要选择的块数量（通常对应扩展后的序列长度），数据类型为 int32。
-- **output_indices** (torch.Tensor, 出参): 预分配的输出张量，用于存储计算出的物理索引。形状通常为 `[total_selected_blocks]` (即所有 lengths 之和)，数据类型为 int32。
-- **topk_indices_offset** (torch.Tensor, 入参): Top-K 索引在全局 Ragged 存储中的起始偏移量，通常由累积序列长度计算得出，数据类型为 int32。
-- **row_starts** (torch.Tensor, 可选入参): 指示 Batch 中每个请求的起始行位置。对于稠密 `score` 输入，建议传入 `None` 以避免 Shape 检查错误；仅在 `score` 为平坦化 Ragged 输入时需要传入，数据类型为 int32。
-
-### 返回值
-
-无返回值（None）。计算结果直接写入传入的 `output_indices` 张量中。
-
-### 约束与调用
-
-- 输入张量必须在 CUDA 设备上。
-- `score` 必须是 float32 类型。
-- `lengths`、`output_indices`、`topk_indices_offset` 的数据类型必须为 int32。
-- 调用前必须确保 `output_indices` 已分配足够的显存空间。
-- 不再需要传入 `int topk` 参数，TopK 值由 `lengths` 张量隐式确定。
-
-### 调用示例
-
-```Python
-import torch
-import mcoplib.sgl_kernel
-# 配置参数
-SEED = 0
-DEVICE = "cuda"
-NUM_TOKENS = 4
-TOPK = 2048
-NUM_BLOCKS = 4096
-# 初始化环境
-torch.manual_seed(SEED)
-torch.set_default_device(DEVICE)
-# 1. 准备输入数据
-score = torch.randn(NUM_TOKENS, NUM_BLOCKS, dtype=torch.float32)
-lengths = torch.full((NUM_TOKENS,), TOPK, dtype=torch.int32)
-topk_indices_offset = torch.arange(0, NUM_TOKENS * TOPK, TOPK, dtype=torch.int32).contiguous()
-output_indices = torch.empty((NUM_TOKENS, TOPK), dtype=torch.int32).contiguous()
-# 2. 算子执行
-print(f"Running fast_topk_transform_ragged_fused with TOPK={TOPK}...")
-print(f"Arg 3 (Output) Shape: {output_indices.shape}      (Expect: [B, TopK])")
-print(f"Arg 4 (Offset) Shape: {topk_indices_offset.shape} (Expect: [B])")
-if torch.cuda.is_available():
-    torch.cuda.synchronize()
-torch.ops.sgl_kernel.fast_topk_transform_ragged_fused(
-    score,
-    lengths,
-    output_indices,      
-    topk_indices_offset,  
-    None
-)
-if torch.cuda.is_available():
-    torch.cuda.synchronize()
-# 验证结果
-print("执行成功。")
-# 打印展平后的前5个结果
-print(f"Sample Indices (First 5): {output_indices.flatten()[:5].tolist()}")
-```
-
-## 117. moe_sum_reduce
-
-### 支持的产品型号
-
-- Metax C500/C550
-
-### 接口原型
-
-```Python
-def moe_sum_reduce(
-    input: torch.Tensor,
-    output: torch.Tensor,
-    scaling_factor: float
-) -> None:
-    pass
-```
-
-### 功能描述
-
-`moe_sum_reduce` 算子用于 Mixture of Experts (MoE) 模型的输出阶段。它将来自不同专家的加权输出（通常已经按 Top-K 维度堆叠）进行归约求和，并应用缩放因子，从而生成最终的 token 嵌入。该操作通常是 `fused_marlin_moe` 等融合 MoE 计算流程的最后一步。
-此功能主要应用于以下场景：
-
-1. MoE 输出聚合：将形状为 `[num_tokens, top_k, hidden_size]` 的中间结果沿 `top_k` 维度求和，得到 `[num_tokens, hidden_size]` 的输出。
-2. 路由缩放 (Routed Scaling)：在聚合的同时，将结果乘以一个全局或路由相关的缩放因子（`scaling_factor`），常用于 DeepSeek 等模型的负载均衡或架构设计中。
-3. 结果写回：支持原地 (In-place) 或非原地操作，将最终结果写入 `output` 张量。
-	**主要功能包括：**
-
-- 维度归约：对输入的 `top_k` 维度进行求和，将多专家的贡献合并。
-- 数值缩放：在归约过程中应用标量乘法。
-- 高效内存访问：优化内存读写模式，减少 MoE 后处理阶段的显存带宽占用。
-
-### 参数说明
-
-- **input** (torch.Tensor, 入参): MoE 层的中间计算结果，包含每个 Token 被路由到的 Top-K 个专家的加权输出。形状通常为 `[num_tokens, top_k, hidden_size]`，数据类型通常为 float16 或 bfloat16。
-- **output** (torch.Tensor, 出参): 最终的 MoE 层输出张量。形状为 `[num_tokens, hidden_size]`，数据类型需与 `input` 保持一致。
-- **scaling_factor** (float, 入参): 应用于归约结果的乘法缩放因子。
-
-### 返回值
-
-无返回值。操作结果直接写入 `output` 张量中。
-
-### 约束与调用
-
-- `input` 必须是 3D 张量，`output` 必须是 2D 张量。
-- `input.size (0)` 必须等于 `output.size (0)`（Token 数量一致）。
-- `input.size (2)` 必须等于 `output.size (1)`（Hidden Size 一致）。
-- `input` 和 `output` 的数据类型必须相同，且必须在 CUDA 设备上。
-
-### 调用示例
-
-```Python
-import torch
-import mcoplib.sgl_kernel
-# 配置参数
-SEED = 0
-DEVICE = "cuda"
-DTYPE = torch.float16
-# 维度设置
-NUM_TOKENS = 128
-TOP_K = 2
-HIDDEN_SIZE = 4096
-SCALING_FACTOR = 1.0
-# 初始化环境
-torch.manual_seed(SEED)
-torch.set_default_device(DEVICE)
-# 1. 创建输入输出 Tensors
-# input_tensor: [NUM_TOKENS, TOP_K, HIDDEN_SIZE]
-input_tensor = torch.randn((NUM_TOKENS, TOP_K, HIDDEN_SIZE), dtype=DTYPE, device=DEVICE)
-# output_tensor: [NUM_TOKENS, HIDDEN_SIZE]
-output_tensor = torch.empty((NUM_TOKENS, HIDDEN_SIZE), dtype=DTYPE, device=DEVICE)
-# 2. 算子执行
-print(f"Running moe_sum_reduce...")
-if torch.cuda.is_available():
-    torch.cuda.synchronize()
-torch.ops.sgl_kernel.moe_sum_reduce(
-    input_tensor,
-    output_tensor,
-    SCALING_FACTOR
-)
-if torch.cuda.is_available():
-    torch.cuda.synchronize()
-# 验证结果
-# 期望计算逻辑：output = sum(input, dim=1) * scaling_factor
-expected_output = torch.sum(input_tensor, dim=1) * SCALING_FACTOR
-diff = (output_tensor - expected_output).abs().max()
-print("执行成功。")
-print(f"Max Diff: {diff.item()}")
-```
-
-## 118. moe_fused_gate
-
-### 支持的产品型号
-
-- Metax C500/C550
-
-### 接口原型
-
-```Python
-def moe_fused_gate(
-    gating_output: torch.Tensor,
-    correction_bias: torch.Tensor,
-    num_expert_group: int,
-    topk_group: int,
-    topk: int,
-    num_fused_shared_experts: int = 0,
-    routed_scaling_factor: float = 1.0,
-    apply_routed_scaling_factor_on_output: bool = False
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    pass
-```
-
-### 功能描述
-
-moe_fused_gate 算子实现了 Mixture-of-Experts (MoE) 模型中专家选择（Gating）的融合计算逻辑，特别是针对类似 DeepSeek V2/V3/R1 系列模型中使用的 Grouped Top-K 路由策略进行了优化。该算子融合了 Softmax、Top-K 选择、分组掩码（Group Masking）和重归一化（Renormalization）等步骤，以提高路由阶段的效率。
-此功能主要应用于以下场景：
-
-1. Grouped Top-K Routing：首先在专家组层面进行粗粒度筛选（Top-K Group），然后在选定组内的专家中进行细粒度筛选（Top-K Expert）。
-2. Shared Expert Integration：支持将共享专家（Shared Experts）与路由选择的专家合并，通常共享专家会被固定分配给每个 Token。
-3. Bias Correction：支持在计算路由分数时应用校正偏置（Correction Bias），用于辅助负载均衡或其他调节目的。
-	**主要功能包括：**
-
-- 高效的 Top-K 选择：在一个 Kernel 中完成组级和专家级的 Top-K 选择。
-- 灵活的路由配置：支持配置组数量、每组选取的专家数、总 Top-K 数以及共享专家数。
-- 数值稳定性：在计算过程中处理 Softmax 和归一化，确保数值稳定。
-
-### 参数说明
-
-- **gating_output** (torch.Tensor, 入参): Gating 网络的原始输出 Logits，形状为 `[num_tokens, num_experts]`，数据类型通常为 float32。
-- **correction_bias** (torch.Tensor, 入参): 用于修正路由分数的偏置张量，形状通常为 `[num_experts]` 或 `[num_tokens, num_experts]`（支持广播），数据类型需与 `gating_output` 兼容。
-- **num_expert_group** (int, 入参): 专家的分组总数。
-- **topk_group** (int, 入参): 每个 Token 选择的专家组数量。
-- **topk** (int, 入参): 每个 Token 最终选择的路由专家数量（不包括共享专家）。
-- **num_fused_shared_experts** (int, 可选入参): 融合的共享专家数量，默认为 0。
-- **routed_scaling_factor** (float, 可选入参): 路由专家的缩放因子，用于调整路由专家的权重，默认为 1.0。
-- **apply_routed_scaling_factor_on_output** (bool, 可选入参): 是否将 `routed_scaling_factor` 直接应用到输出的权重上，默认为 False。
-
-### 返回值
-
-返回一个元组 `(topk_weights, topk_ids)`：
-
-- **topk_weights** (torch.Tensor): 选定专家的权重，形状为 `[num_tokens, topk + num_fused_shared_experts]`，数据类型为 float32。
-- **topk_ids** (torch.Tensor): 选定专家的索引，形状为 `[num_tokens, topk + num_fused_shared_experts]`，数据类型为 int32。
-
-### 约束与调用
-
-- 输入张量必须在 CUDA 设备上。
-- `gating_output` 的最后一维大小（专家总数）必须能被 `num_expert_group` 整除。
-- `topk` 必须小于等于专家总数。
-- 目前算子实现可能对 `num_expert_group` 和专家数量有特定限制（例如 `num_experts / num_expert_group <= 32`，这取决于具体的 Kernel 实现细节，如源码注释所述）。
-
-### 调用示例
-
-```Python
-import torch
-import mcoplib.sgl_kernel
-# 配置参数
-SEED = 0
-DEVICE = "cuda"
-NUM_TOKENS = 128
-NUM_EXPERTS = 64
-NUM_EXPERT_GROUP = 8
-TOPK_GROUP = 2
-TOPK = 4
-NUM_FUSED_SHARED_EXPERTS = 0
-# 初始化环境
-torch.manual_seed(SEED)
-torch.set_default_device(DEVICE)
-# 1. 创建输入 Tensors
-# gating_output: [NUM_TOKENS, NUM_EXPERTS]
-gating_output = torch.randn((NUM_TOKENS, NUM_EXPERTS), dtype=torch.float32, device=DEVICE)
-# correction_bias: [NUM_EXPERTS]
-correction_bias = torch.zeros((NUM_EXPERTS,), dtype=torch.float32, device=DEVICE)
-# 2. 算子执行
-print(f"Running moe_fused_gate...")
-if torch.cuda.is_available():
-    torch.cuda.synchronize()
-topk_weights, topk_ids = torch.ops.sgl_kernel.moe_fused_gate(
-    gating_output,
-    correction_bias,
-    NUM_EXPERT_GROUP,
-    TOPK_GROUP,
-    TOPK,
-    NUM_FUSED_SHARED_EXPERTS,
-    1.0,  # routed_scaling_factor
-    False # apply_routed_scaling_factor_on_output
-)
-if torch.cuda.is_available():
-    torch.cuda.synchronize()
-# 验证结果形状
-print("执行成功。")
-print(f"TopK Weights Shape: {topk_weights.shape}") # Should be [NUM_TOKENS, TOPK]
-print(f"TopK IDs Shape: {topk_ids.shape}")         # Should be [NUM_TOKENS, TOPK]
-```
-
-## 119. prepare_moe_input
-
-### 支持的产品型号
-
-- Metax C500/C550
-
-### 接口原型
-
-```Python
-def prepare_moe_input(
-    topk_ids: torch.Tensor,
-    expert_offsets: torch.Tensor,
-    block_scale_offsets: Optional[torch.Tensor],
-    problem_sizes1: torch.Tensor,
-    problem_sizes2: torch.Tensor,
-    src_idx: torch.Tensor,
-    dst_idx: torch.Tensor,
-    num_experts: int,
-    intermediate_size: int,
-    hidden_size: int
-) -> None:
-    pass
-```
-
-### 功能描述
-
-`prepare_moe_input` 算子用于为 CUTLASS 基础的 Mixture of Experts (MoE) 计算准备元数据。它负责统计每个专家被分配的 Token 数量，生成用于重排输入数据的索引映射，并设置分组矩阵乘法（Grouped GEMM）所需的维度信息。
-此功能主要应用于以下场景：
-
-1. MoE 输入重排：在执行专家计算前，需要将分散在 batch 中的 token 按照其选择的专家进行聚类，以便进行连续内存访问和批量计算。
-2. 元数据构建：计算 `expert_offsets`（每个专家处理的 token 起始位置）和 `problem_sizes`（每个专家 GEMM 的 M/N/K 维度），供后续的 CUTLASS Grouped GEMM 内核使用。
-3. 结果还原：生成逆向映射索引，以便在专家计算完成后将结果还原回原始的 Token 顺序。
-
-- 操作逻辑：
-	1. 统计 `topk_ids` 中每个专家出现的次数，计算前缀和得到 `expert_offsets`。
-	2. 生成 `src_idx`（Permutation Index），用于将输入 Tensor (`[batch_size, k]`) 扩展并重排为 `[batch_size * topk, k]`，使得属于同一专家的行在内存中连续。
-	3. 生成 `dst_idx`（Inverse Permutation Index），用于后续 `apply_shuffle_mul_sum` 等算子将计算结果写回原始位置。
-	4. 填充 `problem_sizes1` 和 `problem_sizes2`，分别定义 Up-Projection 和 Down-Projection 阶段每个专家对应的 GEMM 维度 (M, N, K)。
-		**主要功能包括：**
-- 基于 Top-K 索引生成排序和还原映射。
-- 计算每个专家的负载（Token 数量）。
-- 初始化 Grouped GEMM 的问题描述符。
-
-### 参数说明
-
-- **topk_ids** (torch.Tensor, 入参): 每个 Token 选择的专家索引。形状为 `[num_tokens, topk]`，数据类型为 int32。
-- **expert_offsets** (torch.Tensor, 出参): 用于存储每个专家的累积 Token 计数。形状通常为 `[num_experts]` 或 `[num_experts + 1]`，数据类型为 int32。
-- **block_scale_offsets** (torch.Tensor, 可选入参): 用于 FP4 等量化的块缩放偏移量。若不需要可传入 None。
-- **problem_sizes1** (torch.Tensor, 出参): 存储第一个 GEMM（Up-proj）每个专家的问题大小信息。形状通常为 `[num_experts, 3]` 或类似结构，存储 `(m, n, k)`，数据类型为 int64 或 int32。
-- **problem_sizes2** (torch.Tensor, 出参): 存储第二个 GEMM（Down-proj）每个专家的问题大小信息。形状同上。
-- **src_idx** (torch.Tensor, 出参): 源数据重排索引 (Input Permutation)。形状为 `[num_tokens * topk]`，数据类型为 int32。
-- **dst_idx** (torch.Tensor, 出参): 目标数据还原索引 (Output Permutation)。形状为 `[num_tokens * topk]`，数据类型为 int32。
-- **num_experts** (int, 入参): 专家总数。
-- **intermediate_size** (int, 入参): 中间层维度大小（通常是 FFN 的隐藏层大小），对应 GEMM1 的 N 维或 GEMM2 的 K 维。
-- **hidden_size** (int, 入参): 模型隐藏层维度大小，对应 GEMM1 的 K 维或 GEMM2 的 N 维。
-
-### 返回值
-
-无返回值。计算结果直接写入 `expert_offsets`, `problem_sizes`, `src_idx`, `dst_idx` 等输出张量中。
-
-### 约束与调用
-
-- 所有 Tensor 必须位于 CUDA 设备上。
-- `topk_ids`、`src_idx`、`dst_idx`、`expert_offsets` 的数据类型必须为 int32。
-- 参数顺序严格遵循 C++ 算子声明，特别是 `block_scale_offsets` 位于 `problem_sizes1` 之前。
-
-### 调用示例
-
-```Python
-import torch
-import mcoplib.sgl_kernel
-# 配置参数
-SEED = 0
-DEVICE = "cuda"
-NUM_TOKENS = 4
-HIDDEN_SIZE = 128
-INTERMEDIATE_SIZE = 256
-NUM_EXPERTS = 4
-TOP_K = 2
-# 初始化环境
-torch.manual_seed(SEED)
-torch.set_default_device(DEVICE)
-# 1. 模拟输入数据
-# topk_ids: [NUM_TOKENS, TOP_K]
-topk_ids = torch.tensor([
-    [0, 1],
-    [1, 2],
-    [0, 3],
-    [2, 3]
-], dtype=torch.int32, device=DEVICE)
-# 2. 预分配输出张量
-total_tokens = NUM_TOKENS * TOP_K
-src_idx = torch.empty((total_tokens,), dtype=torch.int32, device=DEVICE)
-dst_idx = torch.empty((total_tokens,), dtype=torch.int32, device=DEVICE)
-expert_offsets = torch.empty((NUM_EXPERTS,), dtype=torch.int32, device=DEVICE)
-# problem_sizes 结构依赖具体实现，假设为 [NUM_EXPERTS, 3]
-problem_sizes1 = torch.zeros((NUM_EXPERTS, 3), dtype=torch.int64, device=DEVICE)
-problem_sizes2 = torch.zeros((NUM_EXPERTS, 3), dtype=torch.int64, device=DEVICE)
-# 3. 算子执行
-print(f"Running prepare_moe_input...")
-if torch.cuda.is_available():
-    torch.cuda.synchronize()
-# 注意参数顺序：block_scale_offsets 在第3个位置
-torch.ops.sgl_kernel.prepare_moe_input(
-    topk_ids,              # 1. topk_ids
-    expert_offsets,        # 2. expert_offsets
-    None,                  # 3. blockscale_offsets (Optional Tensor)
-    problem_sizes1,        # 4. problem_sizes1
-    problem_sizes2,        # 5. problem_sizes2
-    src_idx,               # 6. input_permutation
-    dst_idx,               # 7. output_permutation
-    NUM_EXPERTS,           # 8. num_experts
-    INTERMEDIATE_SIZE,     # 9. n
-    HIDDEN_SIZE            # 10. k
-)
-if torch.cuda.is_available():
-    torch.cuda.synchronize()
-# 验证结果
-print("执行成功。")
-print(f"Expert Offsets: {expert_offsets.tolist()}")
-print(f"Source Indices: {src_idx.tolist()}")
-```
-
-## 120. apply_shuffle_mul_sum
-
-### 支持的产品型号
-
-- Metax C500/C550/C588/C600
-
-### 接口原型
-
-```python
-def apply_shuffle_mul_sum(
-    input: torch.Tensor,
-    output: torch.Tensor,
-    permutation: torch.Tensor,
-    factors: Optional[torch.Tensor] = None
-) -> None
-```
-
-### 功能描述
-
-apply_shuffle_mul_sum 算子实现了针对张量的重排（Shuffle）、按因子缩放（Mul）以及累加聚合（Sum）的融合操作。该算子根据 permutation 提供的索引映射关系，将 input 张量中的各行数据映射到 output 张量的对应位置，并在累加前乘以 factors 权重因子。这种融合算子通过减少中间显存读写，显著提升了专家混合模型（MoE）中 Token 分发或聚合逻辑的执行效率。
-
-- 计算公式：
-
-$$
-  \text{dst}[k \times \text{stride} + j] += 
-  \begin{cases} 
-  \text{input}[i \times \text{stride} + j], & \text{当 factors 不存在} \\
-  \text{input}[i \times \text{stride} + j] \times \text{factors}[i], & \text{当 factors 存在}
-  \end{cases}
-$$
-
-  其中元素的线性索引与二维位置的映射关系为：
-
-$$
-  n = i \times \text{stride} + j
-$$
-
-  各变量的维度与含义：
-
-- $\text{input} \in \mathbb{T}^{\text{height} \times \text{stride}}$ ：输入张量，包含待处理的原始数据，数据类型为 $\mathbb{T}$ ，有效列范围为 $0 \leq j < \text{width}$
-- $\text{dst} \in \mathbb{T}^{\text{num\\_reduced} \times \text{stride}}$ ：输出张量，用于存储按索引聚合（Sum）后的结果，数据类型与 $\text{input}$ 一致
-- $\text{perm} \in \mathbb{I}^{\text{height}}$ ：索引映射张量（permutation），数据类型为 $\mathbb{I}$ （通常为 $\text{int32}$ ），决定 $\text{input}$ 的第 $i$ 行映射到 $\text{dst}$ 的第 $k$ 行
-- $\text{factors} \in \mathbb{T}^{\text{height}}$ ：可选的权重因子张量，若存在，则在累加前对输入元素进行缩放，数据类型与 $\text{input}$ 一致
-- $i$ ：输入张量的行索引，范围为 $0 \leq i < \text{height}$
-- $k$ ：输出张量的行索引， $k = \text{perm}[i]$ ，范围为 $0 \leq k < \text{num\\_reduced}$
-- $j$ ：张量的列索引，范围为 $0 \leq j < \text{stride}$ （ $\text{stride} \geq \text{width}$ ，保证内存对齐）
-- $\text{height}$ ：输入张量的总行数（如 Token 总数）
-- $\text{num\\_reduced}$ ：输出张量的总行数（如聚合后的专家位总数）
-- $\text{width}$ ：张量的有效宽度（每行的有效元素数）
-- $\text{stride}$ ：张量的内存步长（每行元素的实际内存间隔）
-
-### 参数说明
-
-- **input** (torch.Tensor, 入参): 输入张量，通常为二维特征矩阵（如 [num_tokens, hidden_dim]）
-- **output** (torch.Tensor, 出参): 目标输出张量，用于存储累加后的结果。在调用前通常需要初始化为 0
-- **permutation** (torch.Tensor, 入参): 索引映射张量，指定输入行映射到输出行的位置
-- **factors** (torch.Tensor, 可选, 入参): 权重因子张量（如 MoE 的门控权重）。若提供，则 output[permutation[i]] += input[i] * factors[i]
-
-### 返回值
-
-无返回值，计算结果直接写入 output 张量中
-
-### 约束与调用
-
-- 所有输入输出张量必须位于 CUDA 设备上
-- permutation 必须为 torch.int32 (Int) 类型，不支持 int64 (Long)
-- input 和 output 的隐藏维度（最后一维）必须保持一致
-- factors 若提供，其长度必须与 input 的行数一致
-- 支持的数据类型：float16, bfloat16, float32
-
-### 调用示例
-
-```python
-import torch
-import mcoplib.sgl_kernel
-# 设置计算设备
-device = "cuda"
-# 核心参数
-num_elements = 1024      
-num_reduced = 512        
-hidden_dim = 128         
-# 1. 构造输入张量
-input_tensor = torch.randn(
-    num_elements, hidden_dim,
-    dtype=torch.float32, device=device
-)
-# 2. 构造输出张量 (初始化为0，因为算子通常执行累加操作)
-output_tensor = torch.zeros(
-    num_reduced, hidden_dim,
-    dtype=torch.float32, device=device
-)
-# 3. 构造索引映射 (关键修改点：使用 torch.int32)
-# 报错是因为默认生成的随机整数是 int64 (Long)，需要强制转为 int32 (Int)
-permutation = torch.randint(
-    0, num_reduced, (num_elements,),
-    dtype=torch.int32, # 修改此处：从 int64 改为 int32
-    device=device
-)
-# 4. 构造权重因子
-factors = torch.rand(
-    num_elements, 
-    dtype=torch.float32, device=device
-)
-# 5. 调用算子
-# 注意：如果算子注册时没有指定参数名，建议按顺序传参
-torch.ops.sgl_kernel.apply_shuffle_mul_sum(
-    input_tensor,
-    output_tensor,
-    permutation,
-    factors
-)
-# 输出结果
-print("apply_shuffle_mul_sum computation completed successfully")
-print(f"Output shape: {output_tensor.shape}")
-```
-
-
-
-## 121. fused_moe_gate_opt
-
-### 支持的产品型号
-
-- Metax C500/C550/C588/C600
-
-### 接口原型
-
-```python
-def fused_moe_gate_opt(
-    gating_outputs: torch.Tensor,
-    correction_bias: torch.Tensor,
-    out_routing_weights: torch.Tensor,
-    out_selected_experts: torch.Tensor,
-    topk: int,
-    renormalize: bool,
-    num_expert_group: int,
-    topk_group: int,
-    num_fused_shared_experts: Optional[int] = None,
-    routed_scaling_factor: Optional[float] = None
-) -> int
-```
-
-### 功能描述
-
-fused_moe_gate_opt 算子实现了专家混合模型（MoE）中门控网络（Gating Network）的核心逻辑融合。该算子接收门控原始输出，在应用偏置校正（Correction Bias）后，执行 Top-K 专家选择（支持分组 Top-K 逻辑），并计算最终的路由权重（Routing Weights）。通过在单个 Kernel 中完成排序、索引提取、权重计算和可选的重正规化（Renormalize），显著提升了混合专家模型在推理阶段的路由效率。
-
-- 计算公式：
-
-$$
-  \begin{aligned}
-  \text{score}[i, e] &= \text{input0}[i \times \text{num\\_experts} + e] + \text{input1}[e] \\
-  (\text{dst\\_w}[i, k], \text{dst\\_idx}[i, k]) &= \text{TopK}(\{\text{score}[i, e]\}_{e=0}^{\text{num\\_experts}-1}, \text{topk}) \\
-  \text{dst\\_w}[i, k] &= 
-  \begin{cases} 
-  \text{dst\\_w}[i, k] \times \text{scale}, & \text{当 renormalize} = \text{False} \\
-  \text{Softmax}(\{\text{dst\\_w}[i, k]\}_{k=0}^{\text{topk}-1}) \times \text{scale}, & \text{当 renormalize} = \text{True}
-  \end{cases}
-  \end{aligned}
-$$
-
-  其中元素的线性索引与二维位置的映射关系为（以输出张量为例）：
-
-$$
-  n = i \times \text{topk} + k
-$$
-
-  各变量的维度与含义：
-
-- $\text{input0} \in \mathbb{T}^{\text{bs} \times \text{num\\_experts}}$ ：门控网络（Gating）原始输出张量，数据类型为 $\mathbb{T}$ （ $\text{bfloat16}$ ）
-- $\text{input1} \in \mathbb{T}^{\text{num\\_experts}}$ ：专家偏置校正张量（Correction Bias），数据类型与 $\text{input0}$ 一致
-- $\text{dst\\_w} \in \mathbb{D}^{\text{bs} \times \text{topk}}$ ：路由权重输出张量，存储计算并可选重正规化后的权重，数据类型为 $\mathbb{D}$ （ $\text{float32}$ ）
-- $\text{dst\\_idx} \in \mathbb{I}^{\text{bs} \times \text{topk}}$ ：专家索引输出张量，存储选中的专家编号，数据类型为 $\mathbb{I}$ （ $\text{int32}$ ）
-- $\text{scale} \in \mathbb{R}$ ：路由权重的缩放因子，计算方式为 $\text{scale} = 1.0 / \text{routed\\_scaling\\_factor}$
-- $n$ ：输出张量元素的线性索引，范围为 $0 \leq n < \text{bs} \times \text{topk}$
-- $i$ ：Batch 维度的行索引（Token 索引），范围为 $0 \leq i < \text{bs}$
-- $k$ ：选中的专家位索引，范围为 $0 \leq k < \text{topk}$
-- $e$ ：原始专家维度的索引，范围为 $0 \leq e < \text{num\\_experts}$
-- $\text{bs}$ ：输入张量的第一维大小（Batch Size）
-- $\text{num\\_experts}$ ：专家的总数量
-- $\text{topk}$ ：每个 Token 最终选取的专家数量，目前仅支持 $8$ 或 $9$
-- $\text{Softmax}$ ：若 $\text{renormalize}$ 参数为 $\text{True}$ ，则对选出的 Top-K 分数执行归一化操作
-- $\text{TopK}$ ：选取分数最高的 $\text{topk}$ 个专家，返回对应权重和索引
-- $\text{renormalize}$ ：布尔型参数，控制是否对 Top-K 权重执行 Softmax 归一化
-
-### 参数说明
-
-- **gating_outputs** (torch.Tensor, 入参): 门控网络的原始输出张量，维度通常为 [batch_size, num_experts]，要求数据类型为 bfloat16
-- **correction_bias** (torch.Tensor, 入参): 专家偏置校正张量，维度为 [num_experts]，要求数据类型为 bfloat16
-- **out_routing_weights** (torch.Tensor, 出参): 存储计算出的路由权重，维度为 [batch_size, topk]，要求数据类型为 float32
-- **out_selected_experts** (torch.Tensor, 出参): 存储选中的专家索引，维度为 [batch_size, topk]，要求数据类型为 int32
-- **topk** (int, 入参): 每个 Token 选择的专家数量，目前仅支持 8 或 9
-- **renormalize** (bool, 入参): 是否对路由权重进行重正规化处理
-- **num_expert_group** (int, 入参): 专家分组的数量
-- **topk_group** (int, 入参): 每一组内选择的 Top-K 数量
-- **num_fused_shared_experts** (int, 可选, 入参): 融合的共享专家数量
-- **routed_scaling_factor** (float, 可选, 入参): 路由权重的缩放因子
-
-### 返回值
-
-返回 int 类型的状态码，0 表示执行成功，1 表示因参数不匹配导致的执行失败
-
-### 约束与调用
-
-- 所有张量必须位于 CUDA 设备上；输入必须为 bfloat16，索引输出必须为 int32
-- Top-K 限制：若无共享专家，topk 必须为 8；若有共享专家，topk 必须为 9
-- 固定参数组合限制：该算子采用了静态分发（Dispatching），仅支持以下特定的专家配置方案，否则会报 "Invalid arguments" 错误：
-- 专家总数 (NUM_EXPERTS)：仅支持 256, 320, 384, 448
-- 典型组合 1 (DeepSeek-V3 风格)：num_experts ∈ {320, 384, 448}, num_expert_group=1, topk_group=1
-- 典型组合 2 (分组风格)：num_experts=256, num_expert_group=8, topk_group=4
-
-### 调用示例
-
-```python
-import torch
-import mcoplib.sgl_kernel
-device = "cuda"
-# 修改为算子支持的参数组合（例如 DeepSeek-V3 风格的配置）
-num_experts = 320          # 必须是 256, 320, 384 或 448
-num_expert_group = 1       # 分组数
-topk_group = 1             # 对于 320 专家，组内 Top-K 必须为 1
-topk = 8                   # 总 Top-K
-# 重新构造符合维度的张量
-gating_outputs = torch.randn(4, num_experts, dtype=torch.bfloat16, device=device)
-correction_bias = torch.randn(num_experts, dtype=torch.bfloat16, device=device)
-out_routing_weights = torch.empty(4, topk, dtype=torch.float32, device=device)
-out_selected_experts = torch.empty(4, topk, dtype=torch.int32, device=device)
-# 调用算子
-status = torch.ops.sgl_kernel.fused_moe_gate_opt(
-    gating_outputs=gating_outputs,
-    correction_bias=correction_bias,
-    out_routing_weights=out_routing_weights,
-    out_selected_experts=out_selected_experts,
-    topk=topk,
-    renormalize=True,
-    num_expert_group=num_expert_group,
-    topk_group=topk_group,
-    num_fused_shared_experts=0,
-    routed_scaling_factor=1.0
-)
-print("fused_moe_gate_opt computation completed with supported parameters")
-print(f"Routing weights shape: {out_routing_weights.shape}")
-print(f"Selected experts shape: {out_selected_experts.shape}")
-```
-
-## 122. fused_silu_mul_dq_quant_interface
-
-### 支持的产品型号
-
-- Metax C500/C550/C588/C600
-
-### 接口原型
-
-```python
-def fused_silu_mul_dq_quant_interface(
-    out: torch.Tensor,
-    scale: torch.Tensor,
-    input: torch.Tensor
-) -> None
-```
-
-### 功能描述
-
-fused_silu_mul_dq_quant_interface 算子实现了 SiLU 激活、元素级乘法以及动态量化的融合操作。该算子通常用于 Transformer 架构中的门控线性单元（GLU），它对输入张量进行 SiLU 激活与内部乘法处理，随后直接将结果量化为 **INT8** 格式，并计算相应的动态量化比例因子（Scaling Factor）。这种融合方式大幅减少了高精度中间变量的显存读写，提升了模型推理的吞吐量。
-
-- 计算公式：
-
-$$
-  \begin{aligned}
-  \text{gate}[i, j] &= \text{input}[i \times 2 \times \text{width} + j] \\
-  \text{up}[i, j] &= \text{input}[i \times 2 \times \text{width} + \text{width} + j] \\
-  \text{tmp}[i, j] &= \text{SiLU}(\text{gate}[i, j]) \times \text{up}[i, j] \\
-  \text{dst}[i \times \text{stride} + j] &= \text{round}\left(\frac{\text{tmp}[i, j]}{\text{scale}[i]}\right)
-  \end{aligned}
-$$
-
-  其中 $\text{SiLU}(x) = \frac{x}{1 + e^{-x}}$ ，元素的线性索引与二维位置的映射关系为（以输出张量为例）：
-
-$$
-  n = i \times \text{stride} + j
-$$
-
-  各变量的维度与含义：
-
-- $\text{input} \in \mathbb{T}^{\text{height} \times (2 \times \text{width})}$ ：输入激活张量，包含 Gate（前一半宽度）和 Up（后一半宽度）的数据，数据类型为 $\mathbb{T}$ （ $\text{float16}$ 或 $\text{bfloat16}$ ）
-- $\text{dst} \in \mathbb{D}^{\text{height} \times \text{stride}}$ ：输出张量，存储处理并量化后的结果，数据类型为 $\mathbb{D}$ （ $\text{int8}$ ），有效列范围为 $0 \leq j < \text{width}$
-- $\text{scale} \in \mathbb{R}^{\text{height}}$ ：输出的动态量化比例因子，存储每一行（每 Token）的缩放系数，数据类型为 $\text{float32}$
-- $\text{SiLU}(x)$ ：激活函数，其公式为 $\text{SiLU}(x) = \frac{x}{1 + e^{-x}}$
-- $n$ ：输出张量元素的线性索引，范围为 $0 \leq n < \text{height} \times \text{stride}$
-- $i$ ：张量的行索引（Token 索引），范围为 $0 \leq i < \text{height}$
-- $j$ ：张量的列索引（隐藏层维度索引），范围为 $0 \leq j < \text{width}$
-- $\text{width}$ ：输出张量的有效宽度，对应模型隐藏层维度，满足 $2 \times \text{width} = \text{input.size}(-1)$
-- $\text{height}$ ：张量的高度，对应输入序列的 Token 数量 $\text{num\\_tokens}$
-- $\text{stride}$ ：输出张量的内存步长，用于保证内存对齐（ $\text{stride} \geq \text{width}$ ）
-- $\text{round}(\cdot)$ ：四舍五入取整操作，将量化后的浮点值转换为 $\text{int8}$ 整数
-
-### 参数说明
-
-- **out** (torch.Tensor, 出参): 输出张量，用于存储量化后的结果，数据类型固定为 **int8**
-- **scale** (torch.Tensor, 出参): 比例因子张量，存储每行的量化缩放系数，数据类型固定为 **float32**
-- **input** (torch.Tensor, 入参): 输入激活张量，数据类型为浮点型（如 float16 或 bfloat16）
-
-### 返回值
-
-无返回值，计算结果直接写入 `out` 和 `scale` 张量中
-
-### 约束与调用
-
-- 内存连续性：`input`、`scale` 和 `out` 张量都必须是连续的（Contiguous）
-- 设备一致性：所有张量必须位于同一个 CUDA/MACA 设备上
-- 维度计算：算子内部根据 `input.size (-1)` 计算隐藏层维度 `hidden_size`，并基于总元素数推导 `num_tokens`
-- 支持的数据类型：
-- 输入张量支持 `float16` 和 `bfloat16`
-- 输出张量必须为 `int8`
-- Scale 张量必须为 `float32`
-
-### 调用示例
-
-```python
-import torch
-import mcoplib.sgl_kernel
-# 设置计算设备
-device = "cuda"
-# 核心参数
-num_tokens = 4       # Token 数量
-hidden_size = 1024   # 隐藏层维度
-# 1. 构造输入张量
-# input: 通常为前向传播中的激活值，支持浮点类型（如 float16 或 bfloat16）
-input_tensor = torch.randn(
-    num_tokens, hidden_size, 
-    dtype=torch.bfloat16, device=device, requires_grad=False
-)
-# 2. 构造输出张量
-# out: 量化后的输出，根据源码 data_ptr<int8_t>() 可知需要 int8 类型
-out = torch.empty(
-    num_tokens, hidden_size, 
-    dtype=torch.int8, device=device
-)
-# scale: 动态量化比例因子，根据源码 data_ptr<float>() 可知需要 float32 类型
-# 形状通常对应 num_tokens (per-token quantization)
-scale = torch.empty(
-    num_tokens, 
-    dtype=torch.float32, device=device
-)
-# 3. 调用算子
-# 算子定义顺序为 (Tensor! out, Tensor! scale, Tensor input)
-torch.ops.sgl_kernel.fused_silu_mul_dq_quant_interface(
-    out=out,
-    scale=scale,
-    input=input_tensor
-)
-# 输出结果
-print("fused_silu_mul_dq_quant_interface computation completed")
-print(f"Output (INT8) shape: {out.shape}")
-print(f"Quantization scales shape: {scale.shape}")
-```
-
-## 123. mx_awq_dequantize
-
-### 支持的产品型号
-
-- Metax C500/C550/C588/C600
-
-### 接口原型
-
-```python
-def mx_awq_dequantize(
-    out: torch.Tensor,
-    _scaling_factors: torch.Tensor,
-    _zeros: torch.Tensor,
-    split_k_iter: int,
-    thx: int,
-    thy: int
-) -> torch.Tensor
-```
-
-### 功能描述
-
-mx_awq_dequantize 算子实现了针对 AWQ（Activation-aware Weight Quantization）算法量化权重的反量化操作。该算子接收打包存储的低比特量化权重内核、缩放因子以及打包的零点数据，通过内部解压逻辑将其还原为高精度浮点张量。这种融合操作常用于大语言模型（LLM）的量化推理，旨在降低显存占用并提升访存效率。
-
-- 计算公式：
-
-$$
-  \begin{aligned}
-  g &= \lfloor j / G \rfloor \\
-  p &= j \% P \\
-  \text{packed\\_idx} &= i \times \text{stride} + \lfloor j / P \rfloor \\
-  \text{q\\_weight} &= \text{unpack}(\text{input0}[\text{packed\\_idx}], p) \\
-  \text{q\\_zero} &= \text{unpack}(\text{input2}[i \times (\text{stride}/G) + g], p) \\
-  \text{dst}[i \times \text{width} + j] &= (\text{q\\_weight} - \text{q\\_zero}) \times \text{input1}[i \times (\text{width}/G) + g]
-  \end{aligned}
-$$
-
-  其中 $\text{unpack}(X, k)$ 函数表示从打包的整数 $X$ 中提取第 $k$ 个低比特量化值（如 4-bit），元素的线性索引与二维位置的映射关系为：
-
-$$
-  n = i \times \text{stride} + \lfloor j / P \rfloor
-$$
-
-  对于打包的输入张量（如 $\text{input0}$ ），其线性索引映射为：
-
-$$
-  \text{packed\\_n} = i \times \text{stride} + \lfloor j / P \rfloor
-$$
-
-  各变量的维度与含义：
-
-- $\text{input0} \in \mathbb{I}^{\text{height} \times \text{stride}}$ ：打包后的量化权重张量（Kernel），数据类型为 $\mathbb{I}$ （ $\text{int32}$ ），有效列范围为 $0 \leq \lfloor j / P \rfloor < \text{width}/P$
-- $\text{input1} \in \mathbb{T}^{\text{height} \times (\text{width}/G)}$ ：量化缩放因子张量（Scaling Factors），数据类型为 $\mathbb{T}$ （ $\text{float16}$ 或 $\text{bfloat16}$ ）
-- $\text{input2} \in \mathbb{I}^{\text{height} \times (\text{stride}/G)}$ ：打包后的量化零点张量（Zeros），数据类型与 $\text{input0}$ 一致（ $\text{int32}$ ）
-- $\text{dst} \in \mathbb{T}^{\text{height} \times \text{width}}$ ：输出张量，存储反量化后的浮点权重，数据类型为 $\mathbb{T}$
-- $n$ ：张量元素的线性索引，范围为 $0 \leq n < \text{height} \times \text{stride}$ （输入张量）或 $0 \leq n < \text{height} \times \text{width}$ （输出张量）
-- $i$ ：输出张量的行索引（对应输出维度 $N$ ），范围为 $0 \leq i < \text{height}$
-- $j$ ：输出张量的列索引（对应输入维度 $K$ ），范围为 $0 \leq j < \text{width}$
-- $P$ ：打包因子（Pack Factor），对于 4-bit 量化， $P = 8$ （即一个 $\text{int32}$ 存储 8 个元素）
-- $G$ ：量化分组大小（Group Size），如 $G = 128$
-- $\text{width}$ ：反量化后的矩阵有效宽度（输入特征维度 $K$ ）
-- $\text{height}$ ：反量化后的矩阵高度（输出特征维度 $N$ ）
-- $\text{stride}$ ：输入打包张量的内存步长，满足 $\text{stride} = \text{width} / P$
-- $\text{unpack}(X, k)$ ：从打包整数 $X$ 中提取第 $k$ 个低比特量化值的解包函数
-- $\text{split\\_k\\_iter}$ ：K 维度并行切分优化参数，用于在硬件层面平衡访存与计算开销
-
-### 参数说明
-
-- **out** (torch.Tensor, 入参): 打包后的量化权重张量（Kernel），通常存储 4-bit 量化后的原始权重
-- **_scaling_factors** (torch.Tensor, 入参): 权重的缩放因子张量，用于线性还原浮点数值
-- **_zeros** (torch.Tensor, 入参): 打包后的量化零点（Zeros）张量，用于偏移还原
-- **split_k_iter** (int, 入参): 内部并行计算的 K 维度切分迭代次数，用于优化计算负载
-- **thx** (int, 入参): 算子内部 CUDA 线程配置参数 X
-- **thy** (int, 入参): 算子内部 CUDA 线程配置参数 Y
-
-### 返回值
-
-返回一个 `torch.Tensor`，即反量化后的高精度浮点权重张量
-
-### 约束与调用
-
-- 所有输入张量必须位于 CUDA 设备上
-- 数据类型限制：
-- out (Kernel) 必须为 **int32** (`Int`) 类型，传入 `Half` (float16) 会导致运行时错误
-- zeros 必须为 **int32** (`Int`) 类型，传入 `Half` (float16) 会导致运行时错误
-- scaling_factors 通常支持 `float16` 或 `bfloat16`
-- 算子内部会根据输入张量的维度计算专家数量（experts）和每组专家数等信息进行任务分发
-
-### 调用示例
-
-```python
-import torch
-import mcoplib.sgl_kernel
-device = "cuda"
-# 1. 构造输入张量
-N, K = 4096, 4096
-group_size = 128
-pack_factor = 8  # 4-bit -> int32
-# 权重 Kernel 必须是 int32
-kernel = torch.randint(0, 2**31, (N, K // pack_factor), dtype=torch.int32, device=device)
-# 缩放因子通常是 float16
-scaling_factors = torch.randn(N, K // group_size, dtype=torch.float16, device=device)
-# 关键修改：zeros 在此算子中也必须是打包好的 int32 (不能是 Half)
-zeros = torch.randint(0, 2**31, (N, K // (group_size * pack_factor)), dtype=torch.int32, device=device)
-# 2. 调用算子
-output = torch.ops.sgl_kernel.mx_awq_dequantize(
-    out=kernel, 
-    _scaling_factors=scaling_factors,
-    _zeros=zeros,  # 确保传入的是 int32
-    split_k_iter=1,
-    thx=128,
-    thy=8
-)
-print("mx_awq_dequantize computation completed successfully")
-print(f"Output shape: {output.shape}")
-```
-
-## 124. tree_speculative_sampling_target_only
-
-### 支持的产品型号
-
-- Metax C500/C550/C588/C600
-
-### 接口原型
-
-```python
-def tree_speculative_sampling_target_only(
-    predicts: torch.Tensor,
-    accept_index: torch.Tensor,
-    accept_token_num: torch.Tensor,
-    candidates: torch.Tensor,
-    retrive_index: torch.Tensor,
-    retrive_next_token: torch.Tensor,
-    retrive_next_sibling: torch.Tensor,
-    uniform_samples: torch.Tensor,
-    uniform_samples_for_final_sampling: torch.Tensor,
-    target_probs: torch.Tensor,
-    draft_probs: torch.Tensor,
-    threshold_single: float,
-    threshold_acc: float,
-    deterministic: bool
-) -> None
-```
-
-### 功能描述
-
-tree_speculative_sampling_target_only 算子实现了树状投机采样（Tree-based Speculative Sampling）中的目标模型验证逻辑。该算子在 GPU 上并行执行接受/拒绝判定，通过比对草稿模型生成的候选 Token 及其概率分布与目标模型的输出分布，确定最终被接受的 Token 序列。它利用树状结构辅助索引进行路径检索，并能根据采样阈值和随机样本在拒绝发生时进行修正采样，显著提升了大语言模型（LLM）的生成效率。
-
-- 计算公式：
-
-$$
-  \begin{aligned}
-  \text{idx} &= \text{candidates}[i, j] \\
-  \text{accept\\_bit}[i, j] &= 
-  \begin{cases} 
-  1, & \text{若 } \text{Uniform}(0,1) \leq \frac{\text{target\\_probs}[i, j, \text{idx}]}{\text{draft\\_probs}[i, j, \text{idx}]} \\
-  0, & \text{否则}
-  \end{cases} \\
-  \text{accept\\_token\\_num}[i] &= \max\left\{ j \mid \forall 0 \leq t < j, \text{accept\\_bit}[i, t] = 1, j \leq \text{steps} \right\} \\
-  \text{predicts}[i] &= 
-  \begin{cases} 
-  \text{candidates}[i, \text{accept\\_token\\_num}[i]], & \text{若 } \text{accept\\_token\\_num}[i] < \text{steps} \\
-  \text{Sample}(\text{Residue Distribution}(\text{target\\_probs}[i, \cdot])), & \text{若拒绝则根据剩余分布采样}
-  \end{cases}
-  \end{aligned}
-$$
-
-  其中元素的线性索引与二维位置的映射关系为：
-
-$$
-  n = i \times \text{steps} + j
-$$
-
-  各变量的维度与含义：
-
-- $\text{target\\_probs} \in \mathbb{T}^{\text{bs} \times \text{steps} \times \text{vocab}}$ ：目标模型输出的概率分布张量，数据类型为 $\mathbb{T}$ （ $\text{float32}$ ）
-- $\text{draft\\_probs} \in \mathbb{T}^{\text{bs} \times \text{steps} \times \text{vocab}}$ ：草稿模型生成的概率分布张量，数据类型与 $\text{target\\_probs}$ 一致
-- $\text{candidates} \in \mathbb{I}^{\text{bs} \times \text{steps}}$ ：草稿模型生成的候选 Token 张量，数据类型为 $\mathbb{I}$ （ $\text{int64}$ ）
-- $\text{predicts} \in \mathbb{D}^{\text{bs}}$ ：输出张量，存储最终决定的下一个 Token 结果，数据类型为 $\mathbb{D}$ （ $\text{int32}$ ）
-- $\text{accept\\_token\\_num} \in \mathbb{D}^{\text{bs}}$ ：输出张量，存储每条序列被接受的有效 Token 数量，数据类型为 $\mathbb{D}$ （ $\text{int32}$ ）
-- $n$ ：中间计算张量元素的线性索引，范围为 $0 \leq n < \text{bs} \times \text{steps}$
-- $i$ ：Batch 维度的索引，范围为 $0 \leq i < \text{bs}$
-- $j$ ：投机步骤的索引，范围为 $0 \leq j < \text{steps}$
-- $\text{bs}$ ：Batch Size 大小（ $\text{batch\\_size}$ ）
-- $\text{steps}$ ：投机生成的步骤数（ $\text{num\\_draft\\_tokens}$ ）
-- $\text{vocab}$ ：词表大小（Vocab Size）
-- $\text{Uniform}(0,1)$ ：服从 $[0,1]$ 区间均匀分布的随机采样函数
-- $\text{Sample}(\cdot)$ ：基于概率分布的 Token 采样函数
-- $\text{Residue Distribution}(\cdot)$ ：拒绝后剩余概率分布，用于最终 Token 采样
-
-### 参数说明
-
-- **predicts** (torch.Tensor, 出参): 存储最终选定的 Token，数据类型必须为 **int32**
-- **accept_index** (torch.Tensor, 出参): 存储被接受 Token 的原始索引位置，数据类型为 **int32**
-- **accept_token_num** (torch.Tensor, 出参): 每个 Batch 被接受的 Token 数量，数据类型为 **int32**
-- **candidates** (torch.Tensor, 入参): 草稿模型生成的候选 Token 张量，数据类型为 **int64**
-- **retrive_index** (torch.Tensor, 入参): 用于树状路径检索的辅助索引张量，数据类型为 **int64**
-- **retrive_next_token** (torch.Tensor, 入参): 用于树状路径检索的辅助索引张量，数据类型为 **int64**
-- **retrive_next_sibling** (torch.Tensor, 入参): 用于树状路径检索的辅助索引张量，数据类型为 **int64**
-- **uniform_samples** (torch.Tensor, 入参): 用于随机判定的均匀分布样本，数据类型为 **float32**
-- **uniform_samples_for_final_sampling** (torch.Tensor, 入参): 用于随机判定的均匀分布样本，数据类型为 **float32**
-- **target_probs** (torch.Tensor, 入参): 目标模型输出的概率分布张量，数据类型为 **float32**
-- **draft_probs** (torch.Tensor, 入参): 草稿模型输出的概率分布张量，数据类型为 **float32**
-- **threshold_single** (float, 入参): 控制采样的阈值参数
-- **threshold_acc** (float, 入参): 控制采样的阈值参数
-- **deterministic** (bool, 入参): 是否开启确定性采样模式
-
-### 返回值
-
-无返回值，计算结果直接写入 `predicts`、`accept_index` 和 `accept_token_num` 张量中
-
-### 约束与调用
-
-- 数据类型限制：
-- 预测与接受索引类张量（predicts、accept_index、accept_token_num）必须为 **int32**
-- 候选 Token 及检索路径张量（candidates、retrive_index、retrive_next_token、retrive_next_sibling）必须为 **int64**
-- 概率与随机样本张量（uniform_samples、uniform_samples_for_final_sampling、target_probs、draft_probs）必须为 **float32**
-- `target_probs` 的第二维（Step 维）大小必须严格等于 `num_draft_tokens`，否则会触发维度校验报错
-- 所有输入输出张量必须位于同一个 CUDA 设备上
-- Python 接口注册定义了 14 个参数，不支持在调用时直接传入 `cuda_stream`
-
-### 调用示例
-
-```python
-import torch
-import mcoplib.sgl_kernel
-# Set computing device
-device = "cuda"
-# Core parameters
-batch_size = 2
-num_spec_step = 4
-num_draft_tokens = 5  # num_draft_tokens = 5
-vocab_size = 128
-# 1. Construct input tensors
-# predicts: [batch_size], dtype=int32
-predicts = torch.zeros(batch_size, dtype=torch.int32, device=device)
-# accept_index: [batch_size, num_spec_step], dtype=int32
-accept_index = torch.zeros((batch_size, num_spec_step), dtype=torch.int32, device=device)
-# accept_token_num: [batch_size], dtype=int32
-accept_token_num = torch.zeros(batch_size, dtype=torch.int32, device=device)
-# candidates: [batch_size, num_draft_tokens], dtype=int64
-candidates = torch.randint(0, vocab_size, (batch_size, num_draft_tokens), dtype=torch.int64, device=device)
-# retrieve indices: [bs, num_draft_tokens], dtype=int64
-retrive_index = torch.zeros((batch_size, num_draft_tokens), dtype=torch.int64, device=device)
-retrive_next_token = torch.zeros((batch_size, num_draft_tokens), dtype=torch.int64, device=device)
-retrive_next_sibling = torch.zeros((batch_size, num_draft_tokens), dtype=torch.int64, device=device)
-# uniform_samples: [batch_size, num_draft_tokens], dtype=float32
-uniform_samples = torch.rand((batch_size, num_draft_tokens), dtype=torch.float32, device=device)
-# uniform_samples_for_final_sampling: [batch_size], dtype=float32
-uniform_samples_for_final_sampling = torch.rand(batch_size, dtype=torch.float32, device=device)
-#  关键修正点 
-# target_probs: [batch_size, num_draft_tokens, vocab_size]
-# 根据报错信息和源码 CHECK_EQ，第二维必须等于 num_draft_tokens (5)，不能是 6
-target_probs = torch.rand((batch_size, num_draft_tokens, vocab_size), dtype=torch.float32, device=device)
-# draft_probs: [batch_size, num_draft_tokens, vocab_size], dtype=float32
-draft_probs = torch.rand((batch_size, num_draft_tokens, vocab_size), dtype=torch.float32, device=device)
-# 2. Scalar parameters
-threshold_single = 1.0
-threshold_acc = 1.0
-deterministic = True
-# 3. Call the operator
-torch.ops.sgl_kernel.tree_speculative_sampling_target_only(
-    predicts=predicts,
-    accept_index=accept_index,
-    accept_token_num=accept_token_num,
-    candidates=candidates,
-    retrive_index=retrive_index,
-    retrive_next_token=retrive_next_token,
-    retrive_next_sibling=retrive_next_sibling,
-    uniform_samples=uniform_samples,
-    uniform_samples_for_final_sampling=uniform_samples_for_final_sampling,
-    target_probs=target_probs,
-    draft_probs=draft_probs,
-    threshold_single=threshold_single,
-    threshold_acc=threshold_acc,
-    deterministic=deterministic
-)
-# Output results
-print("tree_speculative_sampling_target_only computation completed successfully")
-print(f"Updated predicts: {predicts}")
-print(f"Accepted token count: {accept_token_num}")
-```
-
-## 125. verify_tree_greedy
-
-### 支持的产品型号
-
-- Metax C500/C550/C588/C600
-
-### 接口原型
-
-```python
-def verify_tree_greedy(
-    predicts: torch.Tensor,
-    accept_index: torch.Tensor,
-    accept_token_num: torch.Tensor,
-    candidates: torch.Tensor,
-    retrive_index: torch.Tensor,
-    retrive_next_token: torch.Tensor,
-    retrive_next_sibling: torch.Tensor,
-    target_predict: torch.Tensor
-) -> None
-```
-
-### 功能描述
-
-verify_tree_greedy 算子实现了基于树状结构的贪婪投机采样（Greedy Speculative Sampling）验证逻辑。该算子在 GPU 上并行比对目标模型生成的贪婪预测结果（`target_predict`）与草稿模型提供的树状候选序列（`candidates`）。利用提供的路径检索索引（`retrive_index` 等），算子能够快速确定每条序列中被接受的最长路径，并更新最终预测的 Token 及接受数量。该算子专门用于贪婪解码场景，旨在通过一次目标模型前向传播验证多个草稿 Token，显著降低推理延迟。
-
-- 计算公式：
-
-$$
-  \begin{aligned}
-  \text{cand} &= \text{candidates}[i, j] \\
-  \text{accept\\_bit}[i, j] &= 
-  \begin{cases} 
-  1, & \text{若候选 Token 满足验证条件（基于目标/草稿模型概率分布）} \\
-  0, & \text{否则}
-  \end{cases} \\
-  \text{accept\\_token\\_num}[i] &= \max\left\{ j \mid \forall 0 \leq t < j, \text{accept\\_bit}[i, t] = 1, j \leq \text{steps} \right\} \\
-  \text{predicts}[i] &= 
-  \begin{cases} 
-  \text{candidates}[i, \text{accept\\_token\\_num}[i]-1], & \text{若 } \text{accept\\_token\\_num}[i] > 0 \\
-  \text{基于目标模型分布重新采样}, & \text{若 } \text{accept\\_token\\_num}[i] = 0
-  \end{cases}
-  \end{aligned}
-$$
-
-  其中元素的线性索引与二维位置（Batch 与 Step）的映射关系为：
-
-$$
-  n = i \times \text{steps} + j
-$$
-
-  各变量的维度与含义：
-
-- $\text{target\\_probs} \in \mathbb{T}^{\text{bs} \times \text{steps} \times \text{vocab}}$ ：目标模型输出的概率分布张量，数据类型为 $\mathbb{T}$ （ $\text{float32}$ ）
-- $\text{draft\\_probs} \in \mathbb{T}^{\text{bs} \times \text{steps} \times \text{vocab}}$ ：草稿模型生成的概率分布张量，数据类型与 $\text{target\\_probs}$ 一致
-- $\text{candidates} \in \mathbb{I}^{\text{bs} \times \text{steps}}$ ：草稿生成的候选 Token 序列，数据类型为 $\mathbb{I}$ （ $\text{int64}$ ）
-- $\text{predicts} \in \mathbb{D}^{\text{bs}}$ ：输出张量，存储最终决定的下一个 Token，数据类型为 $\mathbb{D}$ （ $\text{int32}$ ）
-- $\text{accept\\_token\\_num} \in \mathbb{D}^{\text{bs}}$ ：输出张量，存储每条序列被验证接受的 Token 总数，数据类型为 $\mathbb{D}$ （ $\text{int32}$ ）
-- $n$ ：中间计算时采样张量的线性索引，范围为 $0 \leq n < \text{bs} \times \text{steps}$
-- $i$ ：张量的 Batch 索引，范围为 $0 \leq i < \text{bs}$
-- $j$ ：投机采样步骤的索引，范围为 $0 \leq j < \text{steps}$
-- $\text{bs}$ ：Batch Size，对应输入张量的第 0 维
-- $\text{steps}$ ：投机生成的候选长度（ $\text{num\\_draft\\_tokens}$ ）， $\text{target\\_probs}$ 的第 1 维必须与此相等
-- $\text{vocab}$ ：词表大小（Vocab Size）
-- $\text{cand}$ ：单步候选 Token， $\text{cand} = \text{candidates}[i, j]$
-- $\text{accept\\_bit}[i, j]$ ：单步验证结果标识（1 为接受，0 为拒绝）
-
-### 参数说明
-
-- **predicts** (torch.Tensor, 出参): 存储最终选定的下一个有效 Token，形状通常为 `[batch_size]`，数据类型必须为 **int32**
-- **accept_index** (torch.Tensor, 出参): 存储被接受 Token 在草稿树中的原始索引，形状为 `[batch_size, num_spec_step]`，数据类型必须为 **int32**
-- **accept_token_num** (torch.Tensor, 出参): 每个 Batch 序列中实际被接受的有效 Token 数量，形状为 `[batch_size]`，数据类型必须为 **int32**
-- **candidates** (torch.Tensor, 入参): 草稿模型生成的候选 Token 张量，数据类型为 **int64**
-- **retrive_index** (torch.Tensor, 入参): 用于在树结构中检索路径和兄弟节点的辅助索引张量，数据类型为 **int64**
-- **retrive_next_token** (torch.Tensor, 入参): 用于在树结构中检索路径和兄弟节点的辅助索引张量，数据类型为 **int64**
-- **retrive_next_sibling** (torch.Tensor, 入参): 用于在树结构中检索路径和兄弟节点的辅助索引张量，数据类型为 **int64**
-- **target_predict** (torch.Tensor, 入参): 目标模型对所有草稿位置生成的贪婪预测 Token 张量，数据类型为 **int64**。其第二维大小必须与 `candidates` 严格一致
-
-### 返回值
-
-无返回值，计算结果直接写入 `predicts`、`accept_index` 和 `accept_token_num` 等出参张量中
-
-### 约束与调用
-
-- 所有输入输出张量必须位于同一个 CUDA/MACA 设备上
-- 数据类型校验：
-- 出参张量（`predicts`, `accept_index`, `accept_token_num`）必须为 **int32**
-- 入参张量（`candidates`, `target_predict` 及索引类张量）必须为 **int64**
-- 维度限制：目标预测张量（`target_predict`）与候选张量（`candidates`）的第二维（投机步数维度）必须相等
-- 调用限制：尽管 C++ 底层支持 `cuda_stream` 参数，但由于 Python 接口注册定义了 8 个参数，调用时不支持传入 `cuda_stream`
-
-### 调用示例
-
-```python
-import torch
-import mcoplib.sgl_kernel
-# Set computing device
-device = "cuda"
-# Core parameters
-batch_size = 2
-num_spec_step = 4
-num_draft_tokens = 5
-vocab_size = 128
-# 1. Construct input tensors
-# predicts: [batch_size], dtype=int32 (mutable output)
-predicts = torch.zeros(batch_size, dtype=torch.int32, device=device)
-# accept_index: [batch_size, num_spec_step], dtype=int32 (mutable output)
-accept_index = torch.zeros((batch_size, num_spec_step), dtype=torch.int32, device=device)
-# accept_token_num: [batch_size], dtype=int32 (mutable output)
-accept_token_num = torch.zeros(batch_size, dtype=torch.int32, device=device)
-# candidates: [batch_size, num_draft_tokens], dtype=int64
-candidates = torch.randint(0, vocab_size, (batch_size, num_draft_tokens), dtype=torch.int64, device=device)
-# retrieve indices: [batch_size, num_draft_tokens], dtype=int64
-retrive_index = torch.zeros((batch_size, num_draft_tokens), dtype=torch.int64, device=device)
-retrive_next_token = torch.zeros((batch_size, num_draft_tokens), dtype=torch.int64, device=device)
-retrive_next_sibling = torch.zeros((batch_size, num_draft_tokens), dtype=torch.int64, device=device)
-# target_predict: [batch_size, num_draft_tokens], dtype=int64
-target_predict = torch.randint(0, vocab_size, (batch_size, num_draft_tokens), dtype=torch.int64, device=device)
-# 2. Call the operator
-# Removed 'cuda_stream' to match the 8-argument registration
-torch.ops.sgl_kernel.verify_tree_greedy(
-    predicts=predicts,
-    accept_index=accept_index,
-    accept_token_num=accept_token_num,
-    candidates=candidates,
-    retrive_index=retrive_index,
-    retrive_next_token=retrive_next_token,
-    retrive_next_sibling=retrive_next_sibling,
-    target_predict=target_predict
-)
-# Output results
-print("verify_tree_greedy computation completed successfully")
-print(f"Updated predicts: {predicts}")
-print(f"Updated accept_token_num: {accept_token_num}")
-```
-
-## 126. reconstruct_indices_from_tree_mask
-
-### 支持的产品型号
-
-- Metax C500/C550/C588/C600
-
-### 接口原型
-
-```python
-def reconstruct_indices_from_tree_mask(
-    tree_mask: torch.Tensor,
-    verified_seq_len: torch.Tensor,
-    positions: torch.Tensor,
-    retrive_index: torch.Tensor,
-    retrive_next_token: torch.Tensor,
-    retrive_next_sibling: torch.Tensor,
-    batch_size: int,
-    draft_token_num: int
-) -> None
-```
-
-### 功能描述
-
-reconstruct_indices_from_tree_mask 算子用于在树状投机采样（Tree-based Speculative Decoding）中，根据给定的布尔遮罩（tree_mask）重建 Token 的位置信息和索引元数据。该算子在 CUDA 内核中并行处理，根据遮罩关系计算每个草稿 Token 的树深度（Depth），并将其与已验证序列长度相加得到绝对位置。同时，它会识别每个 Token 在树结构中的检索索引、下一个 Token 索引以及下一个兄弟节点索引，这些元数据对于后续的投机验证至关重要。
-
-- 计算公式：
-
-$$
-  \begin{aligned}
-  \text{positions}[n] &= \text{tree\\_depth}[i, t] + \text{verified\\_seq\\_len}[i] \\
-  \text{retrive\\_index}[n] &= n \\
-  \text{retrive\\_next\\_token}[n] &= 
-  \begin{cases} 
-  \text{first\\_child\\_idx}(i, t), & \text{若 Token } t \text{ 存在子节点} \\
--1, & \text{若无子节点}
-  \end{cases} \\
-  \text{retrive\\_next\\_sibling}[n] &= 
-  \begin{cases} 
-  \text{next\\_sibling\\_idx}(i, t), & \text{若 Token } t \text{ 存在兄弟节点} \\
--1, & \text{若无兄弟节点}
-  \end{cases}
-  \end{aligned}
-$$
-
-  其中 $\text{first\\_child\\_idx}(i, t) = \arg\min_{k}\{k \mid \text{tree\\_mask}[i, t, k] = \text{True}\}$ ， $\text{next\\_sibling\\_idx}(i, t) = \arg\min_{k>t}\{k \mid \text{tree\\_mask}[i, \text{parent}(t), k] = \text{True}\}$ ；元素的线性索引与多维位置的映射关系为：
-
-$$
-  n = i \times \text{draft\\_token\\_num} + t
-$$
-
-  对于三维遮罩张量，其内部线性寻址关系为：
-
-$$
-  \text{mask\\_n} = i \times \text{draft\\_token\\_num} \times \text{draft\\_token\\_num} + j \times \text{draft\\_token\\_num} + k
-$$
-
-  各变量的维度与含义：
-
-- $\text{tree\\_mask} \in \mathbb{B}^{\text{batch\\_size} \times \text{draft\\_token\\_num} \times \text{draft\\_token\\_num}}$ ：输入树结构关系遮罩，数据类型为 $\mathbb{B}$ （ $\text{bool}$ ）； $\text{tree\\_mask}[i, j, k] = \text{True}$ 表示在第 $i$ 个 Batch 中，Token $k$ 是 Token $j$ 的后代
-- $\text{verified\\_seq\\_len} \in \mathbb{I}^{\text{batch\\_size}}$ ：输入张量，记录每个 Batch 已验证的序列长度，数据类型为 $\mathbb{I}$ （ $\text{int64}$ ）
-- $\text{positions} \in \mathbb{I}^{\text{batch\\_size} \times \text{draft\\_token\\_num}}$ ：输出张量，存储重建后的 Token 绝对位置，计算方式为树深度加上已验证长度，数据类型为 $\mathbb{I}$ （ $\text{int64}$ ）
-- $\text{retrive\\_index} \in \mathbb{I}^{\text{batch\\_size} \times \text{draft\\_token\\_num}}$ ：输出张量，存储 Token 的扁平化检索索引，直接映射为当前线性索引 $n$ ，数据类型为 $\mathbb{I}$ （ $\text{int64}$ ）
-- $\text{retrive\\_next\\_token} \in \mathbb{I}^{\text{batch\\_size} \times \text{draft\\_token\\_num}}$ ：输出张量，存储每个 Token 的第一个子节点索引，若无子节点则为 $-1$ ，数据类型为 $\mathbb{I}$ （ $\text{int64}$ ）
-- $\text{retrive\\_next\\_sibling} \in \mathbb{I}^{\text{batch\\_size} \times \text{draft\\_token\\_num}}$ ：输出张量，存储每个 Token 的下一个兄弟节点索引，若无兄弟节点则为 $-1$ ，数据类型为 $\mathbb{I}$ （ $\text{int64}$ ）
-- $n$ ：输出张量元素的线性索引，范围为 $0 \leq n < \text{batch\\_size} \times \text{draft\\_token\\_num}$
-- $i$ ：Batch 索引，范围为 $0 \leq i < \text{batch\\_size}$
-- $t$ ：当前 Batch 内的 Token 偏移索引，范围为 $0 \leq t < \text{draft\\_token\\_num}$
-- $j, k$ ：三维遮罩张量的 Token 索引，范围为 $0 \leq j, k < \text{draft\\_token\\_num}$
-- $\text{draft\\_token\\_num}$ ：树中草稿 Token 的有效宽度
-- $\text{batch\\_size}$ ：批处理的高度（行数）
-- $\text{tree\\_depth}[i, t]$ ：第 $i$ 个 Batch 中 Token $t$ 在树结构中的深度
-- $\text{parent}(t)$ ：Token $t$ 在树结构中的父节点索引
-
-### 参数说明
-
-- **tree_mask** (torch.Tensor, 入参): 树结构关系的布尔遮罩张量，形状为 `[batch_size, draft_token_num, draft_token_num]`，数据类型为 **bool**
-- **verified_seq_len** (torch.Tensor, 入参): 存储每个 batch 当前已验证序列长度的张量，数据类型为 **int64**
-- **positions** (torch.Tensor, 出参): 输出张量，存储重建后的 Token 绝对位置信息，数据类型为 **int64**
-- **retrive_index** (torch.Tensor, 出参): 输出张量，存储每个 Token 的检索索引，数据类型为 **int64**
-- **retrive_next_token** (torch.Tensor, 出参): 输出张量，存储对应的下一个 Token 索引，若无则为 -1，数据类型为 **int64**
-- **retrive_next_sibling** (torch.Tensor, 出参): 输出张量，存储对应的下一个兄弟节点索引，若无则为 -1，数据类型为 **int64**
-- **batch_size** (int, 入参): 批处理大小
-- **draft_token_num** (int, 入参): 每个 batch 中的草稿 Token 数量
-
-### 返回值
-
-无返回值，计算结果直接写入 `positions`、`retrive_index`、`retrive_next_token` 和 `retrive_next_sibling` 张量中
-
-### 约束与调用
-
-- 所有张量必须位于 CUDA 设备上
-- 数据类型约束：
-- `tree_mask` 必须为 **bool**
-- 其余所有张量（入参及出参）必须为 **int64**
-- 维度一致性：`tree_mask` 在内存中被视为大小为 `batch_size * draft_token_num * draft_token_num` 的连续数组进行访问
-
-### 调用示例
-
-```python
-import torch
-import mcoplib.sgl_kernel
-# 设置计算设备
-device = "cuda"
-# 核心参数
-bs = 2                  # Batch Size
-draft_token_num = 16    # 树中草稿 Token 的数量
-# 1. 构造输入张量
-# tree_mask: [bs, draft_token_num, draft_token_num]，实现中强制转换为 bool*
-tree_mask = torch.randint(
-    0, 2, (bs, draft_token_num, draft_token_num), 
-    dtype=torch.bool, device=device
-)
-# verified_seq_len: [bs]，存储每个 batch 已验证的序列长度，类型为 int64
-verified_seq_len = torch.tensor([10, 20], dtype=torch.int64, device=device)
-# 2. 构造输出/修改张量 (这些张量在 C++ 中被标记为 mutable/Tensor!)
-# 数据类型均为 int64 (Long)
-positions = torch.zeros((bs, draft_token_num), dtype=torch.int64, device=device)
-retrive_index = torch.zeros((bs, draft_token_num), dtype=torch.int64, device=device)
-retrive_next_token = torch.zeros((bs, draft_token_num), dtype=torch.int64, device=device)
-retrive_next_sibling = torch.zeros((bs, draft_token_num), dtype=torch.int64, device=device)
-# 3. 调用算子
-# 注意参数顺序需匹配注册信息
-torch.ops.sgl_kernel.reconstruct_indices_from_tree_mask(
-    tree_mask,
-    verified_seq_len,
-    positions,
-    retrive_index,
-    retrive_next_token,
-    retrive_next_sibling,
-    bs,                 # batch_size
-    draft_token_num     # draft_token_num
-)
-# 输出结果
-print("reconstruct_indices_from_tree_mask computation completed")
-print(f"Positions shape: {positions.shape}")
-print(f"Retrieve Index shape: {retrive_index.shape}")
-print(f"Next Token Index shape: {retrive_next_token.shape}")
-print(f"Next Sibling Index shape: {retrive_next_sibling.shape}")
-```
-
-## 127. build_tree_kernel_efficient
-
-### 支持的产品型号
-
-- Metax C500/C550/C588/C600
-
-### 接口原型
-
-```python
-def build_tree_kernel_efficient(
-    parent_list: torch.Tensor,
-    selected_index: torch.Tensor,
-    verified_seq_len: torch.Tensor,
-    tree_mask: torch.Tensor,
-    positions: torch.Tensor,
-    retrive_index: torch.Tensor,
-    retrive_next_token: torch.Tensor,
-    retrive_next_sibling: torch.Tensor,
-    topk: int,
-    depth: int,
-    draft_token_num: int,
-    tree_mask_mode: int
-) -> None
-```
-
-### 功能描述
-
-build_tree_kernel_efficient 算子用于在树状投机采样（Speculative Decoding）中高效构建树结构元数据。该算子根据输入的父节点列表，在 GPU 上并行计算每个草稿 Token 的树深度，并结合已验证序列长度生成绝对位置信息。同时，它负责生成树结构注意力掩码（tree_mask）以及用于验证阶段的路径检索索引（下一个 Token 索引和兄弟节点索引），从而减少树结构在 CPU 与 GPU 之间的频繁同步开销。
-
-- 计算公式：
-
-$$
-  \text{depth}[i, t] = 
-  \begin{cases} 
-  0, & \text{根节点（无父节点）} \\
-  \text{depth}[i, \text{parent\\_list}[i, t]] + 1, & \text{子节点（深度为父节点深度+1）}
-  \end{cases}
-$$
-
-  该算子通过遍历 parent_list 重建投机采样的树状拓扑结构。其中 $\text{depth}$ 代表节点在树中的层级（根节点深度为 0），用于计算 Token 的绝对位置。
-  其中元素的线性索引与多维位置的映射关系为：
-
-$$
-  n = i \times \text{draft\\_token\\_num} + t
-$$
-
-  对于三维遮罩张量 tree_mask，其内部线性寻址关系为：
-
-$$
-  \text{mask\\_n} = i \times \text{draft\\_token\\_num} \times \text{draft\\_token\\_num} + j \times \text{draft\\_token\\_num} + k
-$$
-
-  各变量的维度与含义：
-
-- $\text{parent\\_list} \in \mathbb{I}^{\text{batch\\_size} \times \text{draft\\_token\\_num}}$ ：输入张量，记录树中每个节点的父节点索引偏移，数据类型为 $\mathbb{I}$ （ $\text{int64}$ ）
-- $\text{verified\\_seq\\_len} \in \mathbb{I}^{\text{batch\\_size}}$ ：输入张量，记录每个 Batch 已验证的序列长度，用于计算绝对位置偏移，数据类型为 $\mathbb{I}$ （ $\text{int64}$ ）
-- $\text{tree\\_mask} \in \mathbb{B}^{\text{batch\\_size} \times \text{draft\\_token\\_num} \times \text{draft\\_token\\_num}}$ ：输出张量，树结构注意力掩码，数据类型为 $\mathbb{B}$ （ $\text{bool}$ ）
-- $\text{positions} \in \mathbb{I}^{\text{batch\\_size} \times \text{draft\\_token\\_num}}$ ：输出张量，存储重建后的 Token 绝对位置信息，数据类型为 $\mathbb{I}$ （ $\text{int64}$ ）
-- $\text{retrive\\_next\\_token} \in \mathbb{I}^{\text{batch\\_size} \times \text{draft\\_token\\_num}}$ ：输出张量，存储每个 Token 对应的第一个子节点索引，数据类型为 $\mathbb{I}$ （ $\text{int64}$ ）
-- $\text{retrive\\_next\\_sibling} \in \mathbb{I}^{\text{batch\\_size} \times \text{draft\\_token\\_num}}$ ：输出张量，存储每个 Token 对应的下一个兄弟节点索引，数据类型为 $\mathbb{I}$ （ $\text{int64}$ ）
-- $n$ ：输出张量元素的线性索引，范围为 $0 \leq n < \text{batch\\_size} \times \text{draft\\_token\\_num}$
-- $i$ ：Batch 索引，范围为 $0 \leq i < \text{batch\\_size}$
-- $t$ ：当前 Batch 内的 Token 偏移索引，范围为 $0 \leq t < \text{draft\\_token\\_num}$
-- $\text{draft\\_token\\_num}$ ：树中草稿 Token 的有效宽度
-- $\text{batch\\_size}$ ：批处理的高度（行数）
-
-### 参数说明
-
-- **parent_list** (torch.Tensor, 入参): 树中每个节点的父节点偏移列表，形状通常为 `[batch_size, draft_token_num]`
-- **selected_index** (torch.Tensor, 入参): 存储被选中的候选 Token 索引
-- **verified_seq_len** (torch.Tensor, 入参): 每个 batch 当前已通过验证的序列长度
-- **tree_mask** (torch.Tensor, 出参): 输出的树结构注意力掩码，用于后续 Self-Attention 计算
-- **positions** (torch.Tensor, 出参): 输出的绝对位置编码信息
-- **retrive_index** (torch.Tensor, 出参): 输出的 Token 检索索引
-- **retrive_next_token** (torch.Tensor, 出参): 输出的当前节点第一个子节点的检索索引
-- **retrive_next_sibling** (torch.Tensor, 出参): 输出的当前节点下一个兄弟节点的检索索引
-- **topk** (int, 入参): 采样时每层的 top-k 候选数量
-- **depth** (int, 入参): 树的最大深度
-- **draft_token_num** (int, 入参): 树中包含的草稿 Token 总数
-- **tree_mask_mode** (int, 入参): 掩码生成模式选择
-
-### 返回值
-
-无返回值，计算出的树掩码、位置信息和各类检索索引直接写入对应的出参张量中
-
-### 约束与调用
-
-- 所有输入及输出张量必须位于 **CUDA** 设备上
-- 数据类型支持：
-- `tree_mask` 必须为 **bool** 类型
-- 索引与位置相关张量（`parent_list`, `positions`, `retrive_index` 等）必须为 **int64** (Long) 类型
-- 内存布局：所有传入的张量应当是连续的（Contiguous），因为内核直接通过 `data_ptr ()` 访问底层物理地址
-
-### 调用示例
-
-```python
-import torch
-import mcoplib.sgl_kernel
-# Set computing device
-device = "cuda"
-# Core parameters
-bs = 2                  # Batch size
-topk = 4                # Top-k selection per branch
-tree_depth = 5          # Depth of the speculative tree
-draft_token_num = 16    # Total number of draft tokens in the tree
-tree_mask_mode = 0      # Mode for tree mask generation
-# 1. Construct input tensors
-# Note: Dtypes must match C++ static_cast expectations (mostly int64 and bool)
-# parent_list: Indices of parent nodes for each node in the tree
-parent_list = torch.zeros((bs, draft_token_num), dtype=torch.int64, device=device)
-# selected_index: Indices of selected tokens
-selected_index = torch.zeros((bs, draft_token_num), dtype=torch.int64, device=device)
-# verified_seq_len: Current verified sequence length per batch
-verified_seq_len = torch.tensor([10, 20], dtype=torch.int64, device=device)
-# 2. Construct output/mutable tensors (marked with ! in registration)
-# tree_mask: [bs, draft_token_num, draft_token_num]
-tree_mask = torch.empty((bs, draft_token_num, draft_token_num), dtype=torch.bool, device=device)
-# positions and indices: [bs, draft_token_num]
-positions = torch.empty((bs, draft_token_num), dtype=torch.int64, device=device)
-retrive_index = torch.empty((bs, draft_token_num), dtype=torch.int64, device=device)
-retrive_next_token = torch.empty((bs, draft_token_num), dtype=torch.int64, device=device)
-retrive_next_sibling = torch.empty((bs, draft_token_num), dtype=torch.int64, device=device)
-# 3. Call the operator
-# Registered in sgl_kernel namespace
-torch.ops.sgl_kernel.build_tree_kernel_efficient(
-    parent_list=parent_list,
-    selected_index=selected_index,
-    verified_seq_len=verified_seq_len,
-    tree_mask=tree_mask,
-    positions=positions,
-    retrive_index=retrive_index,
-    retrive_next_token=retrive_next_token,
-    retrive_next_sibling=retrive_next_sibling,
-    topk=topk,
-    depth=tree_depth,
-    draft_token_num=draft_token_num,
-    tree_mask_mode=tree_mask_mode
-)
-# Output results
-print("build_tree_kernel_efficient computation completed")
-print(f"tree_mask shape: {tree_mask.shape}")
-print(f"positions shape: {positions.shape}")
-print(f"retrive_index sample: {retrive_index[0, :5]}")
-```
-
-## 128. segment_packbits
-
-### 支持的产品型号
-
-- Metax C500/C550/C588/C600
-
-### 接口原型
-
-```python
-def segment_packbits(
-    x: torch.Tensor,
-    input_indptr: torch.Tensor,
-    output_indptr: torch.Tensor,
-    y: torch.Tensor,
-    batch_size: int,
-    cuda_stream: int = 0
-) -> None
-```
-
-### 功能描述
-
-segment_packbits 算子实现了分段位打包（Bit-packing）功能。它将输入的布尔型张量按照指定的段偏移指针（indptr）划分为多个段，并在每个段内将连续的布尔值压缩为比特位（1 个比特位代表 1 个布尔值），最终以 uint8 字节流的形式存储。该算子在位打包时采用小端序（Little-endian）逻辑，常用于树状投机采样等变长序列场景中，以降低布尔掩码的显存占用和传输带宽。
-
-- 计算公式：
-
-$$
-  \text{dst}[\text{output\\_indptr}[b] + \text{byte\\_off}] |= \text{int}(\text{input}[\text{input\\_indptr}[b] + 8 \times \text{byte\\_off} + \text{bit\\_idx}]) \ll \text{bit\\_idx}
-$$
-
-  其中， $\text{int}(\cdot)$ 将布尔值转换为整数（ $\text{True}$ 映射为 $1$ ， $\text{False}$ 映射为 $0$ ），且位打包遵循小端序（Little-endian）逻辑。
-  其中元素的线性索引与多维位置的映射关系为：
-
-$$
-  \text{input\\_n} = \text{input\\_indptr}[b] + 8 \times \text{byte\\_off} + \text{bit\\_idx} \\
-  \text{output\\_n} = \text{output\\_indptr}[b] + \text{byte\\_off}
-$$
-
-  各变量的维度与含义：
-
-- $\text{input} \in \mathbb{B}^{\text{input\\_len}}$ ：输入布尔张量，数据类型为 $\mathbb{B}$ （ $\text{bool}$ ），包含待压缩的原始数据
-- $\text{dst} \in \mathbb{U}^{\text{output\\_len}}$ ：输出张量，存储打包后的比特数据，数据类型为 $\mathbb{U}$ （ $\text{uint8}$ ）
-- $\text{input\\_indptr} \in \mathbb{I}^{\text{num\\_segments}+1}$ ：输入段偏移指针，用于定义输入张量 $\text{input}$ 中每个 Segment 的起始和结束位置，数据类型为 $\mathbb{I}$ （ $\text{int32}$ ）
-- $\text{output\\_indptr} \in \mathbb{I}^{\text{num\\_segments}+1}$ ：输出段偏移指针，用于定义输出张量 $\text{dst}$ 中每个 Segment 的起始和结束位置，数据类型与 $\text{input\\_indptr}$ 一致
-- $b$ ：分段索引（Batch 索引），范围为 $0 \leq b < \text{num\\_segments}$
-- $\text{byte\\_off}$ ：当前 Segment 内的字节偏移，范围为 $0 \leq \text{byte\\_off} < \lfloor (\text{input\\_indptr}[b+1] - \text{input\\_indptr}[b])/8 \rfloor$
-- $\text{bit\\_idx}$ ：字节内的比特位索引，范围为 $0 \leq \text{bit\\_idx} < 8$
-- $\text{num\\_segments}$ ：需要处理的总分段数量
-- $\text{input\\_len}$ ：输入张量的总长度，满足 $\text{input\\_len} = \text{input\\_indptr}[\text{num\\_segments}]$
-- $\text{output\\_len}$ ：输出张量的总长度，满足 $\text{output\\_len} = \text{output\\_indptr}[\text{num\\_segments}]$
-
-### 参数说明
-
-- **x** (torch.Tensor, 入参): 输入的布尔型张量，包含待压缩的原始布尔数据
-- **input_indptr** (torch.Tensor, 入参): 输入段偏移指针，用于定义 `x` 中各段的起始和结束位置，数据类型为 **int32**
-- **output_indptr** (torch.Tensor, 入参): 输出段偏移指针，用于定义压缩后各段在 `y` 中的起始和结束位置，数据类型为 **int32**
-- **y** (torch.Tensor, 出参): 输出张量，用于存储打包后的比特数据，数据类型为 **uint8**
-- **batch_size** (int, 入参): 批处理大小，即总共需要处理的分段数量
-- **cuda_stream** (int, 入参): 异步执行任务的 CUDA 流指针
-
-### 返回值
-
-无返回值，打包后的结果直接写入输出张量 `y` 中
-
-### 约束与调用
-
-- 所有输入输出张量必须位于同一个 CUDA 设备上
-- 数据类型限制：
-- `x` 必须为 **bool** 类型
-- `y` 必须为 **uint8** 类型
-- `input_indptr` 与 `output_indptr` 必须为 **int32** 类型
-- `output_indptr` 的长度必须大于等于 `batch_size + 1`
-- 算子内部直接通过 `data_ptr ()` 访问地址，建议所有张量保持内存连续（Contiguous）
-
-### 调用示例
-
-```python
-import torch
-import mcoplib.sgl_kernel
-# Set computing device
-device = "cuda"
-# Core parameters
-batch_size = 2
-bits_per_segment = 16  # Each segment has 16 boolean flags
-total_bits = batch_size * bits_per_segment
-# 1. Construct input tensors
-# x: Input boolean tensor to be packed
-x = torch.randint(0, 2, (total_bits,), dtype=torch.bool, device=device)
-# input_indptr: Defines the start/end indices of segments in input 'x'
-# Must be int32 and size should be batch_size + 1
-input_indptr = torch.tensor([0, 16, 32], dtype=torch.int32, device=device)
-# output_indptr: Defines the start/end indices of packed segments in output 'y'
-# 16 bits pack into 2 bytes (uint8)
-output_indptr = torch.tensor([0, 2, 4], dtype=torch.int32, device=device)
-# 2. Construct output tensor
-# y: Output tensor for packed bits, must be uint8 (or int8)
-y = torch.empty((4,), dtype=torch.uint8, device=device)
-cuda_stream = 0
-# 3. Call the operator
-# Registered in sgl_kernel namespace with 6 arguments
-torch.ops.sgl_kernel.segment_packbits(
-    x=x,
-    input_indptr=input_indptr,
-    output_indptr=output_indptr,
-    y=y,
-    batch_size=batch_size,
-    cuda_stream=cuda_stream
-)
-# Output results
-print("segment_packbits computation completed")
-print(f"Input boolean tensor shape: {x.shape}")
-print(f"Output packed tensor (uint8) shape: {y.shape}")
-```
-
-## 129. transfer_kv_per_layer
-
-### 支持的产品型号
-
-- Metax C500/C550/C588/C600
-
-### 接口原型
-
-```python
-def transfer_kv_per_layer(
-    src_k: torch.Tensor,
-    dst_k: torch.Tensor,
-    src_v: torch.Tensor,
-    dst_v: torch.Tensor,
-    src_indices: torch.Tensor,
-    dst_indices: torch.Tensor,
-    item_size: int,
-    block_quota: int,
-    num_warps_per_block: int
-) -> None
-```
-
-### 功能描述
-
-transfer_kv_per_layer 算子用于在单层维度上，根据指定的源索引和目标索引，将 Key (K) 和 Value (V) 的 Cache 数据从源张量复制到目标张量中。该操作主要应用于大模型推理过程中的 KV Cache 显存管理场景，如 Page Attention 中的物理块搬运、碎片整理等。
-
-- 计算公式：
-
-$$
-  \text{dst\\_k}[\mathcal{A}_{\text{dst}}] = \text{src\\_k}[\mathcal{A}_{\text{src}}]
-$$
-
-
-
-$$
-  \text{dst\\_v}[\mathcal{A}_{\text{dst}}] = \text{src\\_v}[\mathcal{A}_{\text{src}}]
-$$
-
-  其中地址偏移量的映射关系为：
-
-$$
-  \mathcal{A}_{\text{src}} = \text{src\\_indices}[b] \times \text{item\\_size} + j
-$$
-
-
-
-$$
-  \mathcal{A}_{\text{dst}} = \text{dst\\_indices}[b] \times \text{item\\_size} + j
-$$
-
-  各变量的维度与含义：
-
-- $\text{src\\_k} \in \mathbb{T}^{\text{total\\_size}}$ ：源 Key 缓存张量，视为一维线性内存，数据类型为 $\mathbb{T}$
-- $\text{dst\\_k} \in \mathbb{T}^{\text{total\\_size}}$ ：目标 Key 缓存张量，数据类型与 $\text{src\\_k}$ 一致
-- $\text{src\\_v} \in \mathbb{T}^{\text{total\\_size}}$ ：源 Value 缓存张量，视为一维线性内存
-- $\text{dst\\_v} \in \mathbb{T}^{\text{total\\_size}}$ ：目标 Value 缓存张量，数据类型与 $\text{src\\_v}$ 一致
-- $\text{src\\_indices} \in \mathbb{Z}^{\text{num\\_blocks}}$ ：源数据块索引张量，数据类型为整型
-- $\text{dst\\_indices} \in \mathbb{Z}^{\text{num\\_blocks}}$ ：目标数据块索引张量，长度与 $\text{src\\_indices}$ 一致
-- $b$ ：数据块的遍历索引，范围为 $0 \leq b < \text{num\\_blocks}$ （其中 $\text{num\\_blocks}$ 为索引张量的长度）
-- $j$ ：块内元素的字节或线性偏移量，范围为 $0 \leq j < \text{item\\_size}$
-- $\text{item\\_size}$ ：单个数据块（Page/Slot）的内存大小（单位通常为字节或元素个数）
-- $\mathcal{A}_{\text{src}}$ ：计算得到的源数据在显存中的绝对线性偏移量
-- $\mathcal{A}_{\text{dst}}$ ：计算得到的目标数据在显存中的绝对线性偏移量
-
-### 参数说明
-
-- **src_k** (torch.Tensor, 入参): 源 Key Cache 张量，待读取的 K Cache 数据存储于此。
-- **dst_k** (torch.Tensor, 出参): 目标 Key Cache 张量，复制后的 K Cache 数据将写入此处。
-- **src_v** (torch.Tensor, 入参): 源 Value Cache 张量，待读取的 V Cache 数据存储于此。
-- **dst_v** (torch.Tensor, 出参): 目标 Value Cache 张量，复制后的 V Cache 数据将写入此处。
-- **src_indices** (torch.Tensor, 入参): 源数据块索引张量，用于指定需要搬运的源数据位置。
-- **dst_indices** (torch.Tensor, 入参): 目标数据块索引张量，用于指定搬运后数据的存储位置。
-- **item_size** (int, 入参): 单个数据块的大小（通常为`head_dim * sizeof (dtype)`或页大小），用于计算内存偏移量。
-- **block_quota** (int, 入参): CUDA Kernel 发射时的 Block 配额，用于控制计算并行度。
-- **num_warps_per_block** (int, 入参): 每个 CUDA Block 使用的 Warp 数量。
-
-### 返回值
-
-无返回值，计算结果直接写入`dst_k`和`dst_v`张量中。
-
-### 约束与调用
-
-- 所有输入张量必须部署在 CUDA 设备上。
-- `src_indices`和`dst_indices`的元素数量必须一致，且数据类型均为整型。
-- `src_k`与`dst_k`的数据类型及张量形状需兼容，`src_v`与`dst_v`的数据类型及张量形状也需兼容。
-- `item_size`必须准确反映待搬运的连续内存块大小，否则会导致数据错位。
-
-### 调用示例
-
-```python
-import torch
-import mcoplib.sgl_kernel
-# 设置计算设备
-device = "cuda" if torch.cuda.is_available() else "cpu"
-assert device == "cuda", "transfer_kv_per_layer only supports CUDA devices"
-# 核心参数
-num_blocks_to_copy = 32      
-item_size = 4096              
-total_pool_blocks = 1024      
-block_quota = 128            
-num_warps_per_block = 4      
-# 1. 构造输入张量
-src_k = torch.randn(
-    total_pool_blocks * item_size,
-    dtype=torch.float32, device=device, requires_grad=False
-)
-src_v = torch.randn(
-    total_pool_blocks * item_size,
-    dtype=torch.float32, device=device, requires_grad=False
-)
-# 构造目标 Key/Value Cache 池 (初始化为空或零)
-dst_k = torch.zeros(
-    total_pool_blocks * item_size,
-    dtype=torch.float32, device=device, requires_grad=False
-)
-dst_v = torch.zeros(
-    total_pool_blocks * item_size,
-    dtype=torch.float32, device=device, requires_grad=False
-)
-# 构造索引张量 (指定从哪里搬运到哪里)
-src_indices = torch.randint(
-    0, total_pool_blocks, (num_blocks_to_copy,),
-    dtype=torch.int64, device=device, requires_grad=False
-)
-dst_indices = torch.randint(
-    0, total_pool_blocks, (num_blocks_to_copy,),
-    dtype=torch.int64, device=device, requires_grad=False
-)
-# 调用算子
-torch.ops.sgl_kernel.transfer_kv_per_layer(
-    src_k=src_k,
-    dst_k=dst_k,
-    src_v=src_v,
-    dst_v=dst_v,
-    src_indices=src_indices,
-    dst_indices=dst_indices,
-    item_size=item_size,
-    block_quota=block_quota,
-    num_warps_per_block=num_warps_per_block
-)
-# 输出结果
-print("transfer_kv_per_layer computation completed")
-print(f"Source K shape: {src_k.shape}")
-print(f"Destination K shape: {dst_k.shape}")
-print(f"Number of blocks transferred: {src_indices.shape[0]}")
-```
-
-## 130. transfer_kv_per_layer_pf_lf
-
-### 支持的产品型号
-
-- Metax C500/C550/C588/C600
-
-### 接口原型
-
-```python
-def transfer_kv_per_layer_pf_lf(
-    src_k: torch.Tensor,
-    dst_k: torch.Tensor,
-    src_v: torch.Tensor,
-    dst_v: torch.Tensor,
-    src_indices: torch.Tensor,
-    dst_indices: torch.Tensor,
-    layer_id: int,
-    item_size: int,
-    src_layout_dim: int,
-    block_quota: int,
-    num_warps_per_block: int
-) -> None
-```
-
-### 功能描述
-
-transfer_kv_per_layer_pf_lf 算子实现了针对特定层（Per Layer）的 KV Cache 数据搬运与格式转换。该算子根据给定的源索引（src_indices）和目标索引（dst_indices），将 Key 和 Value 张量从源存储位置传输到目标存储位置。后缀 `pf_lf` 通常指代特定的页面格式（Page Format）或布局格式（Layout Format）的处理，用于优化推理过程中的显存管理和访问效率。
-
-- 计算公式：
-
-$$
-  \text{dst\\_k}[\text{dst\\_addr}] = \text{src\\_k}[\text{src\\_addr}]
-$$
-
-
-
-$$
-  \text{dst\\_v}[\text{dst\\_addr}] = \text{src\\_v}[\text{src\\_addr}]
-$$
-
-  其中源地址索引与目标地址索引的映射关系为：
-
-$$
-  \text{src\\_addr} = \text{layer\\_id} \times \text{src\\_layout\\_dim} + \text{src\\_indices}[i] \times \text{item\\_size} + j
-$$
-
-
-
-$$
-  \text{dst\\_addr} = \text{dst\\_indices}[i] \times \text{item\\_size} + j
-$$
-
-  各变量的维度与含义：
-
-- $\text{src\\_k}, \text{src\\_v} \in \mathbb{T}^{\text{Total\\_Src} \times \text{item\\_size}}$ ：源键值张量，数据类型为 $\mathbb{T}$ 。
-- $\text{dst\\_k}, \text{dst\\_v} \in \mathbb{T}^{\text{Total\\_Dst} \times \text{item\\_size}}$ ：目标键值张量，数据类型与源张量一致。
-- $\text{src\\_indices} \in \mathbb{Z}^{N}$ ：源数据索引张量，包含 $N$ 个待搬运块/页的索引值。
-- $\text{dst\\_indices} \in \mathbb{Z}^{N}$ ：目标数据索引张量，包含 $N$ 个目标位置的索引值。
-- $i$ ：索引张量的遍历下标，范围为 $0 \leq i < N$ ，其中 $N$ 为本次传输涉及的索引数量（即`indices`张量的长度）。
-- $j$ ：数据块内的元素偏移，范围为 $0 \leq j < \text{item\\_size}$ 。
-- $\text{layer\\_id} \in \mathbb{Z}$ ：当前处理的层级 ID，用于在源数据中定位特定层。
-- $\text{src\\_layout\\_dim} \in \mathbb{Z}$ ：源数据的布局维度跨度（Stride），用于计算层级偏移量。通常表示不同层之间的数据间隔。
-- $\text{item\\_size} \in \mathbb{Z}$ ：单个 KV 数据块（或 Head 维度）的元素数量。
-
-### 参数说明
-
-- **src_k** (torch.Tensor, 入参): 源 Key 张量，包含待传输的 K 数据。
-- **dst_k** (torch.Tensor, 入参/出参): 目标 Key 张量，数据将被写入此位置。
-- **src_v** (torch.Tensor, 入参): 源 Value 张量，包含待传输的 V 数据。
-- **dst_v** (torch.Tensor, 入参/出参): 目标 Value 张量，数据将被写入此位置。
-- **src_indices** (torch.Tensor, 入参): 源数据索引张量，指定从源张量中读取数据的位置。
-- **dst_indices** (torch.Tensor, 入参): 目标数据索引张量，指定写入目标张量的位置。
-- **layer_id** (int, 入参): 当前操作的层 ID，用于计算偏移或定位特定层的数据。
-- **item_size** (int, 入参): 单个元素的大小或隐藏层维度大小（Hidden Size）。
-- **src_layout_dim** (int, 入参): 源数据的布局维度参数，用于处理内存跨度。
-- **block_quota** (int, 入参): CUDA 计算块的配额限制，用于资源控制。
-- **num_warps_per_block** (int, 入参): 每个 CUDA Block 中使用的 Warp 数量，用于调优并行度。
-
-### 返回值
-
-无返回值，计算结果直接更新到`dst_k`和`dst_v`张量中。
-
-### 约束与调用
-
-- 所有输入张量通常需位于 CUDA 设备上。
-- `src_indices`和`dst_indices`的长度应保持逻辑一致，确保搬运的数据量匹配。
-- `dst_k`和`dst_v`必须预先分配足够的空间以容纳传输的数据。
-- `block_quota`和`num_warps_per_block`需根据具体硬件架构设置合理的数值以获得最佳性能。
-
-### 调用示例
-
-```python
-import torch
-import mcoplib.sgl_kernel 
-# 设置计算设备
-device = "cuda"
-# 核心参数
-num_blocks = 32           
-item_size = 128        
-layer_id = 5           
-src_layout_dim = 4096   
-block_quota = 64       
-num_warps = 4             
-# 1. 构造输入张量
-# Source Tensors: 模拟包含多层数据的源显存池
-# 大小通常需要覆盖 layer_id * src_layout_dim 的偏移范围
-total_src_size = src_layout_dim * (layer_id + 1) + 2048
-src_k = torch.randn(
-    total_src_size, item_size,
-    dtype=torch.float16, device=device, requires_grad=False
-)
-src_v = torch.randn(
-    total_src_size, item_size,
-    dtype=torch.float16, device=device, requires_grad=False
-)
-# Destination Tensors: 模拟目标 KV Cache
-total_dst_size = 10000
-dst_k = torch.zeros(
-    total_dst_size, item_size,
-    dtype=torch.float16, device=device, requires_grad=False
-)
-dst_v = torch.zeros(
-    total_dst_size, item_size,
-    dtype=torch.float16, device=device, requires_grad=False
-)
-# Indices: 构造搬运索引
-# src_indices 指向源数据中的相对偏移
-src_indices = torch.randint(
-    0, 2048, (num_blocks,),
-    dtype=torch.int64, device=device
-)
-# dst_indices 指向目标 Cache 中的物理页/块位置
-dst_indices = torch.randint(
-    0, total_dst_size, (num_blocks,),
-    dtype=torch.int64, device=device
-)
-# 调用算子
-torch.ops.sgl_kernel.transfer_kv_per_layer_pf_lf(
-    src_k,
-    dst_k,
-    src_v,
-    dst_v,
-    src_indices,
-    dst_indices,
-    layer_id,
-    item_size,
-    src_layout_dim,
-    block_quota,
-    num_warps
-)
-# 输出结果
-print("transfer_kv_per_layer_pf_lf computation completed")
-print(f"Destination Key buffer shape: {dst_k.shape}")
-print(f"Destination Value buffer shape: {dst_v.shape}")
-```
-
-## 131. transfer_kv_per_layer_ph_lf
-
-### 支持的产品型号
-
-- Metax C500/C550/C588/C600
-
-### 接口原型
-
-```python
-def transfer_kv_per_layer_ph_lf(
-    src_k: torch.Tensor,
-    dst_k: torch.Tensor,
-    src_v: torch.Tensor,
-    dst_v: torch.Tensor,
-    src_indices: torch.Tensor,
-    dst_indices: torch.Tensor,
-    layer_id: int,
-    item_size: int,
-    src_layout_dim: int,
-    page_size: int,
-    head_num: int,
-    block_quota: int,
-    num_warps_per_block: int
-) -> None
-```
-
-### 功能描述
-
-transfer_kv_per_layer_ph_lf 算子实现了 Transformer 模型指定层中键（K）值（V）张量的跨位置传输操作，基于源/目标索引映射关系，将源 KV 张量（src_k/src_v）中指定位置的数据迁移至目标 KV 张量（dst_k/dst_v）的对应位置，适配布局维度、页大小、注意力头数等参数，同时遵循块配额、warp 数量等 CUDA 计算资源约束。
-
-- 计算公式：
-
-$$
-  \text{dst\\_k}[\text{dst\\_idx}] = \text{src\\_k}[\text{src\\_idx}], \quad \text{dst\\_v}[\text{dst\\_idx}] = \text{src\\_v}[\text{src\\_idx}]
-$$
-
-  其中源数据与目标数据的线性索引计算为：
-
-$$
-  \text{src\\_idx} = \text{layer\\_id} \times \text{src\\_layout\\_dim} + \text{src\\_indices}[i] \times \text{block\\_size} + j
-$$
-
-
-
-$$
-  \text{dst\\_idx} = \text{dst\\_indices}[i] \times \text{block\\_size} + j
-$$
-
-  元素的线性索引映射关系为：
-
-$$
-  n = \text{page\\_idx} \times \text{block\\_size} + j
-$$
-
-  式中：
-
-$$
-  0 \leq i < N, \quad 0 \leq j < \text{block\\_size}, \quad N = \text{len}(\text{src\\_indices}) = \text{len}(\text{dst\\_indices})
-$$
-
-
-
-$$
-  \text{block\\_size} = \text{head\\_num} \times \text{page\\_size} \times \text{item\\_size}
-$$
-
-  各变量的维度与含义：
-
-- $\text{src\\_k} \in \mathbb{T}^{*}$ ：源输入 K 张量，包含所有层的 K 数据，数据类型为 $\mathbb{T}$
-- $\text{src\\_v} \in \mathbb{T}^{*}$ ：源输入 V 张量，包含所有层的 V 数据，数据类型与 $\text{src\\_k}$ 一致
-- $\text{dst\\_k} \in \mathbb{T}^{*}$ ：目标输出 K 张量（通常为 Paged Attention 的显存池），数据类型与 $\text{src\\_k}$ 一致
-- $\text{dst\\_v} \in \mathbb{T}^{*}$ ：目标输出 V 张量（通常为 Paged Attention 的显存池），数据类型与 $\text{src\\_k}$ 一致
-- $\text{block\\_size} \in \mathbb{Z}$ ：单个显存页/块包含的元素总数，计算方式为 $\text{block\\_size} = \text{head\\_num} \times \text{page\\_size} \times \text{item\\_size}$
-- $i \in \mathbb{Z}$ ：块/页索引遍历下标，范围为 $0 \leq i < N$ ，其中 $N$ 为 $\text{src\\_indices}$ （或 $\text{dst\\_indices}$ ）张量的长度（即本次搬运的页数）
-- $j \in \mathbb{Z}$ ：块内元素的线性偏移，范围为 $0 \leq j < \text{block\\_size}$
-- $\text{src\\_indices} \in \mathbb{Z}^{N}$ ：源数据的页/块索引张量，维度为 $N$ （ $N$ 为本次搬运的页数）
-- $\text{dst\\_indices} \in \mathbb{Z}^{N}$ ：目标数据的页/块索引张量（物理页地址），维度为 $N$
-- $\text{layer\\_id} \in \mathbb{Z}$ ：当前操作的目标层 ID
-- $\text{src\\_layout\\_dim} \in \mathbb{Z}$ ：源数据中层与层之间的内存步长（Stride），通常以元素个数为单位
-- $\text{page\\_size} \in \mathbb{Z}$ ：每个分页包含的 Token 数量（槽位大小）
-- $\text{head\\_num} \in \mathbb{Z}$ ：注意力头（Attention Heads）的数量
-- $\text{item\\_size} \in \mathbb{Z}$ ：单个 Token 的特征维度大小（通常为 Head Dimension）
-- $\text{src\\_idx} \in \mathbb{Z}$ ：源张量中元素的线性索引
-- $\text{dst\\_idx} \in \mathbb{Z}$ ：目标张量中元素的线性索引
-- $n \in \mathbb{Z}$ ：张量元素的通用线性索引，范围为 $0 \leq n < \text{block\\_size} \times N$ （本次搬运的总元素数）
-- $\text{page\\_idx} \in \mathbb{Z}$ ：页/块索引（可取 $\text{src\\_indices}[i]$ 或 $\text{dst\\_indices}[i]$ ）
-- $N \in \mathbb{Z}$ ：本次搬运的页数，即 $\text{src\\_indices}$/$\text{dst\\_indices}$ 张量的长度
-
-### 参数说明
-
-- **src_k** (torch.Tensor, 入参): 源键张量，提供待传输的键数据
-- **dst_k** (torch.Tensor, 入参/出参): 目标键张量，接收源键数据，传输完成后会被结果覆盖
-- **src_v** (torch.Tensor, 入参): 源值张量，提供待传输的值数据
-- **dst_v** (torch.Tensor, 入参/出参): 目标值张量，接收源值数据，传输完成后会被结果覆盖
-- **src_indices** (torch.Tensor, 入参): 源索引张量，指定 src_k/src_v 中参与传输的数据位置索引
-- **dst_indices** (torch.Tensor, 入参): 目标索引张量，指定 dst_k/dst_v 中接收数据的位置索引
-- **layer_id** (int, 入参): 层编号，标识当前执行 KV 传输的 Transformer 层 ID
-- **item_size** (int, 入参): 单个 KV 数据项的尺寸，定义基础数据单元大小
-- **src_layout_dim** (int, 入参): 源 KV 张量的布局维度，描述张量的维度组织方式
-- **page_size** (int, 入参): 内存页大小，适配分页存储的尺寸参数
-- **head_num** (int, 入参): 注意力头数量，匹配 Transformer 模型的注意力头配置
-- **block_quota** (int, 入参): 计算块资源配额，限制单个 CUDA 块可使用的资源上限
-- **num_warps_per_block** (int, 入参): 每个 CUDA 计算块的 warp 数量，指定硬件执行单元的组织方式
-
-### 返回值
-
-无返回值，KV 数据传输结果直接写入 dst_k 和 dst_v 张量中
-
-### 约束与调用
-
-- 所有张量必须部署在 CUDA 设备上
-- src_indices/dst_indices 的元素值需在对应 KV 张量的有效索引范围内
-- page_size、item_size、src_layout_dim 需为正整数且维度匹配
-- head_num 需为正整数，符合 Transformer 模型的注意力头数量设计规范
-- block_quota 和 num_warps_per_block 需满足 CUDA 硬件的计算块资源限制
-- 支持的数据类型：float16, bfloat16, float32
-
-### 调用示例
-
-```python
-import torch
-import mcoplib.sgl_kernel
-# 设置计算设备
-device = "cuda"
-# 核心参数
-num_blocks = 16            # 本次搬运的页/块数量 (Indices length)
-layer_id = 3               # 当前处理的层级 ID (Layer ID)
-item_size = 128            # 单个元素的维度大小 (Head Dim)
-page_size = 16             # 每个页包含的 Token 数 (Page Size)
-head_num = 8               # 注意力头数 (Head Num)
-src_layout_dim = 100000    # 源数据层间跨度 (Layer Stride)
-block_quota = 64           # CUDA Block 配额
-num_warps = 4              # 每个 Block 的 Warp 数量
-# 计算单个 Page/Block 对应的行数或元素偏移 (用于构造张量形状)
-# 假设数据是平铺存储，每个 Block 包含 head_num * page_size 个 item_size 向量
-block_elem_count = page_size * head_num 
-# 1. 构造输入张量
-# Source Tensors: 模拟源显存池，需覆盖 layer_id 的偏移量
-# 形状足够大以容纳 src_layout_dim * (layer_id + 1)
-total_src_rows = src_layout_dim * (layer_id + 2) 
-src_k = torch.randn(
-    total_src_rows, item_size,
-    dtype=torch.float16, device=device, requires_grad=False
-)
-src_v = torch.randn(
-    total_src_rows, item_size,
-    dtype=torch.float16, device=device, requires_grad=False
-)
-# Destination Tensors: 模拟目标 Paged Attention 显存池
-# 假设总容量为 1024 个物理页
-max_physical_pages = 1024
-total_dst_rows = max_physical_pages * block_elem_count
-dst_k = torch.zeros(
-    total_dst_rows, item_size,
-    dtype=torch.float16, device=device, requires_grad=False
-)
-dst_v = torch.zeros(
-    total_dst_rows, item_size,
-    dtype=torch.float16, device=device, requires_grad=False
-)
-# Indices: 构造索引张量
-# src_indices: 源数据中的逻辑块索引
-src_indices = torch.arange(
-    0, num_blocks, 
-    dtype=torch.int64, device=device
-)
-# dst_indices: 目标显存池中的物理块索引 (随机指定位置)
-dst_indices = torch.randint(
-    0, max_physical_pages, (num_blocks,),
-    dtype=torch.int64, device=device
-)
-# 调用算子
-torch.ops.sgl_kernel.transfer_kv_per_layer_ph_lf(
-    src_k=src_k,
-    dst_k=dst_k,
-    src_v=src_v,
-    dst_v=dst_v,
-    src_indices=src_indices,
-    dst_indices=dst_indices,
-    layer_id=layer_id,
-    item_size=item_size,
-    src_layout_dim=src_layout_dim,
-    page_size=page_size,
-    head_num=head_num,
-    block_quota=block_quota,
-    num_warps_per_block=num_warps
-)
-# 输出结果
-print("transfer_kv_per_layer_ph_lf computation completed")
-print(f"Destination Key buffer shape: {dst_k.shape}")
-print(f"Destination Value buffer shape: {dst_v.shape}")
-print(f"Transferred blocks count: {num_blocks}")
-```
-
-## 132. transfer_kv_all_layer
-
-### 支持的产品型号
-
-- Metax C500/C550/C588/C600
-
-### 接口原型
-
-```python
-def transfer_kv_all_layer(
-    src_k_layers: torch.Tensor,
-    dst_k_layers: torch.Tensor,
-    src_v_layers: torch.Tensor,
-    dst_v_layers: torch.Tensor,
-    src_indices: torch.Tensor,
-    dst_indices: torch.Tensor,
-    item_size: int,
-    num_layers: int,
-    block_quota: int,
-    num_warps_per_block: int
-) -> None
-```
-
-### 功能描述
-
-transfer_kv_all_layer 算子实现了跨所有层的 KV Cache（键值缓存）数据传输操作。该算子根据指定的源索引（`src_indices`）和目标索引（`dst_indices`），将 Key 和 Value 张量数据从源存储（`src`）复制到目标存储（`dst`）。这通常用于大模型推理过程中的显存管理、分页注意力机制（Paged Attention）或缓存整理。
-
-- 计算公式：
-	对于任意层索引 $l$ （ $0 \leq l < \text{num\\_layers}$ ）和任意索引位置 $idx$ （ $0 \leq idx < \text{block\\_quota}$ ），有：
-
-$$
-  \begin{cases}
-  \text{dst\\_k\\_layers}[l][\text{dst\\_indices}[idx]] = \text{src\\_k\\_layers}[l][\text{src\\_indices}[idx]] \\
-  \text{dst\\_v\\_layers}[l][\text{dst\\_indices}[idx]] = \text{src\\_v\\_layers}[l][\text{src\\_indices}[idx]]
-  \end{cases}
-$$
-
-  其中，单个 layer 内张量元素的线性索引与二维位置的映射关系为：
-
-$$
-  n = s \times \text{item\\_size} + f
-$$
-
-  各变量的维度与含义：
-
-- $\text{src\\_k\\_layers} \in \mathbb{T}^{\text{num\\_layers} \times S \times \text{item\\_size}}$ ：源 Key 张量集合，数据类型为 $\mathbb{T}$ ，包含 $\text{num\\_layers}$ 个 layer 的 Key 张量，每个 layer 的 Key 张量维度为 $S \times \text{item\\_size}$ （ $S$ 为源序列长度）
-- $\text{src\\_v\\_layers} \in \mathbb{T}^{\text{num\\_layers} \times S \times \text{item\\_size}}$ ：源 Value 张量集合，数据类型与 $\text{src\\_k\\_layers}$ 一致
-- $\text{dst\\_k\\_layers} \in \mathbb{T}^{\text{num\\_layers} \times D \times \text{item\\_size}}$ ：目标 Key 张量集合，数据类型与 $\text{src\\_k\\_layers}$ 一致，包含 $\text{num\\_layers}$ 个 layer 的 Key 张量，每个 layer 的 Key 张量维度为 $D \times \text{item\\_size}$ （ $D$ 为目标序列长度）
-- $\text{dst\\_v\\_layers} \in \mathbb{T}^{\text{num\\_layers} \times D \times \text{item\\_size}}$ ：目标 Value 张量集合，数据类型与 $\text{src\\_v\\_layers}$ 一致
-- $\text{src\\_indices} \in \mathbb{Z}^{\text{block\\_quota}}$ ：源张量的索引列表，每个元素对应 $\text{src\\_k\\_layers}/\text{src\\_v\\_layers}$ 单个 layer 内的线性索引
-- $\text{dst\\_indices} \in \mathbb{Z}^{\text{block\\_quota}}$ ：目标张量的索引列表，每个元素对应 $\text{dst\\_k\\_layers}/\text{dst\\_v\\_layers}$ 单个 layer 内的线性索引
-- $\text{item\\_size} \in \mathbb{Z}^+$ ：每个 Key/Value 元素的特征维度大小
-- $\text{num\\_layers} \in \mathbb{Z}^+$ ：张量集合包含的 layer 数量
-- $\text{block\\_quota} \in \mathbb{Z}^+$ ：单次传输的索引数量（即 $\text{src\\_indices}/\text{dst\\_indices}$ 的长度）
-- $\text{num\\_warps\\_per\\_block}$ ：CUDA 核函数的 warp 配置参数（不参与计算逻辑）
-- $n$ ：单个 layer 内张量元素的线性索引，范围为 $0 \leq n < S$ （源）或 $0 \leq n < D$ （目标）
-- $s$ ：单个 layer 内张量的序列维度索引，范围为 $0 \leq s < S$ （源）或 $0 \leq s < D$ （目标）
-- $f$ ：单个 layer 内张量的特征维度索引，范围为 $0 \leq f < \text{item\\_size}$
-
-### 参数说明
-
-- **src_k_layers** (torch.Tensor, 入参): 源 Key 缓存张量，包含所有层的数据。
-- **dst_k_layers** (torch.Tensor, 入参/出参): 目标 Key 缓存张量，数据将被写入此张量。
-- **src_v_layers** (torch.Tensor, 入参): 源 Value 缓存张量，包含所有层的数据。
-- **dst_v_layers** (torch.Tensor, 入参/出参): 目标 Value 缓存张量，数据将被写入此张量。
-- **src_indices** (torch.Tensor, 入参): 源数据的索引张量，指示从哪里读取数据。
-- **dst_indices** (torch.Tensor, 入参): 目标数据的索引张量，指示将数据写入何处。
-- **item_size** (int, 入参): 单个数据项的大小（通常对应 hidden_dim 或 head_dim 的字节大小或元素数量）。
-- **num_layers** (int, 入参): 模型 Transformer 层的总数。
-- **block_quota** (int, 入参): CUDA 核心计算时的块配额或限制参数。
-- **num_warps_per_block** (int, 入参): 每个 CUDA 线程块（Block）中使用的 Warp 数量，用于配置并行计算粒度。
-
-### 返回值
-
-无返回值，计算结果直接写入 `dst_k_layers` 和 `dst_v_layers` 张量中。
-
-### 约束与调用
-
-- 设备限制: 所有输入张量必须位于 CUDA 设备上（由 `m.impl (..., torch::kCUDA, ...)` 决定）。
-- 数据一致性: `src` 和 `dst` 的张量维度应由 `item_size` 和 `num_layers` 及其对应的索引逻辑保证一致。
-- 底层实现: 该函数通过 PyTorch 的 C++ 扩展绑定到 CUDA 核心实现，调用时需确保传入正确的 CUDA 上下文。
-
-### 调用示例
-
-```python
-import torch
-import numpy as np
-import mcoplib.sgl_kernel
-# Set computation device
-device = "cuda"
-# Core parameters
-num_layers = 2
-capacity = 1024
-item_size = 128
-idx_len = 16
-block_quota = 8
-num_warps = 4
-# 1. Construct Data Tensors (Float16)
-src_k = torch.randn(num_layers, capacity, item_size, dtype=torch.float16, device=device)
-dst_k = torch.zeros_like(src_k)
-src_v = torch.randn_like(src_k)
-dst_v = torch.zeros_like(src_k)
-# 2. Construct Pointer Tensors (UInt64)
-# The operator requires tensors containing memory addresses (pointers)
-def to_uint64_ptr(t):
-    return torch.tensor(
-        np.array([sub.data_ptr() for sub in t], dtype=np.uint64),
-        device=device, dtype=torch.uint64
-    )
-src_k_ptrs = to_uint64_ptr(src_k)
-dst_k_ptrs = to_uint64_ptr(dst_k)
-src_v_ptrs = to_uint64_ptr(src_v)
-dst_v_ptrs = to_uint64_ptr(dst_v)
-# 3. Construct Index Tensors
-src_idx = torch.arange(idx_len, device=device, dtype=torch.long)
-dst_idx = torch.arange(idx_len, device=device, dtype=torch.long)
-# Call the operator
-torch.ops.sgl_kernel.transfer_kv_all_layer(
-    src_k_ptrs,
-    dst_k_ptrs,
-    src_v_ptrs,
-    dst_v_ptrs,
-    src_idx,
-    dst_idx,
-    item_size,
-    num_layers,
-    block_quota,
-    num_warps
-)
-# Output results
-torch.cuda.synchronize()
-print("transfer_kv_all_layer computation completed")
-print(f"src_k_ptrs.shape: {src_k_ptrs.shape}")
-print(f"item_size: {item_size} | 张量dtype字节数: {src_k_ptrs.element_size()}")
-```
-
-## 133. transfer_kv_all_layer_lf_pf
-
-### 支持的产品型号
-
-- Metax C500/C550/C588/C600
-
-### 接口原型
-
-```python
-def transfer_kv_all_layer_lf_pf(
-    src_k_layers: torch.Tensor,
-    dst_k: torch.Tensor,
-    src_v_layers: torch.Tensor,
-    dst_v: torch.Tensor,
-    src_indices: torch.Tensor,
-    dst_indices: torch.Tensor,
-    item_size: int,
-    dst_layout_dim: int,
-    num_layers: int,
-    block_quota: int,
-    num_warps_per_block: int
-) -> None
-```
-
-### 功能描述
-
-transfer_kv_all_layer_lf_pf 算子实现了多 layer 源 KV 张量到目标 KV 张量的索引式传输操作。该算子将包含`num_layers`个 layer 的源 Key/Value 张量集合（`src_k_layers`、`src_v_layers`），按照指定的源索引（`src_indices`）和目标索引（`dst_indices`），搬运到对应的目标 Key/Value 张量（`dst_k`、`dst_v`）中，常用于 Transformer 模型的 KV 缓存数据高效搬运场景。
-
-- 计算公式：
-	对于任意层索引 $l$ （ $0 \leq l < \text{num\\_layers}$ ）、任意索引位置 $idx$ （ $0 \leq idx < \text{block\\_quota}$ ），以及任意特征维度索引 $f$ （ $0 \leq f < \text{item\\_size}$ ），有：
-
-$$
-  \begin{cases}
-  \text{dst\\_k}\left[\text{dst\\_indices}[idx] \times \text{dst\\_layout\\_dim} + f\right] = \text{src\\_k\\_layers}[l]\left[\text{src\\_indices}[idx] \times \text{item\\_size} + f\right] \\
-  \text{dst\\_v}\left[\text{dst\\_indices}[idx] \times \text{dst\\_layout\\_dim} + f\right] = \text{src\\_v\\_layers}[l]\left[\text{src\\_indices}[idx] \times \text{item\\_size} + f\right]
-  \end{cases}
-$$
-
-  其中，源层内张量元素的线性索引与目标张量元素的线性索引映射关系分别为：
-
-$$
-  n_{\text{src}} = \text{src\\_indices}[idx] \times \text{item\\_size} + f
-$$
-
-  
-
-$$
-  n_{\text{dst}} = \text{dst\\_indices}[idx] \times \text{dst\\_layout\\_dim} + f
-$$
-
-  各变量的维度与含义：
-
-- $\text{src\\_k\\_layers} \in \mathbb{T}^{\text{num\\_layers} \times S \times \text{item\\_size}}$ ：源 Key 张量集合，数据类型为 $\mathbb{T}$ ，包含 $\text{num\\_layers}$ 个 layer 的 Key 张量，每个 layer 的 Key 张量维度为 $S \times \text{item\\_size}$ （ $S$ 为源序列长度）
-- $\text{src\\_v\\_layers} \in \mathbb{T}^{\text{num\\_layers} \times S \times \text{item\\_size}}$ ：源 Value 张量集合，数据类型与 $\text{src\\_k\\_layers}$ 一致
-- $\text{dst\\_k} \in \mathbb{T}^{D \times \text{dst\\_layout\\_dim}}$ ：目标 Key 张量，数据类型与 $\text{src\\_k\\_layers}$ 一致，维度为 $D \times \text{dst\\_layout\\_dim}$ （ $D$ 为目标序列长度， $\text{dst\\_layout\\_dim} \geq \text{item\\_size}$ 以保证内存对齐）
-- $\text{dst\\_v} \in \mathbb{T}^{D \times \text{dst\\_layout\\_dim}}$ ：目标 Value 张量，数据类型与 $\text{src\\_v\\_layers}$ 一致
-- $\text{src\\_indices} \in \mathbb{Z}^{\text{block\\_quota}}$ ：源张量的索引列表，每个元素对应 $\text{src\\_k\\_layers}/\text{src\\_v\\_layers}$ 单个 layer 内的序列维度索引
-- $\text{dst\\_indices} \in \mathbb{Z}^{\text{block\\_quota}}$ ：目标张量的索引列表，每个元素对应 $\text{dst\\_k}/\text{dst\\_v}$ 的序列维度索引
-- $\text{item\\_size} \in \mathbb{Z}^+$ ：每个 Key/Value 元素的特征维度大小
-- $\text{dst\\_layout\\_dim} \in \mathbb{Z}^+$ ：目标张量的内存步长（序列维度单步对应的内存间隔）
-- $\text{num\\_layers} \in \mathbb{Z}^+$ ：源张量集合包含的 layer 数量
-- $\text{block\\_quota} \in \mathbb{Z}^+$ ：单次传输的索引数量（即 $\text{src\\_indices}/\text{dst\\_indices}$ 的长度）
-- $\text{num\\_warps\\_per\\_block}$ ：CUDA 核函数的 warp 配置参数（不参与计算逻辑）
-- $n_{\text{src}}$ ：源层内张量元素的线性索引，范围为 $0 \leq n_{\text{src}} < S \times \text{item\\_size}$
-- $n_{\text{dst}}$ ：目标张量元素的线性索引，范围为 $0 \leq n_{\text{dst}} < D \times \text{dst\\_layout\\_dim}$
-- $S$ ：源序列长度，满足 $0 \leq \text{src\\_indices}[idx] < S$
-- $D$ ：目标序列长度，满足 $0 \leq \text{dst\\_indices}[idx] < D$
-
-### 参数说明
-
-- **src_k_layers** (torch.Tensor, 入参): 源 Key 张量集合，维度为`num_layers × 源序列长度 × item_size`，存储待传输的多 layer 源 Key 数据
-- **dst_k** (torch.Tensor, 入参/出参): 目标 Key 张量，维度为`目标序列长度 × dst_layout_dim`，传输后的 Key 数据会写入该张量
-- **src_v_layers** (torch.Tensor, 入参): 源 Value 张量集合，维度与`src_k_layers`一致，存储待传输的多 layer 源 Value 数据
-- **dst_v** (torch.Tensor, 入参/出参): 目标 Value 张量，维度与`dst_k`一致，传输后的 Value 数据会写入该张量
-- **src_indices** (torch.Tensor, 入参): 源索引列表，长度为`block_quota`，元素对应`src_k_layers/src_v_layers`单 layer 内的序列维度索引
-- **dst_indices** (torch.Tensor, 入参): 目标索引列表，长度为`block_quota`，元素对应`dst_k/dst_v`的序列维度索引
-- **item_size** (int, 入参): 单个 Key/Value 元素的特征维度大小
-- **dst_layout_dim** (int, 入参): 目标张量的内存步长（序列维度单步对应的内存间隔）
-- **num_layers** (int, 入参): 源 KV 张量集合包含的 layer 数量
-- **block_quota** (int, 入参): 单次传输的索引数量（即`src_indices`/`dst_indices`的长度）
-- **num_warps_per_block** (int, 入参): CUDA 核函数的 warp 配置参数，用于控制并行执行粒度
-
-### 返回值
-
-无返回值，传输结果直接写入`dst_k`和`dst_v`张量中
-
-### 约束与调用
-
-- 所有张量必须位于 CUDA 设备上（代码包含`DCHECK_CUDA`检查）
-- `src_k_layers`的 layer 数量必须等于`num_layers`（代码包含`DCHECK_EQ (src_k_layers.size (0), num_layers)`检查）
-- `src_indices`与`dst_indices`的长度必须等于`block_quota`
-- 支持的张量数据类型：CUDA 设备兼容的浮点类型（如 float16、bfloat16、float32 等）
-
-### 调用示例
-
-```python
-import torch
-import numpy as np
-import mcoplib.sgl_kernel
-# Set computation device
-device = "cuda"
-# Core parameters
-num_layers = 2
-capacity = 1024
-item_size = 128
-dst_layout_dim = capacity  # 新增参数，通常指显存布局的维度/跨度
-idx_len = 16
-block_quota = 8
-num_warps = 4
-# 1. Construct Source Tensors (Need Pointer Conversion)
-# src_k/v_layers: [num_layers, capacity, item_size]
-src_k_data = torch.randn(num_layers, capacity, item_size, dtype=torch.float16, device=device)
-src_v_data = torch.randn_like(src_k_data)
-# 2. Construct Destination Tensors (Direct Tensor, NO Pointer Conversion)
-# dst_k/v: The operator expects raw data tensors for destination, not a pointer table.
-# Shape usually matches the flat buffer or specific layout.
-dst_k = torch.zeros(num_layers, capacity, item_size, dtype=torch.float16, device=device)
-dst_v = torch.zeros_like(dst_k)
-# 3. Helper: Convert Source to UInt64 Pointer Tensor
-def to_uint64_ptr(t):
-    # Only for Source layers which require address table
-    return torch.tensor(
-        np.array([sub.data_ptr() for sub in t], dtype=np.uint64),
-        device=device, dtype=torch.uint64
-    )
-src_k_ptrs = to_uint64_ptr(src_k_data)
-src_v_ptrs = to_uint64_ptr(src_v_data)
-# 4. Construct Index Tensors
-src_idx = torch.arange(idx_len, device=device, dtype=torch.long)
-dst_idx = torch.arange(idx_len, device=device, dtype=torch.long)
-# Call the operator
-# Note argument order: src(Ptr), dst(Data), src(Ptr), dst(Data), indices...
-torch.ops.sgl_kernel.transfer_kv_all_layer_lf_pf(
-    src_k_ptrs,       # Source K: Pointer Tensor (UInt64)
-    dst_k,            # Dest K:   Data Tensor (Float16)
-    src_v_ptrs,       # Source V: Pointer Tensor (UInt64)
-    dst_v,            # Dest V:   Data Tensor (Float16)
-    src_idx,
-    dst_idx,
-    item_size,
-    dst_layout_dim,   # New int parameter
-    num_layers,
-    block_quota,
-    num_warps
-)
-# Output results
-torch.cuda.synchronize()
-print("transfer_kv_all_layer_lf_pf computation completed")
-```
-
-## 134. transfer_kv_all_layer_lf_ph
-
-### 支持的产品型号
-
-- Metax C500/C550/C588/C600
-
-### 接口原型
-
-```python
-def transfer_kv_all_layer_lf_ph(
-    const at::Tensor src_k_layers,
-    at::Tensor dst_k,
-    const at::Tensor src_v_layers,
-    at::Tensor dst_v,
-    const at::Tensor src_indices,
-    const at::Tensor dst_indices,
-    int64_t item_size,
-    int64_t dst_layout_dim,
-    int64_t num_layers,
-    int64_t page_size,
-    int64_t head_num,
-    int64_t block_quota,
-    int64_t num_warps_per_block
-) -> None
-```
-
-### 功能描述
-
-transfer_kv_all_layer_lf_ph 算子实现 KV 缓存跨层的数据传输功能：读取源 K/V 层张量（src_k_layers、src_v_layers）数据，基于源索引（src_indices）和目标索引（dst_indices），将对应数据传输并写入到目标 K/V 张量（dst_k、dst_v）中，同时完成层数校验、维度适配等逻辑处理，适用于 Transformer 模型 KV 缓存的跨层数据调度场景。
-
-- 计算公式：
-	对于索引张量的每个线性索引 $n$ （ $0 \leq n < \text{len}(\text{src\\_indices})$ ），执行 KV 张量的元素转移：
-
-$$
-  \text{dst\\_k}[\text{dst\\_indices}[n]] = \text{src\\_k\\_layers}[\text{src\\_indices}[n]]
-$$
-
-
-
-$$
-  \text{dst\\_v}[\text{dst\\_indices}[n]] = \text{src\\_v\\_layers}[\text{src\\_indices}[n]]
-$$
-
-  同时需满足以下约束：
-
-$$
-  \text{num\\_layers} = \text{src\\_k\\_layers.size}(0)
-$$
-
-
-
-$$
-  \text{item\\_size} \% 8 == 0
-$$
-
-  各变量的维度与含义：
-
-- $\text{src\\_k\\_layers} \in \mathbb{T}^{\text{num\\_layers} \times *}$ ：源 k 的层张量，数据类型为 $\mathbb{T}$ ，其第 0 维度长度等于 $\text{num\\_layers}$
-- $\text{dst\\_k} \in \mathbb{T}^{*}$ ：目标 k 张量，存储转移后的 k 数据，数据类型与 $\text{src\\_k\\_layers}$ 一致
-- $\text{src\\_v\\_layers} \in \mathbb{T}^{\text{num\\_layers} \times *}$ ：源 v 的层张量，数据类型与 $\text{src\\_k\\_layers}$ 一致，其第 0 维度长度等于 $\text{num\\_layers}$
-- $\text{dst\\_v} \in \mathbb{T}^{*}$ ：目标 v 张量，存储转移后的 v 数据，数据类型与 $\text{src\\_v\\_layers}$ 一致
-- $\text{src\\_indices} \in \text{long}^{\text{N}}$ ：源索引张量（CUDA 张量）， $\text{N}$ 为索引长度，每个元素对应源张量的索引
-- $\text{dst\\_indices} \in \text{long}^{\text{N}}$ ：目标索引张量（CUDA 张量），长度与 $\text{src\\_indices}$ 相同（ $\text{len}(\text{dst\\_indices}) = \text{len}(\text{src\\_indices})$ ），每个元素对应目标张量的索引
-- $\text{item\\_size}$ ：每个转移项的字节大小，需满足 $ \text{item\\_size} \% 8 == 0 $ 以保证内存对齐
-- $\text{dst\\_layoutdim}$ ：目标张量的布局维度，用于目标张量的内存布局计算
-- $\text{num\\_layers}$ ：参与转移的层数，与 $\text{src\\_k\\_layers}$ 的第 0 维度长度相等
-- $\text{page\\_size}$ ：页大小，用于张量的页式内存管理
-- $\text{head\\_num}$ ：多头注意力的头数量，对应 KV 张量的头维度
-- $\text{block\\_quota}$ ：CUDA 核函数的块资源配额，用于块级资源分配
-- $\text{num\\_warps\\_per\\_block}$ ：每个 CUDA 块分配的 warps 数量，用于核函数的线程调度
-- $n$ ：索引张量的线性索引，范围为 $0 \leq n < \text{N}$ ，其中 $\text{N} = \text{len}(\text{src\\_indices})$
-
-### 参数说明
-
-- **src_k_layers** (const at::Tensor, 入参): 源 K 层张量，存储各层 K 缓存数据
-- **dst_k** (at::Tensor, 入参/出参): 目标 K 张量，计算完成后会被传输后的 K 缓存数据覆盖
-- **src_v_layers** (const at::Tensor, 入参): 源 V 层张量，存储各层 V 缓存数据
-- **dst_v** (at::Tensor, 入参/出参): 目标 V 张量，计算完成后会被传输后的 V 缓存数据覆盖
-- **src_indices** (const at::Tensor, 入参): 源数据索引张量，用于定位 src_k_layers/src_v_layers 中待传输的数据位置
-- **dst_indices** (const at::Tensor, 入参): 目标位置索引张量，用于定位 dst_k/dst_v 中数据写入的位置
-- **item_size** (int64_t, 入参): 单个 KV 数据项的字节大小
-- **dst_layout_dim** (int64_t, 入参): 目标 K/V 张量的布局维度，用于适配数据写入的维度规则
-- **num_layers** (int64_t, 入参): 待处理的 KV 缓存层数，需与 src_k_layers 的实际层数匹配
-- **page_size** (int64_t, 入参): KV 缓存的页大小，用于数据分片传输的粒度控制
-- **head_num** (int64_t, 入参): 注意力头数量，适配 KV 缓存按头维度的传输逻辑
-- **block_quota** (int64_t, 入参): 块配额，用于限制 CUDA 核函数的块资源使用
-- **num_warps_per_block** (int64_t, 入参): 每个 CUDA 块的线程束数量，用于核函数的线程调度
-
-### 返回值
-
-无返回值，计算结果直接写入 dst_k 和 dst_v 张量中
-
-### 约束与调用
-
-- 所有张量必须位于 CUDA 设备上（算子基于 CUDA 实现）
-- src_k_layers 的实际层数必须与入参 num_layers 严格匹配（代码中通过 TORCH_CHECK 校验）
-- 支持的数据类型需与 CUDA 核函数兼容（如 float16、bfloat16 等常见深度学习张量类型）
-- dst_layout_dim 需与 dst_k/dst_v 的实际维度结构匹配，否则会导致数据写入位置错误
-- block_quota 和 num_warps_per_block 需符合 CUDA 设备的线程/块资源限制，避免核函数启动失败
-
-### 调用示例
-
-```python
-import torch
-import numpy as np
-import mcoplib.sgl_kernel
-# Set computation device
-device = "cuda"
-# Core parameters
-num_layers = 2
-capacity = 1024
-item_size = 128
-dst_layout_dim = capacity  # Layout dimension stride
-# Specific parameters for _ph (PageHeadLayout)
-page_size = 16
-head_num = 4
-idx_len = 16
-block_quota = 8
-num_warps = 4
-# 1. Construct Source Tensors (Need Pointer Conversion)
-# src_k/v_layers: [num_layers, capacity, item_size]
-src_k_data = torch.randn(num_layers, capacity, item_size, dtype=torch.float16, device=device)
-src_v_data = torch.randn_like(src_k_data)
-# 2. Construct Destination Tensors (Direct Tensor, NO Pointer Conversion)
-# dst_k/v: Raw data tensors. Shape depends on the specific layout, 
-# ensuring sufficient size for testing.
-dst_k = torch.zeros(num_layers, capacity, item_size, dtype=torch.float16, device=device)
-dst_v = torch.zeros_like(dst_k)
-# 3. Helper: Convert Source to UInt64 Pointer Tensor
-def to_uint64_ptr(t):
-    return torch.tensor(
-        np.array([sub.data_ptr() for sub in t], dtype=np.uint64),
-        device=device, dtype=torch.uint64
-    )
-src_k_ptrs = to_uint64_ptr(src_k_data)
-src_v_ptrs = to_uint64_ptr(src_v_data)
-# 4. Construct Index Tensors
-src_idx = torch.arange(idx_len, device=device, dtype=torch.long)
-dst_idx = torch.arange(idx_len, device=device, dtype=torch.long)
-# Call the operator
-# Signature: src_ptr, dst_data, src_ptr, dst_data, indices, ...
-# Extra args: dst_layout_dim, num_layers, page_size, head_num, ...
-torch.ops.sgl_kernel.transfer_kv_all_layer_lf_ph(
-    src_k_ptrs,       # Source K: Pointer Tensor (UInt64)
-    dst_k,            # Dest K:   Data Tensor (Float16)
-    src_v_ptrs,       # Source V: Pointer Tensor (UInt64)
-    dst_v,            # Dest V:   Data Tensor (Float16)
-    src_idx,
-    dst_idx,
-    item_size,
-    dst_layout_dim,   # arg 1
-    num_layers,       # arg 2
-    page_size,        # arg 3 (New)
-    head_num,         # arg 4 (New)
-    block_quota,
-    num_warps
-)
-# Output results
-torch.cuda.synchronize()
-print("transfer_kv_all_layer_lf_ph computation completed")
-```
-
-## 135. transfer_kv_per_layer_mla
-
-### 支持的产品型号
-
-- Metax C500/C550/C588/C600
-
-### 接口原型
-
-```python
-def transfer_kv_per_layer_mla(
-    src: torch.Tensor,
-    dst: torch.Tensor,
-    src_indices: torch.Tensor,
-    dst_indices: torch.Tensor,
-    item_size: int,
-    block_quote: int,
-    num_warps_per_block: int
-) -> None
-```
-
-### 功能描述
-
-该算子基于 CUDA 实现**单一层的 KV（Key-Value）数据传输**，通过源索引张量（`src_indices`）和目标索引张量（`dst_indices`），将源张量（`src`）中的 KV 数据搬运到目标张量（`dst`）中，用于 KV 缓存相关的数据迁移操作。
-
-- 计算公式：
-	对于索引张量的每个线性索引 $n$ （ $0 \leq n < \text{len}(\text{src\\_indices})$ ），执行张量元素的转移操作：
-
-$$
-  \text{dst}[\text{dst\\_indices}[n]] = \text{src}[\text{src\\_indices}[n]]
-$$
-
-  同时需满足内存对齐约束：
-
-$$
-  \text{item\\_size} \% 8 == 0
-$$
-
-  各变量的维度与含义：
-
-- $\text{src} \in \mathbb{T}^{*}$ ：源张量，数据类型为 $\mathbb{T}$ ，存储待转移的原始数据
-- $\text{dst} \in \mathbb{T}^{*}$ ：目标张量，存储转移后的数据，数据类型与 $\text{src}$ 一致
-- $\text{src\\_indices} \in \text{long}^{\text{N}}$ ：源索引张量（CUDA 张量）， $\text{N}$ 为索引长度，每个元素对应 $\text{src}$ 中待转移元素的索引
-- $\text{dst\\_indices} \in \text{long}^{\text{N}}$ ：目标索引张量（CUDA 张量），长度与 $\text{src\\_indices}$ 相同（ $\text{len}(\text{dst\\_indices}) = \text{len}(\text{src\\_indices})$ ），每个元素对应 $\text{dst}$ 中存储转移元素的索引
-- $\text{item\\_size}$ ：每个转移项的字节大小，需满足 $ \text{item\\_size} \% 8 == 0 $ 以保证内存对齐
-- $\text{block\\_quota}$ ：CUDA 核函数的块资源配额，用于块级资源分配
-- $\text{num\\_warps\\_per\\_block}$ ：每个 CUDA 块分配的 warps 数量，用于核函数的线程调度
-- $n$ ：索引张量的线性索引，范围为 $0 \leq n < \text{N}$ ，其中 $\text{N} = \text{len}(\text{src\\_indices})$
-
-### 参数说明
-
-- **src** (const at::Tensor, 入参): 源 KV 数据张量，需存储于 CUDA 设备
-- **dst** (const at::Tensor, 入参/出参): 目标 KV 数据张量，需存储于 CUDA 设备；传输完成后，数据会写入此张量
-- **src_indices** (const at::Tensor, 入参): 源数据的索引张量，需存储于 CUDA 设备，用于指定从`src`中读取数据的位置
-- **dst_indices** (const at::Tensor, 入参): 目标数据的索引张量，需存储于 CUDA 设备，用于指定向`dst`中写入数据的位置
-- **item_size** (int64_t, 入参): 单个 KV 数据项的字节大小
-- **block_quote** (int64_t, 入参): 与 CUDA 块相关的配置参数
-- **num_warps_per_block** (int64_t, 入参): 每个 CUDA 块分配的 warp 数量
-
-### 返回值
-
-无返回值，计算结果直接写入 dst 和 dst 张量中
-
-### 约束与调用
-
-- 所有输入张量（`src`、`dst`、`src_indices`、`dst_indices`）必须位于 CUDA 设备上
-- `src_indices` 必须是 CUDA 张量，且数据类型为`long`
-- `dst_indices` 必须是 CUDA 张量，且数据类型为`long`
-- `src_indices` 与 `dst_indices` 的长度必须完全一致
-- `item_size` 必须能被 8 整除（即`item_size % 8 == 0`）
-
-### 调用示例
-
-```python
-import torch
-import mcoplib.sgl_kernel
-# 设置计算设备
-device = "cuda"
-# 核心参数
-item_size = 128
-idx_len = 16
-block_quota = 8
-num_warps = 4
-# 1. 构造输入输出张量 (直接使用数据 Tensor)
-# 假设数据形状为 [token_num, item_size]
-src = torch.randn(1024, item_size, dtype=torch.float16, device=device)
-dst = torch.zeros_like(src)
-# 2. 构造索引张量
-src_idx = torch.arange(idx_len, device=device, dtype=torch.long)
-dst_idx = torch.arange(idx_len, device=device, dtype=torch.long)
-# 调用算子
-torch.ops.sgl_kernel.transfer_kv_per_layer_mla(
-    src=src,
-    dst=dst,
-    src_indices=src_idx,
-    dst_indices=dst_idx,
-    item_size=item_size,
-    block_quota=block_quota,
-    num_warps_per_block=num_warps
-)
-# 输出结果
-torch.cuda.synchronize()
-print("transfer_kv_per_layer_mla computation completed")
-```
-
-## 136. transfer_kv_per_layer_mla_pf_lf
-
-### 支持的产品型号
-
-- Metax C500/C550/C588/C600
-
-### 接口原型
-
-```python
-def transfer_kv_per_layer_mla_pf_lf(
-    src: torch.Tensor,
-    dst: torch.Tensor,
-    src_indices: torch.Tensor,
-    dst_indices: torch.Tensor,
-    layer_id: int,
-    item_size: int,
-    src_layout_dim: int,
-    block_quote: int,
-    num_warps_per_block: int
-) -> None
-```
-
-### 功能描述
-
-该算子基于 CUDA 实现**带布局维度与层标识的单一层 KV（Key-Value）数据传输**，通过源索引张量（`src_indices`）、目标索引张量（`dst_indices`）及层标识（`layer_id`），结合源数据布局维度（`src_layout_dim`），将源张量（`src`）中的 KV 数据搬运到目标张量（`dst`）中，用于 KV 缓存场景下的层内数据迁移。
-
-- 计算公式：
-	对于索引张量的每个线性索引 $n$ （ $0 \leq n < \text{len}(\text{src\\_indices})$ ），结合指定层编号 $\text{layer\\_id}$ 执行张量元素的转移操作：
-
-$$
-  \text{dst}[\text{dst\\_indices}[n]] = \text{src}[\text{src\\_indices}[n] + \text{layer\\_id} \times \text{src\\_layout\\_dim}]
-$$
-
-  同时需满足内存对齐约束：
-
-$$
-  \text{item\\_size} \% 8 == 0
-$$
-
-  各变量的维度与含义：
-
-- $\text{src} \in \mathbb{T}^{*}$ ：源张量，数据类型为 $\mathbb{T}$ ，包含多层数据（层间数据由 $\text{src\\_layout\\_dim}$ 分隔），存储待转移的原始数据
-- $\text{dst} \in \mathbb{T}^{*}$ ：目标张量，存储转移后的数据，数据类型与 $\text{src}$ 一致
-- $\text{src\\_indices} \in \text{long}^{\text{N}}$ ：源索引张量（CUDA 张量）， $\text{N}$ 为索引长度，每个元素对应 $\text{src}$ 中当前层内待转移元素的索引
-- $\text{dst\\_indices} \in \text{long}^{\text{N}}$ ：目标索引张量（CUDA 张量），长度与 $\text{src\\_indices}$ 相同（ $\text{len}(\text{dst\\_indices}) = \text{len}(\text{src\\_indices})$ ），每个元素对应 $\text{dst}$ 中存储转移元素的索引
-- $\text{layer\\_id}$ ：当前处理的层编号，用于定位 $\text{src}$ 中对应层的数据（当前层数据的起始偏移为 $\text{layer\\_id} \times \text{src\\_layout\\_dim}$ ）
-- $\text{item\\_size}$ ：每个转移项的字节大小，需满足 $ \text{item\\_size} \% 8 == 0 $ 以保证内存对齐
-- $\text{src\\_layout\\_dim}$ ：源张量的层内布局维度，用于计算当前层在 $\text{src}$ 中的数据偏移
-- $\text{block\\_quota}$ ：CUDA 核函数的块资源配额，用于块级资源分配
-- $\text{num\\_warps\\_per\\_block}$ ：每个 CUDA 块分配的 warps 数量，用于核函数的线程调度
-- $n$ ：索引张量的线性索引，范围为 $0 \leq n < \text{N}$ ，其中 $\text{N} = \text{len}(\text{src\\_indices})$
-
-### 参数说明
-
-- **src** (const at::Tensor, 入参): 源 KV 数据张量，需存储于 CUDA 设备，作为数据读取的数据源。
-- **dst** (const at::Tensor, 入参/出参): 目标 KV 数据张量，需存储于 CUDA 设备；数据传输完成后，结果直接写入此张量。
-- **src_indices** (const at::Tensor, 入参): 源数据索引张量，需存储于 CUDA 设备，用于指定从`src`中读取数据的位置。
-- **dst_indices** (const at::Tensor, 入参): 目标数据索引张量，需存储于 CUDA 设备，用于指定向`dst`中写入数据的位置。
-- **layer_id** (int64_t, 入参): 当前待处理的 KV 数据所属的层标识。
-- **item_size** (int64_t, 入参): 单个 KV 数据项的字节大小。
-- **src_layout_dim** (int64_t, 入参): 源 KV 数据张量的布局维度参数，用于匹配数据存储结构。
-- **block_quote** (int64_t, 入参): CUDA 核函数启动时的块级配置参数。
-- **num_warps_per_block** (int64_t, 入参): 每个 CUDA 块分配的 warp 数量，用于控制 CUDA 并行计算的调度逻辑。
-
-### 返回值
-
-无返回值，数据传输结果直接写入`dst`张量中。
-
-### 约束与调用
-
-- 所有输入张量（`src`、`dst`、`src_indices`、`dst_indices`）必须存储在 CUDA 设备上。
-- `src_indices` 需为 CUDA 张量，且数据类型为`long`（int64）。
-- `dst_indices` 需为 CUDA 张量，且数据类型为`long`（int64）。
-- `src_indices` 与 `dst_indices` 的张量长度必须完全一致。
-- `item_size` 必须满足`item_size % 8 == 0`（即能被 8 整除）。
-
-### 调用示例
-
-```python
-import torch
-import mcoplib.sgl_kernel
-# 设置计算设备
-device = "cuda"
-# 核心参数
-layer_id = 0
-item_size = 128
-src_layout_dim = 1024  # 源数据的布局维度跨度
-idx_len = 16
-block_quota = 8
-num_warps = 4
-# 1. 构造输入输出张量
-src = torch.randn(2048, item_size, dtype=torch.float16, device=device)
-dst = torch.zeros(1024, item_size, dtype=torch.float16, device=device)
-# 2. 构造索引张量
-src_idx = torch.arange(idx_len, device=device, dtype=torch.long)
-dst_idx = torch.arange(idx_len, device=device, dtype=torch.long)
-# 调用算子
-torch.ops.sgl_kernel.transfer_kv_per_layer_mla_pf_lf(
-    src=src,
-    dst=dst,
-    src_indices=src_idx,
-    dst_indices=dst_idx,
-    layer_id=layer_id,
-    item_size=item_size,
-    src_layout_dim=src_layout_dim,
-    block_quota=block_quota,
-    num_warps_per_block=num_warps
-)
-# 输出结果
-torch.cuda.synchronize()
-print("transfer_kv_per_layer_mla_pf_lf computation completed")
-```
-
-## 137. transfer_kv_all_layer_mla
-
-### 支持的产品型号
-
-- Metax C500/C550/C588/C600
-
-### 接口原型
-
-```python
-def transfer_kv_all_layer_mla(
-    src_layers: torch.Tensor,
-    dst_layers: torch.Tensor,
-    src_indices: torch.Tensor,
-    dst_indices: torch.Tensor,
-    item_size: int,
-    num_layers: int,
-    block_quote: int,
-    num_warps_per_block: int
-) -> None
-```
-
-### 功能描述
-
-该算子基于 CUDA 实现**所有层的 KV（Key-Value）数据传输**：先校验源层张量（`src_layers`）的层数与指定总层数（`num_layers`）是否一致，再通过源索引张量（`src_indices`）、目标索引张量（`dst_indices`），将源层张量中的 KV 数据批量搬运到目标层张量（`dst_layers`）中，核心用于 KV 缓存场景下的多层数据迁移操作。
-
-- 计算公式：
-	对于索引张量的每个线性索引 $n$ （ $0 \leq n < \text{len}(\text{src\\_indices})$ ），执行多层张量的元素转移操作：
-
-$$
-  \text{dst\\_layers}[\text{dst\\_indices}[n]] = \text{src\\_layers}[\text{src\\_indices}[n]]
-$$
-
-  同时需满足层数匹配约束：
-
-$$
-  \text{num\\_layers} = \text{src\\_layers.size}(0)
-$$
-
-  及内存对齐约束：
-
-$$
-  \text{item\\_size} \% 8 == 0
-$$
-
-  各变量的维度与含义：
-
-- $\text{src\\_layers} \in \mathbb{T}^{\text{num\\_layers} \times *}$ ：源层张量，数据类型为 $\mathbb{T}$ ，其第 0 维度长度等于 $\text{num\\_layers}$ ，存储待转移的多层原始数据
-- $\text{dst\\_layers} \in \mathbb{T}^{\text{num\\_layers} \times *}$ ：目标层张量，存储转移后的多层数据，数据类型与 $\text{src\\_layers}$ 一致
-- $\text{src\\_indices} \in \text{long}^{\text{N}}$ ：源索引张量（CUDA 张量）， $\text{N}$ 为索引长度，每个元素对应 $\text{src\\_layers}$ 中待转移元素的索引
-- $\text{dst\\_indices} \in \text{long}^{\text{N}}$ ：目标索引张量（CUDA 张量），长度与 $\text{src\\_indices}$ 相同（ $\text{len}(\text{dst\\_indices}) = \text{len}(\text{src\\_indices})$ ），每个元素对应 $\text{dst\\_layers}$ 中存储转移元素的索引
-- $\text{item\\_size}$ ：每个转移项的字节大小，需满足 $ \text{item\\_size} \% 8 == 0 $ 以保证内存对齐
-- $\text{num\\_layers}$ ：参与转移的层数，与 $\text{src\\_layers}$ 的第 0 维度长度相等（ $\text{num\\_layers} = \text{src\\_layers.size}(0)$ ）
-- $\text{block\\_quota}$ ：CUDA 核函数的块资源配额，用于块级资源分配
-- $\text{num\\_warps\\_per\\_block}$ ：每个 CUDA 块分配的 warps 数量，用于核函数的线程调度
-- $n$ ：索引张量的线性索引，范围为 $0 \leq n < \text{N}$ ，其中 $\text{N} = \text{len}(\text{src\\_indices})$
-
-### 参数说明
-
-- **src_layers** (const at::Tensor, 入参): 源所有层的 KV 数据张量，需存储于 CUDA 设备，作为多层数据读取的数据源。
-- **dst_layers** (const at::Tensor, 入参/出参): 目标所有层的 KV 数据张量，需存储于 CUDA 设备；数据传输完成后，结果直接写入此张量。
-- **src_indices** (const at::Tensor, 入参): 源数据索引张量，需存储于 CUDA 设备，用于指定从`src_layers`中读取数据的位置。
-- **dst_indices** (const at::Tensor, 入参): 目标数据索引张量，需存储于 CUDA 设备，用于指定向`dst_layers`中写入数据的位置。
-- **item_size** (int64_t, 入参): 单个 KV 数据项的字节大小。
-- **num_layers** (int64_t, 入参): 待处理的 KV 数据总层数，需与`src_layers`的层数匹配。
-- **block_quote** (int64_t, 入参): CUDA 核函数启动时的块级配置参数。
-- **num_warps_per_block** (int64_t, 入参): 每个 CUDA 块分配的 warp 数量，用于控制 CUDA 并行计算的调度逻辑。
-
-### 返回值
-
-无返回值，数据传输结果直接写入`dst_layers`张量中。
-
-### 约束与调用
-
-- 所有输入张量（`src_layers`、`dst_layers`、`src_indices`、`dst_indices`）必须存储在 CUDA 设备上。
-- `num_layers`必须与`src_layers.size (0)`（即源层张量的层数）完全一致，否则会触发参数合法性校验失败。
-- `src_indices`需为 CUDA 张量，且数据类型为`long`（int64）。
-- `dst_indices`需为 CUDA 张量，且数据类型为`long`（int64）。
-- `src_indices`与`dst_indices`的张量长度必须完全一致。
-- `item_size`必须满足`item_size % 8 == 0`（即能被 8 整除）。
-
-### 调用示例
-
-```python
-import torch
-import numpy as np
-import mcoplib.sgl_kernel
-# 设置计算设备
-device = "cuda"
-# 核心参数
-num_layers = 2
-capacity = 1024
-item_size = 128
-idx_len = 16
-block_quota = 8
-num_warps = 4
-# 1. 构造基础数据张量 (Float16)
-src_data = torch.randn(num_layers, capacity, item_size, dtype=torch.float16, device=device)
-dst_data = torch.zeros_like(src_data)
-# 2. 构造 UInt64 指针张量 (用于多层寻址)
-def to_uint64_ptr(t):
-    return torch.tensor(
-        np.array([sub.data_ptr() for sub in t], dtype=np.uint64),
-        device=device, dtype=torch.uint64
-    )
-src_layers_ptrs = to_uint64_ptr(src_data)
-dst_layers_ptrs = to_uint64_ptr(dst_data)
-# 3. 构造索引张量
-src_idx = torch.arange(idx_len, device=device, dtype=torch.long)
-dst_idx = torch.arange(idx_len, device=device, dtype=torch.long)
-# 调用算子
-torch.ops.sgl_kernel.transfer_kv_all_layer_mla(
-    src_layers=src_layers_ptrs,  # UInt64 指针表
-    dst_layers=dst_layers_ptrs,  # UInt64 指针表
-    src_indices=src_idx,
-    dst_indices=dst_idx,
-    item_size=item_size,
-    num_layers=num_layers,
-    block_quota=block_quota,
-    num_warps_per_block=num_warps
-)
-# 输出结果
-torch.cuda.synchronize()
-print("transfer_kv_all_layer_mla computation completed")
-```
-
-## 138. transfer_kv_all_layer_mla_lf_pf
-
-### 支持的产品型号
-
-- Metax C500/C550/C588/C600
-
-### 接口原型
-
-```cpp
-def transfer_kv_all_layer_mla_lf_pf(
-    src_layers: torch.Tensor,
-    dst: torch.Tensor,
-    src_indices: torch.Tensor,
-    dst_indices: torch.Tensor,
-    item_size: int,
-    dst_layout_dim: int,
-    num_layers: int,
-    block_quote: int,
-    num_warps_per_block: int
-) -> None
-```
-
-### 功能描述
-
-该算子基于 CUDA 实现**带目标布局维度的所有层 KV（Key-Value）数据传输**：先校验源层张量（`src_layers`）的层数与指定总层数（`num_layers`）是否一致，再结合目标布局维度（`dst_layout_dim`），通过源索引张量（`src_indices`）、目标索引张量（`dst_indices`），将源层张量中的 KV 数据批量搬运到目标张量（`dst`）中，用于 KV 缓存场景下的多层数据迁移。
-
-- 计算公式：
-	对于索引张量的每个线性索引 $n$ （ $0 \leq n < \text{len}(\text{src\\_indices})$ ），执行多层源张量到目标张量的元素转移操作：
-
-$$
-  \text{dst}[\text{dst\\_indices}[n]] = \text{src\\_layers}[\text{src\\_indices}[n]]
-$$
-
-  同时需满足层数匹配约束：
-
-$$
-  \text{num\\_layers} = \text{src\\_layers.size}(0)
-$$
-
-  及内存对齐约束：
-
-$$
-  \text{item\\_size} \% 8 == 0
-$$
-
-  各变量的维度与含义：
-
-- $\text{src\\_layers} \in \mathbb{T}^{\text{num\\_layers} \times *}$ ：源层张量，数据类型为 $\mathbb{T}$ ，其第 0 维度长度等于 $\text{num\\_layers}$ ，存储待转移的多层原始数据
-- $\text{dst} \in \mathbb{T}^{*}$ ：目标张量，存储转移后的多层数据，数据类型与 $\text{src\\_layers}$ 一致
-- $\text{src\\_indices} \in \text{long}^{\text{N}}$ ：源索引张量（CUDA 张量）， $\text{N}$ 为索引长度，每个元素对应 $\text{src\\_layers}$ 中待转移元素的索引
-- $\text{dst\\_indices} \in \text{long}^{\text{N}}$ ：目标索引张量（CUDA 张量），长度与 $\text{src\\_indices}$ 相同（ $\text{len}(\text{dst\\_indices}) = \text{len}(\text{src\\_indices})$ ），每个元素对应 $\text{dst}$ 中存储转移元素的索引
-- $\text{item\\_size}$ ：每个转移项的字节大小，需满足 $ \text{item\\_size} \% 8 == 0 $ 以保证内存对齐
-- $\text{dst\\_layout\\_dim}$ ：目标张量的布局维度，用于目标张量的内存布局计算
-- $\text{num\\_layers}$ ：参与转移的层数，与 $\text{src\\_layers}$ 的第 0 维度长度相等（ $\text{num\\_layers} = \text{src\\_layers.size}(0)$ ）
-- $\text{block\\_quota}$ ：CUDA 核函数的块资源配额，用于块级资源分配
-- $\text{num\\_warps\\_per\\_block}$ ：每个 CUDA 块分配的 warps 数量，用于核函数的线程调度
-- $n$ ：索引张量的线性索引，范围为 $0 \leq n < \text{N}$ ，其中 $\text{N} = \text{len}(\text{src\\_indices})$
-
-### 参数说明
-
-- **src_layers** (const at::Tensor, 入参): 源所有层的 KV 数据张量，需存储于 CUDA 设备，作为多层数据读取的数据源。
-- **dst** (const at::Tensor, 入参/出参): 目标 KV 数据张量，需存储于 CUDA 设备；数据传输完成后，结果直接写入此张量。
-- **src_indices** (const at::Tensor, 入参): 源数据索引张量，需存储于 CUDA 设备，用于指定从`src_layers`中读取数据的位置。
-- **dst_indices** (const at::Tensor, 入参): 目标数据索引张量，需存储于 CUDA 设备，用于指定向`dst`中写入数据的位置。
-- **item_size** (int64_t, 入参): 单个 KV 数据项的字节大小。
-- **dst_layout_dim** (int64_t, 入参): 目标 KV 数据张量的布局维度参数，用于匹配目标数据存储结构。
-- **num_layers** (int64_t, 入参): 待处理的 KV 数据总层数，需与`src_layers`的层数匹配。
-- **block_quote** (int64_t, 入参): CUDA 核函数启动时的块级配置参数。
-- **num_warps_per_block** (int64_t, 入参): 每个 CUDA 块分配的 warp 数量，用于控制 CUDA 并行计算的调度逻辑。
-
-### 返回值
-
-无返回值，数据传输结果直接写入`dst`张量中。
-
-### 约束与调用
-
-- 所有输入张量（`src_layers`、`dst`、`src_indices`、`dst_indices`）必须存储在 CUDA 设备上。
-- `num_layers`必须与`src_layers.size (0)`（即源层张量的层数）完全一致，否则会触发参数合法性校验失败。
-- `src_indices`需为 CUDA 张量，且数据类型为`long`（int64）。
-- `dst_indices`需为 CUDA 张量，且数据类型为`long`（int64）。
-- `src_indices`与`dst_indices`的张量长度必须完全一致。
-- `item_size`必须满足`item_size % 8 == 0`（即能被 8 整除）。
-
-### 调用示例
-
-```python
-import torch
-import numpy as np
-import mcoplib.sgl_kernel
-# 设置计算设备
-device = "cuda"
-# 核心参数
-num_layers = 2
-capacity = 1024
-item_size = 128
-dst_layout_dim = capacity  # 目标张量的布局维度
-idx_len = 16
-block_quota = 8
-num_warps = 4
-# 1. 构造源数据 (多层) 与 目标数据 (连续)
-src_data = torch.randn(num_layers, capacity, item_size, dtype=torch.float16, device=device)
-# 目标是一个连续的大张量 [num_layers, capacity, item_size]
-dst_tensor = torch.zeros(num_layers, capacity, item_size, dtype=torch.float16, device=device)
-# 2. 构造源指针张量 (UInt64)
-def to_uint64_ptr(t):
-    return torch.tensor(
-        np.array([sub.data_ptr() for sub in t], dtype=np.uint64),
-        device=device, dtype=torch.uint64
-    )
-src_layers_ptrs = to_uint64_ptr(src_data)
-# 3. 构造索引张量
-src_idx = torch.arange(idx_len, device=device, dtype=torch.long)
-dst_idx = torch.arange(idx_len, device=device, dtype=torch.long)
-# 调用算子
-torch.ops.sgl_kernel.transfer_kv_all_layer_mla_lf_pf(
-    src_layers=src_layers_ptrs,  # UInt64 指针表
-    dst=dst_tensor,              # 直接使用数据张量 (at::Tensor)
-    src_indices=src_idx,
-    dst_indices=dst_idx,
-    item_size=item_size,
-    dst_layout_dim=dst_layout_dim,
-    num_layers=num_layers,
-    block_quota=block_quota,
-    num_warps_per_block=num_warps
-)
-# 输出结果
-torch.cuda.synchronize()
-print("transfer_kv_all_layer_mla_lf_pf computation completed")
-```
-
-## 139. transfer_kv_direct
-
-### 支持的产品型号
-
-- Metax C500/C550/C588/C600
-
-### 接口原型
-
-```python
-def transfer_kv_direct(
-    src_layers: List[torch.Tensor],
-    dst_layers: List[torch.Tensor],
-    src_indices: torch.Tensor,
-    dst_indices: torch.Tensor,
-    page_size: int
-) -> None
-```
-
-### 功能描述
-
-transfer_kv_direct 算子主要用于在不同的 KV Cache 层之间进行数据的直接传输与拷贝。其核心逻辑采用了贪婪策略来优化传输效率：算子会将索引数据移动到 CPU，遍历索引数组，自动检测“源索引（src）”和“目标索引（dst）”是否同时保持物理连续。如果检测到连续的块，它会将这些连续的页合并为一个大的批次，然后按层调用底层的 transfer_page_direct 函数进行批量传输。这种机制有效减少了碎片化的内存拷贝调用次数。
-
-- 计算公式：
-
-$$
-  \text{dst\\_layers}[l][\text{dst\\_index} + k] = \text{src\\_layers}[l][\text{src\\_index} + k], \quad k \in [0, \text{num\\_tokens})
-$$
-
-  其中批量划分规则为：
-
-$$
-  \text{end\\_index} = 
-  \begin{cases} 
-  i+1, & \text{当 } (\text{src\\_indices}[i+1] - \text{src\\_indices}[i] \neq 1) \lor (\text{dst\\_indices}[i+1] - \text{dst\\_indices}[i] \neq 1) \\
-  \text{num\\_indices}, & \text{当 } i = \text{num\\_indices} - 1
-  \end{cases}
-$$
-
-  算子执行前需满足的合法性约束：
-
-$$
-  \begin{cases}
-  \text{len}(\text{src\\_layers}) = \text{len}(\text{dst\\_layers}) \\
-  \text{num\\_indices} = \text{len}(\text{src\\_indices}) = \text{len}(\text{dst\\_indices}) \\
-  \text{page\\_size} > 0 \\
-  \text{num\\_indices} \% \text{page\\_size} = 0
-  \end{cases}
-$$
-
-  各变量的维度与含义：
-
-- $\text{src\\_layers} \in \mathbb{List}[\mathbb{T}^{*}]$ ：源 KV 缓存层张量列表，每个张量为任意维度的 KV 缓存数据，数据类型为 $\mathbb{T}$ ，列表长度为 $\text{num\\_layers}$
-- $\text{dst\\_layers} \in \mathbb{List}[\mathbb{T}^{*}]$ ：目标 KV 缓存层张量列表，与 $\text{src\\_layers}$ 的维度、数据类型、列表长度均一致，用于接收传输后的数据
-- $\text{src\\_indices} \in \mathbb{Z}^{\text{num\\_indices}}$ ：源 KV 缓存的位置索引张量，元素为整数类型，用于索引源数据的位置
-- $\text{dst\\_indices} \in \mathbb{Z}^{\text{num\\_indices}}$ ：目标 KV 缓存的位置索引张量，元素为整数类型，用于索引目标存储位置
-- $\text{page\\_size} \in \mathbb{Z}^+$ ：批量处理的页大小，为正整数
-- $\text{num\\_indices} \in \mathbb{Z}^+$ ：索引张量的元素总数，满足 $\text{num\\_indices} \% \text{page\\_size} = 0$
-- $\text{num\\_layers} \in \mathbb{Z}^+$ ：KV 缓存的层数，即 $\text{len}(\text{src\\_layers})$
-- $l$ ：KV 缓存层索引，范围为 $0 \leq l < \text{num\\_layers}$
-- $\text{start\\_index} \in \mathbb{Z}$ ：批量传输的起始索引，范围为 $0 \leq \text{start\\_index} < \text{num\\_indices}$
-- $\text{end\\_index} \in \mathbb{Z}$ ：批量传输的结束索引，范围为 $\text{start\\_index} < \text{end\\_index} \leq \text{num\\_indices}$
-- $\text{num\\_tokens} \in \mathbb{Z}^+$ ：单批次传输的 token 数量，满足 $\text{num\\_tokens} = \text{end\\_index} - \text{start\\_index}$
-- $\text{src\\_index} \in \mathbb{Z}$ ：单批次源数据的起始位置，即 $\text{src\\_indices}[\text{start\\_index}]$
-- $\text{dst\\_index} \in \mathbb{Z}$ ：单批次目标数据的起始位置，即 $\text{dst\\_indices}[\text{start\\_index}]$
-- $k$ ：单批次内的 token 偏移量，范围为 $0 \leq k < \text{num\\_tokens}$
-- $i$ ：全局索引遍历变量，范围为 $0 \leq i < \text{num\\_indices}$
-
-### 参数说明
-
-- **src_layers** (const std::vector<at::Tensor>&, 入参): 源 KV Cache 层的张量列表
-- **dst_layers** (std::vector<at::Tensor>, 入参/出参): 目标 KV Cache 层的张量列表，数据将被写入其中
-- **src_indices** (const at::Tensor, 入参): 源数据的页索引张量
-- **dst_indices** (const at::Tensor, 入参): 目标数据的页索引张量
-- **page_size** (int64_t, 入参): 每一页的大小（以元素数量或特定单位计，代码中用于校验索引整除性）
-
-### 返回值
-
-无返回值，计算结果直接更新到 dst_layers 所指向的内存中
-
-### 约束与调用
-
-- src_layers 的数量必须等于 dst_layers 的数量
-- src_indices 的元素个数必须等于 dst_indices 的元素个数
-- page_size 必须大于 0
-- src_indices 的元素总数必须能被 page_size 整除
-- src_indices 和 dst_indices 必须为 int64（Long）类型的张量
-- 索引张量会被显式拷贝到 CPU（. cpu ()）进行连续性判断，但实际的数据传输（transfer_page_direct）依然在原设备（通常是 GPU）上执行
-
-### 调用示例
-
-```python
-import torch
-import mcoplib.sgl_kernel
-# 设置计算设备
-device = "cuda" if torch.cuda.is_available() else "cpu"
-assert device == "cuda", "transfer_kv_direct 仅支持CUDA设备"
-# 核心参数
-num_layers = 2
-page_size = 16
-head_dim = 64
-num_heads = 8
-total_pages = 100
-# 1. 构造 KV Cache 层
-# 原始物理存储: [total_pages, num_heads, page_size, head_dim]
-src_layers = []
-dst_layers = []
-for _ in range(num_layers):
-    s = torch.randn(total_pages, num_heads, page_size, head_dim, dtype=torch.float16, device=device)
-    d = torch.zeros(total_pages, num_heads, page_size, head_dim, dtype=torch.float16, device=device)
-    src_layers.append(s)
-    dst_layers.append(d)
-# 【关键修复】算子需要 Token 级扁平视图: [Total_Tokens, Heads, Dim]
-src_layers_flat = [t.view(-1, num_heads, head_dim) for t in src_layers]
-dst_layers_flat = [t.view(-1, num_heads, head_dim) for t in dst_layers]
-# 2. 构造索引 (Indices)
-# 示例：Source Page 5 -> Dest Page 10
-src_page_ids = [5, 6]
-dst_page_ids = [10, 11]
-src_indices_list = []
-dst_indices_list = []
-for s_id, d_id in zip(src_page_ids, dst_page_ids):
-    # 计算扁平化后的 Token 索引范围
-    src_indices_list.append(torch.arange(s_id * page_size, (s_id + 1) * page_size, device=device))
-    dst_indices_list.append(torch.arange(d_id * page_size, (d_id + 1) * page_size, device=device))
-src_indices = torch.cat(src_indices_list).to(dtype=torch.int64)
-dst_indices = torch.cat(dst_indices_list).to(dtype=torch.int64)
-# 3. 调用算子
-torch.ops.sgl_kernel.transfer_kv_direct(
-    src_layers_flat,
-    dst_layers_flat,
-    src_indices,
-    dst_indices,
-    page_size
-)
-print("transfer_kv_direct computation completed")
-# 验证数据
-is_equal = torch.allclose(src_layers[0][5], dst_layers[0][10])
-print(f"Data verification (Source Page 5 == Dest Page 10): {is_equal}")
-#  打印维度信息 
-print("\n=== Tensor Dimensions Info ===")
-print(f"Original Layer Shape (Page-based):   {src_layers[0].shape}")
-print(f"Flattened Layer Shape (Token-based): {src_layers_flat[0].shape}")
-print(f"Source Indices Shape:                {src_indices.shape}")
-print(f"Dest Indices Shape:                  {dst_indices.shape}")
-```
-
-## 140. transfer_kv_per_layer_direct_pf_lf
-
-### 支持的产品型号
-
-- Metax C500/C550/C588/C600
-
-### 接口原型
-
-```python
-def transfer_kv_per_layer_direct_pf_lf(
-    src_ptrs: List[torch.Tensor],
-    dst_ptrs: List[torch.Tensor],
-    src_indices: torch.Tensor,
-    dst_indices: torch.Tensor,
-    layer_id: int,
-    page_size: int
-) -> None
-```
-
-### 功能描述
-
-该算子是 `transfer_kv_page_first_direct_impl` 的一个特化封装版本。它通过将模板参数 `IsLf2Pf` 设置为 `false` 来调用底层实现。
-具体逻辑如下：
-
-1. **调用路径**：直接调用 `transfer_kv_page_first_direct_impl<false>(...)`。
-2. **核心逻辑**（源于其调用的 Impl 中的 `else` 分支）：
-
- - 遍历页（Pages）和层（Layers）。
- - 针对每一页和每一层，计算源和目标的偏移索引。
- - 调用 `transfer_page_direct` 进行实际的数据搬运。
- - **MLA 支持**：代码中包含针对 MLA（Multi-Head Latent Attention）的逻辑判断（通过检查 `src_ptrs.size () == 1`），如果不是 MLA (`! is_mla`)，则会进行额外的 `transfer_page_direct` 调用来处理后续数据。
- - 从函数命名后缀 `_pf_lf` 和模板参数 `false` 推断，该算子用于处理与“Layer First to Page First”相反或特定的内存布局转换（可能是 Page First to Layer First）。
- - 计算公式：
-
-$$
-  \text{dst\\_layer}[\text{dst\\_offset} + t] = \text{src\\_layer}[\text{src\\_offset} + t], \quad t \in [0, \text{batch\\_tokens})
-$$
-
-  其中批次偏移量与 token 数的计算规则：
-
-$$
-  \begin{cases}
-  \text{src\\_offset} = \text{src\\_indices}[\text{batch\\_start}] \\
-  \text{dst\\_offset} = \text{dst\\_indices}[\text{batch\\_start}] \\
-  \text{batch\\_tokens} = \text{batch\\_end} - \text{batch\\_start}
-  \end{cases}
-$$
-
-  批次划分的终止条件：
-
-$$
-  \text{batch\\_end} = 
-  \begin{cases} 
-  b+1, & \text{当 } (\text{src\\_indices}[b+1] - \text{src\\_indices}[b] \neq 1) \lor (\text{dst\\_indices}[b+1] - \text{dst\\_indices}[b] \neq 1) \\
-  \text{total\\_indices}, & \text{当 } b = \text{total\\_indices} - 1
-  \end{cases}
-$$
-
-  算子执行前的合法性约束：
-
-$$
-  \begin{cases}
-  \text{total\\_indices} = \text{len}(\text{src\\_indices}) = \text{len}(\text{dst\\_indices}) \\
-  \text{page\\_size} > 0 \\
-  \text{total\\_indices} \% \text{page\\_size} = 0
-  \end{cases}
-$$
-
-  各变量的维度与含义：
-
-- $\text{src\\_layer} \in \mathbb{T}^{*}$ ：单层级的源 KV 缓存张量，数据类型为 $\mathbb{T}$ ，维度为适配 KV 缓存存储的任意维度
-- $\text{dst\\_layer} \in \mathbb{T}^{*}$ ：单层级的目标 KV 缓存张量，数据类型、维度与 $\text{src\\_layer}$ 完全一致，用于接收当前层传输后的 KV 数据
-- $\text{src\\_indices} \in \mathbb{Z}^{\text{total\\_indices}}$ ：当前层源 KV 缓存的位置索引张量，元素为整数类型，用于索引源数据的位置
-- $\text{dst\\_indices} \in \mathbb{Z}^{\text{total\\_indices}}$ ：当前层目标 KV 缓存的位置索引张量，元素为整数类型，用于索引目标存储位置
-- $\text{page\\_size} \in \mathbb{Z}^+$ ：批量处理的页大小，为正整数
-- $\text{total\\_indices} \in \mathbb{Z}^+$ ：当前层索引张量的元素总数，满足 $\text{total\\_indices} \% \text{page\\_size} = 0$
-- $\text{batch\\_start} \in \mathbb{Z}$ ：单批次传输的起始索引，范围为 $0 \leq \text{batch\\_start} < \text{total\\_indices}$
-- $\text{batch\\_end} \in \mathbb{Z}$ ：单批次传输的结束索引，范围为 $\text{batch\\_start} < \text{batch\\_end} \leq \text{total\\_indices}$
-- $\text{batch\\_tokens} \in \mathbb{Z}^+$ ：单批次传输的 token 数量，满足 $\text{batch\\_tokens} = \text{batch\\_end} - \text{batch\\_start}$
-- $\text{src\\_offset} \in \mathbb{Z}$ ：单批次源数据在当前层 KV 缓存中的起始位置，即 $\text{src\\_indices}[\text{batch\\_start}]$
-- $\text{dst\\_offset} \in \mathbb{Z}$ ：单批次目标数据在当前层 KV 缓存中的起始位置，即 $\text{dst\\_indices}[\text{batch\\_start}]$
-- $t$ ：单批次内的 token 偏移量，范围为 $0 \leq t < \text{batch\\_tokens}$
-- $b$ ：全局索引遍历变量，范围为 $0 \leq b < \text{total\\_indices}$
-
-### 参数说明
-
-- **src_ptrs** (const std::vector<at::Tensor>&, 入参): 源 KV Cache 的张量指针列表（通常包含 K 和 V 的 cache）
-- **dst_ptrs** (std::vector<at::Tensor>, 入参/出参): 目标 KV Cache 的张量指针列表，数据将被写入其中
-- **src_indices** (const at::Tensor&, 入参): 源数据的页索引张量
-- **dst_indices** (const at::Tensor&, 入参): 目标数据的页索引张量
-- **layer_id** (int64_t, 入参): 当前操作的基础层 ID，用于计算 offset
-- **page_size** (int64_t, 入参): 页大小
-
-### 返回值
-
-- 无返回值 (void)。计算结果直接更新到 `dst_ptrs` 指向的内存中
-
-### 约束与调用
-
-- 底层校验（继承自 `transfer_kv_page_first_direct_impl`）：
-- `src_indices` 和 `dst_indices` 的元素数量必须相等
-- `page_size` 必须大于 0
-- `src_indices` 的元素总数必须能被 `page_size` 整除
-- 实现依赖：该函数是一个简单的 wrapper，所有具体的计算逻辑、循环遍历和 CUDA/CPU 索引处理均依赖于 `transfer_kv_page_first_direct_impl` 的实现
-
-### 调用示例
-
-```python
-import torch
-import mcoplib.sgl_kernel
-# 设置计算设备
-device = "cuda" if torch.cuda.is_available() else "cpu"
-assert device == "cuda", "此算子仅支持CUDA设备"
-# 核心参数
-num_layers = 2
-page_size = 16
-head_dim = 64
-num_heads = 8
-total_pages = 100
-total_tokens = total_pages * page_size
-# 1. 构造 KV Cache
-# Destination: 标准的分层存储 List[Tensor]
-# 物理存储: [total_pages, num_heads, page_size, head_dim] -> 展平为 [total_tokens, num_heads, head_dim]
-dst_layers = []
-for _ in range(num_layers):
-    d = torch.zeros(total_pages, num_heads, page_size, head_dim, dtype=torch.float16, device=device)
-    dst_layers.append(d)
-dst_layers_flat = [t.view(-1, num_heads, head_dim) for t in dst_layers]
-# Source: 聚合存储 (Fused)
-# [Total_Tokens, Num_Layers, Num_Heads, Head_Dim]
-src_fused = torch.randn(
-    total_tokens, num_layers, num_heads, head_dim,
-    dtype=torch.float16, device=device
-)
-# 算子要求 src_ptrs 是 vector<Tensor>，所以要把这个大张量包进列表
-src_ptrs = [src_fused]
-# 2. 构造索引 (Indices)
-# 示例：Source Page 5 -> Dest Page 10
-src_page_ids = [5, 6]
-dst_page_ids = [10, 11]
-src_indices_list = []
-dst_indices_list = []
-for s_id, d_id in zip(src_page_ids, dst_page_ids):
-    src_indices_list.append(torch.arange(s_id * page_size, (s_id + 1) * page_size, device=device))
-    dst_indices_list.append(torch.arange(d_id * page_size, (d_id + 1) * page_size, device=device))
-src_indices = torch.cat(src_indices_list).to(dtype=torch.int64)
-dst_indices = torch.cat(dst_indices_list).to(dtype=torch.int64)
-# 3. 调用算子
-# C++签名: transfer_kv_per_layer_direct_pf_lf(src_ptrs, dst_ptrs, src_indices, dst_indices, layer_id, page_size)
-torch.ops.sgl_kernel.transfer_kv_per_layer_direct_pf_lf(
-    src_ptrs,
-    dst_layers_flat,
-    src_indices,
-    dst_indices,
-    0, 
-    page_size
-)
-print("transfer_kv_per_layer_direct_pf_lf computation completed")
-#  打印维度信息 
-print("\n=== Tensor Dimensions Info ===")
-print(f"Source Fused Tensor Shape:     {src_fused.shape}")
-print(f"Dest Layer 0 Shape (Flat):     {dst_layers_flat[0].shape}")
-print(f"Source Indices Shape:          {src_indices.shape}")
-print(f"Dest Indices Shape:            {dst_indices.shape}")
-```
-
-## 141. transfer_kv_all_layer_direct_lf_pf
-
-### 支持的产品型号
-
-- Metax C500/C550/C588/C600
-
-### 接口原型
-
-```cpp
-def transfer_kv_all_layer_direct_lf_pf(
-    src_ptrs: List[torch.Tensor],
-    dst_ptrs: List[torch.Tensor],
-    src_indices: torch.Tensor,
-    dst_indices: torch.Tensor,
-    page_size: int
-) -> None
-```
-
-### 功能描述
-
-该算子是 `transfer_kv_page_first_direct_impl` 的特化封装版本，专门用于执行 **Layer First 到 Page First (LF to PF)** 的数据布局转换与传输。
-具体逻辑如下：
-
-1. **调用路径**：内部直接调用了 `transfer_kv_page_first_direct_impl<true>(..., 0, page_size)`，其中模板参数 `true` 激活了 `IsLf2Pf`（Layer First to Page First）的代码分支。
-2. **核心逻辑**：
-
- - **MLA 判断**：通过检查 `dst_ptrs.size () == 1` 来判断是否为 MLA（Multi-Head Latent Attention）模式。
- - **层数计算**：如果是 MLA，层数等于 `src_ptrs.size ()`；否则等于 `src_ptrs.size () / 2`（暗示非 MLA 模式下 src 包含 K 和 V 两部分层数据）。
- - **遍历与传输**：
- - 算子遍历所有页（Pages）和层（Layers）。
- - 从 CPU 端的索引张量中获取源索引和目标索引。
- - **K Cache 传输**：将 `src_ptrs[j]`（Layer First）的数据传输到 `dst_ptrs[0]`（Page First，通过 `. select` 选定层）中。
- - **V Cache 传输**（非 MLA 模式）：将 `src_ptrs[j + num_layers]` 的数据传输到 `dst_ptrs[1]` 中。
-- 计算公式：
-
-$$
-  \text{dst\\_ptrs}[j][\text{d\\_index} + t] = \text{src\\_ptrs}[j][\text{s\\_index} + t], \quad t \in [0, \text{page\\_size})
-$$
-
-  其中页批次的索引计算规则：
-
-$$
-  \begin{cases}
-  \text{s\\_index} = \frac{\text{src\\_indices}[i \times \text{page\\_size}]}{\text{page\\_size}} \\
-  \text{d\\_index} = \frac{\text{dst\\_indices}[i \times \text{page\\_size} + \text{num\\_layers} \times \text{page\\_size}]}{\text{page\\_size}} \\
-  \text{num\\_pages} = \frac{\text{src\\_indices.numel()}}{\text{page\\_size}}
-  \end{cases}
-$$
-
-  算子执行前的合法性约束：
-
-$$
-  \begin{cases}
-  \text{src\\_indices.numel()} = \text{dst\\_indices.numel()} \\
-  \text{page\\_size} > 0 \\
-  \text{src\\_indices.numel()} \% \text{page\\_size} = 0
-  \end{cases}
-$$
-
-  各变量的维度与含义：
-
-- $\text{src\\_ptrs} \in \mathbb{List}[\mathbb{T}^{*}]$ ：所有层的源 KV 缓存张量列表，每个张量为对应层的 KV 数据，数据类型为 $\mathbb{T}$
-- $\text{dst\\_ptrs} \in \mathbb{List}[\mathbb{T}^{*}]$ ：所有层的目标 KV 缓存张量列表，维度、数据类型与 $\text{src\\_ptrs}$ 一致，用于接收传输后的数据
-- $\text{src\\_indices} \in \mathbb{Z}^{\text{src\\_indices.numel ()}}$ ：源 KV 缓存的位置索引张量，元素为整数类型，用于定位源数据位置
-- $\text{dst\\_indices} \in \mathbb{Z}^{\text{dst\\_indices.numel ()}}$ ：目标 KV 缓存的位置索引张量，元素为整数类型，用于定位目标存储位置
-- $\text{page\\_size} \in \mathbb{Z}^+$ ：批量处理的页大小，为正整数
-- $\text{num\\_pages} \in \mathbb{Z}^+$ ：页批次的总数量，满足 $\text{num\\_pages} = \frac{\text{src\\_indices.numel ()}}{\text{page\\_size}}$
-- $\text{num\\_layers} \in \mathbb{Z}^+$ ：KV 缓存的层数，满足 $\text{num\\_layers} = \frac{\text{src\\_ptrs.size ()}}{2}$ （由代码中`src_ptrs.size () / 2`推导）
-- $i$ ：页批次的遍历索引，范围为 $0 \leq i < \text{num\\_pages}$
-- $j$ ：KV 层的遍历索引，范围为 $0 \leq j < \text{num\\_layers}$
-- $\text{s\\_index} \in \mathbb{Z}$ ：当前页批次在源 KV 缓存中的起始位置（按页划分后的索引）
-- $\text{d\\_index} \in \mathbb{Z}$ ：当前页批次在目标 KV 缓存中的起始位置（按页划分后的索引）
-- $t$ ：当前页批次内的 token 偏移量，范围为 $0 \leq t < \text{page\\_size}$
-
-### 参数说明
-
-- **src_ptrs** (const std::vector<at::Tensor>&, 入参): 源 KV Cache 张量列表（Layer First 布局，通常每个元素代表一层）
-- **dst_ptrs** (std::vector<at::Tensor>, 入参/出参): 目标 KV Cache 张量列表（Page First 布局，通常包含 K 和 V 的张量）
-- **src_indices** (const at::Tensor&, 入参): 源数据的页索引张量
-- **dst_indices** (const at::Tensor&, 入参): 目标数据的页索引张量
-- **page_size** (int64_t, 入参): 页大小，用于计算页数和校验索引
-
-### 返回值
-
-- 无返回值 (void)。计算结果直接写入 `dst_ptrs` 指向的内存中
-
-### 约束与调用
-
-- 底层校验（继承自实现函数）：
-- `src_indices` 和 `dst_indices` 的元素数量必须相等
-- `page_size` 必须大于 0
-- `src_indices` 的元素总数必须能被 `page_size` 整除
-- 输入输出布局假设：
-- 源数据 (`src_ptrs`) 被假定为按层分开的 Vector 结构（Layer First）
-- 目标数据 (`dst_ptrs`) 被假定为紧凑的 Tensor 结构，通过 `select` 操作访问特定层（Page First）
-- 参数传递：调用底层实现时，`layer_id` 被硬编码为 `0`
-
-### 调用示例
-
-```python
-import torch
-import mcoplib.sgl_kernel
-# 设置计算设备
-device = "cuda" if torch.cuda.is_available() else "cpu"
-assert device == "cuda", "此算子仅支持CUDA设备"
-# 核心参数
-num_layers = 2
-page_size = 16
-head_dim = 64
-num_heads = 8
-total_pages = 100
-# total_tokens = total_pages * page_size (这个变量在定义dst时暂时用不到)
-# 1. 构造 KV Cache
-# === Source: Layer First (LF) ===
-# 保持之前的扁平化处理，因为读取时是按 Token 索引读取的
-src_layers = []
-for _ in range(num_layers):
-    s = torch.randn(total_pages, num_heads, page_size, head_dim, dtype=torch.float16, device=device)
-    src_layers.append(s)
-# [Total_Tokens, Num_Heads, Head_Dim]
-src_layers_flat = [t.view(-1, num_heads, head_dim) for t in src_layers]
-# === Destination: Page First (PF) / Fused ===
-# 【关键修改】必须定义为 5D 张量，显式包含 Page_Size 维度
-# 结构: [Total_Pages, Num_Layers, Page_Size, Num_Heads, Head_Dim]
-dst_fused = torch.zeros(
-    total_pages, num_layers, page_size, num_heads, head_dim,
-    dtype=torch.float16, device=device
-)
-# 算子要求 dst_ptrs 是 vector<Tensor>
-dst_ptrs = [dst_fused]
-# 2. 构造索引 (Indices)
-# 示例：Source Page 5 -> Dest Page 10
-src_page_ids = [5, 6]
-dst_page_ids = [10, 11]
-src_indices_list = []
-dst_indices_list = []
-for s_id, d_id in zip(src_page_ids, dst_page_ids):
-    # 生成 Token 级索引
-    src_indices_list.append(torch.arange(s_id * page_size, (s_id + 1) * page_size, device=device))
-    dst_indices_list.append(torch.arange(d_id * page_size, (d_id + 1) * page_size, device=device))
-src_indices = torch.cat(src_indices_list).to(dtype=torch.int64)
-dst_indices = torch.cat(dst_indices_list).to(dtype=torch.int64)
-# 3. 调用算子
-# C++签名: transfer_kv_all_layer_direct_lf_pf(src_ptrs, dst_ptrs, src_indices, dst_indices, page_size)
-torch.ops.sgl_kernel.transfer_kv_all_layer_direct_lf_pf(
-    src_layers_flat,
-    dst_ptrs,
-    src_indices,
-    dst_indices,
-    page_size
-)
-print("transfer_kv_all_layer_direct_lf_pf computation completed")
-#  打印维度信息 
-print("\n=== Tensor Dimensions Info ===")
-print(f"Source Layer 0 Shape (Flat):   {src_layers_flat[0].shape}")
-# 这里的 shape 应该是 5 维的
-print(f"Dest Fused Tensor Shape:       {dst_fused.shape}") 
-print(f"Source Indices Shape:          {src_indices.shape}")
-```
-
-## 142. store_kv_cache
-
-### 支持的产品型号
-
-- Metax C500/C550/C588/C600
-
-### 接口原型
-
-```python
-def store_kv_cache(
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
-    out_loc: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor
-) -> None
-```
-
-### 功能描述
-
-store_kv_cache 算子用于将输入的 Key (k) 和 Value (v) 张量根据给定的索引位置 (out_loc) 存储到预分配的 KV 缓存（k_cache 和 v_cache）中。该算子通过 CUDA kernel 并行处理内存拷贝，支持高效的非连续缓存更新，是 LLM 推理框架中处理 KV Cache 动态存储的核心操作。
-
-- 计算公式：
-	对于键缓存与输入键张量的元素，满足：
-
-$$
-  \text{k\\_cache}[b, \text{out\\_loc}[b] + s, h, c] = \text{k}[b, s, h, c]
-$$
-
-  对于值缓存与输入值张量的元素，满足：
-
-$$
-  \text{v\\_cache}[b, \text{out\\_loc}[b] + s, h, c] = \text{v}[b, s, h, c]
-$$
-
-  各变量的维度与含义：
-
-- $\text{k\\_cache} \in \mathbb{T}^{M \times L \times H \times C}$ ：键缓存张量，数据类型为 $\mathbb{T}$ ，维度为[batch 数, 缓存最大序列长度, 注意力头数, 单头维度]
-- $\text{v\\_cache} \in \mathbb{T}^{M \times L \times H \times C}$ ：值缓存张量，数据类型与 $\text{k\\_cache}$ 一致，维度与 $\text{k\\_cache}$ 相同
-- $\text{out\\_loc} \in \mathbb{Z}^M$ ：每个 batch 在缓存中的起始序列位置张量，维度为[batch 数]
-- $\text{k} \in \mathbb{T}^{M \times S \times H \times C}$ ：输入键张量，数据类型与 $\text{k\\_cache}$ 一致，维度为[batch 数, 当前序列长度, 注意力头数, 单头维度]
-- $\text{v} \in \mathbb{T}^{M \times S \times H \times C}$ ：输入值张量，数据类型与 $\text{v\\_cache}$ 一致，维度与 $\text{k}$ 相同
-- $b$ ：batch 索引，范围为 $0 \leq b < M$
-- $s$ ：当前序列的步索引，范围为 $0 \leq s < S$
-- $h$ ：注意力头索引，范围为 $0 \leq h < H$
-- $c$ ：单头维度索引，范围为 $0 \leq c < C$
-- $M$ ：batch 的数量（ $\text{k\\_cache.size (0)} = \text{k.size (0)} = M$ ）
-- $L$ ：缓存的最大序列长度（ $\text{k\\_cache.size (1)} = L$ ）
-- $S$ ：当前输入序列的长度（ $\text{k.size (1)} = S$ ）
-- $H$ ：注意力头的数量（ $\text{k\\_cache.size (2)} = \text{k.size (2)} = H$ ）
-- $C$ ：每个注意力头的维度（ $\text{k\\_cache.size (3)} = \text{k.size (3)} = C$ ）
-
-### 参数说明
-
-- **k_cache** (torch.Tensor, 入参/出参): 全局 Key 缓存张量，形状通常为 [max_tokens, num_heads, head_size]
-- **v_cache** (torch.Tensor, 入参/出参): 全局 Value 缓存张量，形状与 k_cache 一致
-- **out_loc** (torch.Tensor, 入参): 一维整数张量（int32 或 int64），包含了当前输入 token 在缓存中对应的存储索引位置
-- **k** (torch.Tensor, 入参): 待存储的新 Key 张量
-- **v** (torch.Tensor, 入参): 待存储的新 Value 张量
-
-### 返回值
-
-无返回值，计算结果直接写入 k_cache 和 v_cache 张量对应的内存地址中
-
-### 约束与调用
-
-- 所有输入张量（k_cache, v_cache, out_loc, k, v）必须位于 CUDA 设备上
-- out_loc 必须是 1D 连续张量，且数据类型必须为 int32 或 int64
-- k 和 v 的最后一维字节数（size_bytes）必须至少能被 128 整除，以满足算子的内存访问粒度要求
-- k 和 v 必须具有相同的形状和步长（strides）
-- k_cache 和 v_cache 必须具有相同的形状和步长
-- k 的 head size 必须与 k_cache 的 head size 一致
-- 支持的数据类型：float16, bfloat16, float32
-
-### 调用示例
-
-```python
-import torch
-# 1. 基础配置
-device = "cuda"
-dtype = torch.bfloat16
-max_tokens, num_tokens, head_dim = 128, 4, 128
-# 2. 准备张量
-# Cache 模拟预分配的大显存
-k_cache = torch.zeros(max_tokens, head_dim, dtype=dtype, device=device)
-v_cache = torch.zeros(max_tokens, head_dim, dtype=dtype, device=device)
-# 输入数据 (待存储的 K 和 V)
-k = torch.randn(num_tokens, head_dim, dtype=dtype, device=device)
-v = torch.randn(num_tokens, head_dim, dtype=dtype, device=device)
-# 存储位置索引 (int32)，例如存储到索引 0, 5, 10, 15
-out_loc = torch.tensor([0, 5, 10, 15], dtype=torch.int32, device=device)
-# 3. 调用算子
-import mcoplib.sgl_kernel 
-torch.ops.sgl_kernel.store_kv_cache(k_cache, v_cache, out_loc, k, v)
-# 4. 打印结果
-print("="*40)
-print(f"k_cache shape: {k_cache.shape}")
-print(f"v_cache shape: {v_cache.shape}")
-print(f"Input k shape: {k.shape}")
-print(f"Indices used:  {out_loc.tolist()}")
-print("-" * 40)
-# 验证第一个位置的数据 (索引 out_loc[0])
-target_idx = out_loc[0].item()
-is_match = torch.allclose(k_cache[target_idx], k[0], atol=1e-3)
-print(f"Verification at index {target_idx}: {'PASS' if is_match else 'FAIL'}")
-print(f"K_cache snippet: {k_cache[target_idx, :4].tolist()}")
-print(f"Original K snippet: {k[0, :4].tolist()}")
-print("="*40)
-```
-
-## 143. apply_token_bitmask_inplace_cuda
-
-### 支持的产品型号
-
-- Metax C500/C550/C588/C600
-
-### 接口原型
-
-```python
-def apply_token_bitmask_inplace_cuda(
-    logits: torch.Tensor,
-    bitmask: torch.Tensor,
-    indices: Optional[torch.Tensor] = None
-) -> None
-```
-
-### 功能描述
-
-apply_token_bitmask_inplace_cuda 算子实现了基于位掩码（bitmask）的 Logits 原地屏蔽操作。该算子根据 bitmask 中对应位的状态（0 或 1），将 logits 张量中非法 token 的分值原地修改为负无穷（-INFINITY）。这种操作通过位运算（Bitwise operations）高效地实现了对词表（Vocabulary）的大规模并行过滤，常用于大语言模型推理中的受限解码（Grammar-guided decoding）或结构化输出约束。
-
-- 计算公式：
-	对于 logits 张量中位置为 $(b, t, v)$ 的元素，依据 bitmask 张量对应位的取值做 inplace 修改：
-
-$$
-  \text{logits}[b, t, v] = 
-  \begin{cases} 
-  \text{NegInf}(\mathbb{T}), & \text{当 } \text{bitmask}[b, t, \lfloor v / K \rfloor] \text{ 的第 } (v \mod K) \text{ 位为 } 0 \\
-  \text{logits}[b, t, v], & \text{当 } \text{bitmask}[b, t, \lfloor v / K \rfloor] \text{ 的第 } (v \mod K) \text{ 位为 } 1
-  \end{cases}
-$$
-
-  其中元素的线性索引与三维位置的映射关系为：
-
-$$
-  n = b \times S_{BT} + t \times S_{TV} + v
-$$
-
-  各变量的维度与含义：
-
-- $\text{logits} \in \mathbb{T}^{B \times T \times V}$ ：待掩码处理的 logits 张量（inplace 修改），数据类型为 $\mathbb{T}$ （float/half 等），维度为[批量数, 序列长度, 词表大小]
-- $\text{bitmask} \in \mathbb{U}^{B \times T \times \lceil V / K \rceil}$ ：掩码张量，数据类型为无符号整数 $\mathbb{U}$ ，每个元素存储 $K$ 位掩码，维度为[批量数, 序列长度, $\lceil V / K \rceil$]
-- $\text{indices}$ （可选） $\in \mathbb{Z}^{B \times T}$ ：指定待处理位置的索引张量，维度与 $\text{logits}$ 前两维匹配
-- $K$ ：每个 bitmask 元素对应的位数（即代码中 $\text{BITS\\_PER\\_BLOCK}$ ，如 75、256）
-- $\text{NegInf}(\mathbb{T})$ ：数据类型 $\mathbb{T}$ 对应的负无穷值（如 float 的极小值）
-- $n$ ： $\text{logits}$ 元素的线性索引，范围为 $0 \leq n < B \times S_{BT}$
-- $b$ ：批量索引，范围为 $0 \leq b < B$
-- $t$ ：序列位置索引，范围为 $0 \leq t < T$
-- $v$ ：词表索引，范围为 $0 \leq v < V$
-- $S_{BT}$ ： $\text{logits}$ 在批量维度的步长，即 $S_{BT} = T \times S_{TV}$
-- $S_{TV}$ ： $\text{logits}$ 在序列维度的步长（词表维度的内存步长，满足 $S_{TV} \geq V$ ）
-
-### 参数说明
-
-- **logits** (torch.Tensor, 入参/出参): 输入的原始得分张量（通常为 2D），计算完成后，被屏蔽位置的值会被原地替换为负无穷
-- **bitmask** (torch.Tensor, 入参): 位掩码张量，数据类型必须为 int32。每个 int32 元素包含 32 个 token 的掩码位
-- **indices** (torch.Tensor, 可选入参): 索引张量，数据类型为 int32。若提供，算子将仅根据索引对指定的行应用掩码；若为 None，则顺序处理所有行
-
-### 返回值
-
-无返回值，计算结果直接写入 logits 张量中
-
-### 约束与调用
-
-- 所有张量必须位于 CUDA 设备上
-- logits 和 bitmask 必须是连续张量（contiguous）
-- bitmask 的数据类型必须为 int32
-- logits 的词表维度（vocab_size）应与 bitmask 提供的总位数匹配
-- 支持的数据类型：float16, bfloat16, float32
-
-### 调用示例
-
-```python
-import torch
-# 1. 基础配置
-device = "cuda"
-batch_size = 2
-vocab_size = 64
-dtype = torch.float32  # 源码支持 float32, float16, bfloat16
-# 2. 准备张量
-# logits 必须是 CUDA 且连续的张量
-logits = torch.randn(batch_size, vocab_size, dtype=dtype, device=device)
-# bitmask 必须是 int32 类型
-# 使用 -1 修复 0xFFFFFFFF 导致的溢出报错
-# 每行 bitmask 的长度应为 (vocab_size + 31) // 32
-bitmask = torch.tensor([
-    [-1,  0], # Batch 0: 前 32 个 token 保留 (1)，后 32 个屏蔽 (0)
-    [ 0, -1]  # Batch 1: 前 32 个 token 屏蔽 (0)，后 32 个保留 (1)
-], dtype=torch.int32, device=device)
-# 3. 调用算子
-import mcoplib.sgl_kernel
-print("="*40)
-print(f"Input Logits Shape:  {logits.shape}")
-print(f"Input Bitmask Shape: {bitmask.shape}")
-print("-" * 40)
-try:
-    # 算子签名: (logits, bitmask, indices=None)
-    torch.ops.sgl_kernel.apply_token_bitmask_inplace_cuda(logits, bitmask)
-    # 4. 打印输出信息 (原地操作，logits 已被修改)
-    print("Execution Status: SUCCESS")
-    print(f"Logits shape after call: {logits.shape}")
-    # 验证 Batch 0 的后半部分是否变为负无穷
-    print(f"Batch 0 (index 31-32): {logits[0, 31:33].tolist()}")
-    print(f"Logits Min Value: {logits.min().item()}")
-except RuntimeError as e:
-    print(f"Execution Status: FAILED")
-    print(f"Error Detail: {e}")
-    # 根据您的图片 05721ec6...png，如果 CUDA < 12.4，这里必然报错
-    if "CUDA version must be >= 12.4" in str(e):
-        print("\n[提示] 您的源码强制要求 CUDA 12.4+ 环境才能运行此特定内核。")
-print("="*40)
-```
-
-## 144. causal_conv1d_update
-
-### 支持的产品型号
-
-- Metax C500/C550/C588/C600
-
-### 接口原型
-
-```cpp
-def causal_conv1d_update(
-    x: torch.Tensor,
-    conv_state: torch.Tensor,
-    weight: torch.Tensor,
-    bias_: Optional[torch.Tensor] = None,
-    silu_activation: bool = False,
-    cache_seqlen_: Optional[torch.Tensor] = None,
-    conv_state_indices_: Optional[torch.Tensor] = None,
-    pad_slot_id: int = 0
-) -> None
-```
-
-### 功能描述
-
-causal_conv1d_update 实现了**因果一维卷积的状态更新操作**，主要用于序列模型中因果卷积的状态维护：结合输入、卷积状态、权重（及可选偏置）完成计算，支持 SiLU 激活（可选），同时处理缓存序列长度、卷积状态索引与填充槽位，实现因果卷积过程中状态的高效更新。
-
-- 计算公式：
-
-$$
-  \text{ConvOut}(x) = \text{Conv1d}_{\text{causal}}(x, \text{conv\\_state}_{\text{prev}}, W) + b \quad (\text{若} \ bias\_ \text{存在})
-$$
-
-
-
-$$
-  \text{ConvOut}_{\text{act}}(x) =
-  \begin{cases}
-  \text{SiLU}(\text{ConvOut}(x)) & \text{若} \ \text{silu\\_activation} = \text{True} \\
-  \text{ConvOut}(x) & \text{否则}
-  \end{cases}
-$$
-
-  
-
-$$
-  \text{conv\\_state}_{\text{curr}} = \text{UpdateState}(\text{conv\\_state}_{\text{prev}}, \text{ConvOut}_{\text{act}}(x), \text{conv\\_state\\_indices}, \text{cache\\_seqlen}, \text{pad\\_slot\\_id})
-$$
-
-  其中各变量的维度与含义：
-
-- $x \in \mathbb{R}^{B \times C \times L}$ ：输入张量， $B$ 为批量大小， $C$ 为通道数， $L$ 为输入序列长度
-- $\text{conv\\_state}_{\text{prev}} \in \mathbb{R}^{B \times C \times K}$ ：更新前的卷积状态张量， $K$ 为因果卷积核大小
-- $\text{conv\\_state}_{\text{curr}} \in \mathbb{R}^{B \times C \times K}$ ：更新后的卷积状态张量（覆盖原 conv_state）
-- $W \in \mathbb{R}^{C_{\text{out}} \times C \times K}$ ：因果一维卷积权重张量， $C_{\text{out}}$ 为输出通道数（通常 $C_{\text{out}}=C$ ）
-- $b \in \mathbb{R}^{C_{\text{out}}}$ ：可选偏置张量（仅当 $bias\_$ 存在时参与计算）
-- $\text{SiLU}(z) = z \cdot \sigma (z)$ ：Sigmoid Linear Unit 激活函数， $\sigma (\cdot)$ 为 Sigmoid 函数
-- $\text{silu\\_activation} \in \{True, False\}$ ：是否启用 SiLU 激活函数的布尔标识
-- $\text{cache\\_seqlen} \in \mathbb{Z}^{B}$ （可选）：批量中每个样本的缓存序列长度张量
-- $\text{conv\\_state\\_indices} \in \mathbb{Z}^{B \times K}$ （可选）：卷积状态更新的索引张量，用于定位状态更新位置
-- $\text{pad\\_slot\\_id} \in \mathbb{Z}$ ：填充槽位标识，用于修正填充位置的缓存序列长度和状态索引取值
-- $\text{Conv1d}_{\text{causal}}(\cdot)$ ：因果一维卷积操作，输出仅依赖当前及之前的输入和卷积状态
-- $\text{UpdateState}(\cdot)$ ：卷积状态更新函数，根据激活后输出、索引、缓存长度和填充槽位更新卷积状态
-	补充单样本维度的状态更新细节公式：
-
-$$
-  \text{conv\\_state}[i, c, k] =
-  \begin{cases}
-  \text{ConvOut}_{\text{act}}[i, c, l] & \text{若} \ k = (\text{cache\\_seqlen}[i] + l) \mod K \\
-  \text{conv\\_state}[i, c, k] & \text{否则}
-  \end{cases}
-$$
-
-  其中：
-
-- $i \in [0, B-1]$ ：批量索引
-- $c \in [0, C-1]$ ：通道索引
-- $k \in [0, K-1]$ ：卷积核维度索引
-- $l \in [0, L-1]$ ：输入序列维度索引
-
-### 参数说明
-
-- **x** (at::Tensor, 入参): 参与因果一维卷积计算的输入张量
-- **conv_state** (at::Tensor, 入参/出参): 卷积状态张量，存储因果卷积的状态信息，计算后会被更新
-- **weight** (at::Tensor, 入参): 因果一维卷积的计算权重张量
-- **bias_** (std::optional<at::Tensor>, 入参): 可选偏置张量，若提供则参与因果卷积的偏置计算
-- **silu_activation** (bool, 入参): 是否启用 SiLU 激活函数，控制计算中是否添加 SiLU 操作
-- **cache_seqlen_** (std::optional<at::Tensor>, 入参): 可选缓存序列长度张量，记录缓存对应的序列长度信息
-- **conv_state_indices_** (std::optional<at::Tensor>, 入参): 可选卷积状态索引张量，用于定位卷积状态的目标位置
-- **pad_slot_id** (int64_t, 入参): 填充槽位标识，用于处理缓存/状态中的填充位置
-
-### 返回值
-
-无返回值，变换结果直接写入输出张量中
-
-### 约束与调用
-
-- 所有张量必须部署在 CUDA 设备上
-- 若提供`bias_`/`cache_seqlen_`/`conv_state_indices_`，其维度、数据类型需与其他张量匹配
-- 支持的数据类型：兼容 float16、bfloat16、float32（需与实际计算场景适配）
-
-### 调用示例
-
-```python
-import torch
-import mcoplib.sgl_kernel
-device = "cuda" if torch.cuda.is_available() else "cpu"
-# 核心参数
-bs = 2 
-C = 256  # dim
-K = 4    # width (卷积核大小)
-pad_slot_id = -1 # 通常默认为 -1 或具体索引
-silu_activation = True 
-x = torch.randn(bs, C, 1, dtype=torch.float32, device=device)
-weight = torch.randn(C, K, dtype=torch.float32, device=device)
-conv_state = torch.randn(bs, C, K, dtype=torch.float32, device=device)
-bias = torch.randn(C, dtype=torch.float32, device=device)
-cache_seqlens = torch.zeros(bs, dtype=torch.int32, device=device) 
-conv_state_indices = torch.arange(bs, dtype=torch.int32, device=device)
-# 调用算子
-torch.ops.sgl_kernel.causal_conv1d_update(
-    x,
-    conv_state,
-    weight,
-    bias,
-    silu_activation,
-    cache_seqlens,        
-    conv_state_indices,   
-    pad_slot_id
-)
-print("Computation completed successfully!")
-```
-
-## 145. causal_conv1d_fwd
-
-### 支持的产品型号
-
-- Metax C500/C550/C588/C600
-
-### 接口原型
-
-```cpp
-def causal_conv1d_fwd(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    bias_: Optional[torch.Tensor] = None,
-    conv_states: Optional[torch.Tensor] = None,
-    query_start_loc: Optional[torch.Tensor] = None,
-    cache_indices: Optional[torch.Tensor] = None,
-    has_initial_state: Optional[torch.Tensor] = None,
-    silu_activation: bool = False,
-    pad_slot_id: int = 0
-) -> None
-```
-
-### 功能描述
-
-causal_conv1d_fwd 算子实现**因果一维卷积的前向计算**，适用于时序类任务（如 Transformer 模型）。它在卷积过程中保证“因果性”（不利用未来时序的信息），同时集成了卷积状态缓存（conv_states）、初始状态标识（has_initial_state）、可选 SiLU 激活等逻辑，还支持缓存索引管理与填充槽位处理，减少时序任务中卷积计算的冗余操作，提升效率。
-
-- 计算公式：
-
-$$
-  d\text{ConvOut} = 
-  \begin{cases}
-  d\text{ConvOut}_{\text{act}} \cdot \left( \sigma(z) + z \cdot \sigma(z) \cdot (1 - \sigma(z)) \right) & \text{若} \ \text{silu\\_activation} = \text{True} \\
-  d\text{ConvOut}_{\text{act}} & \text{否则}
-  \end{cases}
-$$
-
-  其中 $z = \text{ConvOut}(x)$ ， $\sigma (\cdot)$ 为 Sigmoid 函数， $d\text{ConvOut}_{\text{act}}$ 为激活后输出的上游梯度。
-
-$$
-  dW = \sum_{b=0}^{B-1} \sum_{t=0}^{L-1} d\text{ConvOut}[b, t, :] \otimes x[b, t-K+1:t+1, :]
-$$
-
-  
-
-$$
-  db = \sum_{b=0}^{B-1} \sum_{t=0}^{L-1} d\text{ConvOut}[b, t, :] \quad (\text{若} \ bias\_ \text{存在})
-$$
-
-  
-
-$$
-  dx[b, t, :] = \sum_{k=0}^{K-1} \sum_{c_{\text{out}}=0}^{C_{\text{out}}-1} d\text{ConvOut}[b, t+k, c_{\text{out}}] \cdot W[c_{\text{out}}, k, :]
-$$
-
-  
-
-$$
-  d\text{conv\\_states}[b, k, :] = \sum_{c_{\text{out}}=0}^{C_{\text{out}}-1} d\text{ConvOut}[b, 0, c_{\text{out}}] \cdot W[c_{\text{out}}, K-1-k, :] \quad (\text{若} \ t-k < 0)
-$$
-
-  其中各变量的维度与含义：
-
-- $dx \in \mathbb{R}^{B \times C_{\text{in}} \times L}$ ：输入张量 $x$ 的梯度，与 $x$ 维度一致， $B$ 为批量大小， $C_{\text{in}}$ 为输入通道数， $L$ 为输入序列长度
-- $dW \in \mathbb{R}^{C_{\text{out}} \times C_{\text{in}} \times K}$ ：权重张量 $W$ 的梯度，与 $W$ 维度一致， $C_{\text{out}}$ 为输出通道数， $K$ 为因果卷积核大小
-- $db \in \mathbb{R}^{C_{\text{out}}}$ ：偏置张量 $b$ 的梯度（仅当 $bias\_$ 存在时计算），与 $b$ 维度一致
-- $d\text{ConvOut} \in \mathbb{R}^{B \times L \times C_{\text{out}}}$ ：卷积输出（未激活）的梯度
-- $d\text{ConvOut}_{\text{act}} \in \mathbb{R}^{B \times L \times C_{\text{out}}}$ ：激活后卷积输出的梯度，为反向传播的上游梯度
-- $d\text{conv\\_states} \in \mathbb{R}^{B \times C_{\text{in}} \times K}$ ：卷积状态张量的梯度，与 $\text{conv\\_states}$ 维度一致
-- $x \in \mathbb{R}^{B \times C_{\text{in}} \times L}$ ：前向传播的输入张量
-- $W \in \mathbb{R}^{C_{\text{out}} \times C_{\text{in}} \times K}$ ：前向传播的卷积权重张量
-- $b \in \mathbb{R}^{C_{\text{out}}}$ ：前向传播的可选偏置张量
-- $\text{silu\\_activation} \in \{True, False\}$ ：前向传播是否启用 SiLU 激活的布尔标识
-- $\sigma (z) = \frac{1}{1 + e^{-z}}$ ：Sigmoid 激活函数， $z \in \mathbb{R}$
-- $\otimes$ ：互相关运算（卷积反向传播的核心运算）
-- $B$ ：批量大小，取值范围 $B \geq 1$
-- $C_{\text{in}}$ ：输入通道数，取值范围 $C_{\text{in}} \geq 1$
-- $C_{\text{out}}$ ：输出通道数，通常 $C_{\text{out}} = C_{\text{in}}$
-- $K$ ：因果卷积核大小，取值范围 $K \geq 1$
-- $L$ ：输入序列长度，取值范围 $L \geq 1$
-- $b \in [0, B-1]$ ：批量索引
-- $t \in [0, L-1]$ ：序列长度索引
-- $k \in [0, K-1]$ ：卷积核维度索引
-- $c_{\text{in}} \in [0, C_{\text{in}}-1]$ ：输入通道索引
-- $c_{\text{out}} \in [0, C_{\text{out}}-1]$ ：输出通道索引
-
-### 参数说明
-
-- **x** (at::Tensor, 入参): 因果卷积的输入数据张量
-- **weight** (at::Tensor, 入参): 卷积核对应的权重张量
-- **bias_** (std::optional<at::Tensor>, 入参): 可选的卷积偏置张量
-- **conv_states** (std::optional<at::Tensor>, 入参): 可选的卷积状态缓存张量，用于存储/读取历史时序的卷积状态
-- **query_start_loc** (std::optional<at::Tensor>, 入参): 可选的查询起始位置张量，定位时序数据中当前查询的起始点
-- **cache_indices** (std::optional<at::Tensor>, 入参): 可选的缓存索引张量，用于管理卷积状态缓存的索引映射
-- **has_initial_state** (std::optional<at::Tensor>, 入参): 可选的标识张量，指示是否存在初始卷积状态
-- **silu_activation** (bool, 入参): 是否在卷积后启用 SiLU 激活函数
-- **pad_slot_id** (int64_t, 入参): 填充槽位的 ID，用于处理缓存中的填充区域
-
-### 返回值
-
-无返回值，变换结果直接写入输出张量中
-
-### 约束与调用
-
-- 所有参与计算的张量（若存在）必须部署在 CUDA 设备上
-- conv_states（若使用）需满足因果卷积的状态缓存形状要求（与输入、卷积核维度匹配）
-- query_start_loc（若使用）的取值需处于合法的时序范围之内
-- 支持的数据类型：float16、bfloat16、float32
-
-### 调用示例
-
-```python
-import torch
-import mcoplib.sgl_kernel
-# 设置计算设备
-device = "cuda" if torch.cuda.is_available() else "cpu"
-assert device == "cuda", "causal_conv1d_fwd only supports CUDA devices"
-# 核心参数
-batch_size = 1      
-C_in = 128          
-L = 64             
-K = 16            
-C_out = 128         
-pad_slot_id = 0      
-silu_activation = True 
-# 1. 构造符合算子要求的张量
-x = torch.randn(
-    batch_size, C_in, L, 
-    dtype=torch.float32, device=device, requires_grad=False
-)
-# 这是一个 depthwise 卷积操作，输入通道和输出通道通常是一致的
-weight = torch.randn(
-    C_out, K,  # 形状改为 (128, 16)
-    dtype=torch.float32, device=device, requires_grad=False
-)
-# 可选偏置
-bias = torch.randn(
-    C_out,
-    dtype=torch.float32, device=device, requires_grad=False
-)
-# 形状应为 (batch_size, dim, kernel_size)
-conv_states = torch.randn(
-    batch_size, C_in, K,
-    dtype=torch.float32, device=device, requires_grad=False
-)
-# 非必要的可选参数
-query_start_loc = None
-cache_indices = None
-has_initial_state = None
-# 调用算子
-torch.ops.sgl_kernel.causal_conv1d_fwd(
-    x=x,
-    weight=weight,
-    bias_=bias,
-    conv_states=conv_states,
-    query_start_loc=query_start_loc,
-    cache_indices=cache_indices,
-    has_initial_state=has_initial_state,
-    silu_activation=silu_activation,
-    pad_slot_id=pad_slot_id
-)
-# 输出结果
-print("causal_conv1d_fwd computation completed successfully!")
-print(f"Input tensor x shape: {x.shape}")
-print(f"Conv weight tensor shape: {weight.shape}")
-print(f"Conv states tensor shape: {conv_states.shape}")
-```
-
-## 146. fused_mla_RMS_rotary_emb
-
-### 支持的产品型号
-
-- Metax C500/C550/C588/C600
-
-### 接口原型
-
-```cpp
-def fused_mla_RMS_rotary_emb(
-    q: torch.Tensor,
-    latent_cache: torch.Tensor,
-    cos_sin_cache: torch.Tensor,
-    positions: torch.Tensor,
-    norm_weight: torch.Tensor,
-    kv_a: torch.Tensor,
-    q_len: int,
-    num_local_heads: int,
-    kv_lora_rank: int,
-    qk_rope_head_dim: int,
-    qk_nope_head_dim: int
-) -> int
-```
-
-### 功能描述
-
-融合多项操作：对输入张量`q`执行旋转位置编码（rotary_emb），对`latent_cache`执行 RMS 归一化，更新`latent_cache`与`kv_a`，最后再对`latent_cache`执行旋转位置编码。
-
-- 计算公式：
-
-$$
-  \begin{align*}
-  &\text{latent\\_cache}_{norm} = \text{norm\\_weight} \odot \frac{\text{latent\\_cache}_{:,0:kv\_lora\_rank}}{\sqrt{\frac{1}{\text{kv\\_lora\\_rank}} \sum_{i=0}^{\text{kv\\_lora\\_rank}-1} \text{latent\\_cache}_{:,i}^2 + \epsilon}} \\
-  &\text{q}_{rope} = \text{RoPE}(\text{q}_{:,:,\text{qk\\_nope\\_head\\_dim}:}, \cos\_\sin\_\text{cache}, \text{positions}) \\
-  &\text{latent\\_cache}_{update} = [\text{latent\\_cache}_{norm} + \text{kv}_a, \text{latent\\_cache}_{:,\text{kv\\_lora\\_rank}:}] \\
-  &\text{latent\\_cache}_{final} = \text{RoPE}(\text{latent\\_cache}_{update}, \cos\_\sin\_\text{cache}, \text{positions})
-  \end{align*}
-$$
-
-  其中：
-
-- $\text{latent\\_cache} \in \mathbb{R}^{q\_len \times (\text{kv\\_lora\\_rank} + \text{qk\\_rope\\_head\\_dim})}$ 是缓存张量，dtype=bf16
-- $\text{norm\\_weight} \in \mathbb{R}^{\text{kv\\_lora\\_rank}}$ 是 RMS 归一化权重，dtype=bf16
-- $\text{q} \in \mathbb{R}^{q\_len \times \text{num\\_local\\_heads} \times (\text{qk\\_nope\\_head\\_dim} + \text{qk\\_rope\\_head\\_dim})}$ 是查询张量，dtype=bf16
-- $\text{kv}_a \in \mathbb{R}^{q\_len \times \text{kv\\_lora\\_rank}}$ 是待更新张量，dtype=bf16
-- $\cos\_\sin\_\text{cache} \in \mathbb{R}^{\text{max} \times \text{qk\\_rope\\_head\\_dim}}$ 是 RoPE 的 cos/sin 缓存，dtype=float
-- $\text{positions} \in \mathbb{Z}^{bs}$ 是位置索引张量，dtype=int64
-- $\text{RoPE}(\cdot)$ 是旋转位置编码函数，定义为：
-
-$$
-    \begin{cases}
-    x_{rot,i} = x_i \cdot \cos(\theta_{pos,i}) - x_{i+\frac{d}{2}} \cdot \sin(\theta_{pos,i}) \\
-    x_{rot,i+\frac{d}{2}} = x_i \cdot \sin(\theta_{pos,i}) + x_{i+\frac{d}{2}} \cdot \cos(\theta_{pos,i})
-    \end{cases}
-$$
-
-    其中 $d=\text{qk\\_rope\\_head\\_dim}$ ， $\theta_{pos, i} = \cos\_\sin\_\text{cache}[\text{positions}[b], i]$ （ $b$ 为 batch 索引）
-
-- $\epsilon$ 是 RMS 归一化的数值稳定性参数（默认极小正值）
-- $q\_len$ 是序列长度， $\text{num\\_local\\_heads}$ 是本地注意力头数， $\text{kv\\_lora\\_rank}$ 是 LoRA 秩， $\text{qk\\_rope\\_head\\_dim}$ 是启用 RoPE 的头维度， $\text{qk\\_nope\\_head\\_dim}$ 是不启用 RoPE 的头维度
-- $\odot$ 表示逐元素乘法， $[:, a: b]$ 表示张量沿第二维度取 $a$ 到 $b$ 的切片， $+$ 表示逐元素加法
-
-### 参数说明
-
-- **q** (torch.Tensor, 入参): 输入张量，用于旋转位置编码计算，维度需匹配`q_len`、`num_local_heads`等参数
-- **latent_cache** (torch.Tensor, 入参/出参): 缓存张量，会被 RMS 归一化更新，后续需执行旋转位置编码
-- **cos_sin_cache** (torch.Tensor, 入参): 旋转位置编码的 cos/sin 预缓存张量，数据类型为 float
-- **positions** (torch.Tensor, 入参): 位置索引张量，用于匹配`cos_sin_cache`的对应位置
-- **norm_weight** (torch.Tensor, 入参): RMS 归一化的权重张量，维度为`kv_lora_rank`
-- **kv_a** (torch.Tensor, 入参/出参): 需更新的张量，维度为`[q_len, kv_lora_rank]`
-- **q_len** (int64_t, 入参): `q`、`latent_cache`、`kv_a`的第 0 维度长度
-- **num_local_heads** (int64_t, 入参): `q`的第 1 维度长度（本地头数）
-- **kv_lora_rank** (int64_t, 入参): LoRA 秩，对应`latent_cache`第 1 维度的部分长度
-- **qk_rope_head_dim** (int64_t, 入参): 启用旋转编码的头维度，对应`q`第 2 维度的部分长度
-- **qk_nope_head_dim** (int64_t, 入参): 不启用旋转编码的头维度，对应`q`第 2 维度的部分长度
-
-### 返回值
-
-返回值为 int64_t 类型
-
-### 约束与调用
-
-- 所有张量必须位于 CUDA 设备上
-- 各张量形状需满足代码中`TORCH_CHECK`的校验规则（如`q.size (0) == q_len`、`latent_cache.size (1) == kv_lora_rank + qk_rope_head_dim`等）
-- 支持的数据类型：bf16（`q`/`latent_cache`/`norm_weight`/`kv_a`）、float（`cos_sin_cache`）、int64（`positions`）
-
-### 调用示例
-
-```python
-import torch
-import mcoplib.sgl_kernel
-# 设置设备
-device = "cuda"
-# 定义核心参数
-q_len = 16             
-num_local_heads = 128  
-kv_lora_rank = 512     
-qk_rope_head_dim = 64   
-qk_nope_head_dim = 128   
-bs = 8                   
-max_cos_sin_len = 2048   
-# 构造输入张量
-q = torch.randn(
-    q_len, num_local_heads, qk_nope_head_dim + qk_rope_head_dim,
-    dtype=torch.bfloat16, device=device
-)
-latent_cache = torch.randn(
-    q_len, kv_lora_rank + qk_rope_head_dim,
-    dtype=torch.bfloat16, device=device
-)
-cos_sin_cache = torch.randn(
-    max_cos_sin_len, qk_rope_head_dim,
-    dtype=torch.float32, device=device 
-)
-positions = torch.randint(0, max_cos_sin_len, (q_len,), dtype=torch.int64, device=device)
-norm_weight = torch.randn(kv_lora_rank, dtype=torch.bfloat16, device=device)
-kv_a = torch.randn(q_len, kv_lora_rank, dtype=torch.bfloat16, device=device)
-# 调用fused_mla_RMS_rotary_emb算子
-ret_code = torch.ops.sgl_kernel.fused_mla_RMS_rotary_emb(
-    q=q,
-    latent_cache=latent_cache,
-    cos_sin_cache=cos_sin_cache,
-    positions=positions,
-    norm_weight=norm_weight,
-    kv_a=kv_a,
-    q_len=q_len,
-    num_local_heads=num_local_heads,
-    kv_lora_rank=kv_lora_rank,
-    qk_rope_head_dim=qk_rope_head_dim,
-    qk_nope_head_dim=qk_nope_head_dim
-)
-# 输出调用结果
-print("fused_mla_RMS_rotary_emb computation completed")
-print(f"Return code: {ret_code}")
-print(f"Updated latent_cache shape: {latent_cache.shape}")
-print(f"Updated kv_a shape: {kv_a.shape}")
-```
-
-## 147. fused_mla_normal_kv_element_wise
-
-### 支持的产品型号
-
-- Metax C500/C550/C588/C600
-
-### 接口原型
-
-```cpp
-def fused_mla_normal_kv_element_wise(
-    kv: torch.Tensor,
-    latent_cache: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    q_len: int,
-    num_local_heads: int,
-    kv_lora_rank: int,
-    qk_nope_head_dim: int,
-    qk_rope_head_dim: int,
-    v_head_dim: int
-) -> int
-```
-
-### 功能描述
-
-在 prefill 阶段完成融合操作：包含数据拷贝、张量维度变换及逐元素运算，用于处理`kv`、`latent_cache`、`k`、`v`之间的数值交互逻辑。
-
-- 计算公式：
-
-$$
-  \begin{align*}
-  &\text{kv}_{reshape} = \text{reshape}(\text{kv}, [\text{bs}, \text{num\\_local\\_heads}, \text{qk\\_nope\\_head\\_dim} + \text{v\\_head\\_dim}]) \\
-  &\text{kv}_{k\_part} = \text{kv}_{reshape}[:,:,0:\text{qk\\_nope\\_head\\_dim}] \\
-  &\text{kv}_{v\_part} = \text{kv}_{reshape}[:,:,\text{qk\\_nope\\_head\\_dim}:] \\
-  &\text{kv}_{final} = \text{concat}([\text{kv}_{k\_part} + \text{latent\\_cache}_{:,\text{kv\\_lora\\_rank}:}, \text{kv}_{v\_part} \odot \text{k}_{:,:,\text{qk\\_rope\\_head\\_dim}:}], 2) \\
-  &\text{kv} = \text{reshape}(\text{kv}_{final}, [\text{bs}, \text{num\\_local\\_heads} \times (\text{qk\\_nope\\_head\\_dim} + \text{v\\_head\\_dim})])
-  \end{align*}
-$$
-
-  其中：
-
-- $\text{kv} \in \mathbb{R}^{\text{bs} \times (\text{num\\_local\\_heads} \times (\text{qk\\_nope\\_head\\_dim} + \text{v\\_head\\_dim}))}$ 是输出张量，dtype=bf16
-- $\text{latent\\_cache} \in \mathbb{R}^{q\_len \times (\text{kv\\_lora\\_rank} + \text{qk\\_rope\\_head\\_dim})}$ 是缓存张量，dtype=bf16
-- $\text{k} \in \mathbb{R}^{\text{bs} \times \text{num\\_local\\_heads} \times (\text{qk\\_nope\\_head\\_dim} + \text{qk\\_rope\\_head\\_dim})}$ 是键张量，dtype=bf16
-- $\text{v} \in \mathbb{R}^{\text{bs} \times \text{num\\_local\\_heads} \times \text{v\\_head\\_dim}}$ 是值张量，dtype=bf16
-- $\text{reshape}(\cdot, [d_1, d_2,...])$ 表示张量维度重塑操作
-- $\text{concat}([T_1, T_2], dim)$ 表示沿 $dim$ 维度拼接张量 $T_1$ 和 $T_2$
-- $\text{bs}$ 是 batch 大小， $\text{num\\_local\\_heads}$ 是本地注意力头数， $\text{kv\\_lora\\_rank}$ 是 LoRA 秩， $\text{qk\\_rope\\_head\\_dim}$ 是启用 RoPE 的头维度， $\text{qk\\_nope\\_head\\_dim}$ 是不启用 RoPE 的头维度， $\text{v\\_head\\_dim}$ 是值头维度
-- $\odot$ 表示逐元素乘法， $+$ 表示逐元素加法， $[:, a: b]$ 表示张量沿指定维度取 $a$ 到 $b$ 的切片
-- $q\_len$ 是 latent_cache 的序列长度维度，与 prefill 阶段的序列长度匹配
-
-### 参数说明
-
-- **kv** (torch.Tensor, 入参/出参): 输出张量，存储处理后的结果，维度为`[bs, num_local_heads * (qk_nope_head_dim + v_head_dim)]`
-- **latent_cache** (torch.Tensor, 入参): 缓存张量，提供运算所需的输入数据
-- **k** (torch.Tensor, 入参): 输入张量，维度为`[bs, num_local_heads, qk_nope_head_dim + qk_rope_head_dim]`
-- **v** (torch.Tensor, 入参): 输入张量，维度为`[bs, num_local_heads, v_head_dim]`
-- **q_len** (int64_t, 入参): `latent_cache`的第 0 维度长度
-- **num_local_heads** (int64_t, 入参): 本地头数（`k`、`v`的第 1 维度长度）
-- **kv_lora_rank** (int64_t, 入参): LoRA 秩（`latent_cache`第 1 维度的部分长度）
-- **qk_nope_head_dim** (int64_t, 入参): 不启用旋转编码的头维度（`k`第 2 维度的部分长度）
-- **qk_rope_head_dim** (int64_t, 入参): 启用旋转编码的头维度（`k`第 2 维度的部分长度）
-- **v_head_dim** (int64_t, 入参): `v`的第 2 维度长度
-
-### 返回值
-
-返回值为 int64_t 类型
-
-### 约束与调用
-
-- 所有张量必须位于 CUDA 设备上
-- 各张量形状需匹配参数维度要求（如`k.size (2) == qk_nope_head_dim + qk_rope_head_dim`、`v.size (2) == v_head_dim`等）
-- 支持的数据类型：bf16（`kv`/`latent_cache`/`k`/`v`）
-
-### 调用示例
-
-```python
-import torch
-import mcoplib.sgl_kernel
-# 设置设备
-device = "cuda"
-# 定义核心参数
-bs = 8             
-q_len = 16             
-num_local_heads = 128    
-kv_lora_rank = 512      
-qk_rope_head_dim = 64    
-qk_nope_head_dim = 128   
-v_head_dim = 128         
-# 构造输入张量（符合参数维度&类型要求）
-kv = torch.empty(
-    q_len, num_local_heads * (qk_nope_head_dim + v_head_dim),
-    dtype=torch.bfloat16, device=device
-)
-latent_cache = torch.randn(
-    q_len, kv_lora_rank + qk_rope_head_dim,
-    dtype=torch.bfloat16, device=device
-)
-k = torch.randn(
-    q_len, num_local_heads, qk_nope_head_dim + qk_rope_head_dim,
-    dtype=torch.bfloat16, device=device
-)
-v = torch.randn(
-    q_len, num_local_heads, v_head_dim,
-    dtype=torch.bfloat16, device=device
-)
-# 调用fused_mla_normal_kv_element_wise算子
-ret_code = torch.ops.sgl_kernel.fused_mla_normal_kv_element_wise(
-    kv=kv,
-    latent_cache=latent_cache,
-    k=k,
-    v=v,
-    q_len=q_len,
-    num_local_heads=num_local_heads,
-    kv_lora_rank=kv_lora_rank,
-    qk_nope_head_dim=qk_nope_head_dim,
-    qk_rope_head_dim=qk_rope_head_dim,
-    v_head_dim=v_head_dim
-)
-# 输出调用结果
-print("fused_mla_normal_kv_element_wise computation completed")
-print(f"Return code: {ret_code}")
-print(f"Updated kv shape: {kv.shape}")
-```
-
-## 148. per_token_cast_to_fp8
-
-### 支持的产品型号
-
-- Metax C500/C550/C588/C600
-
-### 接口原型
-
-```python
-def per_token_cast_to_fp8(
-    out: torch.Tensor,
-    scale: torch.Tensor,
-    input: torch.Tensor
-) -> None
-```
-
-### 功能描述
-
-per_token_cast_to_fp8 算子实现了按 Token（行）进行的动态 FP8 量化转换。该算子首先计算输入张量每一行（Token 维度）元素的绝对最大值（abs_max），根据 FP8 (E4M3) 的表示范围计算出对应的缩放因子（scale），然后将输入数据缩放并原地或异地转换为 FP8 格式。这种逐 Token 量化的方式能有效保留异常值信息，减少量化误差，提高 FP8 推理时的精度。
-
-- 计算公式：
-	首先逐 token 计算缩放因子（将输入缩放到 FP8 动态范围内）：
-
-$$
-  \text{scale}[i] = \frac{\max_{j \in [0, \text{dim}-1]} \left| \text{input}[i, j] \right|}{\text{max\\_fp8}}
-$$
-
-  （注： $\text{max\\_fp8}$ 为目标 FP8 格式的最大可表示正值，如 E4M3 格式对应 $65504.0$ ，E5M2 格式对应 $57344.0$ ）
-  再逐元素执行缩放与 FP8 量化：
-
-$$
-  \text{out}[i, j] = \text{quantize}_{\text{fp8}} \left( \frac{\text{input}[i, j]}{\text{scale}[i]} \right)
-$$
-
-  其中 $\text{quantize}_{\text{fp8}}(\cdot)$ 是将浮点值映射为目标 FP8 格式（E4M3/E5M2）的量化操作。
-  其中元素的线性索引与二维位置的映射关系为：
-
-$$
-  n = i \times \text{stride} + j
-$$
-
-  各变量的维度与含义：
-
-- $\text{input} \in \mathbb{T}^{\text{num\\_tokens} \times \text{dim}}$ ：输入张量，数据类型为 $\mathbb{T}$ （如 fp16/fp32），每行对应一个 token 的特征
-- $\text{out} \in \text{FP8}^{\text{num\\_tokens} \times \text{dim}}$ ：输出张量，数据类型为 FP8（E4M3/E5M2），维度与 $\text{input}$ 一致
-- $\text{scale} \in \mathbb{R}^{\text{num\\_tokens}}$ ：逐 token 的缩放因子张量，每个元素对应一个 token 的缩放系数
-- $\text{num\\_tokens}$ ：输入张量的 token 数量（行数）
-- $\text{dim}$ ：每个 token 的特征维度（列数）
-- $\text{max\\_fp8}$ ：目标 FP8 格式的最大可表示正值（由 FP8 子类型决定）
-- $\text{stride}$ ：输入/输出张量的内存步长（每行元素的实际内存间隔，满足 $\text{stride} \geq \text{dim}$ 以保证内存对齐）
-- $i$ ：token 的行索引，范围为 $0 \leq i < \text{num\\_tokens}$
-- $j$ ：token 的特征列索引，范围为 $0 \leq j < \text{dim}$
-- $n$ ：张量元素的线性索引，范围为 $0 \leq n < \text{num\\_elems}$ （ $\text{num\\_elems} = \text{num\\_tokens} \times \text{stride}$ ）
-
-### 参数说明
-
-- **out** (torch.Tensor, 出参): 转换后的 FP8 张量，类型为 torch.float8_e4m3fn
-- **scale** (torch.Tensor, 出参): 存储每一行计算得出的缩放因子张量，通常为 torch.float32 类型
-- **input** (torch.Tensor, 入参): 待转换的输入张量，通常为 bfloat16 类型
-
-### 返回值
-
-无返回值，计算结果直接写入 out 和 scale 张量中
-
-### 约束与调用
-
-- 所有张量必须位于 CUDA 设备上
-- input、scale 和 out 张量必须是内存连续的（contiguous）
-- 输入张量的最后一维（hidden_size）必须是 128 的整数倍
-- 算子内部采用 FP8 E4M3 标准，缩放因子计算逻辑中包含针对 448.0（E4M3 最大可表示值）的归一化处理
-- 支持的数据类型：输入目前仅支持 bfloat16，输出支持 float8_e4m3fn
-
-### 调用示例
-
-```python
-import torch
-# 1. 基础配置
-device = "cuda"  # 环境中可能是 MACA 设备，但 PyTorch 接口通常映射为 cuda
-num_tokens = 8
-hidden_size = 512  # 必须是 128 的倍数
-dtype_in = torch.bfloat16
-dtype_out = torch.float8_e4m3fn  # 对应源码中的 maca_fp8_e4m3
-# 2. 准备张量
-# 输入张量 (BF16)
-input_tensor = torch.randn(num_tokens, hidden_size, dtype=dtype_in, device=device)
-# 输出张量 (FP8) - 必须是连续的 (contiguous)
-out_tensor = torch.empty(num_tokens, hidden_size, dtype=dtype_out, device=device)
-# Scale 张量 (FP32) 
-# 源码逻辑：每 128 个元素计算一个 scale
-# 因此 scale 长度为 总元素量 / 128
-scale_size = (num_tokens * hidden_size) // 128
-scale_tensor = torch.empty(scale_size, dtype=torch.float32, device=device)
-# 3. 调用算子
-import mcoplib.sgl_kernel
-print("="*40)
-print(f"Input shape:  {input_tensor.shape} ({input_tensor.dtype})")
-print(f"Output shape: {out_tensor.shape} ({out_tensor.dtype})")
-print(f"Scale shape:  {scale_tensor.shape} ({scale_tensor.dtype})")
-print("-" * 40)
-try:
-    # 算子注册签名: (out, scale, input)
-    torch.ops.sgl_kernel.per_token_cast_to_fp8(out_tensor, scale_tensor, input_tensor)
-    print("Execution Status: SUCCESS")
-    # 打印部分结果
-    print(f"Scale snippet: {scale_tensor[:4].tolist()}")
-except Exception as e:
-    print(f"Execution Status: FAILED")
-    print(f"Error Detail: {e}")
-print("="*40)
-```
-
-## 149. topk_sigmoid
-
-### 支持的产品型号
-
-- Metax C500/C550/C588/C600
-
-### 接口原型
-
-```python
-def topk_sigmoid(
-    topk_weights: torch.Tensor,
-    topk_indices: torch.Tensor,
-    gating_output: torch.Tensor,
-    renormalize: bool,
-    correction_bias: Optional[torch.Tensor] = None
-) -> None
-```
-
-### 功能描述
-
-topk_sigmoid 是混合专家（MoE）模型门控阶段的融合算子，集成了门控输出校正、TopK 专家选择、Sigmoid 权重计算及重归一化功能。该算子先对门控输出（可选叠加校正偏置）执行 TopK 筛选，再对选中专家对应的门控值计算 Sigmoid 激活权重，同时支持对权重进行重归一化，通过融合多步操作减少内存交互开销，提升 MoE 门控阶段的计算效率。
-
-### 参数说明
-
-- **topk_weights** (torch.Tensor, 出参): 选中 TopK 专家对应的 Sigmoid 权重张量，形状为（B, topk）（B 为批大小，topk 为单样本选中的专家数），支持数据类型为 float16/bfloat16
-- **topk_indices** (torch.Tensor, 出参): 选中 TopK 专家的索引张量，形状为（B, topk），数据类型为 int32
-- **gating_output** (torch.Tensor, 入参): 门控网络的输出张量，形状为（B, num_experts）（num_experts 为专家总数），支持数据类型为 float16/bfloat16
-- **renormalize** (bool, 入参): 是否对 TopK 后的 Sigmoid 权重执行重归一化的标志位
-- **correction_bias** (Optional[torch.Tensor], 入参): 门控输出的校正偏置张量，形状为（num_experts），支持数据类型为 float16/bfloat16；若为 None，则不执行门控输出校正
-
-### 返回值
-
-该算子无返回值，所有输出（TopK 专家权重、TopK 专家索引）均通过指定的出参张量（topk_weights、topk_indices）返回。
-
-### 约束与调用
-
-- 所有输入/出参张量必须部署在 CUDA 设备上
-- gating_output 的最后一维维度需与 correction_bias 的形状（num_experts）匹配；若 correction_bias 为 None，则无此约束
-- topk_weights、topk_indices 的形状需为（B, topk），其中 topk 为实际筛选的专家数量（由门控逻辑确定）
-- 数据类型约束：gating_output、correction_bias、topk_weights 支持 float16/bfloat16；topk_indices 必须为 int32 类型
-- 若开启 renormalize，需保证 TopK 后的 Sigmoid 权重之和不为零，否则会导致重归一化计算数值不稳定
-
-### 调用示例
-
-```python
-import torch
-import mcoplib.sgl_kernel
-# --- 配置参数 ---
-DEVICE = "cuda"
-NUM_TOKENS = 64      
-NUM_EXPERTS = 8    
-TOP_K = 2           
-RENORMALIZE = True   
-DTYPE_IDX = torch.int32 
-DTYPE_VAL = torch.float32
-torch.set_default_device(DEVICE)
-print(f"Config: Tokens={NUM_TOKENS}, Experts={NUM_EXPERTS}, K={TOP_K}")
-# 1. 准备输入数据
-gating_output = torch.randn(NUM_TOKENS, NUM_EXPERTS, dtype=DTYPE_VAL)
-# correction_bias: 可选的偏置项 [Experts] (可以传 None)
-# 如果不需要 bias，可以将此变量设为 None
-correction_bias = torch.randn(NUM_EXPERTS, dtype=DTYPE_VAL) 
-# 2. 准备输出数据
-# 输出形状由 [Tokens, TOP_K] 决定，算子内部会根据这个形状确定 K 值
-topk_weights = torch.empty(NUM_TOKENS, TOP_K, dtype=DTYPE_VAL)
-topk_indices = torch.empty(NUM_TOKENS, TOP_K, dtype=DTYPE_IDX)
-# 3. 执行算子
-print("Running topk_sigmoid...")
-if torch.cuda.is_available():
-    torch.cuda.synchronize()
-torch.ops.sgl_kernel.topk_sigmoid(
-    topk_weights,       # Output Tensor!
-    topk_indices,       # Output Tensor!
-    gating_output,      # Input Tensor
-    RENORMALIZE,        # bool
-    correction_bias     # Input Tensor? (Optional)
-)
-if torch.cuda.is_available():
-    torch.cuda.synchronize()
-print("执行成功")
-print("-" * 30)
-# 4. 结果验证
-print("Sample Results (First Token):")
-print(f"Raw Logits:    {gating_output[0].tolist()}")
-print(f"Selected Idxs: {topk_indices[0].tolist()}")
-print(f"Selected Wgts: {topk_weights[0].tolist()}")
-```
-
-## 150. kimi_k2_moe_fused_gate
-
-### 支持的产品型号
-
-- Metax C500/C550/C588/C600
-
-### 接口原型
-
-```python
-def kimi_k2_moe_fused_gate(
-    gate_weights: torch.Tensor,
-    expert_indices: torch.Tensor,
-    input_logits: torch.Tensor,
-    gate_bias: torch.Tensor,
-    topk: int,
-    renormalize: bool = True,
-    scaling_factor: float = 1.0
-) -> None
-```
-
-### 功能描述
-
-kimi_k2_moe_fused_gate 算子是面向 MoE（混合专家）大模型的融合式门控核心算子，整合了 MoE 门控的全量核心逻辑。该算子先对输入的门控预测值张量叠加偏置项完成基础打分，再执行 topk 筛选得到每个 token 对应的最优 k 个专家索引及对应权重，支持对筛选后的专家权重做归一化处理，同时支持权重缩放系数的融合应用，所有计算逻辑一步融合完成，大幅减少显存的读写交互与中间张量的创建开销，显著提升 MoE 架构大模型的推理计算效率。
-
-- 计算公式：
-	输入张量与超参定义, 算子输入及超参说明：
-
-$$
-    \begin{cases}
-    \text{input} \in \mathbb{R}^{T \times E}, & T = B \times S \text{（}B\text{为batch size，}S\text{为序列长度，}T\text{为Token总数），}E\text{为专家总数} \\
-    \text{bias} \in \mathbb{R}^E, & \text{每个专家对应的偏置张量} \\
-    \text{topk} = K, & \text{激活专家数（正整数，}K \ll E\text{）} \\
-    \text{renormalize} \in \{\text{True}, \text{False}\}, & \text{是否对Top-K得分做归一化的布尔标识} \\
-    \text{routed\\_scaling\\_factor} \in \mathbb{R}, & \text{路由结果的缩放因子} \\
-    \text{apply\\_routed\\_scaling\\_factor\\_on\\_output} \in \{\text{True}, \text{False}\}, & \text{是否在输出上应用缩放因子的布尔标识}
-    \end{cases}
-$$
-
-    其中： $t \in [0, T-1]$ （Token 维度索引）， $e \in [0, E-1]$ （专家维度索引）， $k \in [0, K-1]$ （Top-K 维度索引）。
-    输入加偏置并计算 Sigmoid 原始得分, 对每个 Token 的每个专家，将输入与对应专家偏置相加后，通过 Sigmoid 激活得到原始门控得分：
-
-$$
-    \text{raw\\_score}_{t,e} = \sigma\left(\text{input}_{t,e} + \text{bias}_e\right) = \frac{1}{1 + \exp\left(-(\text{input}_{t,e} + \text{bias}_e)\right)}
-$$
-
-    其中： $\text{raw\\_score} \in \mathbb{R}^{T \times E}$ ， $\sigma (\cdot)$ 为 Sigmoid 函数， $\exp (\cdot)$ 为自然指数函数。
-    逐 Token 筛选 Top-K 得分与专家索引, 对每个 Token，在专家维度上筛选出原始得分中最大的 $K$ 个值，同时记录对应的专家索引：
-
-$$
-    \begin{cases}
-    \text{topk\\_score}_{t,k} = \text{TopK}(\text{raw\\_score}_{t,:}, K) \\
-    \text{topk\\_index}_{t,k} = \text{ArgTopK}(\text{raw\\_score}_{t,:}, K)
-    \end{cases}
-$$
-
-    其中： $\text{topk\\_score} \in \mathbb{R}^{T \times K}$ （Top-K 得分张量）， $\text{topk\\_index} \in \mathbb{Z}^{T \times K}$ （Top-K 对应的专家索引张量）， $\text{TopK}(\cdot)$ 为取前 K 大值函数， $\text{ArgTopK}(\cdot)$ 为取前 K 大值对应索引的函数。
-    Top-K 得分的可选归一化, 若 $\text{renormalize}$ 为 True，对每个 Token 的 Top-K 得分做求和归一化（加入稳定小量避免除零）；否则直接沿用 Top-K 得分：
-
-$$
-    \text{normed\\_score}_{t,k} = 
-    \begin{cases} 
-    \frac{\text{topk\\_score}_{t,k}}{\sum_{k'=0}^{K-1}\text{topk\\_score}_{t,k'} + \epsilon}, & \text{renormalize} = \text{True} \\
-    \text{topk\\_score}_{t,k}, & \text{renormalize} = \text{False}
-    \end{cases}
-$$
-
-    其中： $\text{normed\\_score} \in \mathbb{R}^{T \times K}$ ， $\epsilon > 0$ 为数值稳定小量（通常取 $10^{-6}$ ）。
-    输出的可选缩放因子应用, 若 $\text{apply\\_routed\\_scaling\\_factor\\_on\\_output}$ 为 True，将归一化后的得分乘以路由缩放因子；否则直接沿用归一化得分：
-
-$$
-    \text{final\\_weight}_{t,k} = 
-    \begin{cases} 
-    \text{normed\\_score}_{t,k} \times \text{routed\\_scaling\\_factor}, & \text{apply\\_routed\\_scaling\\_factor\\_on\\_output} = \text{True} \\
-    \text{normed\\_score}_{t,k}, & \text{apply\\_routed\\_scaling\\_factor\\_on\\_output} = \text{False}
-    \end{cases}
-$$
-
-    其中： $\text{final\\_weight} \in \mathbb{R}^{T \times K}$ ，为最终的专家门控权重张量。
-    算子最终双输出, 该融合算子输出两个张量，无额外中间张量：
-
-$$
-    \text{outputs} = (\text{final\\_weight}, \text{topk\\_index})
-$$
-
-    其中：主输出 $\text{final\\_weight}$ 为浮点型专家门控权重，用于后续专家输出的加权融合；辅输出 $\text{topk\\_index}$ 为整型专家索引，用于筛选激活的专家计算结果。
-
-### 参数说明
-
-- **gate_weights** (torch.Tensor, 出参): 每个 token 选中的 topk 个专家对应的归一化门控权重张量，形状为 B×S×K，数据类型为 float16/bfloat16
-- **expert_indices** (torch.Tensor, 出参): 每个 token 选中的 topk 个专家的索引张量，形状为 B×S×K，数据类型为 int32
-- **input_logits** (torch.Tensor, 入参): MoE 门控网络的原始输入预测张量，形状为 B×S×E，支持数据类型为 float16/bfloat16；其中 E 为专家总数，B 为批次维度，S 为序列长度维度
-- **gate_bias** (torch.Tensor, 入参): MoE 门控网络的偏置张量，形状为 E，与输入的专家维度严格匹配，支持数据类型为 float16/bfloat16
-- **topk** (int, 入参): 每个 token 需要选择的最优专家数量，为正整数，取值范围为 1 ≤ topk ≤ E
-- **renormalize** (bool, 入参): 布尔型开关，是否对选中的 topk 个专家的权重做归一化处理，使单 token 下选中专家的权重之和为 1，默认值为 True
-- **scaling_factor** (float, 入参): 门控权重的全局缩放系数，用于权重幅值的精细化调控，默认值为 1.0，无缩放效果
-
-### 返回值
-
-该算子无返回值，所有输出（选中专家的权重、专家索引）均通过指定的出参张量（gate_weights、expert_indices）返回。
-
-### 约束与调用
-
-- 所有输入/出参张量必须位于 CUDA 设备上
-- input_logits 的形状必须为 B×S×E，gate_bias 的形状必须为 E，二者的专家维度 E 必须完全一致
-- gate_weights、expert_indices 的形状必须为 B×S×K，与 input_logits 的批次维度 B、序列维度 S 保持一致，K 为入参 topk 的取值
-- input_logits、gate_bias、gate_weights 支持的数据类型为 float16/bfloat16，expert_indices 必须为 int32 类型
-- topk 必须为正整数，且数值不能超过专家总数 E，否则会触发索引越界错误
-- 若 renormalize 设置为 True，单 token 下输出的 gate_weights 对应维度的权重求和结果恒等于 1.0，保证专家路由的权重分配合理性
-
-### 调用示例
-
-```python
-import torch
-import mcoplib.sgl_kernel
-# --- 配置参数 ---
-DEVICE = "cuda"
-NUM_TOKENS = 64       
-NUM_EXPERTS = 384     
-TOP_K = 2           
-RENORMALIZE = True    
-ROUTED_SCALING_FACTOR = 1.0
-APPLY_SCALING = False
-DTYPE_VAL = torch.float32 
-DTYPE_IDX = torch.int32   
-torch.set_default_device(DEVICE)
-print(f"Config: Tokens={NUM_TOKENS}, Experts={NUM_EXPERTS}, K={TOP_K}")
-# 1. 准备输入数据
-# gating_output 形状变为 [64, 384]
-gating_output = torch.randn(NUM_TOKENS, NUM_EXPERTS, dtype=DTYPE_VAL)
-# bias 形状变为 [384]
-correction_bias = torch.randn(NUM_EXPERTS, dtype=DTYPE_VAL)
-# 2. 执行算子
-print(f"Running kimi_k2_moe_fused_gate (Op: {torch.ops.sgl_kernel.kimi_k2_moe_fused_gate})...")
-if torch.cuda.is_available():
-    torch.cuda.synchronize()
-results = torch.ops.sgl_kernel.kimi_k2_moe_fused_gate(
-    gating_output,    
-    correction_bias,  
-    TOP_K,            
-    RENORMALIZE,      
-    ROUTED_SCALING_FACTOR, 
-    APPLY_SCALING     
-)
-if torch.cuda.is_available():
-    torch.cuda.synchronize()
-print("执行成功")
-print("-" * 30)
-# 3. 结果验证与解包
-topk_weights = results[0]
-topk_indices = results[1]
-print("Sample Results (First Token):")
-# 打印前 10 个 logits 示例
-print(f"Raw Logits (first 10): {gating_output[0][:10].tolist()} ...")
-print(f"Selected Idxs: {topk_indices[0].tolist()}")
-print(f"Selected Wgts: {topk_weights[0].tolist()}")
-# 验证形状
-print(f"\nShape Verification:")
-print(f"Weights Shape: {topk_weights.shape} (Expected: [{NUM_TOKENS}, {TOP_K}])")
-print(f"Indices Shape: {topk_indices.shape} (Expected: [{NUM_TOKENS}, {TOP_K}])")
-```
-
-## 151. fused_qk_norm_rope
-
-### 支持的产品型号
-
-- Metax C500/C550/C588/C600
-
-### 接口原型
-
-```python
-def fused_qk_norm_rope(
-    gkv: torch.Tensor,
-    num_heads_q: int,
-    num_heads_k: int,
-    num_heads_v: int,
-    head_dim: int,
-    eps: float,
-    q_weight: torch.Tensor,
-    k_weight: torch.Tensor,
-    base: float,
-    is_neox: bool,
-    position_ids: torch.Tensor,
-    factor: float,
-    low: float,
-    high: float,
-    attention_factor: float
-) -> None
-```
-
-### 功能描述
-
-fused_qk_norm_rope 算子是面向 GPU 优化的融合计算算子，将 Query/Key 的权重映射、归一化操作与 RoPE（旋转位置编码）计算合并执行，减少 GPU 显存的读写开销，常用于大语言模型注意力机制模块的训练与推理流程。
-
-- 计算公式：
-	当前版本中，fused_qk_norm_rope 算子仅支持输入张量位于 CUDA 设备上
-
-$$
-\text{output}[b, s, idx] = 
-\begin{cases} 
-\text{RoPE}\left( \frac{\text{qkv}[b, s, idx] \cdot w_q}{\sqrt{\text{mean}(\text{qkv}[b, s, \text{q\\_range}]^2) + \text{eps}}}, \text{pos}_s \right) & idx \in \text{q\\_range} \\
-\text{RoPE}\left( \frac{\text{qkv}[b, s, idx] \cdot w_k}{\sqrt{\text{mean}(\text{qkv}[b, s, \text{k\\_range}]^2) + \text{eps}}}, \text{pos}_s \right) & idx \in \text{k\\_range} \\
-\text{qkv}[b, s, idx] & idx \in \text{v\\_range}
-\end{cases}
-$$
-
-其中：
-
-- $\text{qkv}$ ：输入张量，需位于 CUDA 设备上，形状记为 $S = (\text{batch\\_size}, \text{seq\\_len}, D)$ ， $D = (\text{num\\_heads\\_q}+\text{num\\_heads\\_k}+\text{num\\_heads\\_v}) \cdot \text{head\\_dim}$ ，为包含查询、键、值的融合张量
-- $\text{num\\_heads\\_q}$ ：查询注意力头的数量，非负整数
-- $\text{num\\_heads\\_k}$ ：键注意力头的数量，非负整数
-- $\text{num\\_heads\\_v}$ ：值注意力头的数量，非负整数
-- $\text{head\\_dim}$ ：单个注意力头的维度，正整数
-- $\text{q\\_range}$ ： $\text{qkv}$ 中查询部分的索引范围，即 $[0, \text{num\\_heads\\_q} \cdot \text{head\\_dim})$
-- $\text{k\\_range}$ ： $\text{qkv}$ 中键部分的索引范围，即 $[\text{num\\_heads\\_q} \cdot \text{head\\_dim}, (\text{num\\_heads\\_q}+\text{num\\_heads\\_k}) \cdot \text{head\\_dim})$
-- $\text{v\\_range}$ ： $\text{qkv}$ 中值部分的索引范围，即 $[(\text{num\\_heads\\_q}+\text{num\\_heads\\_k}) \cdot \text{head\\_dim}, D)$
-- $w_q$ ：查询头对应的权重张量，形状与 $\text{q\\_range}$ 维度匹配
-- $w_k$ ：键头对应的权重张量，形状与 $\text{k\\_range}$ 维度匹配
-- $\text{eps}$ ：防止除零的小常数，正浮点数
-- $\text{pos}_s$ ：序列位置 $s$ 对应的位置索引，来自 $\text{position\\_ids}$ 张量
-- $\text{Norm}(x) = \frac{x}{\sqrt{\text{mean}(x^2) + \text{eps}}}$ ：归一化操作，对张量对应部分的元素计算均值平方后做标准化
-- $\text{RoPE}(\cdot, \text{pos}_s)$ ：旋转位置编码操作，基于位置索引 $\text{pos}_s$ 对张量进行旋转编码
-- $\text{output}$ ：输出张量，形状与 $\text{qkv}$ 完全一致（即 $S = (\text{batch\\_size}, \text{seq\\_len}, D)$ ），存储融合处理后的结果
-- $[b, s, idx]$ ：张量的多维索引， $b$ 为批次索引（ $0 \leq b < \text{batch\\_size}$ ）、 $s$ 为序列位置索引（ $0 \leq s < \text{seq\\_len}$ ）、 $idx$ 为维度索引（ $0 \leq idx < D$ ）
-- $\cdot$ ：张量与权重的逐元素（或匹配维度）乘法运算
-
-### 参数说明
-
-- **gkv** (torch.Tensor, 入参/出参): 输入输出张量，用于承载融合计算后的 Q/K/V 相关结果，需部署在 CUDA 设备上
-- **num_heads_q** (int, 入参): Query 对应的注意力头数量
-- **num_heads_k** (int, 入参): Key 对应的注意力头数量
-- **num_heads_v** (int, 入参): Value 对应的注意力头数量
-- **head_dim** (int, 入参): 单个注意力头的特征维度，需满足算子内部的对齐约束（如特定数值的倍数）
-- **eps** (float, 入参): 归一化操作中用于避免除零的微小平滑值
-- **q_weight** (torch.Tensor, 入参): Query 对应的权重张量，形状需与 num_heads_q、head_dim 匹配，需部署在 CUDA 设备上
-- **k_weight** (torch.Tensor, 入参): Key 对应的权重张量，形状需与 num_heads_k、head_dim 匹配，需部署在 CUDA 设备上
-- **base** (float, 入参): RoPE 编码中的基数值，用于计算位置编码的缩放因子
-- **is_neox** (bool, 入参): 是否采用 GPT-NeoX 风格的 RoPE 编码实现逻辑
-- **position_ids** (torch.Tensor, 入参): 序列的位置索引张量，用于提供 RoPE 编码的位置信息，需部署在 CUDA 设备上
-- **factor** (float, 入参): 融合计算流程中的缩放因子参数
-- **low** (float, 入参): 计算过程中的数值下界参数
-- **high** (float, 入参): 计算过程中的数值上界参数
-- **attention_factor** (float, 入参): 注意力计算环节的缩放因子参数
-
-### 返回值
-
-计算结果通过入参`gkv`（引用传递）输出，无独立返回张量
-
-### 约束与调用
-
-- 所有输入张量必须部署在 CUDA 设备上
-- 各张量的形状需满足注意力头数、头维度的匹配关系（如 q_weight 的形状需与 num_heads_q×head_dim 对齐）
-- head_dim 需满足算子内部静态断言的对齐要求（如为特定数值的整数倍）
-- 支持的数据类型：float16（torch.float16）、bfloat16（torch.bfloat16）
-- position_ids 的形状需与输入序列的长度维度匹配
-
-### 调用示例
-
-```python
-import torch
-import mcoplib.sgl_kernel
-# 配置参数
-SEED = 42
-DEVICE = "cuda"
-# 维度设置
-BATCH_SIZE = 2
-SEQ_LEN = 128
-HEAD_DIM = 128
-NUM_HEADS_Q = 32
-NUM_HEADS_K = 32
-NUM_HEADS_V = 32
-# 初始化环境
-torch.manual_seed(SEED)
-torch.set_default_device(DEVICE)
-TOTAL_TOKENS = BATCH_SIZE * SEQ_LEN
-HIDDEN_SIZE_QKV = (NUM_HEADS_Q + NUM_HEADS_K + NUM_HEADS_V) * HEAD_DIM
-# 1. 准备数据
-qkv = torch.randn((TOTAL_TOKENS, HIDDEN_SIZE_QKV), dtype=torch.bfloat16, device=DEVICE)
-# 准备权重 (Weight)
-q_weight = torch.randn((HEAD_DIM,), dtype=torch.bfloat16, device=DEVICE)
-k_weight = torch.randn((HEAD_DIM,), dtype=torch.bfloat16, device=DEVICE)
-position_ids = torch.arange(SEQ_LEN, device=DEVICE).unsqueeze(0).expand(BATCH_SIZE, -1).reshape(-1).to(torch.int)
-# 其他标量参数
-eps = 1e-5
-base = 10000.0
-is_neox = True
-factor = 1.0
-low = 0.0
-high = 0.0
-attention_factor = 1.0
-# 2. 调用算子
-print(f"Running fused_qk_norm_rope...")
-print(f"Input shape: {qkv.shape}")
-print(f"Position_ids dtype: {position_ids.dtype}") 
-torch.ops.sgl_kernel.fused_qk_norm_rope(
-    qkv,                
-    NUM_HEADS_Q,
-    NUM_HEADS_K,
-    NUM_HEADS_V,
-    HEAD_DIM,
-    eps,
-    q_weight,           
-    k_weight,         
-    base,
-    is_neox,
-    position_ids,       
-    factor,
-    low,
-    high,
-    attention_factor
-)
-print("执行成功 (Execution Success).")
-if torch.cuda.is_available():
-    torch.cuda.synchronize()
-# 3. 验证结果
-print(f"Output Mean: {qkv.float().mean().item():.4f}")
-print(f"Output Std:  {qkv.float().std().item():.4f}")
-```
-
-## 152. weak_ref_tensor
-
-### 支持的产品型号
-
-- Metax C500/C550/C588/C600
-
-### 接口原型
-
-```python
-def weak_ref_tensor(
-    input: at::Tensor
-) -> at::Tensor
-```
-
-### 功能描述
-
-weak_ref_tensor 算子是面向 CUDA 张量的内存复用工具算子：基于输入 CUDA 张量的原始数据指针，复用其形状、步幅、数据类型等属性，创建一个共享原张量内存的新张量视图（不拷贝数据），用于避免不必要的显存数据拷贝，提升 CUDA 张量的内存复用效率，常用于大语言模型等显存敏感场景的张量内存管理。
-
-- 计算公式：
-	当前版本中，weak_ref_tensor 算子仅支持输入张量位于 CUDA 设备上
-
-$$
-\text{output}[i_1, i_2, ..., i_n] = \text{input}[i_1, i_2, ..., i_n]
-$$
-
-其中：
-
-- $\text{input}$ ：输入张量，需位于 CUDA 设备上，形状记为 $S = (s_1, s_2, ..., s_n)$ ， $n$ 为张量维度数
-- $\text{output}$ ：输出张量，形状与 $\text{input}$ 完全一致（即 $S = (s_1, s_2, ..., s_n)$ ），与 $\text{input}$ 共享数据存储
-- $[i_1, i_2, ..., i_n]$ ：张量任意位置的多维索引，满足 $0 \leq i_k < s_k$ （ $k = 1, 2, ..., n$ ），覆盖张量所有元素
-- $=$ ：表示输出张量对应位置元素与输入张量对应位置元素取值相同
-
-### 参数说明
-
-- **input** (at::Tensor, 入参): 输入的 CUDA 张量，算子会基于其数据指针、形状、步幅等属性创建新张量视图，必须是位于 CUDA 设备上的合法张量。
-
-### 返回值
-
-at::Tensor: 输出的新张量，与输入张量共享数据内存，形状、步幅、数据类型、设备等属性均与输入张量完全一致。
-
-### 约束与调用
-
-- 输入张量**必须位于 CUDA 设备上**，非 CUDA 张量会触发错误
-- 新张量与输入张量共享内存，输入张量的生命周期需覆盖新张量的使用周期，否则会出现悬空指针风险
-- 支持的张量数据类型与输入张量一致（如 float16（at::ScalarType::Half）、bfloat16（at::ScalarType::BFloat16）、float32 等）
-- 输入张量需保持数据指针有效，非法或已释放的张量会导致新张量访问异常
-
-### 调用示例
-
-```python
-import torch
-import mcoplib.sgl_kernel
-# 1. 准备数据 (必须在 CUDA 上)
-torch.set_default_device("cuda")
-input_tensor = torch.randn(4, 4096)
-# 2. 算子执行
-# 这里的 weak_ref_tensor 返回一个新的 Tensor，指向相同的显存
-output_tensor = torch.ops.sgl_kernel.weak_ref_tensor(input_tensor)
-# 3. 打印结果
-print(f"Input Shape:  {input_tensor.shape}")
-print(f"Output Shape: {output_tensor.shape}")
-```
-
-## 153. CalSumOp
-
-### 支持的产品型号
-
-- Metax C500/C550/C588/C600
-
-### 接口原型
-
-```cpp
-template<typename T, typename D>
-void CalSumOp(
-    const T* __restrict input,
-    const unsigned char* __restrict mask,
-    D* __restrict dst,
-    int width,
-    int height,
-    int stride,
-    cudaStream_t stream
-);
-```
-
-### 功能描述
-
-CalSumOp 是基于 CUDA 并行实现的**带掩码筛选的张量求和算子**。该算子先通过`unsigned char`类型的 mask 筛选输入张量中的有效元素，再对有效元素进行求和计算，最终将结果写入输出张量。同时利用`cudaStream_t`管理异步执行，减少内存访问开销，提升计算效率，适用于需要按掩码过滤后求和的张量处理场景（如特征筛选后的聚合计算）。
-
-- 计算公式：
-
-$$
-  \text{dst}[0] = \sum_{i=0}^{\text{height}-1} \sum_{j=0}^{\text{width}-1} \left( \text{input}[i \times \text{stride} + j] \times \mathbb{I}\{\text{mask}[i \times \text{stride} + j] \neq 0\} \right)
-$$
-
-  其中：
-
-- $\text{input} \in \mathbb{R}^{\text{height} \times \text{width}}$ 是二维输入张量（实际内存布局由 stride 决定，支持非连续存储）
-- $\text{mask} \in \{0, 1\}^{\text{height} \times \text{width}}$ 是二进制掩码张量，与 input 的维度和内存布局完全对齐
-- $\text{dst} \in \mathbb{R}^1$ 是标量输出张量，唯一元素存储掩码筛选后的求和结果
-- $\text{width} \in \mathbb{N}^+$ 是输入张量的宽度维度（列数），表示每行的元素数量
-- $\text{height} \in \mathbb{N}^+$ 是输入张量的高度维度（行数），表示张量的总行数
-- $\text{stride} \in \mathbb{N}^+$ 是输入/掩码张量的内存步长，即相邻行首元素的内存偏移量（以元素个数为单位）
-- $\mathbb{I}\{\cdot\}$ 是指示函数，满足 $\mathbb{I}\{P\}=1$ （当条件 $P$ 为真）， $\mathbb{I}\{P\}=0$ （当条件 $P$ 为假）
-- $i \times \text{stride} + j$ 是张量中位置 $(i, j)$ 对应的一维内存偏移索引（ $i$ 为行索引， $j$ 为列索引）
-	CUDA 并行计算的线程映射规则：
-
-$$
-  \text{global\\_tid} = \text{blockIdx.x} \times \text{blockDim.x} + \text{threadIdx.x}
-$$
-
-
-
-$$
-  i = \lfloor \text{global\\_tid} / \text{width} \rfloor, \quad j = \text{global\\_tid} \bmod \text{width}
-$$
-
-
-
-$$
-  \text{partial\\_sum}[\text{global\\_tid}] = \text{input}[i \times \text{stride} + j] \times \mathbb{I}\{\text{mask}[i \times \text{stride} + j] \neq 0\}
-$$
-
-
-
-$$
-  \text{dst}[0] = \text{blockReduceSum}(\text{partial\\_sum}, \text{stream})
-$$
-
-  其中：
-
-- $\text{global\\_tid} \in \mathbb{N}$ 是 CUDA 线程的全局唯一索引
-- $\text{blockIdx.x} \in \mathbb{N}$ 是 CUDA 线程块的一维索引
-- $\text{blockDim.x} \in \mathbb{N}^+$ 是每个 CUDA 线程块的线程数量
-- $\text{threadIdx.x} \in \mathbb{N}$ 是线程块内的线程索引
-- $\text{partial\\_sum}$ 是线程级局部求和缓存张量
-- $\text{blockReduceSum}(\cdot, \cdot)$ 是 CUDA 块级归约求和函数，基于指定的`stream`异步执行全局求和
-
-### 参数说明
-
-- **input** (const T* __restrict, 入参): 输入张量（模板类型 T），存储待求和的原始数据。
-- **mask** (const unsigned char* __restrict, 入参): 掩码张量，通过元素值标记`input`中参与求和的有效元素（通常非 0 为有效）。
-- **dst** (D* __restrict, 出参): 输出张量（模板类型 D），存储掩码筛选后的求和结果。
-- **width** (int, 入参): 输入张量的宽度维度，用于确定维度范围。
-- **height** (int, 入参): 输入张量的高度维度，用于确定维度范围。
-- **stride** (int, 入参): 输入张量的步长，用于计算元素的内存偏移地址。
-- **stream** (cudaStream_t, 入参): CUDA 流，用于管理算子的异步执行流程。
-
-### 约束与调用
-
-- 所有张量（`input`/`mask`/`dst`）必须存储在 CUDA 设备内存中。
-- 支持的模板类型：`T`（输入类型）包括`char`、`short`、`float`等；`D`（输出类型）包括`double`等（以实际模板实例化为准）。
-- `mask`的元素类型固定为`unsigned char`，有效元素的标记规则需与业务逻辑一致。
-- `width`/`height`/`stride`的取值需匹配输入张量的实际维度布局，避免内存越界。
-- 需依赖 CUDA 运行时环境，支持 CUDA 流操作及并行核函数执行。
-
-### 调用示例
-
-```C++
-#include <iostream>
-#include <vector>
-#include <cuda_runtime.h>
-#include "utils.h"
-#include "calsum.h"  
-// 封装CUDA错误检查宏（避免隐藏bug）
-#define CHECK_CUDA_ERR(err) \
-    do { \
-        if (err != cudaSuccess) { \
-            std::cerr << "CUDA Error: " << cudaGetErrorString(err) \
-                      << " at line " << __LINE__ << std::endl; \
-            exit(1); \
-        } \
-    } while (0)
-int main() {
-    // 1. 定义输入参数（示例：3x2的矩阵，连续存储，stride=宽度）
-    const int width = 2;     // 每行元素个数
-    const int height = 3;    // 总行数
-    const int stride = width;// 行步长（连续存储时等于width）
-    const int num_elems = stride * height; // 总元素数（内存维度）
-    // 2. 构造Host端输入数据
-    // input: [1,2, 3,4, 5,6] → 3行2列的矩阵
-    std::vector<float> input_h = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f};
-    // mask: [1,0, 1,1, 0,1] → 仅标记部分元素参与求和
-    std::vector<unsigned char> mask_h = {1, 0, 1, 1, 0, 1};
-    std::vector<double> dst_h(1, 0.0); // 输出为标量（仅1个元素）
-    // 3. 分配Device端内存（带错误检查）
-    float* input_d = nullptr;
-    unsigned char* mask_d = nullptr;
-    double* dst_d = nullptr;
-    CHECK_CUDA_ERR(cudaMalloc(&input_d, num_elems * sizeof(float)));
-    CHECK_CUDA_ERR(cudaMalloc(&mask_d, num_elems * sizeof(unsigned char)));
-    CHECK_CUDA_ERR(cudaMalloc(&dst_d, dst_h.size() * sizeof(double)));
-    // 4. Host → Device 拷贝数据（带错误检查）
-    CHECK_CUDA_ERR(cudaMemcpy(input_d, input_h.data(), num_elems * sizeof(float), cudaMemcpyHostToDevice));
-    CHECK_CUDA_ERR(cudaMemcpy(mask_d, mask_h.data(), num_elems * sizeof(unsigned char), cudaMemcpyHostToDevice));
-    // 初始化输出显存为0（可选，确保初始值干净）
-    CHECK_CUDA_ERR(cudaMemset(dst_d, 0, dst_h.size() * sizeof(double)));
-    // 5. 调用CalSumOp<float, double>算子（指定输入float，输出double，使用默认流）
-    CalSumOp<float, double>(
-        input_d,
-        mask_d,
-        dst_d,
-        width,
-        height,
-        stride,
-        (cudaStream_t)0  // 使用CUDA默认流
-    );
-    // 等待CUDA核函数执行完成（必须加，避免结果未计算完成就读取）
-    CHECK_CUDA_ERR(cudaDeviceSynchronize());
-    // 6. Device → Host 拷贝结果（带错误检查）
-    CHECK_CUDA_ERR(cudaMemcpy(dst_h.data(), dst_d, dst_h.size() * sizeof(double), cudaMemcpyDeviceToHost));
-    // 7. 验证结果（预期求和：1 + 3 + 4 + 6 = 14）
-    std::cout << "CalSumOp<float, double> 运算结果：" << std::endl;
-    std::cout << "掩码筛选后的求和值 = " << dst_h[0] << std::endl;
-    // 8. 释放Device内存
-    cudaFree(input_d);
-    cudaFree(mask_d);
-    cudaFree(dst_d);
-    return 0;
-}
-```
-
-## 154. CountNoZeroOp
-
-### 支持的产品型号
-
-- - Metax C500/C550/C588/C600
-
-### 接口原型
-
-```cpp
-template<typename T, typename D>
-void CountNoZeroOp(
-    const T* __restrict input,
-    const unsigned char* __restrict mask,
-    D* __restrict dst,
-    int width,
-    int height,
-    int stride,
-    cudaStream_t stream
-);
-```
-
-### 功能描述
-
-CountNoZeroOp 算子实现了输入张量中非零元素的并行统计功能，支持结合掩码（mask）筛选特定位置后统计对应区域的非零元素数量。算子通过双版本 CUDA 核函数（带 mask/不带 mask）、共享内存缓存、线程同步与归约等优化手段，减少全局内存访问开销，提升并行计算效率，适用于张量有效元素计数的场景。
-
-- 计算公式：
-
-$$
-  \text{count}_{\text{non-zero}} = \sum_{i=0}^{\text{height}-1} \sum_{j=0}^{\text{width}-1} \mathbb{I}\left( \text{input}[i \times \text{stride} + j] \neq 0 \right)
-$$
-
-  若启用掩码（mask）筛选统计区域，计算公式为：
-
-$$
-  \text{count}_{\text{non-zero}}^{\text{masked}} = \sum_{i=0}^{\text{height}-1} \sum_{j=0}^{\text{width}-1} \mathbb{I}\left( \text{mask}[i \times \text{stride} + j] = 1 \land \text{input}[i \times \text{stride} + j] \neq 0 \right)
-$$
-
-  其中：
-
-- $\mathbb{I}(\cdot)$ 是指示函数，满足条件时取值为 $1$ ，否则为 $0$
-- $\text{input}[i \times \text{stride} + j] \in \mathbb{T}$ 是输入张量在 $(i, j)$ 位置的元素， $\mathbb{T}$ 为支持的数值类型（int、short、float、double、unsigned char 等）
-- $\text{mask}[i \times \text{stride} + j] \in \{0,1\}$ 是掩码张量在 $(i, j)$ 位置的元素， $1$ 表示统计该位置， $0$ 表示跳过
-- $\text{count}_{\text{non-zero}} \in \mathbb{D}$ 是无掩码时的非零元素总数， $\mathbb{D}$ 为整数类型（如 int32、int64）
-- $\text{count}_{\text{non-zero}}^{\text{masked}} \in \mathbb{D}$ 是带掩码时的非零元素总数
-- $\text{height} \in \mathbb{N}^+$ 是输入张量的高度维度大小
-- $\text{width} \in \mathbb{N}^+$ 是输入张量的宽度维度大小
-- $\text{stride} \in \mathbb{N}^+$ 是输入张量的内存步长（单行列数对应的内存偏移量，满足 $\text{stride} \geq \text{width}$ ）
-	并行计算时，算子将二维统计任务拆分到线程块/线程中，单线程负责的子区域计数归约公式为：
-
-$$
-  \text{count}_{\text{thread}} = \sum_{(i,j) \in \Omega_{\text{thread}}} \mathbb{I}\left( \text{cond}(i,j) \right)
-$$
-
-
-
-$$
-  \text{count}_{\text{non-zero}} = \sum_{\text{thread} \in \text{all\\_threads}} \text{count}_{\text{thread}}
-$$
-
-  其中：
-
-- $\Omega_{\text{thread}}$ 是单个线程负责统计的 $(i, j)$ 位置集合
-- $\text{cond}(i, j)$ 是统计条件（无掩码时为 $\text{input}[i \times \text{stride} + j] \neq 0$ ，带掩码时为 $\text{mask}[i \times \text{stride} + j] = 1 \land \text{input}[i \times \text{stride} + j] \neq 0$ ）
-- $\text{count}_{\text{thread}} \in \mathbb{D}$ 是单个线程统计得到的子区域非零元素数
-
-### 参数说明
-
-- **input** (const T* __restrict, 入参): 待统计的输入张量设备指针，存储原始数据
-- **mask** (const unsigned char* __restrict, 入参): 掩码张量设备指针，用于指定需统计的元素位置（可选，未启用时执行全量非零统计）
-- **dst** (D* __restrict, 出参): 输出张量设备指针，存储最终统计得到的非零元素总数
-- **width** (int, 入参): 输入张量的宽度维度大小
-- **height** (int, 入参): 输入张量的高度维度大小
-- **stride** (int, 入参): 输入张量的内存步长（单行列数对应的内存偏移量）
-- **stream** (cudaStream_t, 入参): CUDA 异步流，用于控制算子的执行流
-
-### 返回值
-
-无返回值，统计结果直接写入`dst`指针指向的设备存储区域
-
-### 约束与调用
-
-- 所有张量（input、mask、dst）必须分配在 CUDA 设备内存上
-- 模板参数`T`支持的数据类型：int、short、float、double、unsigned char 等（需与输入数据类型匹配）
-- 模板参数`D`需为整数类型（用于存储计数结果）
-- 若使用 mask，mask 的元素数量需与 input 的统计区域维度匹配
-- stride 需大于等于 width，确保张量内存布局的有效性
-- 核函数线程配置需符合模板参数（如 NM_THREADS）的约束
-
-### 调用示例
-
-```C++
-#include <iostream>
-#include <vector>
-#include <cuda_runtime.h>
-#include "utils.h"
-#include "count_nozero.h"  
-// 封装CUDA错误检查宏
-#define CHECK_CUDA_ERR(err) \
-    do { \
-        if (err != cudaSuccess) { \
-            std::cerr << "CUDA Error: " << cudaGetErrorString(err) \
-                      << " at line " << __LINE__ << std::endl; \
-            exit(1); \
-        } \
-    } while (0)
-int main() {
-    // 1. 定义输入参数
-    const int width = 3;    // 每行3个元素
-    const int height = 2;   // 共2行
-    const int stride = width;
-    const int num_elems = stride * height;
-    // 2. 构造Host端输入数据
-    // Input: [ 0.0, 1.5, 0.0, 
-    // -2.0, 0.0, 3.0 ]
-    std::vector<float> input_h = {0.0f, 1.5f, 0.0f, -2.0f, 0.0f, 3.0f};
-    // Mask: [ 1, 1, 1,
-    //         1, 1, 0 ]-> 最后一个元素(3.0)被mask掉，应该不参与计数
-    std::vector<unsigned char> mask_h = {1, 1, 1, 1, 1, 0};
-    // Output: 注意这里改为 int，因为截图显示 CountNoZeroOp<float, int>
-    std::vector<int> dst_h(1, 0); 
-    // 3. 分配Device端内存
-    float* input_d = nullptr;
-    unsigned char* mask_d = nullptr;
-    int* dst_d = nullptr;
-    CHECK_CUDA_ERR(cudaMalloc(&input_d, num_elems * sizeof(float)));
-    CHECK_CUDA_ERR(cudaMalloc(&mask_d, num_elems * sizeof(unsigned char)));
-    CHECK_CUDA_ERR(cudaMalloc(&dst_d, dst_h.size() * sizeof(int)));
-    // 4. Host → Device 拷贝数据
-    CHECK_CUDA_ERR(cudaMemcpy(input_d, input_h.data(), num_elems * sizeof(float), cudaMemcpyHostToDevice));
-    CHECK_CUDA_ERR(cudaMemcpy(mask_d, mask_h.data(), num_elems * sizeof(unsigned char), cudaMemcpyHostToDevice));
-    CHECK_CUDA_ERR(cudaMemset(dst_d, 0, dst_h.size() * sizeof(int))); // 初始化输出为0
-    // 5. 调用 CountNoZeroOp<float, int> 算子
-    // 根据截图第157行：template void CountNoZeroOp<float, int>(...)
-    CountNoZeroOp<float, int>(
-        input_d,
-        mask_d,     // 如果传 nullptr，则对应截图代码里的 else 分支（无mask模式）
-        dst_d,
-        width,
-        height,
-        stride,
-        (cudaStream_t)0
-    );
-    // 等待核函数完成
-    CHECK_CUDA_ERR(cudaDeviceSynchronize());
-    // 6. Device → Host 拷贝结果
-    CHECK_CUDA_ERR(cudaMemcpy(dst_h.data(), dst_d, dst_h.size() * sizeof(int), cudaMemcpyDeviceToHost));
-    // 预期结果: 2
-    std::cout << "CountNoZeroOp<float, int> 运算结果：" << std::endl;
-    std::cout << "非零元素个数 (经过Mask筛选) = " << dst_h[0] << std::endl;
-    // 8. 释放内存
-    cudaFree(input_d);
-    cudaFree(mask_d);
-    cudaFree(dst_d);
-    return 0;
-}
-```
-
-## 155. MeanStdevOp
-
-### 支持的产品型号
-
-- Metax C500/C550/C588/C600
-
-### 接口原型
-
-```cpp
-template<typename T, typename D>
-void MeanStdevOp(
-    const T* __restrict input,
-    D* __restrict mean,
-    D* __restrict std,
-    int width,
-    int height,
-    int stride,
-    cudaStream_t stream
-);
-```
-
-### 功能描述
-
-MeanStdevOp 算子实现了输入张量的**均值与标准差**的 CUDA 并行计算。该算子分两步完成：
-
-1. 对输入数据做并行求和，计算出张量的均值；
-2. 基于均值计算每个元素与均值差的平方和，进一步得到标准差。
-	这种并行化实现减少了计算耗时，常用于数据预处理、模型特征归一化等需要统计量的场景。
-
-- 计算公式：
-
-$$
-  \mu = \frac{1}{W \times H} \sum_{i=0}^{H-1} \sum_{j=0}^{W-1} x_{i,j}
-$$
-
-
-
-$$
-  \sigma = \sqrt{\frac{1}{W \times H} \sum_{i=0}^{H-1} \sum_{j=0}^{W-1} (x_{i,j} - \mu)^2}
-$$
-
-  其中：
-
-- $x_{i, j} \in \mathbb{R}$ 是输入张量 $\text{input}$ 中第 $i$ 行第 $j$ 列的有效元素，实际存储位置为 $\text{input}[i \times \text{stride} + j]$
-- $\mu \in \mathbb{R}$ 是输入张量所有有效元素的均值，计算结果写入 $\text{mean}$ 指针指向的 CUDA 设备内存
-- $\sigma \in \mathbb{R}$ 是输入张量所有有效元素的总体标准差，计算结果写入 $\text{std}$ 指针指向的 CUDA 设备内存
-- $W \in \mathbb{N}^+$ 是输入张量的有效宽度（对应算子参数 $\text{width}$ ）
-- $H \in \mathbb{N}^+$ 是输入张量的高度（对应算子参数 $\text{height}$ ）
-- $\text{stride} \in \mathbb{N}^+$ 是输入张量的存储步长（每行实际存储的元素数，需满足 $\text{stride} \geq W$ ）
-- $\mathbb{N}^+$ 表示正整数集合
-	若需计算样本标准差（除以 $W \times H - 1$ ），算子可扩展为：
-
-$$
-  \sigma_{\text{sample}} = \sqrt{\frac{1}{W \times H - 1} \sum_{i=0}^{H-1} \sum_{j=0}^{W-1} (x_{i,j} - \mu)^2}
-$$
-
-  其中 $\sigma_{\text{sample}} \in \mathbb{R}$ 为样本标准差，适用于小批量数据统计场景。
-
-### 参数说明
-
-- **input** (const T* __restrict, 入参): 待计算统计量的设备端输入张量指针
-- **mean** (D* __restrict, 出参): 存储计算结果的设备端均值指针
-- **std** (D* __restrict, 出参): 存储计算结果的设备端标准差指针
-- **width** (int, 入参): 输入张量的有效宽度（每行有效元素数）
-- **height** (int, 入参): 输入张量的高度（行数）
-- **stride** (int, 入参): 输入张量的存储步长（每行实际存储的元素数，含填充）
-- **stream** (cudaStream_t, 入参): 执行计算的 CUDA 流（管理异步任务队列）
-
-### 约束与调用
-
-- 所有张量（input、mean、std）必须位于 CUDA 设备内存中
-- 支持的数据类型：模板参数 T/D 兼容 float 等数值类型（代码包含 float 的特化实现）
-- 需满足`stride ≥ width`（步长需不小于有效宽度，匹配存储布局）
-- **stream**需为有效的 CUDA 流对象（可传`cudaStreamDefault`使用默认流）
-
-### 调用示例
-
-```C++
-#include <iostream>
-#include <vector>
-#include <cuda_runtime.h>
-#include "utils.h"
-#include "meanstdev.h"  
-// 封装CUDA错误检查宏（避免隐藏bug）
-#define CHECK_CUDA_ERR(err) \
-    do { \
-        if (err != cudaSuccess) { \
-            std::cerr << "CUDA Error: " << cudaGetErrorString(err) \
-                      << " at line " << __LINE__ << std::endl; \
-            exit(1); \
-        } \
-    } while (0)
-int main() {
-    // 1. 定义输入参数（2x2矩阵，连续存储无填充）
-    const int width = 2;     // 有效宽度
-    const int height = 2;    // 高度
-    const int stride = width;// 存储步长（无填充，等于有效宽度）
-    const int num_elems = stride * height; // 总存储元素数
-    // 2. 构造Host端输入数据（2x2矩阵：[[1.0, 2.0], [3.0, 4.0]]）
-    // 预期均值：(1+2+3+4)/4 = 2.5；预期总体标准差：sqrt(5/4) ≈ 1.11803
-    std::vector<float> input_h = {1.0f, 2.0f, 3.0f, 4.0f};
-    // Host端存储均值/标准差的变量
-    float mean_h = 0.0f;
-    float std_h = 0.0f;
-    // 3. 分配Device端内存（带错误检查）
-    float* input_d = nullptr;  // 输入张量设备内存
-    float* mean_d = nullptr;   // 均值结果设备内存（单个值）
-    float* std_d = nullptr;    // 标准差结果设备内存（单个值）
-    CHECK_CUDA_ERR(cudaMalloc(&input_d, num_elems * sizeof(float)));
-    CHECK_CUDA_ERR(cudaMalloc(&mean_d, sizeof(float)));
-    CHECK_CUDA_ERR(cudaMalloc(&std_d, sizeof(float)));
-    // 4. Host → Device 拷贝输入数据（带错误检查）
-    CHECK_CUDA_ERR(cudaMemcpy(input_d, input_h.data(), num_elems * sizeof(float), cudaMemcpyHostToDevice));
-    // 5. 调用MeanStdevOp算子（模板参数T=float, D=float；使用默认CUDA流）
-    MeanStdevOp<float, float>(
-        input_d, 
-        mean_d, 
-        std_d, 
-        width, 
-        height, 
-        stride, 
-        cudaStreamDefault  // 显式使用默认流，替代(0)更规范
-    );
-    // 等待CUDA核函数执行完成（必须加，确保结果就绪）
-    CHECK_CUDA_ERR(cudaDeviceSynchronize());
-    // 6. Device → Host 拷贝结果（均值+标准差）
-    CHECK_CUDA_ERR(cudaMemcpy(&mean_h, mean_d, sizeof(float), cudaMemcpyDeviceToHost));
-    CHECK_CUDA_ERR(cudaMemcpy(&std_h, std_d, sizeof(float), cudaMemcpyDeviceToHost));
-    // 7. 验证/打印结果
-    std::cout << "MeanStdevOp<float, float> 运算结果：" << std::endl;
-    std::cout << "输入矩阵：" << std::endl;
-    for (int i = 0; i < height; ++i) {
-        for (int j = 0; j < width; ++j) {
-            std::cout << input_h[i * stride + j] << " ";
-        }
-        std::cout << std::endl;
-    }
-    std::cout << "计算得到的均值：" << mean_h << "（预期：2.5）" << std::endl;
-    std::cout << "计算得到的总体标准差：" << std_h << "（预期≈1.11803）" << std::endl;
-    // 8. 释放Device内存
-    CHECK_CUDA_ERR(cudaFree(input_d));
-    CHECK_CUDA_ERR(cudaFree(mean_d));
-    CHECK_CUDA_ERR(cudaFree(std_d));
-    return 0;
-}
-```
-
-## 156. fused_postprocess_yuv420
-
-### 支持的产品型号
-
-- Metax C500/C550/C588/C600
-
-### 接口原型
-
-```c
-void fused_postprocess_yuv420(
-    const float* __restrict inputData,
-    uint8_t* __restrict yuv420Data,
-    int width,
-    int height,
-    float scale,
-    cudaStream_t stream
-);
-```
-
-### 功能描述
-
-fused_postprocess_yuv420 是融合式后处理算子，负责将输入的 float 类型数据转换为 YUV420 格式的图像数据。过程集成了颜色空间转换、数据缩放等步骤，通过融合操作减少内存访问次数，提升计算效率；基于 CUDA 执行，支持通过 CUDA 流实现异步计算。
-
-- 计算公式：
-	该算子实现 $float$ 类型 RGB 数据到 $uint8_t$ 类型 YUV420 格式的转换，包含数据缩放、颜色空间转换与格式排布：
-
-$$
-  R' = \text{round}(inputData_{(y,x,0)} \times scale),\ G' = \text{round}(inputData_{(y,x,1)} \times scale),\ B' = \text{round}(inputData_{(y,x,2)} \times scale)
-$$
-
-
-
-$$
-  R' = \max(0, \min(255, R')),\ G' = \max(0, \min(255, G')),\ B' = \max(0, \min(255, B'))
-$$
-
-
-
-$$
-  Y(x,y) = 0.299 \times R' + 0.587 \times G' + 0.114 \times B'
-$$
-
-
-
-$$
-  U(x,y) = -0.147 \times R' - 0.289 \times G' + 0.436 \times B' + 128
-$$
-
-
-
-$$
-  V(x,y) = 0.615 \times R' - 0.515 \times G' - 0.100 \times B' + 128
-$$
-
-
-
-$$
-  \text{yuv420Data}[y \times width + x] = \text{round}(Y(x,y))
-$$
-
-
-
-$$
-  \text{yuv420Data}[height \times width + (y//2) \times (width//2) + (x//2)] = \text{round}(\text{avg}_{2×2}U(x,y))
-$$
-
-
-
-$$
-  \text{yuv420Data}[height \times width + \frac{height \times width}{4} + (y//2) \times (width//2) + (x//2)] = \text{round}(\text{avg}_{2×2}V(x,y))
-$$
-
-  其中：
-
-- $inputData \in \mathbb{R}^{height \times width \times 3}$ ： $float$ 类型输入张量，存储每个像素的 $R、G、B$ 通道值（对应索引 $0、1、2$ ）
-- $yuv420Data \in \mathbb{U}^{height \times width + \frac{height \times width}{2}}$ ： $uint8_t$ 类型输出张量，存储 YUV420 格式数据
-- $width, height \in \mathbb{N}^+$ ：目标图像的宽度与高度
-- $scale \in \mathbb{R}^+$ ：输入数据的缩放因子
-- $R', G', B' \in \mathbb{N}$ ：缩放并裁剪后的 RGB 通道值，范围 $[0,255]$
-- $Y (x, y), U (x, y), V (x, y) \in \mathbb{R}$ ：转换后的 YUV 分量值
-- $\text{avg}_{2×2}U (x, y)$ ： $2×2$ 像素块内 $U$ 分量的均值
-- $\text{avg}_{2×2}V (x, y)$ ： $2×2$ 像素块内 $V$ 分量的均值
-
-### 参数说明
-
-- **inputData** (const float* __restrict, 入参): 待处理的 float 类型输入张量，存储原始数据
-- **yuv420Data** (uint8_t* __restrict, 出参): 输出缓冲区，存储转换后的 YUV420 格式图像数据（uint8_t 类型）
-- **width** (int, 入参): 目标图像的宽度
-- **height** (int, 入参): 目标图像的高度
-- **scale** (float, 入参): 数据缩放因子，用于调整输入数据的数值范围
-- **stream** (cudaStream_t, 入参): CUDA 流对象，指定算子异步执行的流
-
-### 约束与调用
-
-- 所有指针对应的内存必须位于 CUDA 设备上
-- inputData 的维度需与 width、height 对应的图像数据量匹配
-- 支持的输入类型：float；输出类型：uint8_t
-
-### 调用示例
-
-```cpp
-#include <iostream>
-#include <vector>
-#include <cuda_runtime.h>
-#include "utils.h"
-#include "process_interface.h"  
-int main() {
-    // 1. 定义输入参数（2x2 RGB图像，简化验证）
-    const int width = 2;                 // 图像宽度
-    const int height = 2;                // 图像高度
-    const float scale = 255.0f;          // 缩放因子（将float[0,1]映射到uint8[0,255]）
-    const int input_elems = height * width * 3;  // RGB输入元素数（2*2*3=12）
-    // YUV420输出大小：Y(2*2) + U(1*1) + V(1*1) = 6字节
-    const int yuv420_elems = height * width + (height/2)*(width/2) + (height/2)*(width/2);
-    // 2. 构造Host端输入数据（RGB全1.0f，缩放后为255）
-    std::vector<float> inputData_h(input_elems, 1.0f);  
-    // 存储YUV420结果的Host数组
-    std::vector<uint8_t> yuv420Data_h(yuv420_elems, 0);  
-    // 3. 分配Device端内存（带错误检查）
-    float* inputData_d = nullptr;
-    uint8_t* yuv420Data_d = nullptr;
-    CHECK_CUDA_ERR(cudaMalloc(&inputData_d, input_elems * sizeof(float)));
-    CHECK_CUDA_ERR(cudaMalloc(&yuv420Data_d, yuv420_elems * sizeof(uint8_t)));
-    // 4. Host → Device 拷贝数据
-    CHECK_CUDA_ERR(cudaMemcpy(inputData_d, inputData_h.data(), input_elems * sizeof(float), cudaMemcpyHostToDevice));
-    // 5. 创建CUDA流并调用算子
-    cudaStream_t stream = nullptr;
-    CHECK_CUDA_ERR(cudaStreamCreate(&stream));
-    fused_postprocess_yuv420(inputData_d, yuv420Data_d, width, height, scale, stream);
-    // 等待CUDA流执行完成
-    CHECK_CUDA_ERR(cudaStreamSynchronize(stream));
-    // 6. Device → Host 拷贝结果
-    CHECK_CUDA_ERR(cudaMemcpy(yuv420Data_h.data(), yuv420Data_d, yuv420_elems * sizeof(uint8_t), cudaMemcpyDeviceToHost));
-    // 7. 验证结果（预期：Y全255，U/V均为128）
-    std::cout << "fused_postprocess_yuv420 运算结果：" << std::endl;
-    std::cout << "Y分量：";
-    for (int i = 0; i < height*width; ++i) {
-        std::cout << (int)yuv420Data_h[i] << " ";
-    }
-    std::cout << "\nU分量：" << (int)yuv420Data_h[height*width] << std::endl;
-    std::cout << "V分量：" << (int)yuv420Data_h[height*width + 1] << std::endl;
-    // 8. 释放资源
-    cudaStreamDestroy(stream);
-    cudaFree(inputData_d);
-    cudaFree(yuv420Data_d);
-    return 0;
-}
-```
-
-## 157. fused_postprocess_nv12
-
-### 支持的产品型号
-
-- Metax C500/C550/C588/C600
-
-### 接口原型
-
-```cpp
-void fused_postprocess_nv12(
-    const float* __restrict inputData,
-    uint8_t* __restrict nv12Data,
-    int width,
-    int height,
-    float scale,
-    cudaStream_t stream
-);
-```
-
-### 功能描述
-
-fused_postprocess_nv12 是融合式后处理算子，负责将输入的 float 类型数据转换为 NV12 格式的图像数据。集成了颜色空间转换、数据缩放等步骤，通过融合操作优化性能；基于 CUDA 执行，支持通过 CUDA 流实现异步计算。
-
-- 计算公式：
-	该算子实现 $float$ 类型 RGB 数据到 $uint8_t$ 类型 NV12 格式的转换，包含数据缩放、颜色空间转换与格式排布：
-
-$$
-  R' = \text{round}(inputData_{(y,x,0)} \times scale),\ G' = \text{round}(inputData_{(y,x,1)} \times scale),\ B' = \text{round}(inputData_{(y,x,2)} \times scale)
-$$
-
-
-
-$$
-  R' = \max(0, \min(255, R')),\ G' = \max(0, \min(255, G')),\ B' = \max(0, \min(255, B'))
-$$
-
-
-
-$$
-  Y(x,y) = 0.299 \times R' + 0.587 \times G' + 0.114 \times B'
-$$
-
-
-
-$$
-  U(x,y) = -0.147 \times R' - 0.289 \times G' + 0.436 \times B' + 128
-$$
-
-
-
-$$
-  V(x,y) = 0.615 \times R' - 0.515 \times G' - 0.100 \times B' + 128
-$$
-
-
-
-$$
-  \text{nv12Data}[y \times width + x] = \text{round}(Y(x,y))
-$$
-
-
-
-$$
-  \text{nv12Data}[height \times width + 2 \times [(y//2) \times (width//2) + (x//2)]] = \text{round}(\text{avg}_{2×2}U(x,y))
-$$
-
-
-
-$$
-  \text{nv12Data}[height \times width + 2 \times [(y//2) \times (width//2) + (x//2)] + 1] = \text{round}(\text{avg}_{2×2}V(x,y))
-$$
-
-  其中：
-
-- $inputData \in \mathbb{R}^{height \times width \times 3}$ ： $float$ 类型输入张量，存储每个像素的 $R、G、B$ 通道值（对应索引 $0、1、2$ ）
-- $nv12Data \in \mathbb{U}^{height \times width + \frac{height \times width}{2}}$ ： $uint8_t$ 类型输出张量，存储 NV12 格式数据
-- $width, height \in \mathbb{N}^+$ ：目标图像的宽度与高度
-- $scale \in \mathbb{R}^+$ ：输入数据的缩放因子
-- $R', G', B' \in \mathbb{N}$ ：缩放并裁剪后的 RGB 通道值，范围 $[0,255]$
-- $Y (x, y), U (x, y), V (x, y) \in \mathbb{R}$ ：转换后的 YUV 分量值
-- $\text{avg}_{2×2}U (x, y)$ ： $2×2$ 像素块内 $U$ 分量的均值
-- $\text{avg}_{2×2}V (x, y)$ ： $2×2$ 像素块内 $V$ 分量的均值
-
-### 参数说明
-
-- **inputData** (const float* __restrict, 入参): 待处理的 float 类型输入张量，存储原始数据
-- **nv12Data** (uint8_t* __restrict, 出参): 输出缓冲区，存储转换后的 NV12 格式图像数据（uint8_t 类型）
-- **width** (int, 入参): 目标图像的宽度
-- **height** (int, 入参): 目标图像的高度
-- **scale** (float, 入参): 数据缩放因子，用于调整输入数据的数值范围
-- **stream** (cudaStream_t, 入参): CUDA 流对象，指定算子异步执行的流
-
-### 约束与调用
-
-- 所有指针对应的内存必须位于 CUDA 设备上
-- inputData 的维度需与 width、height 对应的图像数据量匹配
-- 支持的输入类型：float；输出类型：uint8_t
-
-### 调用示例
-
-```cpp
-#include <iostream>
-#include <vector>
-#include <cuda_runtime.h>
-#include "utils.h"
-#include "process_interface.h"  
-int main() {
-    // 1. 定义输入参数（2x2 RGB图像，简化验证）
-    const int width = 2;                 // 图像宽度
-    const int height = 2;                // 图像高度
-    const float scale = 255.0f;          // 缩放因子（将float[0,1]映射到uint8[0,255]）
-    const int input_elems = height * width * 3;  // RGB输入元素数（2*2*3=12）
-    // NV12输出大小：Y(2*2) + UV(1*1*2) = 6字节
-    const int nv12_elems = height * width + (height/2)*(width/2)*2;
-    // 2. 构造Host端输入数据（RGB全1.0f，缩放后为255）
-    std::vector<float> inputData_h(input_elems, 1.0f);  
-    // 存储NV12结果的Host数组
-    std::vector<uint8_t> nv12Data_h(nv12_elems, 0);  
-    // 3. 分配Device端内存（带错误检查）
-    float* inputData_d = nullptr;
-    uint8_t* nv12Data_d = nullptr;
-    CHECK_CUDA_ERR(cudaMalloc(&inputData_d, input_elems * sizeof(float)));
-    CHECK_CUDA_ERR(cudaMalloc(&nv12Data_d, nv12_elems * sizeof(uint8_t)));
-    // 4. Host → Device 拷贝数据
-    CHECK_CUDA_ERR(cudaMemcpy(inputData_d, inputData_h.data(), input_elems * sizeof(float), cudaMemcpyHostToDevice));
-    // 5. 创建CUDA流并调用算子
-    cudaStream_t stream = nullptr;
-    CHECK_CUDA_ERR(cudaStreamCreate(&stream));
-    fused_postprocess_nv12(inputData_d, nv12Data_d, width, height, scale, stream);
-    // 等待CUDA流执行完成
-    CHECK_CUDA_ERR(cudaStreamSynchronize(stream));
-    // 6. Device → Host 拷贝结果
-    CHECK_CUDA_ERR(cudaMemcpy(nv12Data_h.data(), nv12Data_d, nv12_elems * sizeof(uint8_t), cudaMemcpyDeviceToHost));
-    // 7. 验证结果（预期：Y全255，U=128、V=128）
-    std::cout << "fused_postprocess_nv12 运算结果：" << std::endl;
-    std::cout << "Y分量：";
-    for (int i = 0; i < height*width; ++i) {
-        std::cout << (int)nv12Data_h[i] << " ";
-    }
-    std::cout << "\nU分量：" << (int)nv12Data_h[height*width] << std::endl;
-    std::cout << "V分量：" << (int)nv12Data_h[height*width + 1] << std::endl;
-    // 8. 释放资源
-    cudaStreamDestroy(stream);
-    cudaFree(inputData_d);
-    cudaFree(nv12Data_d);
-    return 0;
-}
-```
-
-## 158. fused_preprocess_yuv420
-
-### 支持的产品型号
-
-- Metax C500/C550/C588/C600
-
-### 接口原型
-
-```cpp
-void fused_preprocess_yuv420(
-    const uint8_t* __restrict yuv420Data,
-    float* __restrict outputData,
-    int width,
-    int height,
-    float scale,
-    cudaStream_t stream
-);
-```
-
-### 功能描述
-
-fused_preprocess_yuv420 算子实现了 YUV420 格式图像数据的融合预处理操作，包含 YUV 颜色空间转换、数值归一化（偏移、范围裁剪）及缩放等步骤。通过融合多步操作降低内存访问开销，提升了图像预处理效率，适用于图像/视频类 AI 模型的输入预处理环节。
-
-- 计算公式：
-
-$$
-  \begin{align*}
-  &\text{Step 1: 提取YUV420格式Y/U/V分量} \\
-  &Y(i,j) = \text{yuv420Data}[i \times \text{width} + j] \\
-  &U(i,j) = \text{yuv420Data}\left[\text{width} \times \text{height} + \left\lfloor \frac{i}{2} \right\rfloor \times \frac{\text{width}}{2} + \left\lfloor \frac{j}{2} \right\rfloor\right] \\
-  &V(i,j) = \text{yuv420Data}\left[\text{width} \times \text{height} \times 5/4 + \left\lfloor \frac{i}{2} \right\rfloor \times \frac{\text{width}}{2} + \left\lfloor \frac{j}{2} \right\rfloor\right] \\
-  &\text{Step 2: YUV420转RGB（BT.601标准）} \\
-  &R(i,j) = 1.164 \times (Y(i,j)-16) + 1.596 \times (V(i,j)-128) \\
-  &G(i,j) = 1.164 \times (Y(i,j)-16) - 0.813 \times (V(i,j)-128) - 0.391 \times (U(i,j)-128) \\
-  &B(i,j) = 1.164 \times (Y(i,j)-16) + 2.018 \times (U(i,j)-128) \\
-  &\text{Step 3: 数值裁剪与缩放} \\
-  &R_{\text{norm}}(i,j) = \text{clip}\left(R(i,j), 0, 255\right) \times \frac{\text{scale}}{255} \\
-  &G_{\text{norm}}(i,j) = \text{clip}\left(G(i,j), 0, 255\right) \times \frac{\text{scale}}{255} \\
-  &B_{\text{norm}}(i,j) = \text{clip}\left(B(i,j), 0, 255\right) \times \frac{\text{scale}}{255} \\
-  &\text{Step 4: 输出赋值} \\
-  &\text{outputData}[i \times \text{width} \times 3 + j \times 3 + c] = 
-  \begin{cases}
-  R_{\text{norm}}(i,j) & c=0 \\
-  G_{\text{norm}}(i,j) & c=1 \\
-  B_{\text{norm}}(i,j) & c=2
-  \end{cases}
-  \end{align*}
-$$
-
-  其中：
-
-- $Y (i, j) \in \mathbb{Z}_{[0,255]}$ 是 YUV420 格式中位置 $(i, j)$ 的亮度分量
-- $U (i, j) \in \mathbb{Z}_{[0,255]}$ 是 YUV420 格式中位置 $(i, j)$ 的蓝色色度分量（色度 U）
-- $V (i, j) \in \mathbb{Z}_{[0,255]}$ 是 YUV420 格式中位置 $(i, j)$ 的红色色度分量（色度 V）
-- $i \in [0, \text{height}-1]$ 是图像行索引， $j \in [0, \text{width}-1]$ 是图像列索引
-- $\text{clip}(x, a, b) = \max\left (\min (x, b), a\right)$ 是数值裁剪函数，限制 $x$ 在 $[a, b]$ 范围内
-- $c \in \{0,1,2\}$ 是输出通道索引（0=R、1=G、2=B）
-- $\text{width} \in \mathbb{Z}_{>0}$ 是输入图像宽度， $\text{height} \in \mathbb{Z}_{>0}$ 是输入图像高度
-- $\text{scale} \in \mathbb{R}$ 是输出数据的缩放系数
-- $\text{yuv420Data} \in \mathbb{U8}^{(\text{width} \times \text{height} \times 3/2)}$ 是 YUV420 格式输入数据（CUDA 设备内存）
-- $\text{outputData} \in \mathbb{R}^{(\text{width} \times \text{height} \times 3)}$ 是预处理后输出数据（CUDA 设备内存）
-
-### 参数说明
-
-- **yuv420Data** (const uint8_t* __restrict, 入参): YUV420 格式的输入图像数据指针，需位于 CUDA 设备内存
-- **outputData** (float* __restrict, 出参): 预处理后的输出数据指针，结果写入该 CUDA 设备内存地址
-- **width** (int, 入参): 输入图像的宽度
-- **height** (int, 入参): 输入图像的高度
-- **scale** (float, 入参): 预处理后数据的缩放系数
-- **stream** (cudaStream_t, 入参): CUDA 流，用于指定算子的异步执行流
-
-### 返回值
-
-无返回值，预处理结果直接写入`outputData`指针指向的内存。
-
-### 约束与调用
-
-- 所有数据指针（`yuv420Data`、`outputData`）必须位于 CUDA 设备内存
-- 输入数据需严格符合 YUV420 格式（Y 分量占`width×height`字节，U、V 分量各占`width×height/4`字节）
-- `width`、`height`需为正偶数（符合 YUV420 分辨率要求）
-- `stream`需为有效的`cudaStream_t`对象
-- 支持输入类型：`uint8_t`；输出类型：`float`
-
-### 调用示例
-
-```cpp
-#include <iostream>
-#include <vector>
-#include <cuda_runtime.h>
-#include "utils.h"
-#include "process_interface.h"  
-int main() {
-    // 1. 定义输入参数（选偶数分辨率，符合YUV420格式要求）
-    const int width = 32;          // 图像宽度（偶数）
-    const int height = 32;         // 图像高度（偶数）
-    const float scale = 1.0f / 255.0f;  // 归一化缩放系数
-    // YUV420数据大小：Y(width*height) + U(width*height/4) + V(width*height/4)
-    const size_t yuv420_data_size = width * height * 3 / 2;
-    // 输出数据大小：RGB三通道，float类型
-    const size_t output_data_size = width * height * 3 * sizeof(float);
-    // 2. 构造Host端输入数据（简单初始化YUV420数据）
-    std::vector<uint8_t> yuv420_data_h(yuv420_data_size, 128);  // 初始化为灰度值128
-    // 输出Host数组（存储RGB结果）
-    std::vector<float> output_data_h(width * height * 3, 0.0f);
-    // 3. 分配Device端内存
-    uint8_t* yuv420_data_d = nullptr;
-    float* output_data_d = nullptr;
-    CHECK_CUDA_ERR(cudaMalloc(&yuv420_data_d, yuv420_data_size));
-    CHECK_CUDA_ERR(cudaMalloc(&output_data_d, output_data_size));
-    // 4. Host → Device 拷贝数据
-    CHECK_CUDA_ERR(cudaMemcpy(yuv420_data_d, yuv420_data_h.data(), yuv420_data_size, 
-                              cudaMemcpyHostToDevice));
-    // 5. 创建CUDA流（可选，也可传0使用默认流）
-    cudaStream_t stream;
-    CHECK_CUDA_ERR(cudaStreamCreate(&stream));
-    // 6. 调用fused_preprocess_yuv420算子
-    fused_preprocess_yuv420(yuv420_data_d, output_data_d, width, height, scale, stream);
-    // 7. 等待CUDA流执行完成
-    CHECK_CUDA_ERR(cudaStreamSynchronize(stream));
-    // 8. Device → Host 拷贝结果
-    CHECK_CUDA_ERR(cudaMemcpy(output_data_h.data(), output_data_d, output_data_size, 
-                              cudaMemcpyDeviceToHost));
-    // 9. 验证结果（打印前10个输出值）
-    std::cout << "fused_preprocess_yuv420 运算结果（前10个RGB值）：" << std::endl;
-    for (int i = 0; i < 10; ++i) {
-        std::cout << output_data_h[i] << " ";
-    }
-    std::cout << std::endl;
-    // 10. 释放资源
-    CHECK_CUDA_ERR(cudaStreamDestroy(stream));
-    cudaFree(yuv420_data_d);
-    cudaFree(output_data_d);
-    return 0;
-}
-```
-
-## 159. fused_preprocess_nv12
-
-### 支持的产品型号
-
-- Metax C500/C550/C588/C600
-
-### 接口原型
-
-```cpp
-void fused_preprocess_nv12(
-    const uint8_t* __restrict nv12Data,
-    float* __restrict outputData,
-    int width,
-    int height,
-    float scale,
-    cudaStream_t stream
-);
-```
-
-### 功能描述
-
-fused_preprocess_nv12 算子实现了 NV12 格式图像数据的融合预处理操作，包含 YUV 颜色空间转换、数值归一化（偏移、范围裁剪）及缩放等步骤。通过融合多步操作减少内存访问次数，提升了图像预处理的计算效率，常用于图像/视频类 AI 模型的输入预处理阶段。
-
-- 计算公式：
-
-$$
-  \begin{align*}
-  &\text{Step 1: 提取NV12格式Y/U/V分量} \\
-  &Y(i,j) = \text{nv12Data}[i \times \text{width} + j] \\
-  &\text{uv\\_idx} = \text{width} \times \text{height} + \left\lfloor \frac{i}{2} \right\rfloor \times \text{width} + \left\lfloor \frac{j}{2} \right\rfloor \times 2 \\
-  &U(i,j) = \text{nv12Data}[\text{uv\\_idx}] \\
-  &V(i,j) = \text{nv12Data}[\text{uv\\_idx}+1] \\
-  &\text{Step 2: YUV420(NV12)转RGB（BT.601标准）} \\
-  &R(i,j) = 1.164 \times (Y(i,j)-16) + 1.596 \times (V(i,j)-128) \\
-  &G(i,j) = 1.164 \times (Y(i,j)-16) - 0.813 \times (V(i,j)-128) - 0.391 \times (U(i,j)-128) \\
-  &B(i,j) = 1.164 \times (Y(i,j)-16) + 2.018 \times (U(i,j)-128) \\
-  &\text{Step 3: 数值裁剪与缩放} \\
-  &R_{\text{norm}}(i,j) = \text{clip}\left(R(i,j), 0, 255\right) \times \frac{\text{scale}}{255} \\
-  &G_{\text{norm}}(i,j) = \text{clip}\left(G(i,j), 0, 255\right) \times \frac{\text{scale}}{255} \\
-  &B_{\text{norm}}(i,j) = \text{clip}\left(B(i,j), 0, 255\right) \times \frac{\text{scale}}{255} \\
-  &\text{Step 4: 输出赋值} \\
-  &\text{outputData}[i \times \text{width} \times 3 + j \times 3 + c] = 
-  \begin{cases}
-  R_{\text{norm}}(i,j) & c=0 \\
-  G_{\text{norm}}(i,j) & c=1 \\
-  B_{\text{norm}}(i,j) & c=2
-  \end{cases}
-  \end{align*}
-$$
-
-  其中：
-
-- $Y (i, j) \in \mathbb{Z}_{[0,255]}$ 是 NV12 格式中位置 $(i, j)$ 的亮度分量
-- $U (i, j) \in \mathbb{Z}_{[0,255]}$ 是 NV12 格式中位置 $(i, j)$ 的蓝色色度分量（色度 U）
-- $V (i, j) \in \mathbb{Z}_{[0,255]}$ 是 NV12 格式中位置 $(i, j)$ 的红色色度分量（色度 V）
-- $i \in [0, \text{height}-1]$ 是图像行索引， $j \in [0, \text{width}-1]$ 是图像列索引
-- $\text{clip}(x, a, b) = \max\left (\min (x, b), a\right)$ 是数值裁剪函数，限制 $x$ 在 $[a, b]$ 范围内
-- $c \in \{0,1,2\}$ 是输出通道索引（0=R、1=G、2=B）
-- $\text{width} \in \mathbb{Z}_{>0}$ 是输入图像宽度， $\text{height} \in \mathbb{Z}_{>0}$ 是输入图像高度
-- $\text{scale} \in \mathbb{R}$ 是输出数据的缩放系数
-- $\text{nv12Data} \in \mathbb{U8}^{(\text{width} \times \text{height} \times 3/2)}$ 是 NV12 格式输入数据（CUDA 设备内存）
-- $\text{outputData} \in \mathbb{R}^{(\text{width} \times \text{height} \times 3)}$ 是预处理后输出数据（CUDA 设备内存）
-
-### 参数说明
-
-- **nv12Data** (const uint8_t* __restrict, 入参): NV12 格式的输入图像数据指针，需位于 CUDA 设备内存
-- **outputData** (float* __restrict, 出参): 预处理后的输出数据指针，结果写入该 CUDA 设备内存地址
-- **width** (int, 入参): 输入图像的宽度
-- **height** (int, 入参): 输入图像的高度
-- **scale** (float, 入参): 预处理后数据的缩放系数
-- **stream** (cudaStream_t, 入参): CUDA 流，用于指定算子的异步执行流
-
-### 返回值
-
-无返回值，预处理结果直接写入`outputData`指针指向的内存。
-
-### 约束与调用
-
-- 所有数据指针（`nv12Data`、`outputData`）必须位于 CUDA 设备内存
-- 输入数据需严格符合 NV12 格式（Y 分量占`width×height`字节，UV 分量交替存储占`width×height/2`字节）
-- `width`、`height`需为正偶数（符合 NV12 分辨率要求）
-- `stream`需为有效的`cudaStream_t`对象
-- 支持输入类型：`uint8_t`；输出类型：`float`
-
-### 调用示例
-
-```cpp
-#include <iostream>
-#include <vector>
-#include <cuda_runtime.h>
-#include "utils.h"
-#include "process_interface.h"  
-int main() {
-    // 1. 定义输入参数（选偶数分辨率，符合NV12格式要求）
-    const int width = 32;          // 图像宽度（偶数）
-    const int height = 32;         // 图像高度（偶数）
-    const float scale = 1.0f / 255.0f;  // 归一化缩放系数
-    // NV12数据大小：Y分量(width*height) + UV分量(width*height/2)
-    const size_t nv12_data_size = width * height * 3 / 2;
-    // 输出数据大小：RGB三通道，float类型
-    const size_t output_data_size = width * height * 3 * sizeof(float);
-    // 2. 构造Host端输入数据（简单初始化NV12数据）
-    std::vector<uint8_t> nv12_data_h(nv12_data_size, 128);  // 初始化为灰度值128
-    // 输出Host数组（存储RGB结果）
-    std::vector<float> output_data_h(width * height * 3, 0.0f);
-    // 3. 分配Device端内存
-    uint8_t* nv12_data_d = nullptr;
-    float* output_data_d = nullptr;
-    CHECK_CUDA_ERR(cudaMalloc(&nv12_data_d, nv12_data_size));
-    CHECK_CUDA_ERR(cudaMalloc(&output_data_d, output_data_size));
-    // 4. Host → Device 拷贝数据
-    CHECK_CUDA_ERR(cudaMemcpy(nv12_data_d, nv12_data_h.data(), nv12_data_size, 
-                              cudaMemcpyHostToDevice));
-    // 5. 创建CUDA流（可选，也可传0使用默认流）
-    cudaStream_t stream;
-    CHECK_CUDA_ERR(cudaStreamCreate(&stream));
-    // 6. 调用fused_preprocess_nv12算子
-    fused_preprocess_nv12(nv12_data_d, output_data_d, width, height, scale, stream);
-    // 7. 等待CUDA流执行完成
-    CHECK_CUDA_ERR(cudaStreamSynchronize(stream));
-    // 8. Device → Host 拷贝结果
-    CHECK_CUDA_ERR(cudaMemcpy(output_data_h.data(), output_data_d, output_data_size, 
-                              cudaMemcpyDeviceToHost));
-    // 9. 验证结果（打印前10个输出值）
-    std::cout << "fused_preprocess_nv12 运算结果（前10个RGB值）：" << std::endl;
-    for (int i = 0; i < 10; ++i) {
-        std::cout << output_data_h[i] << " ";
-    }
-    std::cout << std::endl;
-    // 10. 释放资源
-    CHECK_CUDA_ERR(cudaStreamDestroy(stream));
-    cudaFree(nv12_data_d);
-    cudaFree(output_data_d);
-    return 0;
-}
-```
-
-## 160. fused_kimi_k3_mla_decode_q_concat_kv_cache_fp8_insert
+## 61. fused_kimi_k3_mla_decode_q_concat_kv_cache_fp8_insert
 
 ### 支持的产品型号
 
@@ -20101,9 +7901,7 @@ print(f"cache_scale_inv shape: {cache_scale_inv.shape}, dtype: {cache_scale_inv.
 print(f"slot_mapping shape: {slot_mapping.shape}, dtype: {slot_mapping.dtype}")
 ```
 
-
-
-## 161. fused_kimi_k3_mla_decode_q_concat_kv_cache_insert
+## 62. fused_kimi_k3_mla_decode_q_concat_kv_cache_insert
 
 ### 支持的产品型号
 
@@ -20268,9 +8066,7 @@ print(f"k_cache shape: {k_cache.shape}, dtype: {k_cache.dtype}")
 print(f"slot_mapping shape: {slot_mapping.shape}, dtype: {slot_mapping.dtype}")
 ```
 
-
-
-## 162.fused_kimi_k3_mla_key_concat_kv_cache_insert
+## 63.fused_kimi_k3_mla_key_concat_kv_cache_insert
 
 ### 支持的产品型号
 
@@ -20425,11 +8221,7 @@ print(f"k_cache shape: {k_cache.shape}, dtype: {k_cache.dtype}")
 print(f"num_tokens(Tp) = {Tp}, num_heads(H) = {H}")
 ```
 
-
-
-
-
-## 163.fused_kimi_k3_mla_key_concat_ds_mla_insert
+## 64.fused_kimi_k3_mla_key_concat_ds_mla_insert
 
 ### 支持的产品型号
 
@@ -20584,11 +8376,7 @@ print(f"k_cache shape: {k_cache.shape}, dtype: {k_cache.dtype}")
 print(f"num_tokens(Tp) = {Tp}, num_heads(H) = {H}")
 ```
 
-
-
-
-
-## 164.fused_kimi_k3_mla_qkv_quant_kv_cache_fp8_insert
+## 65.fused_kimi_k3_mla_qkv_quant_kv_cache_fp8_insert
 
 ### 支持的产品型号
 
@@ -20796,11 +8584,7 @@ print(f"k_cache shape: {k_cache.shape}, dtype: {k_cache.dtype}")
 print(f"num_tokens(Tp) = {Tp}, num_heads(H) = {H}")
 ```
 
-
-
-
-
-## 165.fused_minimax_m3_qknorm_rope_kv_insert
+## 66.fused_minimax_m3_qknorm_rope_kv_insert
 
 ### 支持的产品型号
 
@@ -21041,11 +8825,7 @@ if index_q_out is not None:
 print(f"num_tokens(N) = {N}")
 ```
 
-
-
-
-
-## 166. fused_unpack
+## 67. fused_unpack
 
 ### 支持的产品型号
 
@@ -21166,17 +8946,13 @@ print(f"topk_ids shape: {topk_ids.shape}, dtype: {topk_ids.dtype}")
 print(f"scale shape: {scale.shape}, dtype: {scale.dtype}")
 ```
 
-
-
-
-
-# 167.ggml_moe_a8
+## 68. ggml_moe_a8
 
 ### 支持的产品型号
 
 - Metax C500/C550/C588/C600/C600U/C600UL
 
-## 算子注册接口
+### 算子注册接口
 
 ```
 ops.def(
@@ -21186,7 +8962,7 @@ ops.def(
   "SymInt row, SymInt top_k, SymInt tokens) -> Tensor");
 ```
 
-## C++ 函数签名
+### C++ 函数签名
 
 ```
 torch::Tensor ggml_moe_a8(torch::Tensor X, torch::Tensor W,
@@ -21196,7 +8972,7 @@ torch::Tensor ggml_moe_a8(torch::Tensor X, torch::Tensor W,
                           int64_t row, int64_t top_k, int64_t tokens);
 ```
 
-## 功能说明
+### 功能说明
 
 GGML 量化 MoE CUDA 算子，输入特征先执行 q8_1 量化，再按专家路由信息，调用对应 GGML 量化矩阵核完成 MoE 加权计算。支持多种 GGML 量化权重类型，输出聚合后的 MoE 中间结果。
 
@@ -21209,14 +8985,14 @@ $$ Y_{i,:} = X_{i,:} W_{e(i)} $$
 - $Y$：输出张量，$[N_{token}\times top\_k, row]$ -
 - $e(i)$：由`sorted_token_ids`、`expert_ids`指定每个 token 分配的专家编号
 
-## 张量约束
+### 张量约束
 
 - 维度要求：`X`为二维张量；`W`为 GGML 量化权重存储张量；`sorted_token_ids`、`expert_ids`、`num_tokens_post_padded`为一维 int32 张量
 - 形状要求：`X`形状为\([tokens, col]\)；输出Y形状自动推导为\([tokens \times top\_k, row]\)
 - 内存布局：输入张量需为 CUDA 连续张量
 - 设备要求：全部张量必须在同一 CUDA 设备
 
-## 参数表
+### 参数表
 
 表格
 
@@ -21233,7 +9009,7 @@ $$ Y_{i,:} = X_{i,:} W_{e(i)} $$
 | tokens                 | IN   | —                              | —          | int64            | 输入 token 总数                          |
 | 返回值 Y               | OUT  | \([tokens\times top\_k, row]\) | contiguous | 同 X             | MoE 矩阵乘结果                           |
 
-## Python 调用示例
+### Python 调用示例
 
 ```
 import torch
@@ -21253,11 +9029,7 @@ num_tokens_post_padded = torch.tensor([tokens], dtype=torch.int32, device="cuda"
 Y = torch.ops.custom.ggml_moe_a8(X, W, sorted_token_ids, expert_ids, num_tokens_post_padded, type_id, row, top_k, tokens)
 ```
 
-
-
-
-
-## 168. grouped_topk
+## 69. grouped_topk
 
 ### 支持的产品型号
 
@@ -21429,11 +9201,7 @@ print(f"weights sum (first 4 tokens): {topk_values[:4].sum(dim=-1).tolist()}")
 print(f"selected experts (first token): {topk_indices[0].tolist()}")
 ```
 
-
-
-
-
-## 169. minimax_allreduce_rms
+## 70. minimax_allreduce_rms
 
 ### 支持的产品型号
 
@@ -21548,11 +9316,7 @@ print(f"input shape: {input_tensor.shape}, dtype: {input_tensor.dtype}")
 print(f"output shape: {output.shape}, dtype: {output.dtype}")
 ```
 
-
-
-
-
-## 170. minimax_allreduce_rms_qk
+## 71. minimax_allreduce_rms_qk
 
 ### 支持的产品型号
 
@@ -21696,11 +9460,7 @@ print(f"q_out shape: {q_out.shape}, dtype: {q_out.dtype}")
 print(f"k_out shape: {k_out.shape}, dtype: {k_out.dtype}")
 ```
 
-
-
-
-
-## 171. mnnvl_lamport_all_gather
+## 72. mnnvl_lamport_all_gather
 
 ### 支持的产品型号
 
@@ -21722,7 +9482,7 @@ def mnnvl_lamport_all_gather(
 
 ### 功能描述
 
-mnnvl_lamport_all_gather 算子是基于 Lamport 时钟同步机制与多节点 NVLink（MNNVL）优化的 All-Gather 集合通信算子。该算子利用本地缓冲区（local_buffer）、多播缓冲区（multicast_buffer）与纪元缓冲区（epoch_buffer）实现跨节点的高效数据收集，通过 Lamport 时钟保证分布式系统中的操作顺序一致性，支持大规模多 GPU 集群场景下的数据聚合，提升大模型推理/训练中的通信效率与可扩展性。
+mnnvl_lamport_all_gather 算子是基于 Lamport 时钟同步机制与多节点高速互联（MNNVL）优化的 All-Gather 集合通信算子。该算子利用本地缓冲区（local_buffer）、多播缓冲区（multicast_buffer）与纪元缓冲区（epoch_buffer）实现跨节点的高效数据收集，通过 Lamport 时钟保证分布式系统中的操作顺序一致性，支持大规模多 GPU 集群场景下的数据聚合，提升大模型推理/训练中的通信效率与可扩展性。
 
 - 计算公式：
 
@@ -21805,11 +9565,7 @@ print(f"out shape: {out.shape}, dtype: {out.dtype}")
 print(f"stage_sz_bytes: {stage_sz_bytes}")
 ```
 
-
-
-
-
-## 172. mnnvl_lamport_reduce_scatter
+## 73. mnnvl_lamport_reduce_scatter
 
 ### 支持的产品型号
 
@@ -21830,7 +9586,7 @@ def mnnvl_lamport_reduce_scatter(
 
 ### 功能描述
 
-mnnvl_lamport_reduce_scatter 算子是基于 Lamport 时钟同步机制与多节点 NVLink（MNNVL）优化的 Reduce-Scatter 集合通信算子。该算子将所有参与进程（rank）的输入张量进行规约求和，并将结果按 rank 分片分发到各进程，利用本地缓冲区（local_buffer）与纪元缓冲区（epoch_buffer）实现跨节点的高效数据规约与分发，通过 Lamport 时钟保证分布式系统中的操作顺序一致性，支持大规模多 GPU 集群场景下的数据聚合，提升大模型推理/训练中的通信效率与可扩展性。
+mnnvl_lamport_reduce_scatter 算子是基于 Lamport 时钟同步机制与多节点高速互联（MNNVL）优化的 Reduce-Scatter 集合通信算子。该算子将所有参与进程（rank）的输入张量进行规约求和，并将结果按 rank 分片分发到各进程，利用本地缓冲区（local_buffer）与纪元缓冲区（epoch_buffer）实现跨节点的高效数据规约与分发，通过 Lamport 时钟保证分布式系统中的操作顺序一致性，支持大规模多 GPU 集群场景下的数据聚合，提升大模型推理/训练中的通信效率与可扩展性。
 
 - 计算公式：
 
@@ -21917,146 +9673,7 @@ print(f"out shape: {out.shape}, dtype: {out.dtype}")
 print(f"stage_sz_bytes: {stage_sz_bytes}")
 ```
 
-
-
-
-
-## 173. per_token_group_quant_8bit_packed
-
-### 支持的产品型号
-
-- Metax C500/C550/C588/C600/C600U/C600UL
-
-### 接口原型
-
-```python
-def per_token_group_quant_8bit_packed(
-    input: torch.Tensor,
-    output_q: torch.Tensor,
-    output_s_packed: torch.Tensor,
-    group_size: int,
-    eps: float,
-    min_8bit: float,
-    max_8bit: float
-) -> None
-```
-
-### 功能描述
-
-per_token_group_quant_8bit_packed 算子实现逐 Token 分组 8-bit 动态量化功能，支持缩放因子的打包存储（UE8M0 格式）。该算子将输入张量沿特征维度按固定分组大小（group_size=128）分组，对每组计算动态缩放因子，并将输入值量化到 8-bit 数据类型（FP8 或 INT8），同时将缩放因子以 UE8M0 格式打包存储到 int32 张量中，提升存储效率，常用于大模型推理中的权重量化或激活量化。
-
-- 计算公式：
-
-分组缩放因子计算，对输入张量的每组计算动态缩放因子：
-
-$$
-\text{scale}_{t,g} = \max_{j \in \text{group}_g} |\text{input}_{t,j}|
-$$
-
-8-bit 量化，使用计算出的缩放因子对每组进行量化：
-
-$$
-\text{output\_q}_{t,j} = \text{clamp}\left(\frac{\text{input}_{t,j}}{\text{scale}_{t,g}}, \text{min\_8bit}, \text{max\_8bit}\right), \quad j \in \text{group}_g
-$$
-
-缩放因子打包，将每组缩放因子转换为 UE8M0 格式（8 位无符号指数），并将 4 组打包到一个 int32 元素中：
-
-$$
-\text{output\_s\_packed}[t, p] = \text{pack4}\left(\text{UE8M0}(\text{scale}_{t,4p}), \text{UE8M0}(\text{scale}_{t,4p+1}), \text{UE8M0}(\text{scale}_{t,4p+2}), \text{UE8M0}(\text{scale}_{t,4p+3})\right)
-$$
-
-其中：
-
-- $t \in [0, T)$ ：token 索引，$T$ 为 token 总数
-- $j \in [0, H)$ ：特征维度索引，$H$ 为隐藏层维度
-- $g \in [0, G)$ ：组索引，$G = H / 128$ 为组数（group_size 固定为 128）
-- $p \in [0, \lceil G/4 \rceil)$ ：打包索引，每 4 组打包到一个 int32
-- $\text{input} \in \mathbb{R}^{T \times H}$ ：输入张量，bf16/fp16
-- $\text{output\_q} \in \mathbb{F}^{T \times H}$ ：8-bit 量化输出张量，FP8 或 INT8
-- $\text{output\_s\_packed} \in \mathbb{Z}^{T \times \lceil G/4 \rceil}$ ：打包缩放因子张量，int32
-- $\text{min\_8bit}, \text{max\_8bit}$ ：8-bit 量化范围约束
-
-### 参数说明
-
-- **input** (torch.Tensor, 入参): 原始输入张量，形状为 [T, H]，数据类型为 bfloat16 或 float16，存储待量化的数据，需为连续张量
-- **output_q** (torch.Tensor, 出参): 8-bit 量化输出张量，形状与 input 一致（[T, H]），数据类型为 FP8 或 INT8，存储量化后的结果，需为连续张量
-- **output_s_packed** (torch.Tensor, 出参): 打包缩放因子张量，形状为 [T, ceil(H/128/4)]，数据类型为 int32，存储 UE8M0 格式打包的缩放因子，要求 stride 为 [1, tma_aligned_mn]
-- **group_size** (int, 入参): 分组量化大小，仅支持 128
-- **eps** (float, 入参): 数值稳定小量，用于防止缩放因子计算中除零
-- **min_8bit** (float, 入参): 8-bit 量化下界，用于约束量化值范围
-- **max_8bit** (float, 入参): 8-bit 量化上界，用于约束量化值范围
-
-### 返回值
-
-无返回值，计算结果直接写入出参张量 output_q 与 output_s_packed 中。
-
-### 约束与调用
-
-- 所有输入/输出张量必须位于 CUDA 设备上
-- 输入张量 input 支持的数据类型：bfloat16、float16
-- 输出张量 output_q 支持的数据类型：FP8（float8_e4m3fn）或 INT8
-- 打包缩放因子张量 output_s_packed 的数据类型必须为 int32
-- group_size 仅支持 128
-- 输入张量必须连续（is_contiguous()），hidden_size 必须能被 128 整除
-- output_s_packed 形状必须为 [mn, k_num_packed_sfk]，其中 k_num_packed_sfk = ceil(groups_per_row / 4)
-- output_s_packed 的 stride 必须为 [1, tma_aligned_mn]，其中 tma_aligned_mn = ceil(mn/4)*4
-- 算子内部通过 PDL（Programmatic Dependent Launch）机制优化 kernel 启动延迟
-
-### 调用示例
-
-```python
-import torch
-import mcoplib.op as op
-
-# 定义运行设备
-device = "cuda"
-
-# 定义算子所需的参数
-num_tokens = 8          # T (mn)
-hidden_size = 512       # H (k)
-group_size = 128        # 固定为 128
-num_groups = hidden_size // group_size  # G
-num_packed = (num_groups + 3) // 4      # 打包后的组数
-
-# 创建输入张量
-input_tensor = torch.randn(num_tokens, hidden_size, dtype=torch.bfloat16, device=device)
-
-# 创建输出张量
-output_q = torch.empty(num_tokens, hidden_size, dtype=torch.float8_e4m3fn, device=device)
-
-# 创建打包缩放因子张量（注意 stride 要求）
-tma_aligned_mn = ((num_tokens + 3) // 4) * 4
-output_s_packed = torch.empty(num_packed, tma_aligned_mn, dtype=torch.int32, device=device)
-output_s_packed = output_s_packed.t()  # 转置以满足 stride [1, tma_aligned_mn]
-output_s_packed = output_s_packed.contiguous()
-
-# 定义 8-bit 范围（FP8 示例）
-min_8bit = -448.0
-max_8bit = 448.0
-eps = 1e-10
-
-# 调用 per_token_group_quant_8bit_packed 算子
-op.per_token_group_quant_8bit_packed(
-    input_tensor,
-    output_q,
-    output_s_packed,
-    group_size,
-    eps,
-    min_8bit,
-    max_8bit
-)
-
-print("per_token_group_quant_8bit_packed computation completed")
-print(f"input shape: {input_tensor.shape}, dtype: {input_tensor.dtype}")
-print(f"output_q shape: {output_q.shape}, dtype: {output_q.dtype}")
-print(f"output_s_packed shape: {output_s_packed.shape}, dtype: {output_s_packed.dtype}")
-```
-
-
-
-
-
-## 174. per_token_group_quant_fp8
+## 74. per_token_group_quant_fp8
 
 ### 支持的产品型号
 
@@ -22188,11 +9805,7 @@ print(f"output_q shape: {output_q.shape}, dtype: {output_q.dtype}")
 print(f"output_s shape: {output_s.shape}, dtype: {output_s.dtype}")
 ```
 
-
-
-
-
-## 175. per_token_group_quant_int8
+## 75. per_token_group_quant_int8
 
 ### 支持的产品型号
 
@@ -22313,11 +9926,7 @@ print(f"output_q shape: {output_q.shape}, dtype: {output_q.dtype}")
 print(f"output_s shape: {output_s.shape}, dtype: {output_s.dtype}")
 ```
 
-
-
-
-
-## 176.permute_cols
+## 76.permute_cols
 
 ### 支持的产品型号
 
@@ -22398,11 +10007,7 @@ print(f"D shape: {D.shape}, dtype: {D.dtype}")
 print(f"perm length: {perm.size(0)}")
 ```
 
-
-
-
-
-## 177.persistent_masked_m_swiglu_mul_quant
+## 77.persistent_masked_m_swiglu_mul_quant
 
 ### 支持的产品型号
 
@@ -22543,7 +10148,7 @@ print(f"E={E}, T={T}, H={H}")
 
 ## 
 
-## 178.persistent_masked_m_silu_mul_quant
+## 78.persistent_masked_m_silu_mul_quant
 
 ### 支持的产品型号
 
@@ -22685,13 +10290,7 @@ print(f"y_s shape: {y_s.shape}, dtype: {y_s.dtype}")
 print(f"E={E}, T={T}, H={H}")
 ```
 
-
-
-
-
-
-
-## 179. persistent_topk
+## 79. persistent_topk
 
 ### 支持的产品型号
 
@@ -22716,7 +10315,7 @@ def persistent_topk(
 
 ### 功能描述
 
-persistent_topk 算子是基于 **CUDA Persistent Kernel**（持久化线程块）设计的 Top-K 筛选算子，面向变长序列批处理场景（如 MoE 路由打分、采样前候选筛选等）。与传统「先全量扫描、再全局归约」的多趟 kernel 不同，persistent kernel 启动固定数量的线程块常驻 SM，线程块通过外部传入的 `workspace` 进行跨块协同（如分块统计、分布式归约、候选归并），在单次 kernel 内完成 Top-K 计算，减少 kernel 启动与全局同步开销；`workspace` 由调用方预分配并可跨调用复用，算子内部不做动态显存分配，便于推理框架的显存池管理。
+persistent_topk 算子是基于 **Persistent Kernel**（持久化线程块）设计的 Top-K 筛选算子，面向变长序列批处理场景（如 MoE 路由打分、采样前候选筛选等）。与传统「先全量扫描、再全局归约」的多趟 kernel 不同，persistent kernel 启动固定数量的线程块常驻计算单元，线程块通过外部传入的 `workspace` 进行跨块协同（如分块统计、分布式归约、候选归并），在单次 kernel 内完成 Top-K 计算，减少 kernel 启动与全局同步开销；`workspace` 由调用方预分配并可跨调用复用，算子内部不做动态显存分配，便于推理框架的显存池管理。
 
 处理流程：
 
@@ -22807,13 +10406,7 @@ print(f"output shape: {output.shape}, dtype: {output.dtype}")
 print(f"lengths: {lengths_list}")
 ```
 
-
-
-
-
-
-
-## 180. register_buffer
+## 80. register_buffer
 
 ### 支持的产品型号
 
@@ -22894,13 +10487,7 @@ print(f"Number of IPC tensors: {len(ipc_tensors)}")
 print(f"Buffer size per rank: {buffer_size} bytes")
 ```
 
-
-
-
-
-
-
-## 181. relu_squared
+## 81. relu_squared
 
 ### 支持的产品型号
 
@@ -22979,11 +10566,7 @@ print(f"input shape: {input_tensor.shape}, dtype: {input_tensor.dtype}")
 print(f"out shape: {out.shape}, dtype: {out.dtype}")
 ```
 
-
-
-
-
-## 182. rms_norm_per_block_quant
+## 82. rms_norm_per_block_quant
 
 ### 支持的产品型号
 
@@ -23136,13 +10719,7 @@ print(f"result shape: {result.shape}, dtype: {result.dtype}")
 print(f"scale shape: {scale.shape}, dtype: {scale.dtype}")
 ```
 
-
-
-
-
-
-
-## 183. shuffle_rows
+## 83. shuffle_rows
 
 ### 支持的产品型号
 
@@ -23236,13 +10813,7 @@ ref = input_tensor[dst2src_map.long()]
 print(f"correctness check: {torch.equal(output_tensor, ref)}")
 ```
 
-
-
-
-
-
-
-## 184.silu_and_mul_per_block_quant
+## 84.silu_and_mul_per_block_quant
 
 ### 支持的产品型号
 
@@ -23383,13 +10954,7 @@ print(f"out shape: {out.shape}, dtype: {out.dtype}")
 print(f"scales shape: {scales.shape}, dtype: {scales.dtype}")
 ```
 
-
-
-
-
-
-
-## 185. silu_and_mul_with_clamp
+## 85. silu_and_mul_with_clamp
 
 ### 支持的产品型号
 
@@ -23484,13 +11049,7 @@ assert result.abs().max().item() <= limit, "clamp not effective!"
 print("clamp check passed")
 ```
 
-
-
-
-
-
-
-## 186. situ_and_mul
+## 86. situ_and_mul
 
 ### 支持的产品型号
 
@@ -23585,13 +11144,7 @@ print(f"input shape: {input.shape} -> out shape: {out.shape}")
 print(f"dtype: {out.dtype}, device: {out.device}")
 ```
 
-
-
-
-
-
-
-## 187. stable_topk_gathered
+## 87. stable_topk_gathered
 
 ### 支持的产品型号
 
@@ -23698,13 +11251,7 @@ ref = token_ids[0][scores[0].argsort(descending=True, stable=True)[:topk]]
 print(f"reference (torch stable sort): {ref.to(torch.int32).tolist()}")
 ```
 
-
-
-
-
-
-
-## 188. topk_softplus_sqrt
+## 88. topk_softplus_sqrt
 
 ### 支持的产品型号
 
@@ -23866,13 +11413,7 @@ print(f"topk_indices shape: {topk_indices.shape}, dtype: {topk_indices.dtype}")
 print(f"token_expert_indices shape: {token_expert_indices.shape}, dtype: {token_expert_indices.dtype}")
 ```
 
-
-
-
-
-
-
-## 189. get_graph_buffer_ipc_meta
+## 89. get_graph_buffer_ipc_meta
 
 ### 支持的产品型号
 
@@ -23943,7 +11484,7 @@ print("get_graph_buffer_ipc_meta: Retrieves IPC metadata for graph buffers")
 
 ---
 
-## 190. allocate_shared_buffer_and_handle
+## 90. allocate_shared_buffer_and_handle
 
 ### 支持的产品型号
 
@@ -24016,7 +11557,7 @@ print(f"Requested size: {buffer_size} bytes")
 
 ---
 
-## 191. free_shared_buffer
+## 91. free_shared_buffer
 
 ### 支持的产品型号
 
@@ -24077,7 +11618,7 @@ print("free_shared_buffer: Releases shared CUDA buffer")
 
 ---
 
-## 192. open_mem_handle
+## 92. open_mem_handle
 
 ### 支持的产品型号
 
@@ -24140,7 +11681,7 @@ print("open_mem_handle: Opens CUDA IPC memory handle for cross-process access")
 
 ---
 
-## 193. dispose
+## 93. dispose
 
 ### 支持的产品型号
 
@@ -24201,7 +11742,7 @@ print("dispose: Destroys CustomAllreduce context and releases resources")
 
 ---
 
-## 194. ggml_mul_mat_a8
+## 94. ggml_mul_mat_a8
 
 ### 支持的产品型号
 
@@ -24297,7 +11838,7 @@ print(f"Quantization type: {quant_type} (Q4_K)")
 
 ---
 
-## 195. ggml_mul_mat_vec_a8
+## 95. ggml_mul_mat_vec_a8
 
 ### 支持的产品型号
 
@@ -24391,7 +11932,7 @@ print(f"Y shape: {Y.shape}, dtype: {Y.dtype}")
 print(f"Quantization type: {quant_type} (Q4_K)")
 ```
 
-## 196. ggml_dequantize
+## 96. ggml_dequantize
 
 ### 支持的产品型号
 
@@ -24476,7 +12017,7 @@ print(f"Quantization type: {quant_type} (Q4_K)")
 
 ---
 
-## 197. ngram_compute_n_gram_ids
+## 97. ngram_compute_n_gram_ids
 
 ### 支持的产品型号
 
@@ -24599,9 +12140,12316 @@ print(f"batch_size: {batch_size}, num_configs: {num_configs}")
 print(f"n_gram_ids shape: {n_gram_ids.shape}, dtype: {n_gram_ids.dtype}")
 ```
 
+# SGLang
+
+## 1. convert_vertical_slash_indexes
+
+### 支持的产品型号
+
+- Metax C500/C550
+
+### 接口原型
+
+```C++
+def convert_vertical_slash_indexes(
+    block_count: torch.Tensor,
+    block_offset: torch.Tensor,
+    column_count: torch.Tensor,
+    column_index: torch.Tensor,
+    q_seqlens: torch.Tensor,
+    kv_seqlens: torch.Tensor,
+    vertical_indexes: torch.Tensor,
+    slash_indexes: torch.Tensor,
+    context_size: int,
+    block_size_M: int,
+    block_size_N: int,
+    causal: bool
+) -> None:
+    pass
+```
+
+### 功能描述
+
+convert_vertical_slash_indexes 算子用于将稀疏注意力机制中的垂直索引和斜线索引转换为适用于块稀疏计算的索引格式。
+该算子在 GPU 上并行处理每个注意力头和查询块，读取预先计算好的垂直模式索引（代表全局重要 Token）和斜线模式索引（代表局部滑动窗口），并将它们合并映射为物理内存中的块偏移量和独立的列索引。
+在计算过程中，算子会根据输入的查询序列长度和键值序列长度动态调整处理范围，同时通过因果参数控制是否应用因果掩码，确保注意力计算不越过当前时间步。对于每个查询块，算法首先确定斜线索引覆盖的 KV 块范围，然后遍历垂直索引，将落在斜线范围内的垂直点合并处理，将范围外的独立垂直点记录为列索引，最终输出每一行对应的有效块数量、块偏移列表以及独立列数量和列索引列表，从而加速后续的块稀疏注意力计算。
+
+- 计算逻辑涉及根据斜线索引 $S_{idx}$ 确定覆盖范围：
+
+$$
+\text{range\\_start} = S_{idx} - \text{BLOCK\\_SIZE\\_M}
+$$
 
 
 
+$$
+\text{range\\_end} = S_{idx}
+$$
+
+其中 $S_{idx}$ 会根据因果关系 causal 进行调整。
+若开启因果掩码，则需确保索引满足 
+
+$$
+S_{idx} \le \text{end\\_m} + (\text{kv\\_seqlen} - \text{q\\_seqlen})
+$$
+
+任何超出该范围的索引将被截断或忽略，从而保证注意力机制只关注到合法的历史信息。
+**主要功能包括：**
+
+- 稀疏索引格式转换：将预计算的垂直模式索引（全局重要 Token）和斜线模式索引（局部滑动窗口）高效映射为适用于块稀疏计算的物理内存块偏移 (`block_offset`) 和独立列索引 (`column_index`)。
+- 动态范围合并与分离：依据块大小 (`block_size_M/N`) 计算斜线索引覆盖范围，自动将落在范围内的垂直点合并处理，并将范围外的垂直点分离为独立列索引，优化后续内存访问。
+- 因果掩码与边界控制：结合动态序列长度 (`q_seqlens`/`kv_seqlens`) 与因果参数 (`causal`)，严格执行 $S_{idx}$ 边界截断逻辑，确保注意力机制不包含非法的前瞻性信息。
+- 并行加速预处理：利用 GPU 并行计算各注意力头及查询块的有效块数量 (`block_count`) 与偏移，通过预先剔除无效块，显著提升后续稀疏 Attention 算子的计算效率。
+
+### 参数说明
+
+- **block_count** (torch.Tensor, 出参): 形状为 `[BATCH, N_HEADS, NUM_ROWS]`，存储每行（Query Block）包含的有效 KV 块数量。
+- **block_offset** (torch.Tensor, 出参): 形状为 `[BATCH, N_HEADS, NUM_ROWS, NNZ_S]`，存储每行对应的有效 KV 块起始索引。
+- **column_count** (torch.Tensor, 出参): 形状为 `[BATCH, N_HEADS, NUM_ROWS]`，存储每行包含的独立垂直列数量。
+- **column_index** (torch.Tensor, 出参): 形状为 `[BATCH, N_HEADS, NUM_ROWS, NNZ_V]`，存储每行对应的独立垂直列索引。
+- **q_seqlens** (torch.Tensor, 入参): 形状为 `[BATCH]`，当前批次中每个样本的 Query 序列长度。
+- **kv_seqlens** (torch.Tensor, 入参): 形状为 `[BATCH]`，当前批次中每个样本的 KV 序列长度。
+- **vertical_indexes** (torch.Tensor, 入参): 形状为 `[BATCH, N_HEADS, NNZ_V]`，预计算的垂直模式索引。
+- **slash_indexes** (torch.Tensor, 入参): 形状为 `[BATCH, N_HEADS, NNZ_S]`，预计算的斜线模式索引。
+- **context_size** (int, 入参): 上下文窗口大小，用于确定总行数。
+- **block_size_M** (int, 入参): Query 维度的块大小。
+- **block_size_N** (int, 入参): KV 维度的块大小。
+- **causal** (bool, 入参): 是否应用因果掩码，True 表示因果注意力，False 表示双向注意力。
+
+### 返回值
+
+无返回值，计算结果直接写入 `block_count`, `block_offset`, `column_count`, `column_index` 张量中。
+
+### 约束与调用
+
+- 所有输入张量必须位于 CUDA 设备上。
+- 输入索引张量的数据类型必须为 `int32`。
+- `NUM_ROWS` 必须等于 `(context_size + block_size_M - 1) / block_size_M`。
+- `NNZ_V` 和 `NNZ_S` 为输入索引张量的最后一维，表示最大的保留稀疏点数。
+- 线程块配置固定为 64 线程，Grid 维度由 Batch、Heads 和 Rows 决定。
+
+### 调用示例
+
+```python
+import torch
+import random
+import mcoplib._C
+# 配置参数
+SEED = 0
+DEVICE = "cuda"
+# 维度设置
+BATCH_SIZE = 2
+NUM_HEADS = 8
+CONTEXT_SIZE = 1024
+BLOCK_SIZE_M = 64
+BLOCK_SIZE_N = 64
+NNZ_V = 32
+NNZ_S = 16
+NUM_ROWS = (CONTEXT_SIZE + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M
+# 初始化环境
+torch.manual_seed(SEED)
+random.seed(SEED)
+torch.set_default_device(DEVICE)
+# ================= 数据准备 =================
+# 1. 创建输入 Tensor
+q_seqlens = torch.randint(1, CONTEXT_SIZE, (BATCH_SIZE,), dtype=torch.int32)
+kv_seqlens = torch.randint(1, CONTEXT_SIZE, (BATCH_SIZE,), dtype=torch.int32)
+# 索引必须有序
+vertical_indexes, _ = torch.sort(torch.randint(0, CONTEXT_SIZE, (BATCH_SIZE, NUM_HEADS, NNZ_V), dtype=torch.int32), dim=-1)
+slash_indexes, _ = torch.sort(torch.randint(0, CONTEXT_SIZE, (BATCH_SIZE, NUM_HEADS, NNZ_S), dtype=torch.int32), dim=-1)
+# 2. 创建输出 Tensor
+block_count = torch.zeros(BATCH_SIZE, NUM_HEADS, NUM_ROWS, dtype=torch.int32)
+block_offset = torch.zeros(BATCH_SIZE, NUM_HEADS, NUM_ROWS, NNZ_S, dtype=torch.int32)
+column_count = torch.zeros(BATCH_SIZE, NUM_HEADS, NUM_ROWS, dtype=torch.int32)
+column_index = torch.zeros(BATCH_SIZE, NUM_HEADS, NUM_ROWS, NNZ_V, dtype=torch.int32)
+# 标量参数
+causal = True
+# ================= 算子执行 =================
+print(f"Running convert_vertical_slash_indexes...")
+print(f"Shapes - Vertical: {vertical_indexes.shape}, Slash: {slash_indexes.shape}")
+if torch.cuda.is_available():
+    torch.cuda.synchronize()
+torch.ops._C.convert_vertical_slash_indexes(
+    block_count,
+    block_offset,
+    column_count,
+    column_index,
+    q_seqlens,
+    kv_seqlens,
+    vertical_indexes,
+    slash_indexes,
+    CONTEXT_SIZE,
+    BLOCK_SIZE_M,
+    BLOCK_SIZE_N,
+    causal
+)
+if torch.cuda.is_available():
+    torch.cuda.synchronize()
+print("执行成功。")
+print(f"Block Count Mean: {block_count.float().mean().item():.4f}")
+print(f"Column Count Mean: {column_count.float().mean().item():.4f}")
+```
+
+## 2. convert_vertical_slash_indexes_mergehead
+
+### 支持的产品型号
+
+- Metax C500/C550
+
+### 接口原型
+
+```C++
+def convert_vertical_slash_indexes_mergehead(
+    block_count: torch.Tensor,
+    block_offset: torch.Tensor,
+    column_count: torch.Tensor,
+    column_index: torch.Tensor,
+    q_seqlens: torch.Tensor,
+    kv_seqlens: torch.Tensor,
+    vertical_indexes: torch.Tensor,
+    slash_indexes: torch.Tensor,
+    vertical_indices_count: torch.Tensor,
+    slash_indices_count: torch.Tensor,
+    context_size: int,
+    block_size_M: int,
+    block_size_N: int,
+    causal: bool
+) -> None:
+    pass
+```
+
+### 功能描述
+
+convert_vertical_slash_indexes_mergehead 算子实现了 MInference 稀疏注意力机制中索引转换的核心步骤（对应论文 Algorithm 4）。该算子负责将稀疏模式中的“垂直线（Vertical）”和“斜线（Slash）”索引转换为用于实际计算的块偏移量（block_offset）和列索引（column_index）。
+与标准版本不同，此 mergehead 版本支持每头（Per-Head）动态的 TopK 配置。它通过 vertical_indices_count 和 slash_indices_count 参数为每个注意力头独立指定有效的索引数量，而不是所有头使用统一的固定 NNZ（非零元素数量）。这允许在多头注意力中根据不同头的稀疏模式特征灵活分配计算资源。
+
+- 索引转换逻辑：
+	算子遍历每个查询块（Q Block），根据 slash_indexes 确定的斜线位置生成连续的 KV 块范围，并将这些范围存储在 block_offset 中；同时，根据 vertical_indexes 确定的垂直线位置生成离散的列索引，存储在 column_index 中。
+- 动态 TopK 机制：
+	在内核执行时，虽然输入张量 vertical_indexes 和 slash_indexes 的物理尺寸由最大缓冲大小 NNZ_V 和 NNZ_S 决定，但实际参与计算的有效索引数量由 per_head_vertical_topkv（对应 vertical_indices_count）和 per_head_slash_topkv（对应 slash_indices_count）控制：
+
+$$
+    \text{Effective\\_NNZ}_V[h] = \text{vertical\\_indices\\_count}[h]
+$$
 
 
 
+$$
+    \text{Effective\\_NNZ}_S[h] = \text{slash\\_indices\\_count}[h]
+$$
+
+    内核循环仅在 0 到 Effective_NNZ 的范围内读取索引，从而实现变长的稀疏模式处理。
+
+- 块与列的计数：
+	算子同时计算并填充 block_count 和 column_count 张量，记录每个 Q 块对应的有效 KV 块数量和离散列数量，供后续的注意力计算内核（如 paged_attention 或类似的稀疏注意力内核）使用，以跳过无效的计算区域。
+	**主要功能包括：**
+- 将垂直和斜线形式的稀疏索引转换为块稀疏（Block-Sparse）格式。
+- 支持 Causal（因果）和 Non-Causal 注意力掩码模式。
+- 支持每头独立的稀疏度配置（MergeHead），允许不同头拥有不同数量的垂直线和斜线索引。
+- 自动处理边界条件，将超出范围的索引截断或转换为填充块。
+- 并行化处理：以 `(N_HEADS, BATCH_SIZE)` 为 Grid，并在 Row 维度上进行线程块划分，利用 GPU 高效执行。
+
+### 参数说明
+
+- **block_count** (torch.Tensor, 出参): 存储每个 Q 块对应的 KV 块数量，形状为 `[BATCH, N_HEADS, NUM_ROWS]`，数据类型需为 int32
+- **block_offset** (torch.Tensor, 出参): 存储斜线模式转换后的 KV 块偏移索引，形状为 `[BATCH, N_HEADS, NUM_ROWS, NNZ_S]`，数据类型需为 int32
+- **column_count** (torch.Tensor, 出参): 存储每个 Q 块对应的离散列数量，形状为 `[BATCH, N_HEADS, NUM_ROWS]`，数据类型需为 int32
+- **column_index** (torch.Tensor, 出参): 存储垂直线模式转换后的离散列索引，形状为 `[BATCH, N_HEADS, NUM_ROWS, NNZ_V]`，数据类型需为 int32
+- **q_seqlens** (torch.Tensor, 入参): 查询序列长度，形状为 `[BATCH]`，数据类型需为 int32
+- **kv_seqlens** (torch.Tensor, 入参): 键值序列长度，形状为 `[BATCH]`，数据类型需为 int32
+- **vertical_indexes** (torch.Tensor, 入参): 垂直线索引，形状为 `[BATCH, N_HEADS, NNZ_V]`，数据类型需为 int32
+- **slash_indexes** (torch.Tensor, 入参): 斜线索引，形状为 `[BATCH, N_HEADS, NNZ_S]`，数据类型需为 int32
+- **vertical_indices_count** (torch.Tensor, 入参): 每个头的有效垂直线索引数量，形状为 `[N_HEADS]`，数据类型需为 int32
+- **slash_indices_count** (torch.Tensor, 入参): 每个头的有效斜线索引数量，形状为 `[N_HEADS]`，数据类型需为 int32
+- **context_size** (int, 入参): 上下文窗口大小，用于计算 `NUM_ROWS`
+- **block_size_M** (int, 入参): Q 维度的块大小（通常为 64）
+- **block_size_N** (int, 入参): KV 维度的块大小（通常为 64）
+- **causal** (bool, 入参): 是否应用因果掩码（True 为 Intra-Attention，False 为 Successor/Encoder-Decoder Attention）
+
+### 返回值
+
+无返回值，计算结果直接写入输出张量 `block_count`, `block_offset`, `column_count`, `column_index` 中
+
+### 约束与调用
+
+- 所有输入 Tensor 必须位于 CUDA 设备上
+- 所有索引相关的 Tensor（包括 count, offset, index）数据类型必须为 `torch.int32` (`int`)
+- `vertical_indexes` 和 `slash_indexes` 的最后一维大小决定了内核中的 `NNZ_V` 和 `NNZ_S` 缓冲区大小，但实际读取量由 `*_indices_count` 控制
+- `block_count` 等输出张量的 `NUM_ROWS` 维度必须等于 `(context_size + block_size_M - 1) // block_size_M`
+- `q_seqlens` 和 `kv_seqlens` 的 batch 维度必须与输入索引张量的 batch 维度一致
+- `vertical_indices_count` 和 `slash_indices_count` 的长度必须等于 `N_HEADS`
+
+### 调用示例
+
+```Python
+import torch
+import mcoplib._C
+# 配置参数
+BATCH_SIZE = 1
+N_HEADS = 4
+CONTEXT_SIZE = 128
+BLOCK_SIZE_M = 64
+BLOCK_SIZE_N = 64
+NNZ_V = 8  # 垂直索引缓冲区大小
+NNZ_S = 8  # 斜线索引缓冲区大小
+DEVICE = "cuda"
+# 计算行数
+NUM_ROWS = (CONTEXT_SIZE + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M
+# 初始化环境
+torch.set_default_device(DEVICE)
+# ================= 数据准备 =================
+# 序列长度
+q_seqlens = torch.tensor([CONTEXT_SIZE] * BATCH_SIZE, dtype=torch.int32)
+kv_seqlens = torch.tensor([CONTEXT_SIZE] * BATCH_SIZE, dtype=torch.int32)
+# 模拟输入的稀疏索引 (Batch, Heads, NNZ)
+vertical_indexes = torch.randint(0, CONTEXT_SIZE, (BATCH_SIZE, N_HEADS, NNZ_V), dtype=torch.int32)
+slash_indexes = torch.randint(0, CONTEXT_SIZE, (BATCH_SIZE, N_HEADS, NNZ_S), dtype=torch.int32)
+# 关键：每头的动态 TopK 计数
+# 假设 Head 0 使用 2 个垂直索引，Head 1 使用 5 个，以此类推
+vertical_indices_count = torch.randint(1, NNZ_V + 1, (N_HEADS,), dtype=torch.int32)
+slash_indices_count = torch.randint(1, NNZ_S + 1, (N_HEADS,), dtype=torch.int32)
+# 分配输出张量
+block_count = torch.zeros((BATCH_SIZE, N_HEADS, NUM_ROWS), dtype=torch.int32)
+column_count = torch.zeros((BATCH_SIZE, N_HEADS, NUM_ROWS), dtype=torch.int32)
+block_offset = torch.zeros((BATCH_SIZE, N_HEADS, NUM_ROWS, NNZ_S), dtype=torch.int32)
+column_index = torch.zeros((BATCH_SIZE, N_HEADS, NUM_ROWS, NNZ_V), dtype=torch.int32)
+causal = True
+# ================= 算子执行 =================
+print(f"Running convert_vertical_slash_indexes_mergehead...")
+if torch.cuda.is_available():
+    torch.cuda.synchronize()
+torch.ops._C.convert_vertical_slash_indexes_mergehead(
+    block_count,
+    block_offset,
+    column_count,
+    column_index,
+    q_seqlens,
+    kv_seqlens,
+    vertical_indexes,
+    slash_indexes,
+    vertical_indices_count,
+    slash_indices_count,
+    CONTEXT_SIZE,
+    BLOCK_SIZE_M,
+    BLOCK_SIZE_N,
+    causal
+)
+if torch.cuda.is_available():
+    torch.cuda.synchronize()
+print("执行成功。")
+print(f"Block Count Max: {block_count.max().item()}")
+print(f"Column Count Max: {column_count.max().item()}")
+```
+
+## 3. fast_hadamard_transform
+
+### 支持的产品型号
+
+- Metax C500/C550
+
+### 接口原型
+
+```Python
+def fast_hadamard_transform(
+    input: torch.Tensor,
+    scale: float = 1.0
+) -> torch.Tensor:
+    pass
+```
+
+### 功能描述
+
+fast_hadamard_transform 算子用于对输入张量执行快速沃尔什-阿达玛变换（Fast Walsh-Hadamard Transform, FWHT）。这是一种正交、对称且对合的线性变换，通常用于深度学习中的特征混合、随机投影或压缩传感等场景。
+此算子利用分治算法将计算复杂度从 $O (N^2)$ 降低到 $O (N \log N)$ 。
+
+- 操作逻辑：
+	算子接收输入张量 input 和缩放因子 scale。
+	对于输入向量 $x$ ，阿达玛变换 $H_n$ 定义为递归结构：
+
+$$
+    H_n = \begin{pmatrix} H_{n-1} & H_{n-1} \\ H_{n-1} & -H_{n-1} \end{pmatrix}, \quad H_0 = 1
+$$
+
+    计算过程实际上执行了蝴蝶运算（Butterfly Operations）。
+
+**主要功能包括**：
+
+- 对输入张量的最后一个维度进行阿达玛变换。
+- 支持通过 `scale` 参数对输出结果进行缩放。
+- 针对不同维度的输入（ $N=2^k$ ）使用了特定的 CUDA 模板优化，以利用共享内存和 Warp 级并行加速。
+- 支持 FP32、FP16 和 BF16 数据类型。
+
+### 参数说明
+
+- **input** (torch.Tensor, 入参): 输入张量，形状通常为 `[batch_size, dim]` 或 `[..., dim]`。数据类型支持 float32, float16, bfloat16。其中 `dim` 必须是 2 的幂次。
+- **scale** (float, 入参, 可选): 输出结果的缩放因子，默认值为 1.0。通常用于归一化操作。
+
+### 返回值
+
+返回变换后的张量，形状和数据类型与 `input` 相同。
+
+### 约束与调用
+
+- `input` 的最后一个维度（dim）必须是 2 的幂次，且指数范围限制在 $3 \le \log_2 (dim) \le 15$ 之间（即 dim 取值范围为 8 到 32768）。
+- `input` 必须在 GPU 设备上。
+- `input` 的内存布局建议是连续的，以获得最佳性能。
+
+### 调用示例
+
+```Python
+import torch
+import mcoplib.sgl_kernel
+# 配置参数
+SEED = 0
+DEVICE = "cuda"
+DTYPE = torch.float16
+DIM = 1024  # 必须是 2 的幂次，范围 [8, 32768]
+BATCH = 4
+# 初始化环境
+torch.manual_seed(SEED)
+torch.set_default_device(DEVICE)
+# 1. 创建输入 Tensor
+input_tensor = torch.randn((BATCH, DIM), dtype=DTYPE)
+# 2. 算子执行
+# 执行 FHT，scale=1.0
+print(f"Running fast_hadamard_transform...")
+if torch.cuda.is_available():
+    torch.cuda.synchronize()
+output = torch.ops.sgl_kernel.fast_hadamard_transform(
+    input_tensor,
+    1.0
+)
+if torch.cuda.is_available():
+    torch.cuda.synchronize()
+# 验证结果
+# 阿达玛变换的性质：H(H(x)) = N * x
+# 因此再次变换并除以 N 应该还原输入
+output_inverse = torch.ops.sgl_kernel.fast_hadamard_transform(
+    output,
+    1.0 / DIM
+)
+diff = (input_tensor - output_inverse).abs().max()
+print("执行成功。")
+print(f"Input shape: {input_tensor.shape}")
+print(f"Reconstruction Max Diff: {diff.item()}")
+```
+
+## 4. fast_hadamard_transform_12N
+
+### 支持的产品型号
+
+- Metax C500/C550
+
+### 接口原型
+
+```Python
+def fast_hadamard_transform_12N(
+    input: torch.Tensor,
+    scale: float = 1.0
+) -> torch.Tensor:
+    pass
+```
+
+### 功能描述
+
+fast_hadamard_transform_12N 算子是快速沃尔什-阿达玛变换（Fast Walsh-Hadamard Transform, FWHT）的一个特定变体，专门针对维度为 $12 \times 2^k$ 的输入张量进行了优化。
+该算子利用分治算法和专用 CUDA 内核，将计算复杂度从 $O (N^2)$ 降低到 $O (N \log N)$ 。与标准的 FHT 不同，此算子专门处理非 2 的纯幂次维度，将其分解为 12 的倍数与 2 的幂次的组合，适用于某些特定的模型架构（如 Hyena Hierarchy 或特定的注意力机制），这些架构的隐藏层维度通常是 12 的倍数（例如 768, 3072 等）。
+
+- 操作逻辑：
+	算子接收输入张量 input 和缩放因子 scale。
+	它将输入向量视为 $12$ 个大小为 $2^k$ 的块的组合，结合了针对 12 路混合的特定逻辑和针对 $2^k$ 的标准蝴蝶运算。
+	主要功能包括：
+- 对输入张量的最后一个维度执行 specialized 12N 阿达玛变换。
+- 支持通过 `scale` 参数对输出结果进行缩放（通常用于归一化，例如乘以 $1/N$ ）。
+- 利用共享内存交换（Smem Exchange）和 Warp Shuffle 原语最大化内存带宽利用率。
+- 支持 FP32、FP16 和 BF16 数据类型。
+
+### 参数说明
+
+- **input** (torch.Tensor, 入参): 输入张量，形状通常为 `[batch_size, dim]` 或 `[..., dim]`。数据类型支持 float32, float16, bfloat16。其中 `dim` 必须满足 $12 \times 2^k$ 的形式。
+- **scale** (float, 入参, 可选): 输出结果的缩放因子，默认值为 1.0。
+
+### 返回值
+
+返回变换后的张量，形状和数据类型与 `input` 相同。
+
+### 约束与调用
+
+- `input` 的最后一个维度（dim）必须满足公式 $dim = 12 \times 2^k$ ，其中 $k$ 的取值范围为 $[2, 10]$ 。
+- 支持的具体维度包括：48, 96, 192, 384, 768, 1536, 3072, 6144, 12288。
+- 不支持超过 12288 的维度。
+- `input` 必须位于 GPU 设备上。
+- 内存布局要求：建议输入张量是连续存储的。
+
+### 调用示例
+
+```Python
+import torch
+import mcoplib.sgl_kernel
+# 配置参数
+SEED = 0
+DEVICE = "cuda"
+DTYPE = torch.float16
+# 维度设置: 必须满足 12 * 2^k
+# 例如 768 = 12 * 64 (k=6)
+DIM = 768 
+BATCH = 4
+# 初始化环境
+torch.manual_seed(SEED)
+torch.set_default_device(DEVICE)
+# 1. 创建输入 Tensor
+# 形状 [BATCH, DIM]
+input_tensor = torch.randn((BATCH, DIM), dtype=DTYPE)
+# 2. 算子执行
+print(f"Running fast_hadamard_transform_12N...")
+if torch.cuda.is_available():
+    torch.cuda.synchronize()
+# 执行正向变换
+output = torch.ops.sgl_kernel.fast_hadamard_transform_12N(
+    input_tensor,
+    1.0
+)
+if torch.cuda.is_available():
+    torch.cuda.synchronize()
+# 验证结果
+# 阿达玛变换性质: H(H(x)) = N * x
+# 因此再次变换并乘以 1/N 应该还原输入
+output_inverse = torch.ops.sgl_kernel.fast_hadamard_transform_12N(
+    output,
+    1.0 / DIM
+)
+# 计算重构误差
+diff = (input_tensor - output_inverse).abs().max()
+print("执行成功。")
+print(f"Input shape: {input_tensor.shape}")
+print(f"Reconstruction Max Diff: {diff.item()}")
+```
+
+## 5. fast_hadamard_transform_20N
+
+### 支持的产品型号
+
+- Metax C500/C550
+
+### 接口原型
+
+```Python
+def fast_hadamard_transform_20N(
+    input: torch.Tensor,
+    scale: float = 1.0
+) -> torch.Tensor:
+    pass
+```
+
+### 功能描述
+
+fast_hadamard_transform_20N 算子是快速沃尔什-阿达玛变换（Fast Walsh-Hadamard Transform, FWHT）的一个特定变体，专门针对维度为 $20 \times 2^k$ 的输入张量进行了优化。
+该算子利用分治算法和专用 CUDA 内核，将计算复杂度从 $O (N^2)$ 降低到 $O (N \log N)$ 。此算子是为了处理特定模型架构中出现的非 2 的纯幂次维度（例如 1280, 5120 等），通过将维度分解为 20 的倍数与 2 的幂次的组合来执行高效变换。
+
+- 操作逻辑：
+	算子接收输入张量 input 和缩放因子 scale。
+	它将输入向量视为 $20$ 个大小为 $2^k$ 的块的组合，结合了针对 20 路混合的特定逻辑和针对 $2^k$ 的标准蝴蝶运算。
+	主要功能包括：
+- 对输入张量的最后一个维度执行 specialized 20N 阿达玛变换。
+- 支持通过 `scale` 参数对输出结果进行缩放（通常用于归一化，例如乘以 $1/N$ ）。
+- 利用共享内存交换（Smem Exchange）和 Warp Shuffle 原语最大化内存带宽利用率。
+- 支持 FP32、FP16 和 BF16 数据类型。
+
+### 参数说明
+
+- **input** (torch.Tensor, 入参): 输入张量，形状通常为 `[batch_size, dim]` 或 `[..., dim]`。数据类型支持 float32, float16, bfloat16。其中 `dim` 必须满足 $20 \times 2^k$ 的形式。
+- **scale** (float, 入参, 可选): 输出结果的缩放因子，默认值为 1.0。
+
+### 返回值
+
+返回变换后的张量，形状和数据类型与 `input` 相同。
+
+### 约束与调用
+
+- `input` 的最后一个维度（dim）必须满足公式 $dim = 20 \times 2^k$ ，其中 $k$ 的取值范围为 $[2, 10]$ 。
+- 支持的维度范围为 80 到 20480。
+- 具体支持的维度包括：80, 160, 320, 640, 1280, 2560, 5120, 10240, 20480。
+- 不支持超过 20480 的维度。
+- `input` 必须位于 GPU 设备上。
+- 内存布局要求：建议输入张量是连续存储的。
+
+### 调用示例
+
+```Python
+import torch
+import mcoplib.sgl_kernel
+# 配置参数
+SEED = 0
+DEVICE = "cuda"
+DTYPE = torch.float16
+# 维度设置: 必须满足 20 * 2^k
+# 例如 1280 = 20 * 64 (k=6)
+DIM = 1280
+BATCH = 4
+# 初始化环境
+torch.manual_seed(SEED)
+torch.set_default_device(DEVICE)
+# 1. 创建输入 Tensor
+# 形状 [BATCH, DIM]
+input_tensor = torch.randn((BATCH, DIM), dtype=DTYPE)
+# 2. 算子执行
+print(f"Running fast_hadamard_transform_20N...")
+if torch.cuda.is_available():
+    torch.cuda.synchronize()
+# 执行正向变换
+output = torch.ops.sgl_kernel.fast_hadamard_transform_20N(
+    input_tensor,
+    1.0
+)
+if torch.cuda.is_available():
+    torch.cuda.synchronize()
+# 验证结果
+# 阿达玛变换性质: H(H(x)) = N * x
+# 因此再次变换并乘以 1/N 应该还原输入
+output_inverse = torch.ops.sgl_kernel.fast_hadamard_transform_20N(
+    output,
+    1.0 / DIM
+)
+# 计算重构误差
+diff = (input_tensor - output_inverse).abs().max()
+print("执行成功。")
+print(f"Input shape: {input_tensor.shape}")
+print(f"Reconstruction Max Diff: {diff.item()}")
+```
+
+## 6. fast_hadamard_transform_28N
+
+### 支持的产品型号
+
+- Metax C500/C550
+
+### 接口原型
+
+```Python
+def fast_hadamard_transform_28N(
+    input: torch.Tensor,
+    scale: float = 1.0
+) -> torch.Tensor:
+    pass
+```
+
+### 功能描述
+
+fast_hadamard_transform_28N 算子是快速沃尔什-阿达玛变换（Fast Walsh-Hadamard Transform, FWHT）的一个特定变体，专门针对维度为 $28 \times 2^k$ 的输入张量进行了优化。
+该算子利用分治算法和专用 CUDA 内核，将计算复杂度从 $O (N^2)$ 降低到 $O (N \log N)$ 。此算子是为了处理特定模型架构中出现的非 2 的纯幂次维度（例如 1792, 3584, 7168 等），通过将维度分解为 28 的倍数与 2 的幂次的组合来执行高效变换。
+
+- 操作逻辑：
+	算子接收输入张量 input 和缩放因子 scale。
+	它将输入向量视为 $28$ 个大小为 $2^k$ 的块的组合，结合了针对 28 路混合的特定逻辑和针对 $2^k$ 的标准蝴蝶运算。
+	**主要功能包括**：
+- 对输入张量的最后一个维度执行 specialized 28N 阿达玛变换。
+- 支持通过 `scale` 参数对输出结果进行缩放（通常用于归一化，例如乘以 $1/N$ ）。
+- 利用共享内存交换（Smem Exchange）和 Warp Shuffle 原语最大化内存带宽利用率。
+- 支持 FP32、FP16 和 BF16 数据类型。
+
+### 参数说明
+
+- **input** (torch.Tensor, 入参): 输入张量，形状通常为 `[batch_size, dim]` 或 `[..., dim]`。数据类型支持 float32, float16, bfloat16。其中 `dim` 必须满足 $28 \times 2^k$ 的形式。
+- **scale** (float, 入参, 可选): 输出结果的缩放因子，默认值为 1.0。
+
+### 返回值
+
+返回变换后的张量，形状和数据类型与 `input` 相同。
+
+### 约束与调用
+
+- `input` 的最后一个维度（dim）必须满足公式 $dim = 28 \times 2^k$ ，其中 $k$ 的取值范围为 $[2, 10]$ 。
+- 支持的维度范围为 112 到 28672。
+- 具体支持的维度包括：112, 224, 448, 896, 1792, 3584, 7168, 14336, 28672。
+- 不支持超过 28672 的维度。
+- `input` 必须位于 GPU 设备上。
+- 内存布局要求：建议输入张量是连续存储的。
+
+### 调用示例
+
+```Python
+import torch
+import mcoplib.sgl_kernel
+# 配置参数
+SEED = 0
+DEVICE = "cuda"
+DTYPE = torch.float16
+# 维度设置: 必须满足 28 * 2^k
+# 例如 1792 = 28 * 64 (k=6)
+DIM = 1792
+BATCH = 4
+# 初始化环境
+torch.manual_seed(SEED)
+torch.set_default_device(DEVICE)
+# 1. 创建输入 Tensor
+# 形状 [BATCH, DIM]
+input_tensor = torch.randn((BATCH, DIM), dtype=DTYPE)
+# 2. 算子执行
+print(f"Running fast_hadamard_transform_28N...")
+if torch.cuda.is_available():
+    torch.cuda.synchronize()
+# 执行正向变换
+output = torch.ops.sgl_kernel.fast_hadamard_transform_28N(
+    input_tensor,
+    1.0
+)
+if torch.cuda.is_available():
+    torch.cuda.synchronize()
+# 验证结果
+# 阿达玛变换性质: H(H(x)) = N * x
+# 因此再次变换并乘以 1/N 应该还原输入
+output_inverse = torch.ops.sgl_kernel.fast_hadamard_transform_28N(
+    output,
+    1.0 / DIM
+)
+# 计算重构误差
+diff = (input_tensor - output_inverse).abs().max()
+print("执行成功。")
+print(f"Input shape: {input_tensor.shape}")
+print(f"Reconstruction Max Diff: {diff.item()}")
+```
+
+## 7. fast_hadamard_transform_40N
+
+### 支持的产品型号
+
+- Metax C500/C550
+
+### 接口原型
+
+```Python
+def fast_hadamard_transform_40N(
+    input: torch.Tensor,
+    scale: float = 1.0
+) -> torch.Tensor:
+    pass
+```
+
+### 功能描述
+
+fast_hadamard_transform_40N 算子用于对最后一个维度大小为 $40 \times 2^k$ 的输入张量执行快速 Hadamard 变换（Fast Hadamard Transform, FHT）。该算子是针对非 2 的幂次维度的优化实现，专门处理基础块大小为 40 的情况。
+此功能主要应用于以下场景：
+
+1. 随机投影：在大模型或机器学习算法中进行降维或特征混合。
+2. FlashAttention 变体：某些 Attention 机制使用 Hadamard 变换来近似 Hessian 或旋转特征空间。
+
+- 操作逻辑：
+	算子接收输入张量 input，对最后一个维度进行 Hadamard 变换，并应用缩放因子 scale。
+	数学上，Hadamard 变换 $H_N$ 定义为递归结构，该算子特别处理 $N = 40 \times 2^k$ 的情况，利用共享内存交换和特定步幅的各种 Kernel Traits 进行加速。
+	**主要功能包括**：
+- 针对维度 $D \in \{160, 320, \dots, 40960\}$ 的高效 FHT 计算。
+- 支持 float16, bfloat16 和 float32 数据类型。
+- 利用 GPU 共享内存（Shared Memory）进行高效的数据交换和蝶形运算。
+
+### 参数说明
+
+- **input** (torch.Tensor, 入参): 输入张量，形状为 `[..., dim]`。其中最后一个维度 `dim` 必须满足 $dim = 40 \times 2^k$ ，且 $2 \le k \le 10$ （即 dim 范围为 160 到 40960），数据类型为 float16, bfloat16 或 float32
+- **scale** (float, 入参): 输出结果的缩放因子，默认为 1.0
+
+### 返回值
+
+返回变换后的张量，形状和数据类型与 `input` 相同
+
+### 约束与调用
+
+- `input` 的最后一个维度大小必须在支持的列表中：160, 320, 640, 1280, 2560, 5120, 10240, 20480, 40960
+- `input` 必须位于 GPU 设备上
+- 算子针对特定维度进行了模板特化优化，性能远高于通用的矩阵乘法实现
+
+### 调用示例
+
+```Python
+import torch
+import mcoplib.sgl_kernel
+# 配置参数
+SEED = 0
+DEVICE = "cuda"
+DTYPE = torch.float16
+# 维度设置 (必须是 40 * 2^k, 这里取 40 * 2^2 = 160)
+BATCH = 8
+SEQ_LEN = 128
+DIM = 160 
+# 初始化环境
+torch.manual_seed(SEED)
+torch.set_default_device(DEVICE)
+# 1. 创建输入 Tensor
+input_tensor = torch.randn(BATCH, SEQ_LEN, DIM, dtype=DTYPE)
+scale = 1.0 / (DIM ** 0.5)
+# 算子执行
+print(f"Running fast_hadamard_transform_40N...")
+if torch.cuda.is_available():
+    torch.cuda.synchronize()
+output = torch.ops.sgl_kernel.fast_hadamard_transform_40N(
+    input_tensor,
+    scale
+)
+if torch.cuda.is_available():
+    torch.cuda.synchronize()
+print("执行成功。")
+print(f"Input shape: {input_tensor.shape}")
+print(f"Output shape: {output.shape}")
+print(f"Output sample (first 5 elements): {output[0, 0, :5]}")
+```
+
+## 8. mctlass_moe_w4a16_gemm_kernel_mnk
+
+### 支持的产品型号
+
+- Metax C500/C550/C588/C600
+
+### 接口原型
+
+```python
+def mctlass_moe_w4a16_gemm_kernel_mnk(
+    num_valid_tokens: int,
+    N: int,
+    K: int,
+    group: int
+) -> int
+```
+
+### 功能描述
+
+该算子用于计算 **W4A16**（权重 4bit，激活值 16bit）混合精度 MoE GEMM 操作所需的 Kernel M 维度大小（`kernel_size.m`）。它并不执行实际的矩阵乘法运算，而是根据输入的问题规模（Token 数、矩阵维度、专家组数），在 `mctlass` 库中查找匹配的 GEMM Kernel 配置，并返回该配置对应的 M 维度大小，用于后续的资源分配或 Grid 设置。
+
+- 计算公式：
+	先对 4bit 量化权重执行反量化，再执行矩阵乘法（仅计算有效 token）：
+
+$$
+  \begin{align*}
+  &b_{\text{dequant}}[k, m] = \left( b[k, m] - \text{zp}_b[k, m] \right) \times \text{scale}_b[k, m] \\
+  &\text{dst}[i, m] = \sum_{k=0}^{K-1} \text{a}[i, k] \times b_{\text{dequant}}[k, m] \quad (0 \leq i < \text{num\\_valid\\_tokens})
+  \end{align*}
+$$
+
+  若 $i \geq \text{num\\_valid\\_tokens}$ （填充行），则 $\text{dst}[i, :] = 0$ 。
+  其中各张量的线性索引与二维位置的映射关系为：
+
+- 激活张量 $\text{a}$ ：
+
+$$
+    n_a = i \times K + k
+$$
+
+- 权重张量 $b$ ：
+
+$$
+    n_b = k \times M + m
+$$
+
+- 输出张量 $\text{dst}$ ：
+
+$$
+    n_{\text{dst}} = i \times M + m
+$$
+
+    各变量的维度与含义：
+
+- $\text{a} \in \mathbb{T}^{N \times K}$ ：16bit 激活输入张量，数据类型为 $\mathbb{T}$ （如 fp16），有效行范围 $0 \leq i < \text{num\\_valid\\_tokens}$
+- $b \in \mathbb{U}^{K \times M}$ ：4bit 量化的权重张量，数据类型为 $\mathbb{U}$ （如 uint4）
+- $\text{zp}_b \in \mathbb{U}^{K \times M}$ ：权重量化的零点张量，数据类型与 $b$ 一致
+- $\text{scale}_b \in \mathbb{R}^{K \times M}$ ：权重量化的缩放因子张量
+- $\text{dst} \in \mathbb{D}^{N \times M}$ ：输出张量，存储矩阵乘结果，数据类型与 $\text{a}$ 一致
+- $\text{num\\_valid\\_tokens}$ ：实际参与计算的有效激活行数（ $0 \leq \text{num\\_valid\\_tokens} \leq N$ ）
+- $N$ ：激活张量的行数（含填充，用于内存对齐）
+- $K$ ：激活与权重的输入特征维度
+- $M$ ：权重与输出的输出特征维度（由业务场景或 group 参数推导）
+- $\text{group}$ ：权重的分组维度（用于分组 GEMM 并行优化，将 $K$ 划分为 $\text{group}$ 个子维度）
+- $i$ ：激活/输出的行索引，范围 $0 \leq i < N$
+- $k$ ：输入特征维度的索引，范围 $0 \leq k < K$
+- $m$ ：输出特征维度的索引，范围 $0 \leq m < M$
+
+### 参数说明
+
+- **num_valid_tokens** (int, 入参): 有效 Token 的数量（对应 GEMM 中的 M 维度）
+- **N** (int, 入参): 权重矩阵的输出维度 N
+- **K** (int, 入参): 权重矩阵的输入维度 K
+- **group** (int, 入参): 组数量（对应 BatchedGemm 中的 Batch 维度，通常指 Expert 数量）
+
+### 返回值
+
+- **kernel_m** (int): 返回计算得到的 Kernel M 维度大小。如果未找到支持的 Kernel，代码会在 C++ 层打印错误信息，但返回值依赖于 `kernel_size.m()` 的默认状态
+
+### 约束与调用
+
+- 数据类型配置：底层固定配置为 `ElementA=maca_bfloat16` (BF16), `ElementB=uint8_t` (4-bit 权重打包), `ElementC=maca_bfloat16` (BF16)
+- 布局约束：固定配置为 LayoutA=RowMajor, LayoutB=ColumnMajor, LayoutC=RowMajor
+- 内部参数：算子内部硬编码了 `pack_factor = 2` 和 `group_size = 64`
+- 错误处理：输入的参数组合需要在 `mctlass` 中找到对应的 Kernel 实现
+
+### 调用示例
+
+```python
+import torch
+import mcoplib.sgl_moe_fused_w4a16
+# 1. 核心参数设置 (对应 C++ 签名中的四个 int64_t 参数)
+# int64_t num_valid_tokens, int64_t N, int64_t K, int64_t group
+num_valid_tokens = 1024   # 有效 token 数量
+N = 4096                  # 输出维度 N
+K = 2048                  # 输入维度 K
+group = 64                # 组大小 (Group Size)
+# 2. 调用算子
+result = mcoplib.sgl_moe_fused_w4a16.mctlass_moe_w4a16_gemm_kernel_mnk(
+    num_valid_tokens,
+    N,
+    K,
+    group
+)
+# 3. 输出结果
+print("mctlass_moe_w4a16_gemm_kernel_mnk called successfully")
+print(f"Input Params -> Tokens: {num_valid_tokens}, N: {N}, K: {K}, Group: {group}")
+print(f"Output Result (Kernel m size): {result}")
+```
+
+## 9. lightning_attention_decode
+
+### 支持的产品型号
+
+- Metax C500/C550/C588/C600
+
+### 接口原型
+
+```cpp
+def lightning_attention_decode(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    past_kv: torch.Tensor,
+    output: torch.Tensor,
+    slope_h: float
+) -> None
+```
+
+### 功能描述
+
+实现 Transformer 解码阶段的 Lightning Attention 计算，通过共享内存优化内存访问效率：
+
+1. 将查询（q）、键（k）、值（v）及历史键值缓存（past_kv）加载到共享内存；
+2. 计算注意力权重的缩放因子（ratio）；
+3. 更新历史键值缓存（past_kv）；
+4. 完成注意力加权求和并将结果写入 output 张量。
+	该算子通过内存访问融合与共享内存复用，提升了解码阶段注意力计算的性能。
+
+- 计算公式：
+
+$$
+  \begin{align*}
+  &\text{K}_{\text{total}} = \text{concat}([\text{past\\_kv}_k, K], 2) \\
+  &\text{V}_{\text{total}} = \text{concat}([\text{past\\_kv}_v, V], 2) \\
+  &\text{score} = \frac{Q \cdot \text{K}_{\text{total}}^T}{\sqrt{d_k}} \cdot \frac{1}{1 + \exp(-\text{slope\\_h} \cdot \text{len}(\text{K}_{\text{total}}))} \\
+  &\text{attn\\_weight} = \text{softmax}(\text{score}) \\
+  &\text{output} = \text{attn\\_weight} \cdot \text{V}_{\text{total}} \\
+  &\text{past\\_kv} = \text{concat}([\text{past\\_kv}, \text{concat}([K, V], 3)], 2)
+  \end{align*}
+$$
+
+  其中：
+
+- $Q \in \mathbb{R}^{\text{bs} \times H \times 1 \times d_k}$ 是解码阶段单步查询张量，dtype∈{float16, bfloat16, float32}
+- $K \in \mathbb{R}^{\text{bs} \times H_k \times 1 \times d_k}$ 是解码阶段单步键张量，dtype∈{float16, bfloat16, float32}
+- $V \in \mathbb{R}^{\text{bs} \times H_k \times 1 \times d_v}$ 是解码阶段单步值张量，dtype∈{float16, bfloat16, float32}，通常 $d_v = d_k$
+- $\text{past\\_kv} = (\text{past\\_kv}_k, \text{past\\_kv}_v) \in \mathbb{R}^{\text{bs} \times H_k \times L_{\text{past}} \times (d_k + d_v)}$ 是历史键值缓存张量，dtype∈{float16, bfloat16, float32}，入参/出参
+- $\text{output} \in \mathbb{R}^{\text{bs} \times H \times 1 \times d_v}$ 是注意力计算输出张量，dtype∈{float16, bfloat16, float32}
+- $\text{slope\\_h} \in \mathbb{R}$ 是注意力权重缩放斜率参数
+- $\text{concat}([T_1, T_2], dim)$ 表示沿 $dim$ 维度拼接张量 $T_1$ 和 $T_2$
+- $\text{softmax}(\cdot)$ 表示沿序列维度（第 2 维）的 softmax 归一化操作
+- $\text{len}(\cdot)$ 表示张量沿序列维度的长度计算， $\text{len}(\text{K}_{\text{total}}) = L_{\text{past}} + 1$
+- $\text{bs}$ 是 batch 大小， $H$ 是查询注意力头数， $H_k$ 是键值注意力头数（GQA/MQA 配置下 $H_k \leq H$ ）
+- $d_k$ 是键/查询头维度（head size）， $d_v$ 是值头维度， $L_{\text{past}}$ 是历史序列长度
+- $\cdot^T$ 表示张量在最后两个维度的转置操作， $\cdot$ 表示矩阵乘法（最后两个维度）
+- $\exp (\cdot)$ 表示逐元素指数运算， $\sqrt{\cdot}$ 表示开平方运算
+- $+$ 表示逐元素加法， $\cdot$ （缩放因子与分数的相乘）表示逐元素乘法
+- $[:, a: b]$ 表示张量沿指定维度取 $a$ 到 $b$ 的切片（CUDA 内核中共享内存加载/存储时的索引操作）
+
+### 参数说明
+
+- **q** (torch.Tensor, 入参): 注意力查询张量，需位于 CUDA 设备且为连续张量
+- **k** (torch.Tensor, 入参): 注意力键张量，需位于 CUDA 设备且为连续张量
+- **v** (torch.Tensor, 入参): 注意力值张量，需位于 CUDA 设备且为连续张量
+- **past_kv** (torch.Tensor, 入参/出参): 历史键值对缓存，计算中会更新该缓存，需位于 CUDA 设备且为连续张量
+- **output** (torch.Tensor, 出参): 注意力计算输出张量，结果直接写入此处，需位于 CUDA 设备且为连续张量
+- **slope_h** (float, 入参): 用于计算注意力权重缩放因子的参数
+
+### 返回值
+
+无返回值，变换结果直接写入输出张量中
+
+### 约束与调用
+
+- 所有张量必须部署在 CUDA 设备上
+- 所有张量需为连续（contiguous）张量，否则会触发合法性检查失败
+- 支持的数据类型：float16、bfloat16、float32
+- 线程块大小固定为`THREADS_PER_BLOCK`（代码中定义为 128），网格大小需根据张量的 batch_size、维度动态计算
+
+### 调用示例
+
+```python
+import torch
+import mcoplib.sgl_kernel
+# 设置计算设备
+device = "cuda" if torch.cuda.is_available() else "cpu"
+assert device == "cuda", "lightning_attention_decode仅支持CUDA设备"
+# 核心参数
+bs = 2               
+H = 16               
+Hk = 8               
+dk = 64              
+dv = 64              
+L_past = 10         
+# 1. 构造输入张量
+q = torch.randn(
+    bs, H, 1, dk,
+    dtype=torch.float32, device=device, requires_grad=False
+)
+k = torch.randn(
+    bs, Hk, 1, dk,
+    dtype=torch.float32, device=device, requires_grad=False
+)
+v = torch.randn(
+    bs, Hk, 1, dv,
+    dtype=torch.float32, device=device, requires_grad=False
+)
+past_kv = torch.randn(
+    bs, Hk, L_past, dk + dv,
+    dtype=torch.float32, device=device, requires_grad=False
+)
+output = torch.empty(
+    bs, H, 1, dv,
+    dtype=torch.float32, device=device, requires_grad=False
+)
+slope = torch.tensor(0.1, dtype=torch.float32, device=device)
+new_kv = torch.empty(
+    bs, Hk, L_past + 1, dk + dv,
+    dtype=torch.float32, device=device, requires_grad=False
+)
+# 调用算子
+torch.ops.sgl_kernel.lightning_attention_decode(
+    q=q,
+    k=k,
+    v=v,
+    past_kv=past_kv,
+    slope=slope,
+    output=output,
+    new_kv=new_kv
+)
+# 输出结果
+print("lightning_attention_decode computation completed")
+print(f"Output shape: {output.shape}")
+print(f"Updated new_kv shape: {new_kv.shape}")
+```
+
+## 10. meta_size
+
+### 支持的产品型号
+
+- Metax C500/C550
+
+### 接口原型
+
+```Python
+def meta_size() -> int:
+    pass
+```
+
+### 功能描述
+
+meta_size 算子用于获取 Custom Allreduce 机制所需的元数据（Metadata）缓冲区的大小（以字节为单位）。在分布式推理场景中，自定义 All-Reduce 内核需要一块共享内存区域来进行秩（Rank）之间的同步信号交换和状态管理。
+此功能主要应用于以下场景：
+
+1. 显存分配：在初始化通信器之前，计算需要分配的 IPC 共享内存的总大小（通常为 `meta_size () + max_buffer_size`）。
+2. 偏移量计算：确定数据缓冲区在共享内存块中的起始偏移量。
+
+- 操作逻辑：
+	算子调用底层 C++ 接口，返回预定义的元数据结构体所占用的字节数。
+	该数值是一个固定常量，取决于底层通信协议的设计。
+	**主要功能包括**：
+- 返回用于同步和元数据的显存大小要求。
+- 辅助上层应用进行正确的显存切分和管理。
+
+### 参数说明
+
+无参数
+
+### 返回值
+
+返回一个整数（int），表示元数据缓冲区所需的字节大小
+
+### 约束与调用
+
+- 该算子返回的是静态配置值，不依赖于当前的输入数据
+- 通常在 `CustomAllreduce` 初始化阶段调用
+
+### 调用示例
+
+```Python
+import torch
+import mcoplib.sgl_kernel
+# 配置参数
+# 无需特定配置，直接调用
+# 算子执行
+print(f"Running meta_size...")
+size_in_bytes = torch.ops.sgl_kernel.meta_size()
+# 验证结果
+print("执行成功。")
+print(f"Meta Size required: {size_in_bytes} bytes")
+```
+
+## 11. init_custom_ar
+
+### 支持的产品型号
+
+- Metax C500/C550
+
+### 接口原型
+
+```Python
+def init_custom_ar(
+    meta_ptrs: List[int],
+    rank_data: torch.Tensor,
+    rank: int,
+    fully_connected: bool
+) -> int:
+    pass
+```
+
+### 功能描述
+
+init_custom_ar 算子用于初始化自定义 All-Reduce（Custom Allreduce）通信器的底层 C++ 状态对象。
+在分布式推理初始化阶段，该算子负责构建用于同步和通信的上下文环境。它接收所有 Rank 的元数据（Meta）缓冲区地址，从而允许内核通过 P2P（Peer-to-Peer）机制在不同 GPU 之间直接读写同步信号，实现低延迟的协同工作。
+**主要功能包括**：
+
+- 创建并初始化 `CustomAllReduce` C++ 对象。
+- 注册用于跨设备同步的共享内存地址（Meta Pointers）。
+- 配置拓扑信息（如 Rank ID 和全连接状态）。
+- 返回状态对象的指针（Handle），供后续的注册和通信操作使用。
+
+### 参数说明
+
+- **meta_ptrs** (List[int], 入参): 包含通信组中所有 Rank 的元数据缓冲区（Meta Buffer）物理地址的列表。
+- 列表长度必须等于 `world_size`。
+- 第 `i` 个元素必须是 Rank `i` 的 Meta Buffer 在当前设备上可见的内存地址（通常通过 IPC 打开句柄获得）。
+- **rank_data** (torch.Tensor, 入参): 用于存储 Rank 相关辅助数据的张量，通常作为临时缓冲区或用于存储拓扑信息。
+- **rank** (int, 入参): 当前进程在通信组中的 Rank ID。
+- **fully_connected** (bool, 入参): 标志位，指示当前环境是否支持全连接（fully connected）拓扑。内核可能会根据此标志选择不同的通信策略。
+
+### 返回值
+
+返回一个整数（int），代表底层 C++ `CustomAllReduce` 状态对象的内存地址（指针）。该值需被妥善保存，并在调用 `register_buffer`、`all_reduce` 和 `dispose` 时传入。
+
+### 约束与调用
+
+- `meta_ptrs` 中的地址必须是有效的，且当前设备必须具有访问这些地址的权限（P2P Access Enabled）。
+- 必须在分布式环境初始化（如 `init_process_group`）之后调用。
+- 返回的指针必须在结束时通过 `dispose` 释放，否则会导致内存泄漏。
+
+### 调用示例
+
+```Python
+import torch
+import mcoplib.sgl_kernel
+# 配置参数
+rank = 0
+world_size = 2
+fully_connected = True
+device = "cuda"
+# 1. 准备 rank_data 缓冲区
+rank_data = torch.empty(8 * 1024 * 1024, dtype=torch.uint8, device=device)
+# 2. 准备 meta_ptrs
+# 在实际场景中，这通常涉及以下步骤：
+# a. 各 Rank 分配 meta buffer (torch.empty)
+# b. 获取 IPC Handle (cudaIpcGetMemHandle)
+# c. 通过 all_gather 交换 Handle
+# d. 通过 cudaIpcOpenMemHandle 打开 Handle 获取地址
+# 这里为了演示，假设我们已经获取了两个有效的设备指针地址
+fake_meta_ptr_rank0 = 140737488355328
+fake_meta_ptr_rank1 = 140737488355400
+meta_ptrs = [fake_meta_ptr_rank0, fake_meta_ptr_rank1]
+# 算子执行
+print(f"Running init_custom_ar...")
+if torch.cuda.is_available():
+    torch.cuda.synchronize()
+# 初始化并获取状态指针
+state_ptr = torch.ops.sgl_kernel.init_custom_ar(
+    meta_ptrs,
+    rank_data,
+    rank,
+    fully_connected
+)
+if torch.cuda.is_available():
+    torch.cuda.synchronize()
+# 验证结果
+print(f"初始化完成，State Pointer: {state_ptr}")
+# 后续需调用 dispose(state_ptr) 释放资源
+```
+
+## 12. all_reduce
+
+### 支持的产品型号
+
+- Metax C500/C550
+
+### 接口原型
+
+```Python
+def all_reduce(
+    fa: int,
+    inp: torch.Tensor,
+    out: torch.Tensor,
+    buffer_ptr: int,
+    buffer_size: int
+) -> None:
+    pass
+```
+
+### 功能描述
+
+all_reduce 算子用于在 Custom Allreduce 上下文中执行 out-of-place 的规约操作。该算子通常在 Eager 模式下或缓冲区尚未注册时使用。它利用初始化好的 Custom Allreduce 状态，将本地输入 inp 规约到输出 out，并在此过程中使用临时缓冲区 buffer 进行数据中转。
+此功能主要应用于以下场景：
+
+1. 未注册张量的规约：当输入张量的内存地址未在初始化阶段通过 `init_custom_ar` 或 `register_buffer` 注册时，需要显式传递一个已注册的临时缓冲区 `buffer` 来协助通信。
+2. Eager 模式下的动态规约：在动态图执行模式下，随时对任意张量进行 All-Reduce 操作。
+
+- 操作逻辑：
+	算子首先将输入数据 inp 拷贝到已注册的共享缓冲区 buffer 中。
+	内核利用 P2P 机制直接访问其他 Rank 的 buffer，执行规约计算（如 Sum）。
+	最终结果写回到本地输出 out。
+	**主要功能包括**：
+- 支持未注册张量的高效 All-Reduce。
+- 自动处理数据搬运和同步。
+- 规约操作默认为 Sum。
+
+### 参数说明
+
+- **fa** (int, 入参): Custom Allreduce 的状态指针（Flat Address），由 `init_custom_ar` 返回
+- **inp** (torch.Tensor, 入参): 需要进行规约的本地输入张量
+- **out** (torch.Tensor, 出参): 存储规约结果的输出张量，形状和数据类型需与 `inp` 一致
+- **buffer_ptr** (int, 入参): 当前 Rank 上已注册的临时缓冲区的内存地址指针。该缓冲区的容量必须能够容纳 `inp` 的数据
+- **buffer_size** (int, 入参): 临时缓冲区的大小（以字节为单位），用于边界检查
+
+### 返回值
+
+无返回值，规约结果直接写入 `out` 张量中
+
+### 约束与调用
+
+- `fa` 必须是有效的状态指针
+- `inp` 和 `out` 必须在同一设备上，且数据类型一致
+- `buffer_ptr` 指向的内存区域必须足够大（`>= inp.numel () * inp.element_size ()`），且必须已经通过 `register_buffer` 注册到 `fa` 关联的通信器中
+- 参与通信的所有 Rank 必须同时调用该算子，且输入张量形状一致
+
+### 调用示例
+
+```Python
+import torch
+import mcoplib.sgl_kernel
+# 简单测试，设置GPU数量为2
+world_size = 2 
+rank = 0       # 当前进程依然作为 0 号 rank
+fully_connected = True 
+# C++ 会检查 fake_ipc_ptrs.size()，现在它等于 2，满足 % 2 == 0
+fake_ipc_ptrs = [0] * world_size 
+device = "cuda"
+rank_data = torch.zeros(1024, dtype=torch.int64, device=device) 
+print("Initializing CustomAllReduce object...")
+try:
+    rank_state_ptr = torch.ops.sgl_kernel.init_custom_ar(
+        fake_ipc_ptrs, 
+        rank_data, 
+        rank, 
+        fully_connected
+    )
+    print(f"Got valid object pointer: {rank_state_ptr}")
+except Exception as e:
+    print(f"Initialization failed: {e}")
+    exit(1)
+inp = torch.randn(1024, 1024, dtype=torch.float16, device=device)
+out = torch.empty_like(inp)
+required_size = inp.numel() * inp.element_size()
+temp_buffer = torch.empty(required_size, dtype=torch.uint8, device=device)
+print("Running all_reduce...")
+try:
+    torch.ops.sgl_kernel.all_reduce(
+        rank_state_ptr,
+        inp,
+        out,
+        temp_buffer.data_ptr(),
+        temp_buffer.numel()
+    )
+    print("All-Reduce computation completed。")
+except Exception as e:
+    # 单卡无法验证完整功能，等不到 rank 1 的信号
+    print(f"All-Reduce called but no more GPU")
+# 清理
+if hasattr(torch.ops.sgl_kernel, "dispose"):
+    torch.ops.sgl_kernel.dispose(rank_state_ptr)
+```
+
+## 13. lightning_attention_decode
+
+### 支持的产品型号
+
+- Metax C500/C550/C588/C600
+
+### 接口原型
+
+```cpp
+def lightning_attention_decode(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    past_kv: torch.Tensor,
+    output: torch.Tensor,
+    slope_h: float
+) -> None
+```
+
+### 功能描述
+
+实现 Transformer 解码阶段的 Lightning Attention 计算，通过共享内存优化内存访问效率：
+
+1. 将查询（q）、键（k）、值（v）及历史键值缓存（past_kv）加载到共享内存；
+2. 计算注意力权重的缩放因子（ratio）；
+3. 更新历史键值缓存（past_kv）；
+4. 完成注意力加权求和并将结果写入 output 张量。
+	该算子通过内存访问融合与共享内存复用，提升了解码阶段注意力计算的性能。
+
+- 计算公式：
+
+$$
+  \begin{align*}
+  &\text{K}_{\text{total}} = \text{concat}([\text{past\\_kv}_k, K], 2) \\
+  &\text{V}_{\text{total}} = \text{concat}([\text{past\\_kv}_v, V], 2) \\
+  &\text{score} = \frac{Q \cdot \text{K}_{\text{total}}^T}{\sqrt{d_k}} \cdot \frac{1}{1 + \exp(-\text{slope\\_h} \cdot \text{len}(\text{K}_{\text{total}}))} \\
+  &\text{attn\\_weight} = \text{softmax}(\text{score}) \\
+  &\text{output} = \text{attn\\_weight} \cdot \text{V}_{\text{total}} \\
+  &\text{past\\_kv} = \text{concat}([\text{past\\_kv}, \text{concat}([K, V], 3)], 2)
+  \end{align*}
+$$
+
+  其中：
+
+- $Q \in \mathbb{R}^{\text{bs} \times H \times 1 \times d_k}$ 是解码阶段单步查询张量，dtype∈{float16, bfloat16, float32}
+- $K \in \mathbb{R}^{\text{bs} \times H_k \times 1 \times d_k}$ 是解码阶段单步键张量，dtype∈{float16, bfloat16, float32}
+- $V \in \mathbb{R}^{\text{bs} \times H_k \times 1 \times d_v}$ 是解码阶段单步值张量，dtype∈{float16, bfloat16, float32}，通常 $d_v = d_k$
+- $\text{past\\_kv} = (\text{past\\_kv}_k, \text{past\\_kv}_v) \in \mathbb{R}^{\text{bs} \times H_k \times L_{\text{past}} \times (d_k + d_v)}$ 是历史键值缓存张量，dtype∈{float16, bfloat16, float32}，入参/出参
+- $\text{output} \in \mathbb{R}^{\text{bs} \times H \times 1 \times d_v}$ 是注意力计算输出张量，dtype∈{float16, bfloat16, float32}
+- $\text{slope\\_h} \in \mathbb{R}$ 是注意力权重缩放斜率参数
+- $\text{concat}([T_1, T_2], dim)$ 表示沿 $dim$ 维度拼接张量 $T_1$ 和 $T_2$
+- $\text{softmax}(\cdot)$ 表示沿序列维度（第 2 维）的 softmax 归一化操作
+- $\text{len}(\cdot)$ 表示张量沿序列维度的长度计算， $\text{len}(\text{K}_{\text{total}}) = L_{\text{past}} + 1$
+- $\text{bs}$ 是 batch 大小， $H$ 是查询注意力头数， $H_k$ 是键值注意力头数（GQA/MQA 配置下 $H_k \leq H$ ）
+- $d_k$ 是键/查询头维度（head size）， $d_v$ 是值头维度， $L_{\text{past}}$ 是历史序列长度
+- $\cdot^T$ 表示张量在最后两个维度的转置操作， $\cdot$ 表示矩阵乘法（最后两个维度）
+- $\exp (\cdot)$ 表示逐元素指数运算， $\sqrt{\cdot}$ 表示开平方运算
+- $+$ 表示逐元素加法， $\cdot$ （缩放因子与分数的相乘）表示逐元素乘法
+- $[:, a: b]$ 表示张量沿指定维度取 $a$ 到 $b$ 的切片（CUDA 内核中共享内存加载/存储时的索引操作）
+
+### 参数说明
+
+- **q** (torch.Tensor, 入参): 注意力查询张量，需位于 CUDA 设备且为连续张量
+- **k** (torch.Tensor, 入参): 注意力键张量，需位于 CUDA 设备且为连续张量
+- **v** (torch.Tensor, 入参): 注意力值张量，需位于 CUDA 设备且为连续张量
+- **past_kv** (torch.Tensor, 入参/出参): 历史键值对缓存，计算中会更新该缓存，需位于 CUDA 设备且为连续张量
+- **output** (torch.Tensor, 出参): 注意力计算输出张量，结果直接写入此处，需位于 CUDA 设备且为连续张量
+- **slope_h** (float, 入参): 用于计算注意力权重缩放因子的参数
+
+### 返回值
+
+无返回值，变换结果直接写入输出张量中
+
+### 约束与调用
+
+- 所有张量必须部署在 CUDA 设备上
+- 所有张量需为连续（contiguous）张量，否则会触发合法性检查失败
+- 支持的数据类型：float16、bfloat16、float32
+- 线程块大小固定为`THREADS_PER_BLOCK`（代码中定义为 128），网格大小需根据张量的 batch_size、维度动态计算
+
+### 调用示例
+
+```python
+import torch
+import mcoplib.sgl_kernel
+# 设置计算设备
+device = "cuda" if torch.cuda.is_available() else "cpu"
+assert device == "cuda", "lightning_attention_decode仅支持CUDA设备"
+# 核心参数
+bs = 2               
+H = 16               
+Hk = 8               
+dk = 64              
+dv = 64              
+L_past = 10         
+# 1. 构造输入张量
+q = torch.randn(
+    bs, H, 1, dk,
+    dtype=torch.float32, device=device, requires_grad=False
+)
+k = torch.randn(
+    bs, Hk, 1, dk,
+    dtype=torch.float32, device=device, requires_grad=False
+)
+v = torch.randn(
+    bs, Hk, 1, dv,
+    dtype=torch.float32, device=device, requires_grad=False
+)
+past_kv = torch.randn(
+    bs, Hk, L_past, dk + dv,
+    dtype=torch.float32, device=device, requires_grad=False
+)
+output = torch.empty(
+    bs, H, 1, dv,
+    dtype=torch.float32, device=device, requires_grad=False
+)
+slope = torch.tensor(0.1, dtype=torch.float32, device=device)
+new_kv = torch.empty(
+    bs, Hk, L_past + 1, dk + dv,
+    dtype=torch.float32, device=device, requires_grad=False
+)
+# 调用算子
+torch.ops.sgl_kernel.lightning_attention_decode(
+    q=q,
+    k=k,
+    v=v,
+    past_kv=past_kv,
+    slope=slope,
+    output=output,
+    new_kv=new_kv
+)
+# 输出结果
+print("lightning_attention_decode computation completed")
+print(f"Output shape: {output.shape}")
+print(f"Updated new_kv shape: {new_kv.shape}")
+```
+
+## 14. merge_state
+
+### 支持的产品型号
+
+- Metax C500/C550
+
+### 接口原型
+
+```Python
+def merge_state(
+    prefix_output: torch.Tensor,
+    prefix_lse: torch.Tensor,
+    suffix_output: torch.Tensor,
+    suffix_lse: torch.Tensor,
+    output: Optional[torch.Tensor] = None,
+    output_lse: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    pass
+```
+
+### 功能描述
+
+merge_state 算子用于合并两个注意力计算阶段的中间状态（State），通常用于 FlashAttention 机制中的分块并行计算或解码阶段的状态更新。算子接收两组部分计算得到的 Output (Values) 和 LogSumExp (LSE) 数据，基于 LSE 进行加权归一化合并，生成最终的 Output 和更新后的 LSE。
+操作逻辑：
+算子接收前缀状态（Prefix）和后缀状态（Suffix），对每个 token 的每个 head 执行以下计算：
+
+1. 计算全局最大 LSE： $max\_lse = \max (p\_lse, s\_lse)$
+2. 计算归一化分母： $out\_se = \exp (p\_lse - max\_lse) + \exp (s\_lse - max\_lse)$
+3. 更新 LSE： $out\_lse = \log (out\_se) + max\_lse$
+4. 计算加权系数并合并 Output：
+
+$$
+    out = p\_out \cdot \frac{\exp(p\_lse - max\_lse)}{out\_se} + s\_out \cdot \frac{\exp(s\_lse - max\_lse)}{out\_se}
+$$
+
+**主要功能包括：**
+
+- 基于 LogSumExp 的数值稳定性加权合并。
+- 支持 In-place 操作（通过传入 output 张量）。
+- 自动处理 padding 和 head 维度的对齐。
+
+### 参数说明
+
+- **prefix_output** (torch.Tensor, 入参): 前缀部分的 Output 张量，形状为 `[num_tokens, num_heads, head_size]`，数据类型推荐使用 bfloat16（根据报错信息推断，Float/Half 可能未注册）。
+- **prefix_lse** (torch.Tensor, 入参): 前缀部分的 LogSumExp 张量，形状为 `[num_tokens, num_heads]`，数据类型通常为 float32。
+- **suffix_output** (torch.Tensor, 入参): 后缀部分的 Output 张量，形状和数据类型与 `prefix_output` 相同。
+- **suffix_lse** (torch.Tensor, 入参): 后缀部分的 LogSumExp 张量，形状和数据类型与 `prefix_lse` 相同。
+- **output** (Optional[torch.Tensor], 出参): 用于存储合并结果的 Output 张量。如果为 None，则自动创建。
+- **output_lse** (Optional[torch.Tensor], 出参): 用于存储合并结果的 LogSumExp 张量。如果为 None，则自动创建。
+
+### 返回值
+
+返回一个元组 `(output, output_lse)`：
+
+- **output**: 合并后的 Output 张量。
+- **output_lse**: 合并后的 LogSumExp 张量。
+
+### 约束与调用
+
+- 输入张量 `prefix_output` 和 `suffix_output` 的形状必须完全一致。
+- `prefix_lse` 和 `suffix_lse` 的形状必须匹配 `[num_tokens, num_heads]`。
+- 建议 Value 张量使用 `bfloat16`，LSE 张量使用 `float32`。
+- 算子支持 CUDA 设备。
+
+### 调用示例
+
+```Python
+import torch
+import mcoplib.sgl_kernel
+# 配置参数
+SEED = 0
+DEVICE = "cuda"
+# 修复：Half 和 Float 均 dispatch 失败，切换为 bfloat16
+DTYPE_VAL = torch.bfloat16
+DTYPE_LSE = torch.float32
+# 维度设置
+NUM_TOKENS = 4
+NUM_HEADS = 8
+HEAD_SIZE = 128
+# 初始化环境
+torch.manual_seed(SEED)
+torch.set_default_device(DEVICE)
+# 1. 创建输入 Tensors
+# 模拟前缀状态
+prefix_out = torch.randn(NUM_TOKENS, NUM_HEADS, HEAD_SIZE, dtype=DTYPE_VAL)
+prefix_lse = torch.randn(NUM_TOKENS, NUM_HEADS, dtype=DTYPE_LSE)
+# 模拟后缀状态
+suffix_out = torch.randn(NUM_TOKENS, NUM_HEADS, HEAD_SIZE, dtype=DTYPE_VAL)
+suffix_lse = torch.randn(NUM_TOKENS, NUM_HEADS, dtype=DTYPE_LSE)
+# 2. 准备输出 Tensors (可选)
+output = torch.empty_like(prefix_out)
+output_lse = torch.empty_like(prefix_lse)
+# 算子执行
+print(f"Running merge_state with {DTYPE_VAL}...")
+if torch.cuda.is_available():
+    torch.cuda.synchronize()
+# 调用 ops
+torch.ops.sgl_kernel.merge_state(
+    prefix_out,
+    prefix_lse,
+    suffix_out,
+    suffix_lse,
+    output,
+    output_lse
+)
+if torch.cuda.is_available():
+    torch.cuda.synchronize()
+# 验证结果
+print("执行成功。")
+print(f"Output Shape: {output.shape}")
+print(f"Output LSE Shape: {output_lse.shape}")
+print(f"Output Mean: {output.float().mean().item()}")
+```
+
+## 15. merge_state_v2
+
+### 支持的产品型号
+
+- Metax C500/C550
+
+### 接口原型
+
+```Python
+def merge_state_v2(
+    prefix_output: torch.Tensor,
+    prefix_lse: torch.Tensor,
+    suffix_output: torch.Tensor,
+    suffix_lse: torch.Tensor,
+    output: Optional[torch.Tensor] = None,
+    output_lse: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    pass
+```
+
+### 功能描述
+
+merge_state_v2 算子用于合并两个独立注意力计算阶段产生的中间状态（Value 和 LogSumExp）。该算子通常应用于 FlashAttention 的分块解码（Split-K Decoding）、投机采样（Speculative Decoding）中的 Cascade Attention 验证阶段，或者 chunked prefill 场景。它根据两组 LogSumExp (LSE) 的值计算归一化权重，将两组部分的 Output 合并为最终的 Output，并更新全局 LSE。
+操作逻辑：
+算子接收两组状态 $(V_a, S_a)$ 和 $(V_b, S_b)$ ，其中 $V$ 代表 Output， $S$ 代表 LSE。对每个 Head 的每个 Token 执行以下计算：
+
+1. 计算最大 LSE： $m = \max (S_a, S_b)$
+2. 计算归一化因子： $l = \exp (S_a - m) + \exp (S_b - m)$
+3. 计算新的 LSE： $S_{new} = m + \log (l)$
+4. 合并 Output：
+
+$$
+    V_{new} = \frac{V_a \cdot \exp(S_a - m) + V_b \cdot \exp(S_b - m)}{l}
+$$
+
+**主要功能包括**：
+
+- 高效合并 FlashAttention 的中间结果。
+- 保证数值稳定性的 LogSumExp 更新。
+- 支持 In-place 操作以减少显存分配。
+
+### 参数说明
+
+- **prefix_output** (torch.Tensor, 入参): 第一部分（前缀）的 Output 张量，形状为 `[num_tokens, num_heads, head_size]`，数据类型支持 float16 或 bfloat16
+- **prefix_lse** (torch.Tensor, 入参): 第一部分（前缀）的 LogSumExp 张量，形状为 `[num_tokens, num_heads]`，数据类型必须为 float32
+- **suffix_output** (torch.Tensor, 入参): 第二部分（后缀）的 Output 张量，形状和数据类型与 `prefix_output` 相同
+- **suffix_lse** (torch.Tensor, 入参): 第二部分（后缀）的 LogSumExp 张量，形状和数据类型与 `prefix_lse` 相同
+- **output** (Optional[torch.Tensor], 出参): 用于存储合并结果的 Output 张量。如果为 None，算子将创建新张量或复用输入（取决于具体实现逻辑，通常建议显式传入或使用返回值）
+- **output_lse** (Optional[torch.Tensor], 出参): 用于存储合并结果的 LSE 张量。如果为 None，算子将创建新张量
+
+### 返回值
+
+返回一个元组 `(output, output_lse)`，包含合并后的 Output 张量和 LogSumExp 张量
+
+### 约束与调用
+
+- 所有输入张量必须在 CUDA 设备上
+- `prefix_output` 和 `suffix_output` 的形状必须完全一致
+- `prefix_lse` 和 `suffix_lse` 的形状必须完全一致，且匹配 Output 的前两维
+- LSE 张量必须连续（Contiguous）
+- 推荐使用 `bfloat16` 作为 Value 的数据类型以获得最佳性能和精度平衡
+
+### 调用示例
+
+```Python
+import torch
+import mcoplib.sgl_kernel
+# 配置参数
+SEED = 0
+DEVICE = "cuda"
+DTYPE_VAL = torch.bfloat16
+DTYPE_LSE = torch.float32
+# 维度设置
+NUM_TOKENS = 64
+NUM_HEADS = 8
+HEAD_SIZE = 128
+# 初始化环境
+torch.manual_seed(SEED)
+torch.set_default_device(DEVICE)
+# 1. 创建输入 Tensors
+# 模拟前缀 Attention 结果
+prefix_out = torch.randn(NUM_TOKENS, NUM_HEADS, HEAD_SIZE, dtype=DTYPE_VAL)
+prefix_lse = torch.randn(NUM_TOKENS, NUM_HEADS, dtype=DTYPE_LSE)
+# 模拟后缀 Attention 结果
+suffix_out = torch.randn(NUM_TOKENS, NUM_HEADS, HEAD_SIZE, dtype=DTYPE_VAL)
+suffix_lse = torch.randn(NUM_TOKENS, NUM_HEADS, dtype=DTYPE_LSE)
+# 2. 准备输出 Tensors
+output = torch.empty_like(prefix_out)
+output_lse = torch.empty_like(prefix_lse)
+# 算子执行
+print(f"Running merge_state_v2...")
+if torch.cuda.is_available():
+    torch.cuda.synchronize()
+torch.ops.sgl_kernel.merge_state_v2(
+    prefix_out,
+    prefix_lse,
+    suffix_out,
+    suffix_lse,
+    output,
+    output_lse
+)
+if torch.cuda.is_available():
+    torch.cuda.synchronize()
+# 验证结果
+print("执行成功。")
+print(f"Output Mean: {output.float().mean().item()}")
+print(f"Output LSE Mean: {output_lse.mean().item()}")
+```
+
+## 16. fused_add_rmsnorm
+
+### 支持的产品型号
+
+- Metax C500/C550
+
+### 接口原型
+
+```Python
+def fused_add_rmsnorm(
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    epsilon: float,
+    enable_pdl: bool = False
+) -> None:
+    pass
+```
+
+### 功能描述
+
+fused_add_rmsnorm 算子将残差连接（Residual Add）与 RMSNorm（Root Mean Square Normalization）操作融合为一个高效的内核。该操作通常用于 Transformer 架构的层级结构中，在每个子层（如 Attention 或 Feed Forward）之后应用。
+操作逻辑：
+
+1. 残差更新：首先将输入 input 与 residual 相加，结果直接原位更新到 residual 张量中。
+
+$$
+    residual \leftarrow input + residual
+$$
+
+2. RMSNorm：然后对更新后的 `residual` 进行 RMSNorm 操作。
+
+- 计算均方根：
+
+$$
+        RMS(x) = \sqrt{\frac{1}{d} \sum_{i=1}^{d} x_i^2 + \epsilon}
+$$
+
+- 归一化并缩放：
+
+$$
+        y = \frac{x}{RMS(x)} \cdot weight
+$$
+
+- 最终结果原位更新到 `input` 张量中。
+	**主要功能包括：**
+- 融合 Add 和 RMSNorm 以减少显存访问次数。
+- 支持 In-place 更新 residual，节省显存。
+- 支持通过 `enable_pdl` 参数开启特定硬件优化。
+
+### 参数说明
+
+- **input** (torch.Tensor, 入参/出参): 输入张量，形状通常为 `[batch_size, seq_len, hidden_size]`。操作后存储 RMSNorm 的结果。数据类型推荐使用 bfloat16。
+- **residual** (torch.Tensor, 入参/出参): 残差张量，形状与 `input` 相同。操作后存储 `input + residual` 的结果。数据类型与 `input` 一致。
+- **weight** (torch.Tensor, 入参): RMSNorm 的权重参数，形状为 `[hidden_size]`。数据类型通常与 `input` 一致。
+- **epsilon** (float, 入参): 数值稳定性常数，通常为 1e-6。
+- **enable_pdl** (bool, 入参): 是否开启 PDL 优化，默认为 False。
+
+### 返回值
+
+无返回值（None）。结果直接写入 `input` 和 `residual` 张量。
+
+### 约束与调用
+
+- `input` 和 `residual` 的形状必须完全一致。
+- `weight` 的大小必须匹配 `input` 的最后一维。
+- 所有输入张量必须在 CUDA 设备上。
+- 数据类型通常要求一致（如均为 bf16）。
+- 建议输入张量是连续存储的。
+
+### 调用示例
+
+```Python
+import torch
+import mcoplib.sgl_kernel
+# 配置参数
+SEED = 0
+DEVICE = "cuda"
+DTYPE = torch.bfloat16  # 使用 bfloat16 避免 Half dispatch 错误
+HIDDEN_SIZE = 4096
+NUM_TOKENS = 128
+EPS = 1e-6
+ENABLE_PDL = False
+# 初始化
+torch.manual_seed(SEED)
+torch.set_default_device(DEVICE)
+# 创建 Tensor
+input_tensor = torch.randn(NUM_TOKENS, HIDDEN_SIZE, dtype=DTYPE)
+residual_tensor = torch.randn(NUM_TOKENS, HIDDEN_SIZE, dtype=DTYPE)
+weight = torch.ones(HIDDEN_SIZE, dtype=DTYPE)
+# 备份
+input_ref = input_tensor.clone()
+residual_ref = residual_tensor.clone()
+# 执行算子
+if torch.cuda.is_available():
+    torch.cuda.synchronize()
+torch.ops.sgl_kernel.fused_add_rmsnorm(
+    input_tensor,
+    residual_tensor,
+    weight,
+    EPS,
+    ENABLE_PDL
+)
+if torch.cuda.is_available():
+    torch.cuda.synchronize()
+# 验证结果
+expected_residual = input_ref + residual_ref
+diff_residual = (residual_tensor - expected_residual).abs().max()
+# 手动计算 RMSNorm (转 float32 计算)
+input_f32 = input_ref.to(torch.float32)
+residual_f32 = residual_ref.to(torch.float32)
+weight_f32 = weight.to(torch.float32)
+expected_residual_f32 = input_f32 + residual_f32
+rstd = torch.rsqrt(expected_residual_f32.pow(2).mean(-1, keepdim=True) + EPS)
+expected_output = (expected_residual_f32 * rstd * weight_f32).to(DTYPE)
+diff_output = (input_tensor - expected_output).abs().max()
+print("执行成功。")
+print(f"Residual Max Diff: {diff_residual.item()}")
+print(f"Output Max Diff: {diff_output.item()}")
+```
+
+## 17. apply_rope_pos_ids_cos_sin_cache
+
+### 支持的产品型号
+
+- Metax C500/C550
+
+### 接口原型
+
+```Python
+def apply_rope_pos_ids_cos_sin_cache(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_rope: torch.Tensor,
+    k_rope: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    pos_ids: torch.Tensor,
+    interleave: bool = False,
+    enable_pdl: bool = False,
+    cuda_stream: int = 0,
+    v: Optional[torch.Tensor] = None,
+    k_buffer: Optional[torch.Tensor] = None,
+    v_buffer: Optional[torch.Tensor] = None,
+    kv_cache_loc: Optional[torch.Tensor] = None
+) -> None:
+    pass
+```
+
+### 功能描述
+
+apply_rope_pos_ids_cos_sin_cache 算子用于对查询（Query）和键（Key）张量应用旋转位置编码（Rotary Positional Embeddings, RoPE）。该算子利用预计算的 Cosine 和 Sine 缓存表，根据输入的位置 ID 对向量进行旋转。
+此外，该算子支持融合操作：如果提供了 Value 张量以及 KV Cache 的缓冲区（buffer 和 location），它可以在执行 RoPE 的同时，将 Key 和 Value 保存到非连续的 KV Cache 内存中（类似 PagedAttention 的写入过程），从而减少显存读写次数。
+**主要功能包括：**
+
+- RoPE 计算：根据 `pos_ids` 从 `cos_sin_cache` 获取旋转系数，应用到 `q` 和 `k`。
+- KV Cache 写入（可选）：如果提供了 `v`、`k_buffer`、`v_buffer` 和 `kv_cache_loc`，则将 RoPE 后的 Key 和原始 Value 写入指定的 Cache 显存位置。
+- 模式支持：支持交错（Interleaved）模式和普通模式的 RoPE 计算。
+
+### 参数说明
+
+- **q** (torch.Tensor, 入参): 输入的 Query 张量，形状为 `[nnz, num_heads, head_dim]`，数据类型通常为 float16 或 bfloat16。`nnz` 为总 Token 数（Batch x SeqLen）。
+- **k** (torch.Tensor, 入参): 输入的 Key 张量，形状为 `[nnz, num_kv_heads, head_dim]`，数据类型与 `q` 一致。
+- **q_rope** (torch.Tensor, 出参): 输出的经过 RoPE 处理的 Query 张量，形状与 `q` 相同。
+- **k_rope** (torch.Tensor, 出参): 输出的经过 RoPE 处理的 Key 张量，形状与 `k` 相同。
+- **cos_sin_cache** (torch.Tensor, 入参): 预计算的 Cos/Sin 缓存表，形状为 `[max_seq_len, rotary_dim]`。通常前一半为 Cos，后一半为 Sin，或者根据具体实现布局。
+- **pos_ids** (torch.Tensor, 入参): 每个 Token 对应的位置索引，形状为 `[nnz]`，数据类型为 int64。
+- **interleave** (bool, 入参): 是否使用交错模式计算 RoPE。默认为 False。
+- **enable_pdl** (bool, 入参): 是否开启 PDL (Parallel Data Layout) 优化。默认为 False。
+- **cuda_stream** (int, 入参): CUDA 流的整数句柄。通常使用 `torch.cuda.current_stream (). cuda_stream` 获取。
+- **v** (Optional[torch.Tensor], 入参): 输入的 Value 张量（可选），形状为 `[nnz, num_kv_heads, head_dim]`。仅在需要同时保存 KV Cache 时提供。
+- **k_buffer** (Optional[torch.Tensor], 出参): KV Cache 中的 Key 缓冲区（可选），形状通常为 `[num_blocks, block_size, num_kv_heads, head_dim]` 或类似结构。
+- **v_buffer** (Optional[torch.Tensor], 出参): KV Cache 中的 Value 缓冲区（可选）。
+- **kv_cache_loc** (Optional[torch.Tensor], 入参): KV Cache 的写入位置索引（可选），形状为 `[nnz]`。
+
+### 返回值
+
+无返回值。结果直接写入 `q_rope`、`k_rope` 以及可选的 `k_buffer` 和 `v_buffer` 中。
+
+### 约束与调用
+
+- 输入张量 `q` 和 `k` 的最后一维必须是连续的（Contiguous）。
+- 所有 Tensor 必须位于相同的 CUDA 设备上。
+- `q` 和 `k` 的第一维（Token 数）和最后一维（Head Dim）必须相等。
+- 如果启用 KV Cache 保存功能，必须同时提供 `v`、`k_buffer`、`v_buffer` 和 `kv_cache_loc`，且它们的维度必须匹配。
+
+### 调用示例
+
+```Python
+import torch
+import mcoplib.sgl_kernel
+# 配置参数
+SEED = 0
+DEVICE = "cuda"
+# 预防 float16 dispatch 错误，使用 bfloat16
+DTYPE = torch.bfloat16
+NNZ = 10              # 总 Token 数
+NUM_Q_HEADS = 4
+NUM_KV_HEADS = 2
+HEAD_DIM = 128
+ROTARY_DIM = 128      # 旋转维度
+MAX_SEQ_LEN = 1024
+# 初始化环境
+torch.manual_seed(SEED)
+torch.set_default_device(DEVICE)
+# 1. 创建输入 Tensors
+q = torch.randn(NNZ, NUM_Q_HEADS, HEAD_DIM, dtype=DTYPE)
+k = torch.randn(NNZ, NUM_KV_HEADS, HEAD_DIM, dtype=DTYPE)
+# 模拟 Cos/Sin Cache (假设简单布局)
+cos_sin_cache = torch.randn(MAX_SEQ_LEN, ROTARY_DIM, dtype=DTYPE)
+# 生成随机位置 ID
+pos_ids = torch.randint(0, MAX_SEQ_LEN, (NNZ,), dtype=torch.int64)
+# 2. 准备输出 Tensors
+q_rope = torch.empty_like(q)
+k_rope = torch.empty_like(k)
+# 3. 获取 CUDA Stream
+current_stream = torch.cuda.current_stream().cuda_stream
+# 算子执行 (仅 RoPE，不保存 Cache)
+print(f"Running apply_rope_pos_ids_cos_sin_cache with {DTYPE}...")
+if torch.cuda.is_available():
+    torch.cuda.synchronize()
+# 修复：传入 cuda_stream 参数
+torch.ops.sgl_kernel.apply_rope_pos_ids_cos_sin_cache(
+    q,
+    k,
+    q_rope,
+    k_rope,
+    cos_sin_cache,
+    pos_ids,
+    False,           # interleave
+    False,           # enable_pdl
+    current_stream,  # cuda_stream (Fix: 补充此参数)
+    None,   # v
+    None,   # k_buffer
+    None,   # v_buffer
+    None    # kv_cache_loc
+)
+if torch.cuda.is_available():
+    torch.cuda.synchronize()
+# 验证结果
+print("执行成功。")
+print(f"Q_RoPE Shape: {q_rope.shape}")
+print(f"K_RoPE Shape: {k_rope.shape}")
+```
+
+## 18. fused_mla_absorb_rotary_emb
+
+### 支持的产品型号
+
+- Metax C500/C550
+
+### 接口原型
+
+```Python
+def fused_mla_absorb_rotary_emb(
+    q: torch.Tensor,
+    w_kc: torch.Tensor,
+    latent_cache: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    norm_weight: torch.Tensor,
+    q_input: torch.Tensor,
+    k_input: torch.Tensor,
+    v_input: torch.Tensor,
+    q_len: int,
+    num_local_heads: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    qk_nope_head_dim: int
+) -> int:
+    pass
+```
+
+### 功能描述
+
+fused_mla_absorb_rotary_emb 算子用于 MLA（Multi-Head Latent Attention）机制中的融合计算。该算子将旋转位置编码（RoPE）的应用、权重吸收（Absorb）以及相关的层归一化（LayerNorm）操作融合，用于高效生成用于后续计算的 Query、Key 和 Value 张量。
+此功能主要应用于以下场景：
+
+1. DeepSeek-V2/V3 推理：针对 MLA 架构的特有优化，处理 Latent Cache 到投影后 Q/K/V 的转换。
+2. 显存与计算优化：通过融合多个 element-wise 和 GEMV 操作，减少显存读写次数，提升推理性能。
+
+- 操作逻辑：
+	算子接收原始查询 q、键内容权重 w_kc、潜在缓存 latent_cache 以及位置编码表 cos_sin_cache。
+	算子结合 positions 索引应用 RoPE，并结合 norm_weight 进行归一化处理。
+	最终将计算结果写入输出张量 q_input、k_input 和 v_input。
+	**主要功能包括**：
+- 对 Latent Cache 进行归一化和权重计算。
+- 融合 RoPE 位置编码应用。
+- 按照 MLA 结构输出投影后的 Q、K、V 数据。
+
+### 参数说明
+
+- **q** (torch.Tensor, 入参): 查询张量，形状为 `[q_len, num_local_heads, qk_nope_head_dim + qk_rope_head_dim]`，数据类型为 bfloat16。其中 `q_len` 对应 Batch Size 或当前批次的 Token 总数。
+- **w_kc** (torch.Tensor, 入参): Key-Content 权重张量，形状为 `[num_local_heads, qk_nope_head_dim, kv_lora_rank]`，数据类型为 float32。
+- **latent_cache** (torch.Tensor, 入参): 潜在缓存张量，形状为 `[bs, kv_lora_rank + qk_rope_head_dim]`，数据类型为 bfloat16。
+- **cos_sin_cache** (torch.Tensor, 入参): RoPE 正余弦缓存表，形状为 `[max_position_embeddings, qk_rope_head_dim]`，数据类型为 bfloat16。
+- **positions** (torch.Tensor, 入参): 位置索引张量，形状为 `[bs]`，数据类型为 int64。
+- **norm_weight** (torch.Tensor, 入参): 归一化权重张量，形状为 `[kv_lora_rank]`，数据类型为 float32。
+- **q_input** (torch.Tensor, 出参): Query 输出张量，形状为 `[bs, qk_nope_head_dim, kv_lora_rank + qk_rope_head_dim]`，数据类型为 bfloat16。
+- **k_input** (torch.Tensor, 出参): Key 输出张量，形状为 `[bs, 1, kv_lora_rank + qk_rope_head_dim]`，数据类型为 bfloat16。
+- **v_input** (torch.Tensor, 出参): Value 输出张量，形状为 `[bs, 1, kv_lora_rank]`，数据类型为 bfloat16。
+- **q_len** (int, 入参): 查询长度，必须等于 `q` 张量的第 0 维大小 (`q.size (0)`)。
+- **num_local_heads** (int, 入参): 本地注意力头数。
+- **kv_lora_rank** (int, 入参): KV LoRA 的秩（Rank）大小。
+- **qk_rope_head_dim** (int, 入参): Query/Key 的 RoPE 维度大小。
+- **qk_nope_head_dim** (int, 入参): Query/Key 的非 RoPE 维度大小。
+
+### 返回值
+
+返回 int 类型状态码（通常为 0 表示成功），计算结果直接写入 `q_input`、`k_input` 和 `v_input` 张量中。
+
+### 约束与调用
+
+- 输入 Tensor 必须在 GPU 上。
+- **严格的混合精度要求**：
+- 数据流张量 (`q`, `latent_cache`, `cos_sin_cache`) 必须为 **bfloat16**。
+- 权重参数张量 (`w_kc`, `norm_weight`) 必须为 **float32**。
+- `q.size (0)` 必须严格等于传入的 `q_len` 参数。
+- `positions` 的值不能超出 `cos_sin_cache` 的最大长度。
+
+### 调用示例
+
+```Python
+import torch
+import mcoplib.sgl_kernel
+# 配置参数
+SEED = 0
+DEVICE = "cuda"
+BS = 4
+Q_LEN = 4
+NUM_LOCAL_HEADS = 128
+KV_LORA_RANK = 512
+QK_ROPE_HEAD_DIM = 64
+QK_NOPE_HEAD_DIM = 128
+MAX_POS = 4096
+torch.manual_seed(SEED)
+torch.set_default_device(DEVICE)
+# 1. 创建数据流张量 (BFloat16)
+q = torch.randn((BS, NUM_LOCAL_HEADS, QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM), dtype=torch.bfloat16)
+latent_cache = torch.randn((BS, KV_LORA_RANK + QK_ROPE_HEAD_DIM), dtype=torch.bfloat16)
+cos_sin_cache = torch.randn((MAX_POS, QK_ROPE_HEAD_DIM), dtype=torch.float32)
+# 2. 创建权重张量 
+w_kc = torch.randn(
+    (NUM_LOCAL_HEADS, QK_NOPE_HEAD_DIM, KV_LORA_RANK), 
+    dtype=torch.bfloat16
+)
+norm_weight = torch.randn(
+    (KV_LORA_RANK,), 
+    dtype=torch.bfloat16
+)
+# 3. 创建索引张量 (Int64)
+positions = torch.randint(0, MAX_POS, (BS,), dtype=torch.int64)
+# 4. 创建输出张量 (BFloat16)
+q_input = torch.empty((BS, QK_NOPE_HEAD_DIM, KV_LORA_RANK + QK_ROPE_HEAD_DIM), dtype=torch.bfloat16)
+k_input = torch.empty((BS, 1, KV_LORA_RANK + QK_ROPE_HEAD_DIM), dtype=torch.bfloat16)
+v_input = torch.empty((BS, 1, KV_LORA_RANK), dtype=torch.bfloat16)
+print(f"Running fused_mla_absorb_rotary_emb...")
+if torch.cuda.is_available():
+    torch.cuda.synchronize()
+torch.ops.sgl_kernel.fused_mla_absorb_rotary_emb(
+    q,
+    w_kc,
+    latent_cache,
+    cos_sin_cache,
+    positions,
+    norm_weight,
+    q_input,
+    k_input,
+    v_input,
+    Q_LEN,
+    NUM_LOCAL_HEADS,
+    KV_LORA_RANK,
+    QK_ROPE_HEAD_DIM,
+    QK_NOPE_HEAD_DIM
+)
+if torch.cuda.is_available():
+    torch.cuda.synchronize()
+print("执行成功。")
+```
+
+## 19. copy_to_gpu_no_ce
+
+### 支持的产品型号
+
+- Metax C500/C550
+
+### 接口原型
+
+```Python
+def copy_to_gpu_no_ce(
+    input: torch.Tensor,
+    output: torch.Tensor
+) -> None:
+    pass
+```
+
+### 功能描述
+
+copy_to_gpu_no_ce 算子用于将小型整型数组从 CPU 内存高效复制到 GPU 显存。该算子不使用标准的 DMA 拷贝引擎（Copy Engine），而是通过将数据作为内核参数直接传递给 GPU 内核来实现数据传输。
+此功能主要应用于以下场景：
+
+1. 元数据传输：传输少量的控制信息或形状信息（如 tensor shapes, flags）。
+2. 低延迟同步：避免启动 DMA 引擎带来的额外开销，适用于极小数据量的快速传输。
+
+- 操作逻辑：
+	算子接收源张量 input 和目标张量 output。
+	算子将 input 中的所有元素逐一复制到 output 对应的位置。
+
+$$
+    \forall i, \quad \text{output}[i] \leftarrow \text{input}[i]
+$$
+
+    其中 $i$ 为元素索引。
+
+**主要功能包括**：
+
+- 将 Int32 数据从 CPU 快速复制到 CUDA 设备。
+- 利用内核参数传递机制绕过传统内存拷贝路径。
+- 严格校验数据长度（仅支持特定的固定长度，如 64 或 72）。
+
+### 参数说明
+
+- **input** (torch.Tensor, 入参): 源张量，必须位于 CPU 上。形状为 1D，数据类型必须为 int32，且内存连续。元素数量必须严格等于 64 或 72。
+- **output** (torch.Tensor, 出参): 目标张量，必须位于 CUDA 设备上。形状为 1D，数据类型必须为 int32，且内存连续。元素数量必须与 `input` 一致。
+
+### 返回值
+
+无返回值，操作结果直接写入 `output` 张量中
+
+### 约束与调用
+
+- `input` 必须是 CPU 张量，`output` 必须是 CUDA 张量
+- `input` 和 `output` 的数据类型必须严格为 `torch.int32`
+- `input` 和 `output` 必须是连续的（Contiguous）且为 1 维张量
+- 张量的元素个数（numel）必须严格等于 64 或 72，否则会抛出异常
+
+### 调用示例
+
+```Python
+import torch
+import mcoplib.sgl_kernel
+# 配置参数
+SEED = 0
+N = 64  # 支持 64 或 72
+DEVICE_CPU = "cpu"
+DEVICE_GPU = "cuda"
+DTYPE = torch.int32
+# 初始化环境
+torch.manual_seed(SEED)
+# 1. 创建 CPU 输入 Tensor
+# 数据必须是 int32 类型，长度必须符合约束
+src_data = [i for i in range(N)]
+input_cpu = torch.tensor(src_data, dtype=DTYPE, device=DEVICE_CPU)
+# 2. 创建 GPU 输出 Tensor
+output_gpu = torch.empty_like(input_cpu, device=DEVICE_GPU)
+# 算子执行
+print(f"Running copy_to_gpu_no_ce with N={N}...")
+if torch.cuda.is_available():
+    torch.cuda.synchronize()
+torch.ops.sgl_kernel.copy_to_gpu_no_ce(
+    input_cpu,
+    output_gpu
+)
+if torch.cuda.is_available():
+    torch.cuda.synchronize()
+# 验证结果
+# 将结果拷回 CPU 进行比对
+output_cpu = output_gpu.cpu()
+diff = (input_cpu - output_cpu).abs().sum()
+print("执行成功。")
+print(f"Diff: {diff.item()}")
+```
+
+## 20. concat_mla_k
+
+### 支持的产品型号
+
+- Metax C500/C550
+
+### 接口原型
+
+```Python
+def concat_mla_k(
+    k: torch.Tensor,
+    k_nope: torch.Tensor,
+    k_rope: torch.Tensor
+) -> None:
+    pass
+```
+
+### 功能描述
+
+concat_mla_k 算子用于在多头潜在注意力（MLA）机制中组合生成最终的 Key 张量。该算子将非旋转位置编码部分（Nope）和旋转位置编码部分（RoPE）拼接并存储到目标内存中。
+此功能主要应用于以下场景：
+
+1. MLA 推理：在 DeepSeek 等采用 MLA 架构的模型中，将压缩后的 latent 向量投影出的两部分（pe 和 nope）合并。
+2. 显存布局优化：将分散存储的 Key 组件合并为连续的张量，以便后续 Attention 计算。
+
+- 操作逻辑：
+	算子接收目标张量 k 以及两个源张量 k_nope 和 k_rope。
+	对于每一个 Token 和 Head，算子将 k_nope 复制到 k 的前 128 维，将 k_rope 复制到 k 的后 64 维。其中 k_rope 会在 Head 维度上进行广播。
+
+$$
+    \text{k}[t, h, 0:128] \leftarrow \text{k\\_nope}[t, h, 0:128]
+$$
+
+
+
+$$
+    \text{k}[t, h, 128:192] \leftarrow \text{k\\_rope}[t, 0, 0:64]
+$$
+
+**主要功能包括**：
+
+- 高效拼接 MLA 的 Key 组件。
+- 支持 RoPE 部分的广播机制（所有 Head 共享同一个 RoPE 向量）。
+- 利用向量化加载和存储（int2/int4）优化显存带宽利用率。
+- 自动处理 L2 预取以隐藏访存延迟。
+
+### 参数说明
+
+- **k** (torch.Tensor, 出参): 目标 Key 张量，形状为 `[num_tokens, 128, 192]`，数据类型必须为 `bfloat16`。其中 192 = 128 (Nope) + 64 (RoPE)。
+- **k_nope** (torch.Tensor, 入参): 非 RoPE 部分的 Key 张量，形状为 `[num_tokens, 128, 128]`，数据类型必须为 `bfloat16`。
+- **k_rope** (torch.Tensor, 入参): RoPE 部分的 Key 张量，形状为 `[num_tokens, 1, 64]`，数据类型必须为 `bfloat16`。
+
+### 返回值
+
+无返回值，操作结果直接写入 `k` 张量中
+
+### 约束与调用
+
+- 所有输入输出张量必须在 CUDA 设备上
+- 数据类型严格限制为 `torch.bfloat16`
+- 张量的最后一维必须是连续的（Stride 为 1）
+- 内存地址必须 16 字节对齐
+- 维度约束：Head 数量固定为 128，Nope 维度固定为 128，RoPE 维度固定为 64
+
+### 调用示例
+
+```Python
+import torch
+import mcoplib.sgl_kernel
+# 配置参数
+SEED = 0
+DEVICE = "cuda"
+DTYPE = torch.bfloat16
+# 固定维度参数
+NUM_TOKENS = 16
+NUM_HEADS = 128
+NOPE_DIM = 128
+ROPE_DIM = 64
+TOTAL_DIM = NOPE_DIM + ROPE_DIM
+# 初始化环境
+torch.manual_seed(SEED)
+# 1. 创建输入 Tensor
+# k_nope: [num_tokens, num_heads, nope_dim]
+k_nope = torch.randn((NUM_TOKENS, NUM_HEADS, NOPE_DIM), dtype=DTYPE, device=DEVICE)
+# k_rope: [num_tokens, 1, rope_dim] -> 会被广播
+k_rope = torch.randn((NUM_TOKENS, 1, ROPE_DIM), dtype=DTYPE, device=DEVICE)
+# 2. 创建输出 Tensor
+k_out = torch.empty((NUM_TOKENS, NUM_HEADS, TOTAL_DIM), dtype=DTYPE, device=DEVICE)
+# 算子执行
+print(f"Running concat_mla_k...")
+if torch.cuda.is_available():
+    torch.cuda.synchronize()
+torch.ops.sgl_kernel.concat_mla_k(
+    k_out,
+    k_nope,
+    k_rope
+)
+if torch.cuda.is_available():
+    torch.cuda.synchronize()
+# 验证结果
+# 验证 Nope 部分
+diff_nope = (k_out[..., :NOPE_DIM] - k_nope).abs().sum()
+# 验证 RoPE 部分 (需要手动广播对比)
+k_rope_expanded = k_rope.expand(NUM_TOKENS, NUM_HEADS, ROPE_DIM)
+diff_rope = (k_out[..., NOPE_DIM:] - k_rope_expanded).abs().sum()
+print("执行成功。")
+print(f"Diff Nope: {diff_nope.item()}")
+print(f"Diff RoPE: {diff_rope.item()}")
+```
+
+## 21. concat_mla_absorb_q
+
+### 支持的产品型号
+
+- Metax C500/C550
+
+### 接口原型
+
+```Python
+def concat_mla_absorb_q(
+    q_nope: torch.Tensor,
+    q_rope: torch.Tensor,
+    out: torch.Tensor
+) -> None:
+    pass
+```
+
+### 功能描述
+
+concat_mla_absorb_q 算子用于 Multi-Head Latent Attention (MLA) 的 Query 向量生成阶段。该算子将非旋转位置编码的 Query 部分（Nope）和旋转位置编码的 Query 部分（RoPE）在最后一个维度上进行拼接，生成完整的 Query 张量。
+此功能主要应用于以下场景：
+
+1. MLA Decode/Prefill：在 DeepSeek-V3 等模型架构中，将经过不同投影层得到的 Query 分量合并，以便进行后续的 Attention 计算或矩阵乘法。
+2. 显存拼接优化：替代通用的 `torch.cat`，利用针对特定维度（512+64）优化的 CUDA Kernel 减少显存带宽开销。
+
+- 操作逻辑：
+	算子接收两个源张量 q_nope 和 q_rope，以及目标张量 out。
+	算子将 q_nope 的内容复制到 out 的低位部分，将 q_rope 的内容复制到 out 的高位部分。
+
+$$
+    \text{out}[..., 0:512] \leftarrow \text{q\\_nope}[...]
+$$
+
+
+
+$$
+    \text{out}[..., 512:576] \leftarrow \text{q\\_rope}[...]
+$$
+
+    主要功能包括：
+
+- 针对固定维度（Nope=512, RoPE=64）的高效拼接。
+- 使用向量化加载（int4/int）优化读写性能。
+- 自动展开循环以提高指令级并行度。
+
+### 参数说明
+
+- **q_nope** (torch.Tensor, 入参): Query 的非位置编码部分，形状为 `[Batch, Head, 512]`，数据类型必须为 `bfloat16`。
+- **q_rope** (torch.Tensor, 入参): Query 的旋转位置编码部分，形状为 `[Batch, Head, 64]`，数据类型必须为 `bfloat16`。
+- **out** (torch.Tensor, 出参): 输出张量，形状为 `[Batch, Head, 576]`，数据类型必须为 `bfloat16`。其中 576 = 512 + 64。
+
+### 返回值
+
+无返回值，拼接结果直接写入 `out` 张量中
+
+### 约束与调用
+
+- 所有输入输出张量必须在 CUDA 设备上
+- 数据类型严格限制为 `torch.bfloat16`
+- 张量的维度必须为 3 维
+- `q_nope` 最后一维必须为 512，`q_rope` 最后一维必须为 64，`out` 最后一维必须为 576
+- 内存地址必须 16 字节对齐
+- 最后一维必须是连续的（Stride 为 1）
+
+### 调用示例
+
+```Python
+import torch
+import mcoplib.sgl_kernel
+# 配置参数
+SEED = 0
+DEVICE = "cuda"
+DTYPE = torch.bfloat16
+# 固定维度参数
+BATCH_SIZE = 16
+NUM_HEADS = 128
+DIM_NOPE = 512
+DIM_ROPE = 64
+DIM_OUT = DIM_NOPE + DIM_ROPE
+# 初始化环境
+torch.manual_seed(SEED)
+# 1. 创建输入 Tensor
+q_nope = torch.randn((BATCH_SIZE, NUM_HEADS, DIM_NOPE), dtype=DTYPE, device=DEVICE)
+q_rope = torch.randn((BATCH_SIZE, NUM_HEADS, DIM_ROPE), dtype=DTYPE, device=DEVICE)
+# 2. 创建输出 Tensor
+out = torch.empty((BATCH_SIZE, NUM_HEADS, DIM_OUT), dtype=DTYPE, device=DEVICE)
+# 算子执行
+print(f"Running concat_mla_absorb_q...")
+if torch.cuda.is_available():
+    torch.cuda.synchronize()
+torch.ops.sgl_kernel.concat_mla_absorb_q(
+    q_nope,
+    q_rope,
+    out
+)
+if torch.cuda.is_available():
+    torch.cuda.synchronize()
+# 验证结果 
+expected = torch.cat([q_nope, q_rope], dim=-1)
+diff = (out - expected).abs().sum()
+print("执行成功。")
+print(f"Diff: {diff.item()}")
+```
+
+## 22. fast_topk
+
+### 支持的产品型号
+
+- Metax C500/C550
+
+### 接口原型
+
+```Python
+def fast_topk(
+    values: torch.Tensor,
+    topk: int,
+    dim: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    pass
+```
+
+### 功能描述
+
+fast_topk 算子用于高效地从输入张量中选取数值最大的 K 个元素及其索引。该算子针对推理场景中的采样阶段（Sampling）进行了特定优化，能够根据 K 值的不同自动选择最优的计算策略。
+此功能主要应用于以下场景：
+
+1. Greedy Sampling：当 K=1 时（即贪婪解码），算子退化为 Max 规约操作，避免全排序开销，显著降低计算量和显存访问。
+2. Top-K Sampling：当 K>1 时，算子执行标准的 Top-K 筛选。
+
+- 操作逻辑：
+	算子接收输入张量 values、目标数量 topk 和操作维度 dim。
+	当 topk == 1 时，执行最大值查找：
+
+$$
+    \text{output}, \text{indices} = \max(\text{values}, \text{dim})
+$$
+
+    当 topk > 1 时，执行 Top-K 排序：
+
+$$
+    \text{output}, \text{indices} = \text{TopK}(\text{values}, k, \text{dim})
+$$
+
+**主要功能包括**：
+
+- 针对 K=1 的特化路径优化。
+- 支持多维张量的指定维度操作。
+- 返回值包含排序后的数值（Values）和原始位置索引（Indices）。
+
+### 参数说明
+
+- **values** (torch.Tensor, 入参): 输入的分数或概率张量（通常为 Logits），数据类型支持 float16, bfloat16 或 float32。
+- **topk** (int, 入参): 需要保留的最大元素个数。必须大于 0。
+- **dim** (int, 入参): 进行筛选的维度索引。
+
+### 返回值
+
+返回一个包含两个张量的元组 `(output_values, output_indices)`：
+
+- **output_values**: 包含前 K 个最大数值的张量，形状与输入张量在 `dim` 维度上变为 `topk`。
+- **output_indices**: 对应数值在原始张量中的索引，数据类型为 int64。
+
+### 约束与调用
+
+- `values` 必须位于 CUDA 设备上
+- `topk` 必须小于或等于 `values` 在 `dim` 维度的大小
+- 返回的 `output_values` 数据类型与输入一致，`output_indices` 为 int64
+- 建议 `dim` 为最后一维（-1）以获得最佳内存访问性能
+
+### 调用示例
+
+```Python
+import torch
+import mcoplib.sgl_kernel
+# 配置参数
+SEED = 0
+DEVICE = "cuda"
+DTYPE = torch.float32  
+# 维度设置
+BATCH_SIZE = 4
+VOCAB_SIZE = 64000  # 需大于 K
+K = 2048
+# 初始化环境
+torch.manual_seed(SEED)
+torch.set_default_device(DEVICE)
+# 1. 创建分数 Tensor
+score = torch.randn(BATCH_SIZE, VOCAB_SIZE, dtype=DTYPE, device=DEVICE).contiguous()
+# 2. 创建输出 Indices Tensor (测试文件要求为 Int32)
+indices = torch.zeros(BATCH_SIZE, K, dtype=torch.int32, device=DEVICE).contiguous()
+# 3. 创建 Lengths Tensor (长度必须为 Batch Size)
+lengths = torch.full((BATCH_SIZE,), K, dtype=torch.int32, device=DEVICE).contiguous()
+# 算子执行
+print(f"Running fast_topk with K={K}...")
+if torch.cuda.is_available():
+    torch.cuda.synchronize()
+# 注意：C++接口需要4个参数，第4个为 row_starts (optional)，需显式传 None
+torch.ops.sgl_kernel.fast_topk(
+    score,
+    indices,
+    lengths,
+    None
+)
+if torch.cuda.is_available():
+    torch.cuda.synchronize()
+# 验证结果
+print("执行成功。")
+# 验证前将结果转为 int64 以便与 PyTorch 原生算子比较
+# 由于 K=2048 较大，这里只比较前 5 个元素以验证正确性
+ref_values, ref_indices = torch.topk(score, K, dim=1)
+print(f"Output Indices (Batch 0, Top 5): {indices[0, :5].tolist()}")
+print(f"Reference Indices (Batch 0, Top 5): {ref_indices[0, :5].tolist()}")
+```
+
+## 23. fast_topk_transform_fused
+
+### 支持的产品型号
+
+- Metax C500/C550
+
+### 接口原型
+
+```Python
+def fast_topk_transform_fused(
+    score: torch.Tensor,
+    lengths: torch.Tensor,
+    dst_page_table: torch.Tensor,
+    src_page_table: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    row_starts: Optional[torch.Tensor] = None
+) -> None:
+    pass
+```
+
+### 功能描述
+
+fast_topk_transform_fused 算子是 DeepSeek Native Sparse Attention (NSA) 机制中的关键组件，用于根据注意力评分（Gating Score）快速筛选出 Top-K 个最相关的 KV 块，并将这些块的物理索引写入到目标页表中。
+此功能主要应用于以下场景：
+
+1. 稀疏注意力选择：在解码或预填充阶段，根据预测的 block 分数，筛选出每一行（或每个 token）需要关注的 KV block。
+2. 索引转换：将筛选出的逻辑块索引直接映射为物理显存中的 Block ID，供后续的 FlashMLA 或其他注意力算子使用。
+
+- 操作逻辑：
+	算子接收评分张量 score，针对每个查询单元计算分值最高的 K 个块的索引。
+	根据计算出的 Top-K 索引，从源页表 src_page_table 中提取对应的物理块 ID。
+	将提取出的物理块 ID 存入 dst_page_table 中，供后续稀疏计算使用。
+	主要功能包括：
+- 融合了 Top-K 排序与 Gather 操作，减少显存访问开销。
+- 支持变长序列（通过 `cu_seqlens_q` 控制）。
+- 专为稀疏注意力模式下的动态页表构建优化。
+
+### 参数说明
+
+- **score** (torch.Tensor, 入参): 块评分张量，通常包含 Gating 网络输出的 Logits，形状为 `[num_tokens, num_blocks]` 或类似结构，数据类型通常为 float16 或 bfloat16。
+- **lengths** (torch.Tensor, 入参): 指定每个查询需要选择的块数量（即 Top-K 中的 K 值，或者扩展后的序列长度），数据类型为 int32。
+- **dst_page_table** (torch.Tensor, 出参): 目标页表张量，用于存储筛选后的物理块索引，数据类型为 int32。
+- **src_page_table** (torch.Tensor, 入参): 源页表张量，包含所有可用的物理块索引，数据类型为 int32。
+- **cu_seqlens_q** (torch.Tensor, 入参): 查询序列的累积长度数组，用于界定 Batch 中每个请求的边界，数据类型为 int32。
+- **row_starts** (torch.Tensor, 可选入参): 用于 Ragged 布局下的行偏移量指示，如果为 None 则不使用，数据类型为 int32。
+
+### 返回值
+
+无返回值，计算结果直接写入 `dst_page_table` 张量中。
+
+### 约束与调用
+
+- 输入张量必须在 CUDA 设备上。
+- `dst_page_table` 的内存必须预先分配，且大小足以容纳 Top-K 选择后的结果。
+- `lengths`、`src_page_table`、`dst_page_table` 和 `cu_seqlens_q` 的数据类型必须为 int32。
+- 算子假设 `src_page_table` 包含了完整的块映射关系。
+
+### 调用示例
+
+```Python
+import torch
+import mcoplib.sgl_kernel
+# 配置参数
+SEED = 0
+DEVICE = "cuda"
+NUM_TOKENS = 4
+TOPK = 2048
+NUM_ALL_BLOCKS = 4096 
+# 初始化环境
+torch.manual_seed(SEED)
+torch.set_default_device(DEVICE)
+# 1. 准备输入数据
+score = torch.randn(NUM_TOKENS, NUM_ALL_BLOCKS, dtype=torch.float32)
+src_page_table = torch.arange(NUM_TOKENS * NUM_ALL_BLOCKS, dtype=torch.int32).reshape(NUM_TOKENS, NUM_ALL_BLOCKS)
+dst_page_table = torch.zeros(NUM_TOKENS, TOPK, dtype=torch.int32)
+lengths = torch.full((NUM_TOKENS,), TOPK, dtype=torch.int32)
+cu_seqlens_q = torch.arange(NUM_TOKENS + 1, dtype=torch.int32)
+# 2. 算子执行
+print(f"Running fast_topk_transform_fused with TOPK={TOPK}...")
+if torch.cuda.is_available():
+    torch.cuda.synchronize()
+torch.ops.sgl_kernel.fast_topk_transform_fused(
+    score,
+    lengths,
+    dst_page_table,
+    src_page_table,
+    cu_seqlens_q,
+    None 
+)
+if torch.cuda.is_available():
+    torch.cuda.synchronize()
+# 验证结果
+print("执行成功。")
+print(f"DST Page Table Shape: {dst_page_table.shape}")
+print(f"Output Sample (Batch 0, Top 5): {dst_page_table[0, :5].tolist()}")
+```
+
+## 24. fast_topk_transform_ragged_fused
+
+### 支持的产品型号
+
+- Metax C500/C550
+
+### 接口原型
+
+```Python
+def fast_topk_transform_ragged_fused(
+    score: torch.Tensor,
+    lengths: torch.Tensor,
+    output_indices: torch.Tensor,
+    topk_indices_offset: torch.Tensor,
+    row_starts: Optional[torch.Tensor] = None
+) -> None:
+    pass
+```
+
+### 功能描述
+
+fast_topk_transform_ragged_fused 算子是 DeepSeek Native Sparse Attention (NSA) 机制在 Ragged（非分页）模式下的核心组件。它用于根据注意力评分（Gating Score）筛选出 Top-K 个最相关的 KV 块，并将这些逻辑块索引转换为用于 Ragged Attention 计算的平坦化（Flattened）物理索引。
+注意： 该算子为 In-place 操作，需要调用方预先分配用于存储结果的输出张量。
+此功能主要应用于以下场景：
+
+1. 稀疏注意力预填充/解码：在不使用 PagedAttention 而使用 Ragged Buffer 的场景下，根据 Block 分数筛选需要关注的区域。
+2. 索引平坦化：将批次中不同请求选出的 Top-K 块索引，结合偏移量 `topk_indices_offset`，压缩为一维或紧凑的索引张量。
+
+- 操作逻辑：
+	算子接收评分张量 score，针对每个查询单元计算分值最高的 K 个块的逻辑索引。
+	将逻辑索引与 topk_indices_offset 相加，计算出在全局 Ragged KV 存储中的绝对偏移位置。
+	结果直接写入预分配的 output_indices 张量中。
+	**主要功能包括：**
+- 高效的 Top-K 筛选与索引计算融合。
+- 支持 Ragged 内存布局下的动态索引生成。
+- 减少 Python 层面的显存操作开销，加速稀疏注意力计算准备阶段。
+
+### 参数说明
+
+- **score** (torch.Tensor, 入参): 块评分张量，通常包含 Gating 网络输出的 Logits，形状为 `[num_tokens, num_blocks]`，数据类型必须为 float32。
+- **lengths** (torch.Tensor, 入参): 指定每个查询需要选择的块数量（通常对应扩展后的序列长度），数据类型为 int32。
+- **output_indices** (torch.Tensor, 出参): 预分配的输出张量，用于存储计算出的物理索引。形状通常为 `[total_selected_blocks]` (即所有 lengths 之和)，数据类型为 int32。
+- **topk_indices_offset** (torch.Tensor, 入参): Top-K 索引在全局 Ragged 存储中的起始偏移量，通常由累积序列长度计算得出，数据类型为 int32。
+- **row_starts** (torch.Tensor, 可选入参): 指示 Batch 中每个请求的起始行位置。对于稠密 `score` 输入，建议传入 `None` 以避免 Shape 检查错误；仅在 `score` 为平坦化 Ragged 输入时需要传入，数据类型为 int32。
+
+### 返回值
+
+无返回值（None）。计算结果直接写入传入的 `output_indices` 张量中。
+
+### 约束与调用
+
+- 输入张量必须在 CUDA 设备上。
+- `score` 必须是 float32 类型。
+- `lengths`、`output_indices`、`topk_indices_offset` 的数据类型必须为 int32。
+- 调用前必须确保 `output_indices` 已分配足够的显存空间。
+- 不再需要传入 `int topk` 参数，TopK 值由 `lengths` 张量隐式确定。
+
+### 调用示例
+
+```Python
+import torch
+import mcoplib.sgl_kernel
+# 配置参数
+SEED = 0
+DEVICE = "cuda"
+NUM_TOKENS = 4
+TOPK = 2048
+NUM_BLOCKS = 4096
+# 初始化环境
+torch.manual_seed(SEED)
+torch.set_default_device(DEVICE)
+# 1. 准备输入数据
+score = torch.randn(NUM_TOKENS, NUM_BLOCKS, dtype=torch.float32)
+lengths = torch.full((NUM_TOKENS,), TOPK, dtype=torch.int32)
+topk_indices_offset = torch.arange(0, NUM_TOKENS * TOPK, TOPK, dtype=torch.int32).contiguous()
+output_indices = torch.empty((NUM_TOKENS, TOPK), dtype=torch.int32).contiguous()
+# 2. 算子执行
+print(f"Running fast_topk_transform_ragged_fused with TOPK={TOPK}...")
+print(f"Arg 3 (Output) Shape: {output_indices.shape}      (Expect: [B, TopK])")
+print(f"Arg 4 (Offset) Shape: {topk_indices_offset.shape} (Expect: [B])")
+if torch.cuda.is_available():
+    torch.cuda.synchronize()
+torch.ops.sgl_kernel.fast_topk_transform_ragged_fused(
+    score,
+    lengths,
+    output_indices,      
+    topk_indices_offset,  
+    None
+)
+if torch.cuda.is_available():
+    torch.cuda.synchronize()
+# 验证结果
+print("执行成功。")
+# 打印展平后的前5个结果
+print(f"Sample Indices (First 5): {output_indices.flatten()[:5].tolist()}")
+```
+
+## 25. moe_sum_reduce
+
+### 支持的产品型号
+
+- Metax C500/C550
+
+### 接口原型
+
+```Python
+def moe_sum_reduce(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    scaling_factor: float
+) -> None:
+    pass
+```
+
+### 功能描述
+
+`moe_sum_reduce` 算子用于 Mixture of Experts (MoE) 模型的输出阶段。它将来自不同专家的加权输出（通常已经按 Top-K 维度堆叠）进行归约求和，并应用缩放因子，从而生成最终的 token 嵌入。该操作通常是 `fused_marlin_moe` 等融合 MoE 计算流程的最后一步。
+此功能主要应用于以下场景：
+
+1. MoE 输出聚合：将形状为 `[num_tokens, top_k, hidden_size]` 的中间结果沿 `top_k` 维度求和，得到 `[num_tokens, hidden_size]` 的输出。
+2. 路由缩放 (Routed Scaling)：在聚合的同时，将结果乘以一个全局或路由相关的缩放因子（`scaling_factor`），常用于 DeepSeek 等模型的负载均衡或架构设计中。
+3. 结果写回：支持原地 (In-place) 或非原地操作，将最终结果写入 `output` 张量。
+	**主要功能包括：**
+
+- 维度归约：对输入的 `top_k` 维度进行求和，将多专家的贡献合并。
+- 数值缩放：在归约过程中应用标量乘法。
+- 高效内存访问：优化内存读写模式，减少 MoE 后处理阶段的显存带宽占用。
+
+### 参数说明
+
+- **input** (torch.Tensor, 入参): MoE 层的中间计算结果，包含每个 Token 被路由到的 Top-K 个专家的加权输出。形状通常为 `[num_tokens, top_k, hidden_size]`，数据类型通常为 float16 或 bfloat16。
+- **output** (torch.Tensor, 出参): 最终的 MoE 层输出张量。形状为 `[num_tokens, hidden_size]`，数据类型需与 `input` 保持一致。
+- **scaling_factor** (float, 入参): 应用于归约结果的乘法缩放因子。
+
+### 返回值
+
+无返回值。操作结果直接写入 `output` 张量中。
+
+### 约束与调用
+
+- `input` 必须是 3D 张量，`output` 必须是 2D 张量。
+- `input.size (0)` 必须等于 `output.size (0)`（Token 数量一致）。
+- `input.size (2)` 必须等于 `output.size (1)`（Hidden Size 一致）。
+- `input` 和 `output` 的数据类型必须相同，且必须在 CUDA 设备上。
+
+### 调用示例
+
+```Python
+import torch
+import mcoplib.sgl_kernel
+# 配置参数
+SEED = 0
+DEVICE = "cuda"
+DTYPE = torch.float16
+# 维度设置
+NUM_TOKENS = 128
+TOP_K = 2
+HIDDEN_SIZE = 4096
+SCALING_FACTOR = 1.0
+# 初始化环境
+torch.manual_seed(SEED)
+torch.set_default_device(DEVICE)
+# 1. 创建输入输出 Tensors
+# input_tensor: [NUM_TOKENS, TOP_K, HIDDEN_SIZE]
+input_tensor = torch.randn((NUM_TOKENS, TOP_K, HIDDEN_SIZE), dtype=DTYPE, device=DEVICE)
+# output_tensor: [NUM_TOKENS, HIDDEN_SIZE]
+output_tensor = torch.empty((NUM_TOKENS, HIDDEN_SIZE), dtype=DTYPE, device=DEVICE)
+# 2. 算子执行
+print(f"Running moe_sum_reduce...")
+if torch.cuda.is_available():
+    torch.cuda.synchronize()
+torch.ops.sgl_kernel.moe_sum_reduce(
+    input_tensor,
+    output_tensor,
+    SCALING_FACTOR
+)
+if torch.cuda.is_available():
+    torch.cuda.synchronize()
+# 验证结果
+# 期望计算逻辑：output = sum(input, dim=1) * scaling_factor
+expected_output = torch.sum(input_tensor, dim=1) * SCALING_FACTOR
+diff = (output_tensor - expected_output).abs().max()
+print("执行成功。")
+print(f"Max Diff: {diff.item()}")
+```
+
+## 26. moe_fused_gate
+
+### 支持的产品型号
+
+- Metax C500/C550
+
+### 接口原型
+
+```Python
+def moe_fused_gate(
+    gating_output: torch.Tensor,
+    correction_bias: torch.Tensor,
+    num_expert_group: int,
+    topk_group: int,
+    topk: int,
+    num_fused_shared_experts: int = 0,
+    routed_scaling_factor: float = 1.0,
+    apply_routed_scaling_factor_on_output: bool = False
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    pass
+```
+
+### 功能描述
+
+moe_fused_gate 算子实现了 Mixture-of-Experts (MoE) 模型中专家选择（Gating）的融合计算逻辑，特别是针对类似 DeepSeek V2/V3/R1 系列模型中使用的 Grouped Top-K 路由策略进行了优化。该算子融合了 Softmax、Top-K 选择、分组掩码（Group Masking）和重归一化（Renormalization）等步骤，以提高路由阶段的效率。
+此功能主要应用于以下场景：
+
+1. Grouped Top-K Routing：首先在专家组层面进行粗粒度筛选（Top-K Group），然后在选定组内的专家中进行细粒度筛选（Top-K Expert）。
+2. Shared Expert Integration：支持将共享专家（Shared Experts）与路由选择的专家合并，通常共享专家会被固定分配给每个 Token。
+3. Bias Correction：支持在计算路由分数时应用校正偏置（Correction Bias），用于辅助负载均衡或其他调节目的。
+	**主要功能包括：**
+
+- 高效的 Top-K 选择：在一个 Kernel 中完成组级和专家级的 Top-K 选择。
+- 灵活的路由配置：支持配置组数量、每组选取的专家数、总 Top-K 数以及共享专家数。
+- 数值稳定性：在计算过程中处理 Softmax 和归一化，确保数值稳定。
+
+### 参数说明
+
+- **gating_output** (torch.Tensor, 入参): Gating 网络的原始输出 Logits，形状为 `[num_tokens, num_experts]`，数据类型通常为 float32。
+- **correction_bias** (torch.Tensor, 入参): 用于修正路由分数的偏置张量，形状通常为 `[num_experts]` 或 `[num_tokens, num_experts]`（支持广播），数据类型需与 `gating_output` 兼容。
+- **num_expert_group** (int, 入参): 专家的分组总数。
+- **topk_group** (int, 入参): 每个 Token 选择的专家组数量。
+- **topk** (int, 入参): 每个 Token 最终选择的路由专家数量（不包括共享专家）。
+- **num_fused_shared_experts** (int, 可选入参): 融合的共享专家数量，默认为 0。
+- **routed_scaling_factor** (float, 可选入参): 路由专家的缩放因子，用于调整路由专家的权重，默认为 1.0。
+- **apply_routed_scaling_factor_on_output** (bool, 可选入参): 是否将 `routed_scaling_factor` 直接应用到输出的权重上，默认为 False。
+
+### 返回值
+
+返回一个元组 `(topk_weights, topk_ids)`：
+
+- **topk_weights** (torch.Tensor): 选定专家的权重，形状为 `[num_tokens, topk + num_fused_shared_experts]`，数据类型为 float32。
+- **topk_ids** (torch.Tensor): 选定专家的索引，形状为 `[num_tokens, topk + num_fused_shared_experts]`，数据类型为 int32。
+
+### 约束与调用
+
+- 输入张量必须在 CUDA 设备上。
+- `gating_output` 的最后一维大小（专家总数）必须能被 `num_expert_group` 整除。
+- `topk` 必须小于等于专家总数。
+- 目前算子实现可能对 `num_expert_group` 和专家数量有特定限制（例如 `num_experts / num_expert_group <= 32`，这取决于具体的 Kernel 实现细节，如源码注释所述）。
+
+### 调用示例
+
+```Python
+import torch
+import mcoplib.sgl_kernel
+# 配置参数
+SEED = 0
+DEVICE = "cuda"
+NUM_TOKENS = 128
+NUM_EXPERTS = 64
+NUM_EXPERT_GROUP = 8
+TOPK_GROUP = 2
+TOPK = 4
+NUM_FUSED_SHARED_EXPERTS = 0
+# 初始化环境
+torch.manual_seed(SEED)
+torch.set_default_device(DEVICE)
+# 1. 创建输入 Tensors
+# gating_output: [NUM_TOKENS, NUM_EXPERTS]
+gating_output = torch.randn((NUM_TOKENS, NUM_EXPERTS), dtype=torch.float32, device=DEVICE)
+# correction_bias: [NUM_EXPERTS]
+correction_bias = torch.zeros((NUM_EXPERTS,), dtype=torch.float32, device=DEVICE)
+# 2. 算子执行
+print(f"Running moe_fused_gate...")
+if torch.cuda.is_available():
+    torch.cuda.synchronize()
+topk_weights, topk_ids = torch.ops.sgl_kernel.moe_fused_gate(
+    gating_output,
+    correction_bias,
+    NUM_EXPERT_GROUP,
+    TOPK_GROUP,
+    TOPK,
+    NUM_FUSED_SHARED_EXPERTS,
+    1.0,  # routed_scaling_factor
+    False # apply_routed_scaling_factor_on_output
+)
+if torch.cuda.is_available():
+    torch.cuda.synchronize()
+# 验证结果形状
+print("执行成功。")
+print(f"TopK Weights Shape: {topk_weights.shape}") # Should be [NUM_TOKENS, TOPK]
+print(f"TopK IDs Shape: {topk_ids.shape}")         # Should be [NUM_TOKENS, TOPK]
+```
+
+## 27. prepare_moe_input
+
+### 支持的产品型号
+
+- Metax C500/C550
+
+### 接口原型
+
+```Python
+def prepare_moe_input(
+    topk_ids: torch.Tensor,
+    expert_offsets: torch.Tensor,
+    block_scale_offsets: Optional[torch.Tensor],
+    problem_sizes1: torch.Tensor,
+    problem_sizes2: torch.Tensor,
+    src_idx: torch.Tensor,
+    dst_idx: torch.Tensor,
+    num_experts: int,
+    intermediate_size: int,
+    hidden_size: int
+) -> None:
+    pass
+```
+
+### 功能描述
+
+`prepare_moe_input` 算子用于为基于分组 GEMM 的 Mixture of Experts (MoE) 计算准备元数据。它负责统计每个专家被分配的 Token 数量，生成用于重排输入数据的索引映射，并设置分组矩阵乘法（Grouped GEMM）所需的维度信息。
+此功能主要应用于以下场景：
+
+1. MoE 输入重排：在执行专家计算前，需要将分散在 batch 中的 token 按照其选择的专家进行聚类，以便进行连续内存访问和批量计算。
+2. 元数据构建：计算 `expert_offsets`（每个专家处理的 token 起始位置）和 `problem_sizes`（每个专家 GEMM 的 M/N/K 维度），供后续的 Grouped GEMM 内核使用。
+3. 结果还原：生成逆向映射索引，以便在专家计算完成后将结果还原回原始的 Token 顺序。
+
+- 操作逻辑：
+	1. 统计 `topk_ids` 中每个专家出现的次数，计算前缀和得到 `expert_offsets`。
+	2. 生成 `src_idx`（Permutation Index），用于将输入 Tensor (`[batch_size, k]`) 扩展并重排为 `[batch_size * topk, k]`，使得属于同一专家的行在内存中连续。
+	3. 生成 `dst_idx`（Inverse Permutation Index），用于后续 `apply_shuffle_mul_sum` 等算子将计算结果写回原始位置。
+	4. 填充 `problem_sizes1` 和 `problem_sizes2`，分别定义 Up-Projection 和 Down-Projection 阶段每个专家对应的 GEMM 维度 (M, N, K)。
+		**主要功能包括：**
+- 基于 Top-K 索引生成排序和还原映射。
+- 计算每个专家的负载（Token 数量）。
+- 初始化 Grouped GEMM 的问题描述符。
+
+### 参数说明
+
+- **topk_ids** (torch.Tensor, 入参): 每个 Token 选择的专家索引。形状为 `[num_tokens, topk]`，数据类型为 int32。
+- **expert_offsets** (torch.Tensor, 出参): 用于存储每个专家的累积 Token 计数。形状通常为 `[num_experts]` 或 `[num_experts + 1]`，数据类型为 int32。
+- **block_scale_offsets** (torch.Tensor, 可选入参): 用于 FP4 等量化的块缩放偏移量。若不需要可传入 None。
+- **problem_sizes1** (torch.Tensor, 出参): 存储第一个 GEMM（Up-proj）每个专家的问题大小信息。形状通常为 `[num_experts, 3]` 或类似结构，存储 `(m, n, k)`，数据类型为 int64 或 int32。
+- **problem_sizes2** (torch.Tensor, 出参): 存储第二个 GEMM（Down-proj）每个专家的问题大小信息。形状同上。
+- **src_idx** (torch.Tensor, 出参): 源数据重排索引 (Input Permutation)。形状为 `[num_tokens * topk]`，数据类型为 int32。
+- **dst_idx** (torch.Tensor, 出参): 目标数据还原索引 (Output Permutation)。形状为 `[num_tokens * topk]`，数据类型为 int32。
+- **num_experts** (int, 入参): 专家总数。
+- **intermediate_size** (int, 入参): 中间层维度大小（通常是 FFN 的隐藏层大小），对应 GEMM1 的 N 维或 GEMM2 的 K 维。
+- **hidden_size** (int, 入参): 模型隐藏层维度大小，对应 GEMM1 的 K 维或 GEMM2 的 N 维。
+
+### 返回值
+
+无返回值。计算结果直接写入 `expert_offsets`, `problem_sizes`, `src_idx`, `dst_idx` 等输出张量中。
+
+### 约束与调用
+
+- 所有 Tensor 必须位于 CUDA 设备上。
+- `topk_ids`、`src_idx`、`dst_idx`、`expert_offsets` 的数据类型必须为 int32。
+- 参数顺序严格遵循 C++ 算子声明，特别是 `block_scale_offsets` 位于 `problem_sizes1` 之前。
+
+### 调用示例
+
+```Python
+import torch
+import mcoplib.sgl_kernel
+# 配置参数
+SEED = 0
+DEVICE = "cuda"
+NUM_TOKENS = 4
+HIDDEN_SIZE = 128
+INTERMEDIATE_SIZE = 256
+NUM_EXPERTS = 4
+TOP_K = 2
+# 初始化环境
+torch.manual_seed(SEED)
+torch.set_default_device(DEVICE)
+# 1. 模拟输入数据
+# topk_ids: [NUM_TOKENS, TOP_K]
+topk_ids = torch.tensor([
+    [0, 1],
+    [1, 2],
+    [0, 3],
+    [2, 3]
+], dtype=torch.int32, device=DEVICE)
+# 2. 预分配输出张量
+total_tokens = NUM_TOKENS * TOP_K
+src_idx = torch.empty((total_tokens,), dtype=torch.int32, device=DEVICE)
+dst_idx = torch.empty((total_tokens,), dtype=torch.int32, device=DEVICE)
+expert_offsets = torch.empty((NUM_EXPERTS,), dtype=torch.int32, device=DEVICE)
+# problem_sizes 结构依赖具体实现，假设为 [NUM_EXPERTS, 3]
+problem_sizes1 = torch.zeros((NUM_EXPERTS, 3), dtype=torch.int64, device=DEVICE)
+problem_sizes2 = torch.zeros((NUM_EXPERTS, 3), dtype=torch.int64, device=DEVICE)
+# 3. 算子执行
+print(f"Running prepare_moe_input...")
+if torch.cuda.is_available():
+    torch.cuda.synchronize()
+# 注意参数顺序：block_scale_offsets 在第3个位置
+torch.ops.sgl_kernel.prepare_moe_input(
+    topk_ids,              # 1. topk_ids
+    expert_offsets,        # 2. expert_offsets
+    None,                  # 3. blockscale_offsets (Optional Tensor)
+    problem_sizes1,        # 4. problem_sizes1
+    problem_sizes2,        # 5. problem_sizes2
+    src_idx,               # 6. input_permutation
+    dst_idx,               # 7. output_permutation
+    NUM_EXPERTS,           # 8. num_experts
+    INTERMEDIATE_SIZE,     # 9. n
+    HIDDEN_SIZE            # 10. k
+)
+if torch.cuda.is_available():
+    torch.cuda.synchronize()
+# 验证结果
+print("执行成功。")
+print(f"Expert Offsets: {expert_offsets.tolist()}")
+print(f"Source Indices: {src_idx.tolist()}")
+```
+
+## 28. apply_shuffle_mul_sum
+
+### 支持的产品型号
+
+- Metax C500/C550/C588/C600
+
+### 接口原型
+
+```python
+def apply_shuffle_mul_sum(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    permutation: torch.Tensor,
+    factors: Optional[torch.Tensor] = None
+) -> None
+```
+
+### 功能描述
+
+apply_shuffle_mul_sum 算子实现了针对张量的重排（Shuffle）、按因子缩放（Mul）以及累加聚合（Sum）的融合操作。该算子根据 permutation 提供的索引映射关系，将 input 张量中的各行数据映射到 output 张量的对应位置，并在累加前乘以 factors 权重因子。这种融合算子通过减少中间显存读写，显著提升了专家混合模型（MoE）中 Token 分发或聚合逻辑的执行效率。
+
+- 计算公式：
+
+$$
+  \text{dst}[k \times \text{stride} + j] += 
+  \begin{cases} 
+  \text{input}[i \times \text{stride} + j], & \text{当 factors 不存在} \\
+  \text{input}[i \times \text{stride} + j] \times \text{factors}[i], & \text{当 factors 存在}
+  \end{cases}
+$$
+
+  其中元素的线性索引与二维位置的映射关系为：
+
+$$
+  n = i \times \text{stride} + j
+$$
+
+  各变量的维度与含义：
+
+- $\text{input} \in \mathbb{T}^{\text{height} \times \text{stride}}$ ：输入张量，包含待处理的原始数据，数据类型为 $\mathbb{T}$ ，有效列范围为 $0 \leq j < \text{width}$
+- $\text{dst} \in \mathbb{T}^{\text{num\\_reduced} \times \text{stride}}$ ：输出张量，用于存储按索引聚合（Sum）后的结果，数据类型与 $\text{input}$ 一致
+- $\text{perm} \in \mathbb{I}^{\text{height}}$ ：索引映射张量（permutation），数据类型为 $\mathbb{I}$ （通常为 $\text{int32}$ ），决定 $\text{input}$ 的第 $i$ 行映射到 $\text{dst}$ 的第 $k$ 行
+- $\text{factors} \in \mathbb{T}^{\text{height}}$ ：可选的权重因子张量，若存在，则在累加前对输入元素进行缩放，数据类型与 $\text{input}$ 一致
+- $i$ ：输入张量的行索引，范围为 $0 \leq i < \text{height}$
+- $k$ ：输出张量的行索引， $k = \text{perm}[i]$ ，范围为 $0 \leq k < \text{num\\_reduced}$
+- $j$ ：张量的列索引，范围为 $0 \leq j < \text{stride}$ （ $\text{stride} \geq \text{width}$ ，保证内存对齐）
+- $\text{height}$ ：输入张量的总行数（如 Token 总数）
+- $\text{num\\_reduced}$ ：输出张量的总行数（如聚合后的专家位总数）
+- $\text{width}$ ：张量的有效宽度（每行的有效元素数）
+- $\text{stride}$ ：张量的内存步长（每行元素的实际内存间隔）
+
+### 参数说明
+
+- **input** (torch.Tensor, 入参): 输入张量，通常为二维特征矩阵（如 [num_tokens, hidden_dim]）
+- **output** (torch.Tensor, 出参): 目标输出张量，用于存储累加后的结果。在调用前通常需要初始化为 0
+- **permutation** (torch.Tensor, 入参): 索引映射张量，指定输入行映射到输出行的位置
+- **factors** (torch.Tensor, 可选, 入参): 权重因子张量（如 MoE 的门控权重）。若提供，则 output[permutation[i]] += input[i] * factors[i]
+
+### 返回值
+
+无返回值，计算结果直接写入 output 张量中
+
+### 约束与调用
+
+- 所有输入输出张量必须位于 CUDA 设备上
+- permutation 必须为 torch.int32 (Int) 类型，不支持 int64 (Long)
+- input 和 output 的隐藏维度（最后一维）必须保持一致
+- factors 若提供，其长度必须与 input 的行数一致
+- 支持的数据类型：float16, bfloat16, float32
+
+### 调用示例
+
+```python
+import torch
+import mcoplib.sgl_kernel
+# 设置计算设备
+device = "cuda"
+# 核心参数
+num_elements = 1024      
+num_reduced = 512        
+hidden_dim = 128         
+# 1. 构造输入张量
+input_tensor = torch.randn(
+    num_elements, hidden_dim,
+    dtype=torch.float32, device=device
+)
+# 2. 构造输出张量 (初始化为0，因为算子通常执行累加操作)
+output_tensor = torch.zeros(
+    num_reduced, hidden_dim,
+    dtype=torch.float32, device=device
+)
+# 3. 构造索引映射 (关键修改点：使用 torch.int32)
+# 报错是因为默认生成的随机整数是 int64 (Long)，需要强制转为 int32 (Int)
+permutation = torch.randint(
+    0, num_reduced, (num_elements,),
+    dtype=torch.int32, # 修改此处：从 int64 改为 int32
+    device=device
+)
+# 4. 构造权重因子
+factors = torch.rand(
+    num_elements, 
+    dtype=torch.float32, device=device
+)
+# 5. 调用算子
+# 注意：如果算子注册时没有指定参数名，建议按顺序传参
+torch.ops.sgl_kernel.apply_shuffle_mul_sum(
+    input_tensor,
+    output_tensor,
+    permutation,
+    factors
+)
+# 输出结果
+print("apply_shuffle_mul_sum computation completed successfully")
+print(f"Output shape: {output_tensor.shape}")
+```
+
+## 29. fused_moe_gate_opt
+
+### 支持的产品型号
+
+- Metax C500/C550/C588/C600
+
+### 接口原型
+
+```python
+def fused_moe_gate_opt(
+    gating_outputs: torch.Tensor,
+    correction_bias: torch.Tensor,
+    out_routing_weights: torch.Tensor,
+    out_selected_experts: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+    num_expert_group: int,
+    topk_group: int,
+    num_fused_shared_experts: Optional[int] = None,
+    routed_scaling_factor: Optional[float] = None
+) -> int
+```
+
+### 功能描述
+
+fused_moe_gate_opt 算子实现了专家混合模型（MoE）中门控网络（Gating Network）的核心逻辑融合。该算子接收门控原始输出，在应用偏置校正（Correction Bias）后，执行 Top-K 专家选择（支持分组 Top-K 逻辑），并计算最终的路由权重（Routing Weights）。通过在单个 Kernel 中完成排序、索引提取、权重计算和可选的重正规化（Renormalize），显著提升了混合专家模型在推理阶段的路由效率。
+
+- 计算公式：
+
+$$
+  \begin{aligned}
+  \text{score}[i, e] &= \text{input0}[i \times \text{num\\_experts} + e] + \text{input1}[e] \\
+  (\text{dst\\_w}[i, k], \text{dst\\_idx}[i, k]) &= \text{TopK}(\{\text{score}[i, e]\}_{e=0}^{\text{num\\_experts}-1}, \text{topk}) \\
+  \text{dst\\_w}[i, k] &= 
+  \begin{cases} 
+  \text{dst\\_w}[i, k] \times \text{scale}, & \text{当 renormalize} = \text{False} \\
+  \text{Softmax}(\{\text{dst\\_w}[i, k]\}_{k=0}^{\text{topk}-1}) \times \text{scale}, & \text{当 renormalize} = \text{True}
+  \end{cases}
+  \end{aligned}
+$$
+
+  其中元素的线性索引与二维位置的映射关系为（以输出张量为例）：
+
+$$
+  n = i \times \text{topk} + k
+$$
+
+  各变量的维度与含义：
+
+- $\text{input0} \in \mathbb{T}^{\text{bs} \times \text{num\\_experts}}$ ：门控网络（Gating）原始输出张量，数据类型为 $\mathbb{T}$ （ $\text{bfloat16}$ ）
+- $\text{input1} \in \mathbb{T}^{\text{num\\_experts}}$ ：专家偏置校正张量（Correction Bias），数据类型与 $\text{input0}$ 一致
+- $\text{dst\\_w} \in \mathbb{D}^{\text{bs} \times \text{topk}}$ ：路由权重输出张量，存储计算并可选重正规化后的权重，数据类型为 $\mathbb{D}$ （ $\text{float32}$ ）
+- $\text{dst\\_idx} \in \mathbb{I}^{\text{bs} \times \text{topk}}$ ：专家索引输出张量，存储选中的专家编号，数据类型为 $\mathbb{I}$ （ $\text{int32}$ ）
+- $\text{scale} \in \mathbb{R}$ ：路由权重的缩放因子，计算方式为 $\text{scale} = 1.0 / \text{routed\\_scaling\\_factor}$
+- $n$ ：输出张量元素的线性索引，范围为 $0 \leq n < \text{bs} \times \text{topk}$
+- $i$ ：Batch 维度的行索引（Token 索引），范围为 $0 \leq i < \text{bs}$
+- $k$ ：选中的专家位索引，范围为 $0 \leq k < \text{topk}$
+- $e$ ：原始专家维度的索引，范围为 $0 \leq e < \text{num\\_experts}$
+- $\text{bs}$ ：输入张量的第一维大小（Batch Size）
+- $\text{num\\_experts}$ ：专家的总数量
+- $\text{topk}$ ：每个 Token 最终选取的专家数量，目前仅支持 $8$ 或 $9$
+- $\text{Softmax}$ ：若 $\text{renormalize}$ 参数为 $\text{True}$ ，则对选出的 Top-K 分数执行归一化操作
+- $\text{TopK}$ ：选取分数最高的 $\text{topk}$ 个专家，返回对应权重和索引
+- $\text{renormalize}$ ：布尔型参数，控制是否对 Top-K 权重执行 Softmax 归一化
+
+### 参数说明
+
+- **gating_outputs** (torch.Tensor, 入参): 门控网络的原始输出张量，维度通常为 [batch_size, num_experts]，要求数据类型为 bfloat16
+- **correction_bias** (torch.Tensor, 入参): 专家偏置校正张量，维度为 [num_experts]，要求数据类型为 bfloat16
+- **out_routing_weights** (torch.Tensor, 出参): 存储计算出的路由权重，维度为 [batch_size, topk]，要求数据类型为 float32
+- **out_selected_experts** (torch.Tensor, 出参): 存储选中的专家索引，维度为 [batch_size, topk]，要求数据类型为 int32
+- **topk** (int, 入参): 每个 Token 选择的专家数量，目前仅支持 8 或 9
+- **renormalize** (bool, 入参): 是否对路由权重进行重正规化处理
+- **num_expert_group** (int, 入参): 专家分组的数量
+- **topk_group** (int, 入参): 每一组内选择的 Top-K 数量
+- **num_fused_shared_experts** (int, 可选, 入参): 融合的共享专家数量
+- **routed_scaling_factor** (float, 可选, 入参): 路由权重的缩放因子
+
+### 返回值
+
+返回 int 类型的状态码，0 表示执行成功，1 表示因参数不匹配导致的执行失败
+
+### 约束与调用
+
+- 所有张量必须位于 CUDA 设备上；输入必须为 bfloat16，索引输出必须为 int32
+- Top-K 限制：若无共享专家，topk 必须为 8；若有共享专家，topk 必须为 9
+- 固定参数组合限制：该算子采用了静态分发（Dispatching），仅支持以下特定的专家配置方案，否则会报 "Invalid arguments" 错误：
+- 专家总数 (NUM_EXPERTS)：仅支持 256, 320, 384, 448
+- 典型组合 1 (DeepSeek-V3 风格)：num_experts ∈ {320, 384, 448}, num_expert_group=1, topk_group=1
+- 典型组合 2 (分组风格)：num_experts=256, num_expert_group=8, topk_group=4
+
+### 调用示例
+
+```python
+import torch
+import mcoplib.sgl_kernel
+device = "cuda"
+# 修改为算子支持的参数组合（例如 DeepSeek-V3 风格的配置）
+num_experts = 320          # 必须是 256, 320, 384 或 448
+num_expert_group = 1       # 分组数
+topk_group = 1             # 对于 320 专家，组内 Top-K 必须为 1
+topk = 8                   # 总 Top-K
+# 重新构造符合维度的张量
+gating_outputs = torch.randn(4, num_experts, dtype=torch.bfloat16, device=device)
+correction_bias = torch.randn(num_experts, dtype=torch.bfloat16, device=device)
+out_routing_weights = torch.empty(4, topk, dtype=torch.float32, device=device)
+out_selected_experts = torch.empty(4, topk, dtype=torch.int32, device=device)
+# 调用算子
+status = torch.ops.sgl_kernel.fused_moe_gate_opt(
+    gating_outputs=gating_outputs,
+    correction_bias=correction_bias,
+    out_routing_weights=out_routing_weights,
+    out_selected_experts=out_selected_experts,
+    topk=topk,
+    renormalize=True,
+    num_expert_group=num_expert_group,
+    topk_group=topk_group,
+    num_fused_shared_experts=0,
+    routed_scaling_factor=1.0
+)
+print("fused_moe_gate_opt computation completed with supported parameters")
+print(f"Routing weights shape: {out_routing_weights.shape}")
+print(f"Selected experts shape: {out_selected_experts.shape}")
+```
+
+## 30. fused_silu_mul_dq_quant_interface
+
+### 支持的产品型号
+
+- Metax C500/C550/C588/C600
+
+### 接口原型
+
+```python
+def fused_silu_mul_dq_quant_interface(
+    out: torch.Tensor,
+    scale: torch.Tensor,
+    input: torch.Tensor
+) -> None
+```
+
+### 功能描述
+
+fused_silu_mul_dq_quant_interface 算子实现了 SiLU 激活、元素级乘法以及动态量化的融合操作。该算子通常用于 Transformer 架构中的门控线性单元（GLU），它对输入张量进行 SiLU 激活与内部乘法处理，随后直接将结果量化为 **INT8** 格式，并计算相应的动态量化比例因子（Scaling Factor）。这种融合方式大幅减少了高精度中间变量的显存读写，提升了模型推理的吞吐量。
+
+- 计算公式：
+
+$$
+  \begin{aligned}
+  \text{gate}[i, j] &= \text{input}[i \times 2 \times \text{width} + j] \\
+  \text{up}[i, j] &= \text{input}[i \times 2 \times \text{width} + \text{width} + j] \\
+  \text{tmp}[i, j] &= \text{SiLU}(\text{gate}[i, j]) \times \text{up}[i, j] \\
+  \text{dst}[i \times \text{stride} + j] &= \text{round}\left(\frac{\text{tmp}[i, j]}{\text{scale}[i]}\right)
+  \end{aligned}
+$$
+
+  其中 $\text{SiLU}(x) = \frac{x}{1 + e^{-x}}$ ，元素的线性索引与二维位置的映射关系为（以输出张量为例）：
+
+$$
+  n = i \times \text{stride} + j
+$$
+
+  各变量的维度与含义：
+
+- $\text{input} \in \mathbb{T}^{\text{height} \times (2 \times \text{width})}$ ：输入激活张量，包含 Gate（前一半宽度）和 Up（后一半宽度）的数据，数据类型为 $\mathbb{T}$ （ $\text{float16}$ 或 $\text{bfloat16}$ ）
+- $\text{dst} \in \mathbb{D}^{\text{height} \times \text{stride}}$ ：输出张量，存储处理并量化后的结果，数据类型为 $\mathbb{D}$ （ $\text{int8}$ ），有效列范围为 $0 \leq j < \text{width}$
+- $\text{scale} \in \mathbb{R}^{\text{height}}$ ：输出的动态量化比例因子，存储每一行（每 Token）的缩放系数，数据类型为 $\text{float32}$
+- $\text{SiLU}(x)$ ：激活函数，其公式为 $\text{SiLU}(x) = \frac{x}{1 + e^{-x}}$
+- $n$ ：输出张量元素的线性索引，范围为 $0 \leq n < \text{height} \times \text{stride}$
+- $i$ ：张量的行索引（Token 索引），范围为 $0 \leq i < \text{height}$
+- $j$ ：张量的列索引（隐藏层维度索引），范围为 $0 \leq j < \text{width}$
+- $\text{width}$ ：输出张量的有效宽度，对应模型隐藏层维度，满足 $2 \times \text{width} = \text{input.size}(-1)$
+- $\text{height}$ ：张量的高度，对应输入序列的 Token 数量 $\text{num\\_tokens}$
+- $\text{stride}$ ：输出张量的内存步长，用于保证内存对齐（ $\text{stride} \geq \text{width}$ ）
+- $\text{round}(\cdot)$ ：四舍五入取整操作，将量化后的浮点值转换为 $\text{int8}$ 整数
+
+### 参数说明
+
+- **out** (torch.Tensor, 出参): 输出张量，用于存储量化后的结果，数据类型固定为 **int8**
+- **scale** (torch.Tensor, 出参): 比例因子张量，存储每行的量化缩放系数，数据类型固定为 **float32**
+- **input** (torch.Tensor, 入参): 输入激活张量，数据类型为浮点型（如 float16 或 bfloat16）
+
+### 返回值
+
+无返回值，计算结果直接写入 `out` 和 `scale` 张量中
+
+### 约束与调用
+
+- 内存连续性：`input`、`scale` 和 `out` 张量都必须是连续的（Contiguous）
+- 设备一致性：所有张量必须位于同一个 CUDA/MACA 设备上
+- 维度计算：算子内部根据 `input.size (-1)` 计算隐藏层维度 `hidden_size`，并基于总元素数推导 `num_tokens`
+- 支持的数据类型：
+- 输入张量支持 `float16` 和 `bfloat16`
+- 输出张量必须为 `int8`
+- Scale 张量必须为 `float32`
+
+### 调用示例
+
+```python
+import torch
+import mcoplib.sgl_kernel
+# 设置计算设备
+device = "cuda"
+# 核心参数
+num_tokens = 4       # Token 数量
+hidden_size = 1024   # 隐藏层维度
+# 1. 构造输入张量
+# input: 通常为前向传播中的激活值，支持浮点类型（如 float16 或 bfloat16）
+input_tensor = torch.randn(
+    num_tokens, hidden_size, 
+    dtype=torch.bfloat16, device=device, requires_grad=False
+)
+# 2. 构造输出张量
+# out: 量化后的输出，根据源码 data_ptr<int8_t>() 可知需要 int8 类型
+out = torch.empty(
+    num_tokens, hidden_size, 
+    dtype=torch.int8, device=device
+)
+# scale: 动态量化比例因子，根据源码 data_ptr<float>() 可知需要 float32 类型
+# 形状通常对应 num_tokens (per-token quantization)
+scale = torch.empty(
+    num_tokens, 
+    dtype=torch.float32, device=device
+)
+# 3. 调用算子
+# 算子定义顺序为 (Tensor! out, Tensor! scale, Tensor input)
+torch.ops.sgl_kernel.fused_silu_mul_dq_quant_interface(
+    out=out,
+    scale=scale,
+    input=input_tensor
+)
+# 输出结果
+print("fused_silu_mul_dq_quant_interface computation completed")
+print(f"Output (INT8) shape: {out.shape}")
+print(f"Quantization scales shape: {scale.shape}")
+```
+
+## 31. mx_awq_dequantize
+
+### 支持的产品型号
+
+- Metax C500/C550/C588/C600
+
+### 接口原型
+
+```python
+def mx_awq_dequantize(
+    out: torch.Tensor,
+    _scaling_factors: torch.Tensor,
+    _zeros: torch.Tensor,
+    split_k_iter: int,
+    thx: int,
+    thy: int
+) -> torch.Tensor
+```
+
+### 功能描述
+
+mx_awq_dequantize 算子实现了针对 AWQ（Activation-aware Weight Quantization）算法量化权重的反量化操作。该算子接收打包存储的低比特量化权重内核、缩放因子以及打包的零点数据，通过内部解压逻辑将其还原为高精度浮点张量。这种融合操作常用于大语言模型（LLM）的量化推理，旨在降低显存占用并提升访存效率。
+
+- 计算公式：
+
+$$
+  \begin{aligned}
+  g &= \lfloor j / G \rfloor \\
+  p &= j \% P \\
+  \text{packed\\_idx} &= i \times \text{stride} + \lfloor j / P \rfloor \\
+  \text{q\\_weight} &= \text{unpack}(\text{input0}[\text{packed\\_idx}], p) \\
+  \text{q\\_zero} &= \text{unpack}(\text{input2}[i \times (\text{stride}/G) + g], p) \\
+  \text{dst}[i \times \text{width} + j] &= (\text{q\\_weight} - \text{q\\_zero}) \times \text{input1}[i \times (\text{width}/G) + g]
+  \end{aligned}
+$$
+
+  其中 $\text{unpack}(X, k)$ 函数表示从打包的整数 $X$ 中提取第 $k$ 个低比特量化值（如 4-bit），元素的线性索引与二维位置的映射关系为：
+
+$$
+  n = i \times \text{stride} + \lfloor j / P \rfloor
+$$
+
+  对于打包的输入张量（如 $\text{input0}$ ），其线性索引映射为：
+
+$$
+  \text{packed\\_n} = i \times \text{stride} + \lfloor j / P \rfloor
+$$
+
+  各变量的维度与含义：
+
+- $\text{input0} \in \mathbb{I}^{\text{height} \times \text{stride}}$ ：打包后的量化权重张量（Kernel），数据类型为 $\mathbb{I}$ （ $\text{int32}$ ），有效列范围为 $0 \leq \lfloor j / P \rfloor < \text{width}/P$
+- $\text{input1} \in \mathbb{T}^{\text{height} \times (\text{width}/G)}$ ：量化缩放因子张量（Scaling Factors），数据类型为 $\mathbb{T}$ （ $\text{float16}$ 或 $\text{bfloat16}$ ）
+- $\text{input2} \in \mathbb{I}^{\text{height} \times (\text{stride}/G)}$ ：打包后的量化零点张量（Zeros），数据类型与 $\text{input0}$ 一致（ $\text{int32}$ ）
+- $\text{dst} \in \mathbb{T}^{\text{height} \times \text{width}}$ ：输出张量，存储反量化后的浮点权重，数据类型为 $\mathbb{T}$
+- $n$ ：张量元素的线性索引，范围为 $0 \leq n < \text{height} \times \text{stride}$ （输入张量）或 $0 \leq n < \text{height} \times \text{width}$ （输出张量）
+- $i$ ：输出张量的行索引（对应输出维度 $N$ ），范围为 $0 \leq i < \text{height}$
+- $j$ ：输出张量的列索引（对应输入维度 $K$ ），范围为 $0 \leq j < \text{width}$
+- $P$ ：打包因子（Pack Factor），对于 4-bit 量化， $P = 8$ （即一个 $\text{int32}$ 存储 8 个元素）
+- $G$ ：量化分组大小（Group Size），如 $G = 128$
+- $\text{width}$ ：反量化后的矩阵有效宽度（输入特征维度 $K$ ）
+- $\text{height}$ ：反量化后的矩阵高度（输出特征维度 $N$ ）
+- $\text{stride}$ ：输入打包张量的内存步长，满足 $\text{stride} = \text{width} / P$
+- $\text{unpack}(X, k)$ ：从打包整数 $X$ 中提取第 $k$ 个低比特量化值的解包函数
+- $\text{split\\_k\\_iter}$ ：K 维度并行切分优化参数，用于在硬件层面平衡访存与计算开销
+
+### 参数说明
+
+- **out** (torch.Tensor, 入参): 打包后的量化权重张量（Kernel），通常存储 4-bit 量化后的原始权重
+- **_scaling_factors** (torch.Tensor, 入参): 权重的缩放因子张量，用于线性还原浮点数值
+- **_zeros** (torch.Tensor, 入参): 打包后的量化零点（Zeros）张量，用于偏移还原
+- **split_k_iter** (int, 入参): 内部并行计算的 K 维度切分迭代次数，用于优化计算负载
+- **thx** (int, 入参): 算子内部 CUDA 线程配置参数 X
+- **thy** (int, 入参): 算子内部 CUDA 线程配置参数 Y
+
+### 返回值
+
+返回一个 `torch.Tensor`，即反量化后的高精度浮点权重张量
+
+### 约束与调用
+
+- 所有输入张量必须位于 CUDA 设备上
+- 数据类型限制：
+- out (Kernel) 必须为 **int32** (`Int`) 类型，传入 `Half` (float16) 会导致运行时错误
+- zeros 必须为 **int32** (`Int`) 类型，传入 `Half` (float16) 会导致运行时错误
+- scaling_factors 通常支持 `float16` 或 `bfloat16`
+- 算子内部会根据输入张量的维度计算专家数量（experts）和每组专家数等信息进行任务分发
+
+### 调用示例
+
+```python
+import torch
+import mcoplib.sgl_kernel
+device = "cuda"
+# 1. 构造输入张量
+N, K = 4096, 4096
+group_size = 128
+pack_factor = 8  # 4-bit -> int32
+# 权重 Kernel 必须是 int32
+kernel = torch.randint(0, 2**31, (N, K // pack_factor), dtype=torch.int32, device=device)
+# 缩放因子通常是 float16
+scaling_factors = torch.randn(N, K // group_size, dtype=torch.float16, device=device)
+# 关键修改：zeros 在此算子中也必须是打包好的 int32 (不能是 Half)
+zeros = torch.randint(0, 2**31, (N, K // (group_size * pack_factor)), dtype=torch.int32, device=device)
+# 2. 调用算子
+output = torch.ops.sgl_kernel.mx_awq_dequantize(
+    out=kernel, 
+    _scaling_factors=scaling_factors,
+    _zeros=zeros,  # 确保传入的是 int32
+    split_k_iter=1,
+    thx=128,
+    thy=8
+)
+print("mx_awq_dequantize computation completed successfully")
+print(f"Output shape: {output.shape}")
+```
+
+## 32. tree_speculative_sampling_target_only
+
+### 支持的产品型号
+
+- Metax C500/C550/C588/C600
+
+### 接口原型
+
+```python
+def tree_speculative_sampling_target_only(
+    predicts: torch.Tensor,
+    accept_index: torch.Tensor,
+    accept_token_num: torch.Tensor,
+    candidates: torch.Tensor,
+    retrive_index: torch.Tensor,
+    retrive_next_token: torch.Tensor,
+    retrive_next_sibling: torch.Tensor,
+    uniform_samples: torch.Tensor,
+    uniform_samples_for_final_sampling: torch.Tensor,
+    target_probs: torch.Tensor,
+    draft_probs: torch.Tensor,
+    threshold_single: float,
+    threshold_acc: float,
+    deterministic: bool
+) -> None
+```
+
+### 功能描述
+
+tree_speculative_sampling_target_only 算子实现了树状投机采样（Tree-based Speculative Sampling）中的目标模型验证逻辑。该算子在 GPU 上并行执行接受/拒绝判定，通过比对草稿模型生成的候选 Token 及其概率分布与目标模型的输出分布，确定最终被接受的 Token 序列。它利用树状结构辅助索引进行路径检索，并能根据采样阈值和随机样本在拒绝发生时进行修正采样，显著提升了大语言模型（LLM）的生成效率。
+
+- 计算公式：
+
+$$
+  \begin{aligned}
+  \text{idx} &= \text{candidates}[i, j] \\
+  \text{accept\\_bit}[i, j] &= 
+  \begin{cases} 
+  1, & \text{若 } \text{Uniform}(0,1) \leq \frac{\text{target\\_probs}[i, j, \text{idx}]}{\text{draft\\_probs}[i, j, \text{idx}]} \\
+  0, & \text{否则}
+  \end{cases} \\
+  \text{accept\\_token\\_num}[i] &= \max\left\{ j \mid \forall 0 \leq t < j, \text{accept\\_bit}[i, t] = 1, j \leq \text{steps} \right\} \\
+  \text{predicts}[i] &= 
+  \begin{cases} 
+  \text{candidates}[i, \text{accept\\_token\\_num}[i]], & \text{若 } \text{accept\\_token\\_num}[i] < \text{steps} \\
+  \text{Sample}(\text{Residue Distribution}(\text{target\\_probs}[i, \cdot])), & \text{若拒绝则根据剩余分布采样}
+  \end{cases}
+  \end{aligned}
+$$
+
+  其中元素的线性索引与二维位置的映射关系为：
+
+$$
+  n = i \times \text{steps} + j
+$$
+
+  各变量的维度与含义：
+
+- $\text{target\\_probs} \in \mathbb{T}^{\text{bs} \times \text{steps} \times \text{vocab}}$ ：目标模型输出的概率分布张量，数据类型为 $\mathbb{T}$ （ $\text{float32}$ ）
+- $\text{draft\\_probs} \in \mathbb{T}^{\text{bs} \times \text{steps} \times \text{vocab}}$ ：草稿模型生成的概率分布张量，数据类型与 $\text{target\\_probs}$ 一致
+- $\text{candidates} \in \mathbb{I}^{\text{bs} \times \text{steps}}$ ：草稿模型生成的候选 Token 张量，数据类型为 $\mathbb{I}$ （ $\text{int64}$ ）
+- $\text{predicts} \in \mathbb{D}^{\text{bs}}$ ：输出张量，存储最终决定的下一个 Token 结果，数据类型为 $\mathbb{D}$ （ $\text{int32}$ ）
+- $\text{accept\\_token\\_num} \in \mathbb{D}^{\text{bs}}$ ：输出张量，存储每条序列被接受的有效 Token 数量，数据类型为 $\mathbb{D}$ （ $\text{int32}$ ）
+- $n$ ：中间计算张量元素的线性索引，范围为 $0 \leq n < \text{bs} \times \text{steps}$
+- $i$ ：Batch 维度的索引，范围为 $0 \leq i < \text{bs}$
+- $j$ ：投机步骤的索引，范围为 $0 \leq j < \text{steps}$
+- $\text{bs}$ ：Batch Size 大小（ $\text{batch\\_size}$ ）
+- $\text{steps}$ ：投机生成的步骤数（ $\text{num\\_draft\\_tokens}$ ）
+- $\text{vocab}$ ：词表大小（Vocab Size）
+- $\text{Uniform}(0,1)$ ：服从 $[0,1]$ 区间均匀分布的随机采样函数
+- $\text{Sample}(\cdot)$ ：基于概率分布的 Token 采样函数
+- $\text{Residue Distribution}(\cdot)$ ：拒绝后剩余概率分布，用于最终 Token 采样
+
+### 参数说明
+
+- **predicts** (torch.Tensor, 出参): 存储最终选定的 Token，数据类型必须为 **int32**
+- **accept_index** (torch.Tensor, 出参): 存储被接受 Token 的原始索引位置，数据类型为 **int32**
+- **accept_token_num** (torch.Tensor, 出参): 每个 Batch 被接受的 Token 数量，数据类型为 **int32**
+- **candidates** (torch.Tensor, 入参): 草稿模型生成的候选 Token 张量，数据类型为 **int64**
+- **retrive_index** (torch.Tensor, 入参): 用于树状路径检索的辅助索引张量，数据类型为 **int64**
+- **retrive_next_token** (torch.Tensor, 入参): 用于树状路径检索的辅助索引张量，数据类型为 **int64**
+- **retrive_next_sibling** (torch.Tensor, 入参): 用于树状路径检索的辅助索引张量，数据类型为 **int64**
+- **uniform_samples** (torch.Tensor, 入参): 用于随机判定的均匀分布样本，数据类型为 **float32**
+- **uniform_samples_for_final_sampling** (torch.Tensor, 入参): 用于随机判定的均匀分布样本，数据类型为 **float32**
+- **target_probs** (torch.Tensor, 入参): 目标模型输出的概率分布张量，数据类型为 **float32**
+- **draft_probs** (torch.Tensor, 入参): 草稿模型输出的概率分布张量，数据类型为 **float32**
+- **threshold_single** (float, 入参): 控制采样的阈值参数
+- **threshold_acc** (float, 入参): 控制采样的阈值参数
+- **deterministic** (bool, 入参): 是否开启确定性采样模式
+
+### 返回值
+
+无返回值，计算结果直接写入 `predicts`、`accept_index` 和 `accept_token_num` 张量中
+
+### 约束与调用
+
+- 数据类型限制：
+- 预测与接受索引类张量（predicts、accept_index、accept_token_num）必须为 **int32**
+- 候选 Token 及检索路径张量（candidates、retrive_index、retrive_next_token、retrive_next_sibling）必须为 **int64**
+- 概率与随机样本张量（uniform_samples、uniform_samples_for_final_sampling、target_probs、draft_probs）必须为 **float32**
+- `target_probs` 的第二维（Step 维）大小必须严格等于 `num_draft_tokens`，否则会触发维度校验报错
+- 所有输入输出张量必须位于同一个 CUDA 设备上
+- Python 接口注册定义了 14 个参数，不支持在调用时直接传入 `cuda_stream`
+
+### 调用示例
+
+```python
+import torch
+import mcoplib.sgl_kernel
+# Set computing device
+device = "cuda"
+# Core parameters
+batch_size = 2
+num_spec_step = 4
+num_draft_tokens = 5  # num_draft_tokens = 5
+vocab_size = 128
+# 1. Construct input tensors
+# predicts: [batch_size], dtype=int32
+predicts = torch.zeros(batch_size, dtype=torch.int32, device=device)
+# accept_index: [batch_size, num_spec_step], dtype=int32
+accept_index = torch.zeros((batch_size, num_spec_step), dtype=torch.int32, device=device)
+# accept_token_num: [batch_size], dtype=int32
+accept_token_num = torch.zeros(batch_size, dtype=torch.int32, device=device)
+# candidates: [batch_size, num_draft_tokens], dtype=int64
+candidates = torch.randint(0, vocab_size, (batch_size, num_draft_tokens), dtype=torch.int64, device=device)
+# retrieve indices: [bs, num_draft_tokens], dtype=int64
+retrive_index = torch.zeros((batch_size, num_draft_tokens), dtype=torch.int64, device=device)
+retrive_next_token = torch.zeros((batch_size, num_draft_tokens), dtype=torch.int64, device=device)
+retrive_next_sibling = torch.zeros((batch_size, num_draft_tokens), dtype=torch.int64, device=device)
+# uniform_samples: [batch_size, num_draft_tokens], dtype=float32
+uniform_samples = torch.rand((batch_size, num_draft_tokens), dtype=torch.float32, device=device)
+# uniform_samples_for_final_sampling: [batch_size], dtype=float32
+uniform_samples_for_final_sampling = torch.rand(batch_size, dtype=torch.float32, device=device)
+#  关键修正点 
+# target_probs: [batch_size, num_draft_tokens, vocab_size]
+# 根据报错信息和源码 CHECK_EQ，第二维必须等于 num_draft_tokens (5)，不能是 6
+target_probs = torch.rand((batch_size, num_draft_tokens, vocab_size), dtype=torch.float32, device=device)
+# draft_probs: [batch_size, num_draft_tokens, vocab_size], dtype=float32
+draft_probs = torch.rand((batch_size, num_draft_tokens, vocab_size), dtype=torch.float32, device=device)
+# 2. Scalar parameters
+threshold_single = 1.0
+threshold_acc = 1.0
+deterministic = True
+# 3. Call the operator
+torch.ops.sgl_kernel.tree_speculative_sampling_target_only(
+    predicts=predicts,
+    accept_index=accept_index,
+    accept_token_num=accept_token_num,
+    candidates=candidates,
+    retrive_index=retrive_index,
+    retrive_next_token=retrive_next_token,
+    retrive_next_sibling=retrive_next_sibling,
+    uniform_samples=uniform_samples,
+    uniform_samples_for_final_sampling=uniform_samples_for_final_sampling,
+    target_probs=target_probs,
+    draft_probs=draft_probs,
+    threshold_single=threshold_single,
+    threshold_acc=threshold_acc,
+    deterministic=deterministic
+)
+# Output results
+print("tree_speculative_sampling_target_only computation completed successfully")
+print(f"Updated predicts: {predicts}")
+print(f"Accepted token count: {accept_token_num}")
+```
+
+## 33. verify_tree_greedy
+
+### 支持的产品型号
+
+- Metax C500/C550/C588/C600
+
+### 接口原型
+
+```python
+def verify_tree_greedy(
+    predicts: torch.Tensor,
+    accept_index: torch.Tensor,
+    accept_token_num: torch.Tensor,
+    candidates: torch.Tensor,
+    retrive_index: torch.Tensor,
+    retrive_next_token: torch.Tensor,
+    retrive_next_sibling: torch.Tensor,
+    target_predict: torch.Tensor
+) -> None
+```
+
+### 功能描述
+
+verify_tree_greedy 算子实现了基于树状结构的贪婪投机采样（Greedy Speculative Sampling）验证逻辑。该算子在 GPU 上并行比对目标模型生成的贪婪预测结果（`target_predict`）与草稿模型提供的树状候选序列（`candidates`）。利用提供的路径检索索引（`retrive_index` 等），算子能够快速确定每条序列中被接受的最长路径，并更新最终预测的 Token 及接受数量。该算子专门用于贪婪解码场景，旨在通过一次目标模型前向传播验证多个草稿 Token，显著降低推理延迟。
+
+- 计算公式：
+
+$$
+  \begin{aligned}
+  \text{cand} &= \text{candidates}[i, j] \\
+  \text{accept\\_bit}[i, j] &= 
+  \begin{cases} 
+  1, & \text{若候选 Token 满足验证条件（基于目标/草稿模型概率分布）} \\
+  0, & \text{否则}
+  \end{cases} \\
+  \text{accept\\_token\\_num}[i] &= \max\left\{ j \mid \forall 0 \leq t < j, \text{accept\\_bit}[i, t] = 1, j \leq \text{steps} \right\} \\
+  \text{predicts}[i] &= 
+  \begin{cases} 
+  \text{candidates}[i, \text{accept\\_token\\_num}[i]-1], & \text{若 } \text{accept\\_token\\_num}[i] > 0 \\
+  \text{基于目标模型分布重新采样}, & \text{若 } \text{accept\\_token\\_num}[i] = 0
+  \end{cases}
+  \end{aligned}
+$$
+
+  其中元素的线性索引与二维位置（Batch 与 Step）的映射关系为：
+
+$$
+  n = i \times \text{steps} + j
+$$
+
+  各变量的维度与含义：
+
+- $\text{target\\_probs} \in \mathbb{T}^{\text{bs} \times \text{steps} \times \text{vocab}}$ ：目标模型输出的概率分布张量，数据类型为 $\mathbb{T}$ （ $\text{float32}$ ）
+- $\text{draft\\_probs} \in \mathbb{T}^{\text{bs} \times \text{steps} \times \text{vocab}}$ ：草稿模型生成的概率分布张量，数据类型与 $\text{target\\_probs}$ 一致
+- $\text{candidates} \in \mathbb{I}^{\text{bs} \times \text{steps}}$ ：草稿生成的候选 Token 序列，数据类型为 $\mathbb{I}$ （ $\text{int64}$ ）
+- $\text{predicts} \in \mathbb{D}^{\text{bs}}$ ：输出张量，存储最终决定的下一个 Token，数据类型为 $\mathbb{D}$ （ $\text{int32}$ ）
+- $\text{accept\\_token\\_num} \in \mathbb{D}^{\text{bs}}$ ：输出张量，存储每条序列被验证接受的 Token 总数，数据类型为 $\mathbb{D}$ （ $\text{int32}$ ）
+- $n$ ：中间计算时采样张量的线性索引，范围为 $0 \leq n < \text{bs} \times \text{steps}$
+- $i$ ：张量的 Batch 索引，范围为 $0 \leq i < \text{bs}$
+- $j$ ：投机采样步骤的索引，范围为 $0 \leq j < \text{steps}$
+- $\text{bs}$ ：Batch Size，对应输入张量的第 0 维
+- $\text{steps}$ ：投机生成的候选长度（ $\text{num\\_draft\\_tokens}$ ）， $\text{target\\_probs}$ 的第 1 维必须与此相等
+- $\text{vocab}$ ：词表大小（Vocab Size）
+- $\text{cand}$ ：单步候选 Token， $\text{cand} = \text{candidates}[i, j]$
+- $\text{accept\\_bit}[i, j]$ ：单步验证结果标识（1 为接受，0 为拒绝）
+
+### 参数说明
+
+- **predicts** (torch.Tensor, 出参): 存储最终选定的下一个有效 Token，形状通常为 `[batch_size]`，数据类型必须为 **int32**
+- **accept_index** (torch.Tensor, 出参): 存储被接受 Token 在草稿树中的原始索引，形状为 `[batch_size, num_spec_step]`，数据类型必须为 **int32**
+- **accept_token_num** (torch.Tensor, 出参): 每个 Batch 序列中实际被接受的有效 Token 数量，形状为 `[batch_size]`，数据类型必须为 **int32**
+- **candidates** (torch.Tensor, 入参): 草稿模型生成的候选 Token 张量，数据类型为 **int64**
+- **retrive_index** (torch.Tensor, 入参): 用于在树结构中检索路径和兄弟节点的辅助索引张量，数据类型为 **int64**
+- **retrive_next_token** (torch.Tensor, 入参): 用于在树结构中检索路径和兄弟节点的辅助索引张量，数据类型为 **int64**
+- **retrive_next_sibling** (torch.Tensor, 入参): 用于在树结构中检索路径和兄弟节点的辅助索引张量，数据类型为 **int64**
+- **target_predict** (torch.Tensor, 入参): 目标模型对所有草稿位置生成的贪婪预测 Token 张量，数据类型为 **int64**。其第二维大小必须与 `candidates` 严格一致
+
+### 返回值
+
+无返回值，计算结果直接写入 `predicts`、`accept_index` 和 `accept_token_num` 等出参张量中
+
+### 约束与调用
+
+- 所有输入输出张量必须位于同一个 CUDA/MACA 设备上
+- 数据类型校验：
+- 出参张量（`predicts`, `accept_index`, `accept_token_num`）必须为 **int32**
+- 入参张量（`candidates`, `target_predict` 及索引类张量）必须为 **int64**
+- 维度限制：目标预测张量（`target_predict`）与候选张量（`candidates`）的第二维（投机步数维度）必须相等
+- 调用限制：尽管 C++ 底层支持 `cuda_stream` 参数，但由于 Python 接口注册定义了 8 个参数，调用时不支持传入 `cuda_stream`
+
+### 调用示例
+
+```python
+import torch
+import mcoplib.sgl_kernel
+# Set computing device
+device = "cuda"
+# Core parameters
+batch_size = 2
+num_spec_step = 4
+num_draft_tokens = 5
+vocab_size = 128
+# 1. Construct input tensors
+# predicts: [batch_size], dtype=int32 (mutable output)
+predicts = torch.zeros(batch_size, dtype=torch.int32, device=device)
+# accept_index: [batch_size, num_spec_step], dtype=int32 (mutable output)
+accept_index = torch.zeros((batch_size, num_spec_step), dtype=torch.int32, device=device)
+# accept_token_num: [batch_size], dtype=int32 (mutable output)
+accept_token_num = torch.zeros(batch_size, dtype=torch.int32, device=device)
+# candidates: [batch_size, num_draft_tokens], dtype=int64
+candidates = torch.randint(0, vocab_size, (batch_size, num_draft_tokens), dtype=torch.int64, device=device)
+# retrieve indices: [batch_size, num_draft_tokens], dtype=int64
+retrive_index = torch.zeros((batch_size, num_draft_tokens), dtype=torch.int64, device=device)
+retrive_next_token = torch.zeros((batch_size, num_draft_tokens), dtype=torch.int64, device=device)
+retrive_next_sibling = torch.zeros((batch_size, num_draft_tokens), dtype=torch.int64, device=device)
+# target_predict: [batch_size, num_draft_tokens], dtype=int64
+target_predict = torch.randint(0, vocab_size, (batch_size, num_draft_tokens), dtype=torch.int64, device=device)
+# 2. Call the operator
+# Removed 'cuda_stream' to match the 8-argument registration
+torch.ops.sgl_kernel.verify_tree_greedy(
+    predicts=predicts,
+    accept_index=accept_index,
+    accept_token_num=accept_token_num,
+    candidates=candidates,
+    retrive_index=retrive_index,
+    retrive_next_token=retrive_next_token,
+    retrive_next_sibling=retrive_next_sibling,
+    target_predict=target_predict
+)
+# Output results
+print("verify_tree_greedy computation completed successfully")
+print(f"Updated predicts: {predicts}")
+print(f"Updated accept_token_num: {accept_token_num}")
+```
+
+## 34. reconstruct_indices_from_tree_mask
+
+### 支持的产品型号
+
+- Metax C500/C550/C588/C600
+
+### 接口原型
+
+```python
+def reconstruct_indices_from_tree_mask(
+    tree_mask: torch.Tensor,
+    verified_seq_len: torch.Tensor,
+    positions: torch.Tensor,
+    retrive_index: torch.Tensor,
+    retrive_next_token: torch.Tensor,
+    retrive_next_sibling: torch.Tensor,
+    batch_size: int,
+    draft_token_num: int
+) -> None
+```
+
+### 功能描述
+
+reconstruct_indices_from_tree_mask 算子用于在树状投机采样（Tree-based Speculative Decoding）中，根据给定的布尔遮罩（tree_mask）重建 Token 的位置信息和索引元数据。该算子在 CUDA 内核中并行处理，根据遮罩关系计算每个草稿 Token 的树深度（Depth），并将其与已验证序列长度相加得到绝对位置。同时，它会识别每个 Token 在树结构中的检索索引、下一个 Token 索引以及下一个兄弟节点索引，这些元数据对于后续的投机验证至关重要。
+
+- 计算公式：
+
+$$
+  \begin{aligned}
+  \text{positions}[n] &= \text{tree\\_depth}[i, t] + \text{verified\\_seq\\_len}[i] \\
+  \text{retrive\\_index}[n] &= n \\
+  \text{retrive\\_next\\_token}[n] &= 
+  \begin{cases} 
+  \text{first\\_child\\_idx}(i, t), & \text{若 Token } t \text{ 存在子节点} \\
+-1, & \text{若无子节点}
+  \end{cases} \\
+  \text{retrive\\_next\\_sibling}[n] &= 
+  \begin{cases} 
+  \text{next\\_sibling\\_idx}(i, t), & \text{若 Token } t \text{ 存在兄弟节点} \\
+-1, & \text{若无兄弟节点}
+  \end{cases}
+  \end{aligned}
+$$
+
+  其中 $\text{first\\_child\\_idx}(i, t) = \arg\min_{k}\{k \mid \text{tree\\_mask}[i, t, k] = \text{True}\}$ ， $\text{next\\_sibling\\_idx}(i, t) = \arg\min_{k>t}\{k \mid \text{tree\\_mask}[i, \text{parent}(t), k] = \text{True}\}$ ；元素的线性索引与多维位置的映射关系为：
+
+$$
+  n = i \times \text{draft\\_token\\_num} + t
+$$
+
+  对于三维遮罩张量，其内部线性寻址关系为：
+
+$$
+  \text{mask\\_n} = i \times \text{draft\\_token\\_num} \times \text{draft\\_token\\_num} + j \times \text{draft\\_token\\_num} + k
+$$
+
+  各变量的维度与含义：
+
+- $\text{tree\\_mask} \in \mathbb{B}^{\text{batch\\_size} \times \text{draft\\_token\\_num} \times \text{draft\\_token\\_num}}$ ：输入树结构关系遮罩，数据类型为 $\mathbb{B}$ （ $\text{bool}$ ）； $\text{tree\\_mask}[i, j, k] = \text{True}$ 表示在第 $i$ 个 Batch 中，Token $k$ 是 Token $j$ 的后代
+- $\text{verified\\_seq\\_len} \in \mathbb{I}^{\text{batch\\_size}}$ ：输入张量，记录每个 Batch 已验证的序列长度，数据类型为 $\mathbb{I}$ （ $\text{int64}$ ）
+- $\text{positions} \in \mathbb{I}^{\text{batch\\_size} \times \text{draft\\_token\\_num}}$ ：输出张量，存储重建后的 Token 绝对位置，计算方式为树深度加上已验证长度，数据类型为 $\mathbb{I}$ （ $\text{int64}$ ）
+- $\text{retrive\\_index} \in \mathbb{I}^{\text{batch\\_size} \times \text{draft\\_token\\_num}}$ ：输出张量，存储 Token 的扁平化检索索引，直接映射为当前线性索引 $n$ ，数据类型为 $\mathbb{I}$ （ $\text{int64}$ ）
+- $\text{retrive\\_next\\_token} \in \mathbb{I}^{\text{batch\\_size} \times \text{draft\\_token\\_num}}$ ：输出张量，存储每个 Token 的第一个子节点索引，若无子节点则为 $-1$ ，数据类型为 $\mathbb{I}$ （ $\text{int64}$ ）
+- $\text{retrive\\_next\\_sibling} \in \mathbb{I}^{\text{batch\\_size} \times \text{draft\\_token\\_num}}$ ：输出张量，存储每个 Token 的下一个兄弟节点索引，若无兄弟节点则为 $-1$ ，数据类型为 $\mathbb{I}$ （ $\text{int64}$ ）
+- $n$ ：输出张量元素的线性索引，范围为 $0 \leq n < \text{batch\\_size} \times \text{draft\\_token\\_num}$
+- $i$ ：Batch 索引，范围为 $0 \leq i < \text{batch\\_size}$
+- $t$ ：当前 Batch 内的 Token 偏移索引，范围为 $0 \leq t < \text{draft\\_token\\_num}$
+- $j, k$ ：三维遮罩张量的 Token 索引，范围为 $0 \leq j, k < \text{draft\\_token\\_num}$
+- $\text{draft\\_token\\_num}$ ：树中草稿 Token 的有效宽度
+- $\text{batch\\_size}$ ：批处理的高度（行数）
+- $\text{tree\\_depth}[i, t]$ ：第 $i$ 个 Batch 中 Token $t$ 在树结构中的深度
+- $\text{parent}(t)$ ：Token $t$ 在树结构中的父节点索引
+
+### 参数说明
+
+- **tree_mask** (torch.Tensor, 入参): 树结构关系的布尔遮罩张量，形状为 `[batch_size, draft_token_num, draft_token_num]`，数据类型为 **bool**
+- **verified_seq_len** (torch.Tensor, 入参): 存储每个 batch 当前已验证序列长度的张量，数据类型为 **int64**
+- **positions** (torch.Tensor, 出参): 输出张量，存储重建后的 Token 绝对位置信息，数据类型为 **int64**
+- **retrive_index** (torch.Tensor, 出参): 输出张量，存储每个 Token 的检索索引，数据类型为 **int64**
+- **retrive_next_token** (torch.Tensor, 出参): 输出张量，存储对应的下一个 Token 索引，若无则为 -1，数据类型为 **int64**
+- **retrive_next_sibling** (torch.Tensor, 出参): 输出张量，存储对应的下一个兄弟节点索引，若无则为 -1，数据类型为 **int64**
+- **batch_size** (int, 入参): 批处理大小
+- **draft_token_num** (int, 入参): 每个 batch 中的草稿 Token 数量
+
+### 返回值
+
+无返回值，计算结果直接写入 `positions`、`retrive_index`、`retrive_next_token` 和 `retrive_next_sibling` 张量中
+
+### 约束与调用
+
+- 所有张量必须位于 CUDA 设备上
+- 数据类型约束：
+- `tree_mask` 必须为 **bool**
+- 其余所有张量（入参及出参）必须为 **int64**
+- 维度一致性：`tree_mask` 在内存中被视为大小为 `batch_size * draft_token_num * draft_token_num` 的连续数组进行访问
+
+### 调用示例
+
+```python
+import torch
+import mcoplib.sgl_kernel
+# 设置计算设备
+device = "cuda"
+# 核心参数
+bs = 2                  # Batch Size
+draft_token_num = 16    # 树中草稿 Token 的数量
+# 1. 构造输入张量
+# tree_mask: [bs, draft_token_num, draft_token_num]，实现中强制转换为 bool*
+tree_mask = torch.randint(
+    0, 2, (bs, draft_token_num, draft_token_num), 
+    dtype=torch.bool, device=device
+)
+# verified_seq_len: [bs]，存储每个 batch 已验证的序列长度，类型为 int64
+verified_seq_len = torch.tensor([10, 20], dtype=torch.int64, device=device)
+# 2. 构造输出/修改张量 (这些张量在 C++ 中被标记为 mutable/Tensor!)
+# 数据类型均为 int64 (Long)
+positions = torch.zeros((bs, draft_token_num), dtype=torch.int64, device=device)
+retrive_index = torch.zeros((bs, draft_token_num), dtype=torch.int64, device=device)
+retrive_next_token = torch.zeros((bs, draft_token_num), dtype=torch.int64, device=device)
+retrive_next_sibling = torch.zeros((bs, draft_token_num), dtype=torch.int64, device=device)
+# 3. 调用算子
+# 注意参数顺序需匹配注册信息
+torch.ops.sgl_kernel.reconstruct_indices_from_tree_mask(
+    tree_mask,
+    verified_seq_len,
+    positions,
+    retrive_index,
+    retrive_next_token,
+    retrive_next_sibling,
+    bs,                 # batch_size
+    draft_token_num     # draft_token_num
+)
+# 输出结果
+print("reconstruct_indices_from_tree_mask computation completed")
+print(f"Positions shape: {positions.shape}")
+print(f"Retrieve Index shape: {retrive_index.shape}")
+print(f"Next Token Index shape: {retrive_next_token.shape}")
+print(f"Next Sibling Index shape: {retrive_next_sibling.shape}")
+```
+
+## 35. build_tree_kernel_efficient
+
+### 支持的产品型号
+
+- Metax C500/C550/C588/C600
+
+### 接口原型
+
+```python
+def build_tree_kernel_efficient(
+    parent_list: torch.Tensor,
+    selected_index: torch.Tensor,
+    verified_seq_len: torch.Tensor,
+    tree_mask: torch.Tensor,
+    positions: torch.Tensor,
+    retrive_index: torch.Tensor,
+    retrive_next_token: torch.Tensor,
+    retrive_next_sibling: torch.Tensor,
+    topk: int,
+    depth: int,
+    draft_token_num: int,
+    tree_mask_mode: int
+) -> None
+```
+
+### 功能描述
+
+build_tree_kernel_efficient 算子用于在树状投机采样（Speculative Decoding）中高效构建树结构元数据。该算子根据输入的父节点列表，在 GPU 上并行计算每个草稿 Token 的树深度，并结合已验证序列长度生成绝对位置信息。同时，它负责生成树结构注意力掩码（tree_mask）以及用于验证阶段的路径检索索引（下一个 Token 索引和兄弟节点索引），从而减少树结构在 CPU 与 GPU 之间的频繁同步开销。
+
+- 计算公式：
+
+$$
+  \text{depth}[i, t] = 
+  \begin{cases} 
+  0, & \text{根节点（无父节点）} \\
+  \text{depth}[i, \text{parent\\_list}[i, t]] + 1, & \text{子节点（深度为父节点深度+1）}
+  \end{cases}
+$$
+
+  该算子通过遍历 parent_list 重建投机采样的树状拓扑结构。其中 $\text{depth}$ 代表节点在树中的层级（根节点深度为 0），用于计算 Token 的绝对位置。
+  其中元素的线性索引与多维位置的映射关系为：
+
+$$
+  n = i \times \text{draft\\_token\\_num} + t
+$$
+
+  对于三维遮罩张量 tree_mask，其内部线性寻址关系为：
+
+$$
+  \text{mask\\_n} = i \times \text{draft\\_token\\_num} \times \text{draft\\_token\\_num} + j \times \text{draft\\_token\\_num} + k
+$$
+
+  各变量的维度与含义：
+
+- $\text{parent\\_list} \in \mathbb{I}^{\text{batch\\_size} \times \text{draft\\_token\\_num}}$ ：输入张量，记录树中每个节点的父节点索引偏移，数据类型为 $\mathbb{I}$ （ $\text{int64}$ ）
+- $\text{verified\\_seq\\_len} \in \mathbb{I}^{\text{batch\\_size}}$ ：输入张量，记录每个 Batch 已验证的序列长度，用于计算绝对位置偏移，数据类型为 $\mathbb{I}$ （ $\text{int64}$ ）
+- $\text{tree\\_mask} \in \mathbb{B}^{\text{batch\\_size} \times \text{draft\\_token\\_num} \times \text{draft\\_token\\_num}}$ ：输出张量，树结构注意力掩码，数据类型为 $\mathbb{B}$ （ $\text{bool}$ ）
+- $\text{positions} \in \mathbb{I}^{\text{batch\\_size} \times \text{draft\\_token\\_num}}$ ：输出张量，存储重建后的 Token 绝对位置信息，数据类型为 $\mathbb{I}$ （ $\text{int64}$ ）
+- $\text{retrive\\_next\\_token} \in \mathbb{I}^{\text{batch\\_size} \times \text{draft\\_token\\_num}}$ ：输出张量，存储每个 Token 对应的第一个子节点索引，数据类型为 $\mathbb{I}$ （ $\text{int64}$ ）
+- $\text{retrive\\_next\\_sibling} \in \mathbb{I}^{\text{batch\\_size} \times \text{draft\\_token\\_num}}$ ：输出张量，存储每个 Token 对应的下一个兄弟节点索引，数据类型为 $\mathbb{I}$ （ $\text{int64}$ ）
+- $n$ ：输出张量元素的线性索引，范围为 $0 \leq n < \text{batch\\_size} \times \text{draft\\_token\\_num}$
+- $i$ ：Batch 索引，范围为 $0 \leq i < \text{batch\\_size}$
+- $t$ ：当前 Batch 内的 Token 偏移索引，范围为 $0 \leq t < \text{draft\\_token\\_num}$
+- $\text{draft\\_token\\_num}$ ：树中草稿 Token 的有效宽度
+- $\text{batch\\_size}$ ：批处理的高度（行数）
+
+### 参数说明
+
+- **parent_list** (torch.Tensor, 入参): 树中每个节点的父节点偏移列表，形状通常为 `[batch_size, draft_token_num]`
+- **selected_index** (torch.Tensor, 入参): 存储被选中的候选 Token 索引
+- **verified_seq_len** (torch.Tensor, 入参): 每个 batch 当前已通过验证的序列长度
+- **tree_mask** (torch.Tensor, 出参): 输出的树结构注意力掩码，用于后续 Self-Attention 计算
+- **positions** (torch.Tensor, 出参): 输出的绝对位置编码信息
+- **retrive_index** (torch.Tensor, 出参): 输出的 Token 检索索引
+- **retrive_next_token** (torch.Tensor, 出参): 输出的当前节点第一个子节点的检索索引
+- **retrive_next_sibling** (torch.Tensor, 出参): 输出的当前节点下一个兄弟节点的检索索引
+- **topk** (int, 入参): 采样时每层的 top-k 候选数量
+- **depth** (int, 入参): 树的最大深度
+- **draft_token_num** (int, 入参): 树中包含的草稿 Token 总数
+- **tree_mask_mode** (int, 入参): 掩码生成模式选择
+
+### 返回值
+
+无返回值，计算出的树掩码、位置信息和各类检索索引直接写入对应的出参张量中
+
+### 约束与调用
+
+- 所有输入及输出张量必须位于 **CUDA** 设备上
+- 数据类型支持：
+- `tree_mask` 必须为 **bool** 类型
+- 索引与位置相关张量（`parent_list`, `positions`, `retrive_index` 等）必须为 **int64** (Long) 类型
+- 内存布局：所有传入的张量应当是连续的（Contiguous），因为内核直接通过 `data_ptr ()` 访问底层物理地址
+
+### 调用示例
+
+```python
+import torch
+import mcoplib.sgl_kernel
+# Set computing device
+device = "cuda"
+# Core parameters
+bs = 2                  # Batch size
+topk = 4                # Top-k selection per branch
+tree_depth = 5          # Depth of the speculative tree
+draft_token_num = 16    # Total number of draft tokens in the tree
+tree_mask_mode = 0      # Mode for tree mask generation
+# 1. Construct input tensors
+# Note: Dtypes must match C++ static_cast expectations (mostly int64 and bool)
+# parent_list: Indices of parent nodes for each node in the tree
+parent_list = torch.zeros((bs, draft_token_num), dtype=torch.int64, device=device)
+# selected_index: Indices of selected tokens
+selected_index = torch.zeros((bs, draft_token_num), dtype=torch.int64, device=device)
+# verified_seq_len: Current verified sequence length per batch
+verified_seq_len = torch.tensor([10, 20], dtype=torch.int64, device=device)
+# 2. Construct output/mutable tensors (marked with ! in registration)
+# tree_mask: [bs, draft_token_num, draft_token_num]
+tree_mask = torch.empty((bs, draft_token_num, draft_token_num), dtype=torch.bool, device=device)
+# positions and indices: [bs, draft_token_num]
+positions = torch.empty((bs, draft_token_num), dtype=torch.int64, device=device)
+retrive_index = torch.empty((bs, draft_token_num), dtype=torch.int64, device=device)
+retrive_next_token = torch.empty((bs, draft_token_num), dtype=torch.int64, device=device)
+retrive_next_sibling = torch.empty((bs, draft_token_num), dtype=torch.int64, device=device)
+# 3. Call the operator
+# Registered in sgl_kernel namespace
+torch.ops.sgl_kernel.build_tree_kernel_efficient(
+    parent_list=parent_list,
+    selected_index=selected_index,
+    verified_seq_len=verified_seq_len,
+    tree_mask=tree_mask,
+    positions=positions,
+    retrive_index=retrive_index,
+    retrive_next_token=retrive_next_token,
+    retrive_next_sibling=retrive_next_sibling,
+    topk=topk,
+    depth=tree_depth,
+    draft_token_num=draft_token_num,
+    tree_mask_mode=tree_mask_mode
+)
+# Output results
+print("build_tree_kernel_efficient computation completed")
+print(f"tree_mask shape: {tree_mask.shape}")
+print(f"positions shape: {positions.shape}")
+print(f"retrive_index sample: {retrive_index[0, :5]}")
+```
+
+## 36. segment_packbits
+
+### 支持的产品型号
+
+- Metax C500/C550/C588/C600
+
+### 接口原型
+
+```python
+def segment_packbits(
+    x: torch.Tensor,
+    input_indptr: torch.Tensor,
+    output_indptr: torch.Tensor,
+    y: torch.Tensor,
+    batch_size: int,
+    cuda_stream: int = 0
+) -> None
+```
+
+### 功能描述
+
+segment_packbits 算子实现了分段位打包（Bit-packing）功能。它将输入的布尔型张量按照指定的段偏移指针（indptr）划分为多个段，并在每个段内将连续的布尔值压缩为比特位（1 个比特位代表 1 个布尔值），最终以 uint8 字节流的形式存储。该算子在位打包时采用小端序（Little-endian）逻辑，常用于树状投机采样等变长序列场景中，以降低布尔掩码的显存占用和传输带宽。
+
+- 计算公式：
+
+$$
+  \text{dst}[\text{output\\_indptr}[b] + \text{byte\\_off}] |= \text{int}(\text{input}[\text{input\\_indptr}[b] + 8 \times \text{byte\\_off} + \text{bit\\_idx}]) \ll \text{bit\\_idx}
+$$
+
+  其中， $\text{int}(\cdot)$ 将布尔值转换为整数（ $\text{True}$ 映射为 $1$ ， $\text{False}$ 映射为 $0$ ），且位打包遵循小端序（Little-endian）逻辑。
+  其中元素的线性索引与多维位置的映射关系为：
+
+$$
+  \text{input\\_n} = \text{input\\_indptr}[b] + 8 \times \text{byte\\_off} + \text{bit\\_idx} \\
+  \text{output\\_n} = \text{output\\_indptr}[b] + \text{byte\\_off}
+$$
+
+  各变量的维度与含义：
+
+- $\text{input} \in \mathbb{B}^{\text{input\\_len}}$ ：输入布尔张量，数据类型为 $\mathbb{B}$ （ $\text{bool}$ ），包含待压缩的原始数据
+- $\text{dst} \in \mathbb{U}^{\text{output\\_len}}$ ：输出张量，存储打包后的比特数据，数据类型为 $\mathbb{U}$ （ $\text{uint8}$ ）
+- $\text{input\\_indptr} \in \mathbb{I}^{\text{num\\_segments}+1}$ ：输入段偏移指针，用于定义输入张量 $\text{input}$ 中每个 Segment 的起始和结束位置，数据类型为 $\mathbb{I}$ （ $\text{int32}$ ）
+- $\text{output\\_indptr} \in \mathbb{I}^{\text{num\\_segments}+1}$ ：输出段偏移指针，用于定义输出张量 $\text{dst}$ 中每个 Segment 的起始和结束位置，数据类型与 $\text{input\\_indptr}$ 一致
+- $b$ ：分段索引（Batch 索引），范围为 $0 \leq b < \text{num\\_segments}$
+- $\text{byte\\_off}$ ：当前 Segment 内的字节偏移，范围为 $0 \leq \text{byte\\_off} < \lfloor (\text{input\\_indptr}[b+1] - \text{input\\_indptr}[b])/8 \rfloor$
+- $\text{bit\\_idx}$ ：字节内的比特位索引，范围为 $0 \leq \text{bit\\_idx} < 8$
+- $\text{num\\_segments}$ ：需要处理的总分段数量
+- $\text{input\\_len}$ ：输入张量的总长度，满足 $\text{input\\_len} = \text{input\\_indptr}[\text{num\\_segments}]$
+- $\text{output\\_len}$ ：输出张量的总长度，满足 $\text{output\\_len} = \text{output\\_indptr}[\text{num\\_segments}]$
+
+### 参数说明
+
+- **x** (torch.Tensor, 入参): 输入的布尔型张量，包含待压缩的原始布尔数据
+- **input_indptr** (torch.Tensor, 入参): 输入段偏移指针，用于定义 `x` 中各段的起始和结束位置，数据类型为 **int32**
+- **output_indptr** (torch.Tensor, 入参): 输出段偏移指针，用于定义压缩后各段在 `y` 中的起始和结束位置，数据类型为 **int32**
+- **y** (torch.Tensor, 出参): 输出张量，用于存储打包后的比特数据，数据类型为 **uint8**
+- **batch_size** (int, 入参): 批处理大小，即总共需要处理的分段数量
+- **cuda_stream** (int, 入参): 异步执行任务的 CUDA 流指针
+
+### 返回值
+
+无返回值，打包后的结果直接写入输出张量 `y` 中
+
+### 约束与调用
+
+- 所有输入输出张量必须位于同一个 CUDA 设备上
+- 数据类型限制：
+- `x` 必须为 **bool** 类型
+- `y` 必须为 **uint8** 类型
+- `input_indptr` 与 `output_indptr` 必须为 **int32** 类型
+- `output_indptr` 的长度必须大于等于 `batch_size + 1`
+- 算子内部直接通过 `data_ptr ()` 访问地址，建议所有张量保持内存连续（Contiguous）
+
+### 调用示例
+
+```python
+import torch
+import mcoplib.sgl_kernel
+# Set computing device
+device = "cuda"
+# Core parameters
+batch_size = 2
+bits_per_segment = 16  # Each segment has 16 boolean flags
+total_bits = batch_size * bits_per_segment
+# 1. Construct input tensors
+# x: Input boolean tensor to be packed
+x = torch.randint(0, 2, (total_bits,), dtype=torch.bool, device=device)
+# input_indptr: Defines the start/end indices of segments in input 'x'
+# Must be int32 and size should be batch_size + 1
+input_indptr = torch.tensor([0, 16, 32], dtype=torch.int32, device=device)
+# output_indptr: Defines the start/end indices of packed segments in output 'y'
+# 16 bits pack into 2 bytes (uint8)
+output_indptr = torch.tensor([0, 2, 4], dtype=torch.int32, device=device)
+# 2. Construct output tensor
+# y: Output tensor for packed bits, must be uint8 (or int8)
+y = torch.empty((4,), dtype=torch.uint8, device=device)
+cuda_stream = 0
+# 3. Call the operator
+# Registered in sgl_kernel namespace with 6 arguments
+torch.ops.sgl_kernel.segment_packbits(
+    x=x,
+    input_indptr=input_indptr,
+    output_indptr=output_indptr,
+    y=y,
+    batch_size=batch_size,
+    cuda_stream=cuda_stream
+)
+# Output results
+print("segment_packbits computation completed")
+print(f"Input boolean tensor shape: {x.shape}")
+print(f"Output packed tensor (uint8) shape: {y.shape}")
+```
+
+## 37. transfer_kv_per_layer
+
+### 支持的产品型号
+
+- Metax C500/C550/C588/C600
+
+### 接口原型
+
+```python
+def transfer_kv_per_layer(
+    src_k: torch.Tensor,
+    dst_k: torch.Tensor,
+    src_v: torch.Tensor,
+    dst_v: torch.Tensor,
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    item_size: int,
+    block_quota: int,
+    num_warps_per_block: int
+) -> None
+```
+
+### 功能描述
+
+transfer_kv_per_layer 算子用于在单层维度上，根据指定的源索引和目标索引，将 Key (K) 和 Value (V) 的 Cache 数据从源张量复制到目标张量中。该操作主要应用于大模型推理过程中的 KV Cache 显存管理场景，如 Page Attention 中的物理块搬运、碎片整理等。
+
+- 计算公式：
+
+$$
+  \text{dst\\_k}[\mathcal{A}_{\text{dst}}] = \text{src\\_k}[\mathcal{A}_{\text{src}}]
+$$
+
+
+
+$$
+  \text{dst\\_v}[\mathcal{A}_{\text{dst}}] = \text{src\\_v}[\mathcal{A}_{\text{src}}]
+$$
+
+  其中地址偏移量的映射关系为：
+
+$$
+  \mathcal{A}_{\text{src}} = \text{src\\_indices}[b] \times \text{item\\_size} + j
+$$
+
+
+
+$$
+  \mathcal{A}_{\text{dst}} = \text{dst\\_indices}[b] \times \text{item\\_size} + j
+$$
+
+  各变量的维度与含义：
+
+- $\text{src\\_k} \in \mathbb{T}^{\text{total\\_size}}$ ：源 Key 缓存张量，视为一维线性内存，数据类型为 $\mathbb{T}$
+- $\text{dst\\_k} \in \mathbb{T}^{\text{total\\_size}}$ ：目标 Key 缓存张量，数据类型与 $\text{src\\_k}$ 一致
+- $\text{src\\_v} \in \mathbb{T}^{\text{total\\_size}}$ ：源 Value 缓存张量，视为一维线性内存
+- $\text{dst\\_v} \in \mathbb{T}^{\text{total\\_size}}$ ：目标 Value 缓存张量，数据类型与 $\text{src\\_v}$ 一致
+- $\text{src\\_indices} \in \mathbb{Z}^{\text{num\\_blocks}}$ ：源数据块索引张量，数据类型为整型
+- $\text{dst\\_indices} \in \mathbb{Z}^{\text{num\\_blocks}}$ ：目标数据块索引张量，长度与 $\text{src\\_indices}$ 一致
+- $b$ ：数据块的遍历索引，范围为 $0 \leq b < \text{num\\_blocks}$ （其中 $\text{num\\_blocks}$ 为索引张量的长度）
+- $j$ ：块内元素的字节或线性偏移量，范围为 $0 \leq j < \text{item\\_size}$
+- $\text{item\\_size}$ ：单个数据块（Page/Slot）的内存大小（单位通常为字节或元素个数）
+- $\mathcal{A}_{\text{src}}$ ：计算得到的源数据在显存中的绝对线性偏移量
+- $\mathcal{A}_{\text{dst}}$ ：计算得到的目标数据在显存中的绝对线性偏移量
+
+### 参数说明
+
+- **src_k** (torch.Tensor, 入参): 源 Key Cache 张量，待读取的 K Cache 数据存储于此。
+- **dst_k** (torch.Tensor, 出参): 目标 Key Cache 张量，复制后的 K Cache 数据将写入此处。
+- **src_v** (torch.Tensor, 入参): 源 Value Cache 张量，待读取的 V Cache 数据存储于此。
+- **dst_v** (torch.Tensor, 出参): 目标 Value Cache 张量，复制后的 V Cache 数据将写入此处。
+- **src_indices** (torch.Tensor, 入参): 源数据块索引张量，用于指定需要搬运的源数据位置。
+- **dst_indices** (torch.Tensor, 入参): 目标数据块索引张量，用于指定搬运后数据的存储位置。
+- **item_size** (int, 入参): 单个数据块的大小（通常为`head_dim * sizeof (dtype)`或页大小），用于计算内存偏移量。
+- **block_quota** (int, 入参): CUDA Kernel 发射时的 Block 配额，用于控制计算并行度。
+- **num_warps_per_block** (int, 入参): 每个 CUDA Block 使用的 Warp 数量。
+
+### 返回值
+
+无返回值，计算结果直接写入`dst_k`和`dst_v`张量中。
+
+### 约束与调用
+
+- 所有输入张量必须部署在 CUDA 设备上。
+- `src_indices`和`dst_indices`的元素数量必须一致，且数据类型均为整型。
+- `src_k`与`dst_k`的数据类型及张量形状需兼容，`src_v`与`dst_v`的数据类型及张量形状也需兼容。
+- `item_size`必须准确反映待搬运的连续内存块大小，否则会导致数据错位。
+
+### 调用示例
+
+```python
+import torch
+import mcoplib.sgl_kernel
+# 设置计算设备
+device = "cuda" if torch.cuda.is_available() else "cpu"
+assert device == "cuda", "transfer_kv_per_layer only supports CUDA devices"
+# 核心参数
+num_blocks_to_copy = 32      
+item_size = 4096              
+total_pool_blocks = 1024      
+block_quota = 128            
+num_warps_per_block = 4      
+# 1. 构造输入张量
+src_k = torch.randn(
+    total_pool_blocks * item_size,
+    dtype=torch.float32, device=device, requires_grad=False
+)
+src_v = torch.randn(
+    total_pool_blocks * item_size,
+    dtype=torch.float32, device=device, requires_grad=False
+)
+# 构造目标 Key/Value Cache 池 (初始化为空或零)
+dst_k = torch.zeros(
+    total_pool_blocks * item_size,
+    dtype=torch.float32, device=device, requires_grad=False
+)
+dst_v = torch.zeros(
+    total_pool_blocks * item_size,
+    dtype=torch.float32, device=device, requires_grad=False
+)
+# 构造索引张量 (指定从哪里搬运到哪里)
+src_indices = torch.randint(
+    0, total_pool_blocks, (num_blocks_to_copy,),
+    dtype=torch.int64, device=device, requires_grad=False
+)
+dst_indices = torch.randint(
+    0, total_pool_blocks, (num_blocks_to_copy,),
+    dtype=torch.int64, device=device, requires_grad=False
+)
+# 调用算子
+torch.ops.sgl_kernel.transfer_kv_per_layer(
+    src_k=src_k,
+    dst_k=dst_k,
+    src_v=src_v,
+    dst_v=dst_v,
+    src_indices=src_indices,
+    dst_indices=dst_indices,
+    item_size=item_size,
+    block_quota=block_quota,
+    num_warps_per_block=num_warps_per_block
+)
+# 输出结果
+print("transfer_kv_per_layer computation completed")
+print(f"Source K shape: {src_k.shape}")
+print(f"Destination K shape: {dst_k.shape}")
+print(f"Number of blocks transferred: {src_indices.shape[0]}")
+```
+
+## 38. transfer_kv_per_layer_pf_lf
+
+### 支持的产品型号
+
+- Metax C500/C550/C588/C600
+
+### 接口原型
+
+```python
+def transfer_kv_per_layer_pf_lf(
+    src_k: torch.Tensor,
+    dst_k: torch.Tensor,
+    src_v: torch.Tensor,
+    dst_v: torch.Tensor,
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    layer_id: int,
+    item_size: int,
+    src_layout_dim: int,
+    block_quota: int,
+    num_warps_per_block: int
+) -> None
+```
+
+### 功能描述
+
+transfer_kv_per_layer_pf_lf 算子实现了针对特定层（Per Layer）的 KV Cache 数据搬运与格式转换。该算子根据给定的源索引（src_indices）和目标索引（dst_indices），将 Key 和 Value 张量从源存储位置传输到目标存储位置。后缀 `pf_lf` 通常指代特定的页面格式（Page Format）或布局格式（Layout Format）的处理，用于优化推理过程中的显存管理和访问效率。
+
+- 计算公式：
+
+$$
+  \text{dst\\_k}[\text{dst\\_addr}] = \text{src\\_k}[\text{src\\_addr}]
+$$
+
+
+
+$$
+  \text{dst\\_v}[\text{dst\\_addr}] = \text{src\\_v}[\text{src\\_addr}]
+$$
+
+  其中源地址索引与目标地址索引的映射关系为：
+
+$$
+  \text{src\\_addr} = \text{layer\\_id} \times \text{src\\_layout\\_dim} + \text{src\\_indices}[i] \times \text{item\\_size} + j
+$$
+
+
+
+$$
+  \text{dst\\_addr} = \text{dst\\_indices}[i] \times \text{item\\_size} + j
+$$
+
+  各变量的维度与含义：
+
+- $\text{src\\_k}, \text{src\\_v} \in \mathbb{T}^{\text{Total\\_Src} \times \text{item\\_size}}$ ：源键值张量，数据类型为 $\mathbb{T}$ 。
+- $\text{dst\\_k}, \text{dst\\_v} \in \mathbb{T}^{\text{Total\\_Dst} \times \text{item\\_size}}$ ：目标键值张量，数据类型与源张量一致。
+- $\text{src\\_indices} \in \mathbb{Z}^{N}$ ：源数据索引张量，包含 $N$ 个待搬运块/页的索引值。
+- $\text{dst\\_indices} \in \mathbb{Z}^{N}$ ：目标数据索引张量，包含 $N$ 个目标位置的索引值。
+- $i$ ：索引张量的遍历下标，范围为 $0 \leq i < N$ ，其中 $N$ 为本次传输涉及的索引数量（即`indices`张量的长度）。
+- $j$ ：数据块内的元素偏移，范围为 $0 \leq j < \text{item\\_size}$ 。
+- $\text{layer\\_id} \in \mathbb{Z}$ ：当前处理的层级 ID，用于在源数据中定位特定层。
+- $\text{src\\_layout\\_dim} \in \mathbb{Z}$ ：源数据的布局维度跨度（Stride），用于计算层级偏移量。通常表示不同层之间的数据间隔。
+- $\text{item\\_size} \in \mathbb{Z}$ ：单个 KV 数据块（或 Head 维度）的元素数量。
+
+### 参数说明
+
+- **src_k** (torch.Tensor, 入参): 源 Key 张量，包含待传输的 K 数据。
+- **dst_k** (torch.Tensor, 入参/出参): 目标 Key 张量，数据将被写入此位置。
+- **src_v** (torch.Tensor, 入参): 源 Value 张量，包含待传输的 V 数据。
+- **dst_v** (torch.Tensor, 入参/出参): 目标 Value 张量，数据将被写入此位置。
+- **src_indices** (torch.Tensor, 入参): 源数据索引张量，指定从源张量中读取数据的位置。
+- **dst_indices** (torch.Tensor, 入参): 目标数据索引张量，指定写入目标张量的位置。
+- **layer_id** (int, 入参): 当前操作的层 ID，用于计算偏移或定位特定层的数据。
+- **item_size** (int, 入参): 单个元素的大小或隐藏层维度大小（Hidden Size）。
+- **src_layout_dim** (int, 入参): 源数据的布局维度参数，用于处理内存跨度。
+- **block_quota** (int, 入参): CUDA 计算块的配额限制，用于资源控制。
+- **num_warps_per_block** (int, 入参): 每个 CUDA Block 中使用的 Warp 数量，用于调优并行度。
+
+### 返回值
+
+无返回值，计算结果直接更新到`dst_k`和`dst_v`张量中。
+
+### 约束与调用
+
+- 所有输入张量通常需位于 CUDA 设备上。
+- `src_indices`和`dst_indices`的长度应保持逻辑一致，确保搬运的数据量匹配。
+- `dst_k`和`dst_v`必须预先分配足够的空间以容纳传输的数据。
+- `block_quota`和`num_warps_per_block`需根据具体硬件架构设置合理的数值以获得最佳性能。
+
+### 调用示例
+
+```python
+import torch
+import mcoplib.sgl_kernel 
+# 设置计算设备
+device = "cuda"
+# 核心参数
+num_blocks = 32           
+item_size = 128        
+layer_id = 5           
+src_layout_dim = 4096   
+block_quota = 64       
+num_warps = 4             
+# 1. 构造输入张量
+# Source Tensors: 模拟包含多层数据的源显存池
+# 大小通常需要覆盖 layer_id * src_layout_dim 的偏移范围
+total_src_size = src_layout_dim * (layer_id + 1) + 2048
+src_k = torch.randn(
+    total_src_size, item_size,
+    dtype=torch.float16, device=device, requires_grad=False
+)
+src_v = torch.randn(
+    total_src_size, item_size,
+    dtype=torch.float16, device=device, requires_grad=False
+)
+# Destination Tensors: 模拟目标 KV Cache
+total_dst_size = 10000
+dst_k = torch.zeros(
+    total_dst_size, item_size,
+    dtype=torch.float16, device=device, requires_grad=False
+)
+dst_v = torch.zeros(
+    total_dst_size, item_size,
+    dtype=torch.float16, device=device, requires_grad=False
+)
+# Indices: 构造搬运索引
+# src_indices 指向源数据中的相对偏移
+src_indices = torch.randint(
+    0, 2048, (num_blocks,),
+    dtype=torch.int64, device=device
+)
+# dst_indices 指向目标 Cache 中的物理页/块位置
+dst_indices = torch.randint(
+    0, total_dst_size, (num_blocks,),
+    dtype=torch.int64, device=device
+)
+# 调用算子
+torch.ops.sgl_kernel.transfer_kv_per_layer_pf_lf(
+    src_k,
+    dst_k,
+    src_v,
+    dst_v,
+    src_indices,
+    dst_indices,
+    layer_id,
+    item_size,
+    src_layout_dim,
+    block_quota,
+    num_warps
+)
+# 输出结果
+print("transfer_kv_per_layer_pf_lf computation completed")
+print(f"Destination Key buffer shape: {dst_k.shape}")
+print(f"Destination Value buffer shape: {dst_v.shape}")
+```
+
+## 39. transfer_kv_per_layer_ph_lf
+
+### 支持的产品型号
+
+- Metax C500/C550/C588/C600
+
+### 接口原型
+
+```python
+def transfer_kv_per_layer_ph_lf(
+    src_k: torch.Tensor,
+    dst_k: torch.Tensor,
+    src_v: torch.Tensor,
+    dst_v: torch.Tensor,
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    layer_id: int,
+    item_size: int,
+    src_layout_dim: int,
+    page_size: int,
+    head_num: int,
+    block_quota: int,
+    num_warps_per_block: int
+) -> None
+```
+
+### 功能描述
+
+transfer_kv_per_layer_ph_lf 算子实现了 Transformer 模型指定层中键（K）值（V）张量的跨位置传输操作，基于源/目标索引映射关系，将源 KV 张量（src_k/src_v）中指定位置的数据迁移至目标 KV 张量（dst_k/dst_v）的对应位置，适配布局维度、页大小、注意力头数等参数，同时遵循块配额、warp 数量等 CUDA 计算资源约束。
+
+- 计算公式：
+
+$$
+  \text{dst\\_k}[\text{dst\\_idx}] = \text{src\\_k}[\text{src\\_idx}], \quad \text{dst\\_v}[\text{dst\\_idx}] = \text{src\\_v}[\text{src\\_idx}]
+$$
+
+  其中源数据与目标数据的线性索引计算为：
+
+$$
+  \text{src\\_idx} = \text{layer\\_id} \times \text{src\\_layout\\_dim} + \text{src\\_indices}[i] \times \text{block\\_size} + j
+$$
+
+
+
+$$
+  \text{dst\\_idx} = \text{dst\\_indices}[i] \times \text{block\\_size} + j
+$$
+
+  元素的线性索引映射关系为：
+
+$$
+  n = \text{page\\_idx} \times \text{block\\_size} + j
+$$
+
+  式中：
+
+$$
+  0 \leq i < N, \quad 0 \leq j < \text{block\\_size}, \quad N = \text{len}(\text{src\\_indices}) = \text{len}(\text{dst\\_indices})
+$$
+
+
+
+$$
+  \text{block\\_size} = \text{head\\_num} \times \text{page\\_size} \times \text{item\\_size}
+$$
+
+  各变量的维度与含义：
+
+- $\text{src\\_k} \in \mathbb{T}^{*}$ ：源输入 K 张量，包含所有层的 K 数据，数据类型为 $\mathbb{T}$
+- $\text{src\\_v} \in \mathbb{T}^{*}$ ：源输入 V 张量，包含所有层的 V 数据，数据类型与 $\text{src\\_k}$ 一致
+- $\text{dst\\_k} \in \mathbb{T}^{*}$ ：目标输出 K 张量（通常为 Paged Attention 的显存池），数据类型与 $\text{src\\_k}$ 一致
+- $\text{dst\\_v} \in \mathbb{T}^{*}$ ：目标输出 V 张量（通常为 Paged Attention 的显存池），数据类型与 $\text{src\\_k}$ 一致
+- $\text{block\\_size} \in \mathbb{Z}$ ：单个显存页/块包含的元素总数，计算方式为 $\text{block\\_size} = \text{head\\_num} \times \text{page\\_size} \times \text{item\\_size}$
+- $i \in \mathbb{Z}$ ：块/页索引遍历下标，范围为 $0 \leq i < N$ ，其中 $N$ 为 $\text{src\\_indices}$ （或 $\text{dst\\_indices}$ ）张量的长度（即本次搬运的页数）
+- $j \in \mathbb{Z}$ ：块内元素的线性偏移，范围为 $0 \leq j < \text{block\\_size}$
+- $\text{src\\_indices} \in \mathbb{Z}^{N}$ ：源数据的页/块索引张量，维度为 $N$ （ $N$ 为本次搬运的页数）
+- $\text{dst\\_indices} \in \mathbb{Z}^{N}$ ：目标数据的页/块索引张量（物理页地址），维度为 $N$
+- $\text{layer\\_id} \in \mathbb{Z}$ ：当前操作的目标层 ID
+- $\text{src\\_layout\\_dim} \in \mathbb{Z}$ ：源数据中层与层之间的内存步长（Stride），通常以元素个数为单位
+- $\text{page\\_size} \in \mathbb{Z}$ ：每个分页包含的 Token 数量（槽位大小）
+- $\text{head\\_num} \in \mathbb{Z}$ ：注意力头（Attention Heads）的数量
+- $\text{item\\_size} \in \mathbb{Z}$ ：单个 Token 的特征维度大小（通常为 Head Dimension）
+- $\text{src\\_idx} \in \mathbb{Z}$ ：源张量中元素的线性索引
+- $\text{dst\\_idx} \in \mathbb{Z}$ ：目标张量中元素的线性索引
+- $n \in \mathbb{Z}$ ：张量元素的通用线性索引，范围为 $0 \leq n < \text{block\\_size} \times N$ （本次搬运的总元素数）
+- $\text{page\\_idx} \in \mathbb{Z}$ ：页/块索引（可取 $\text{src\\_indices}[i]$ 或 $\text{dst\\_indices}[i]$ ）
+- $N \in \mathbb{Z}$ ：本次搬运的页数，即 $\text{src\\_indices}$/$\text{dst\\_indices}$ 张量的长度
+
+### 参数说明
+
+- **src_k** (torch.Tensor, 入参): 源键张量，提供待传输的键数据
+- **dst_k** (torch.Tensor, 入参/出参): 目标键张量，接收源键数据，传输完成后会被结果覆盖
+- **src_v** (torch.Tensor, 入参): 源值张量，提供待传输的值数据
+- **dst_v** (torch.Tensor, 入参/出参): 目标值张量，接收源值数据，传输完成后会被结果覆盖
+- **src_indices** (torch.Tensor, 入参): 源索引张量，指定 src_k/src_v 中参与传输的数据位置索引
+- **dst_indices** (torch.Tensor, 入参): 目标索引张量，指定 dst_k/dst_v 中接收数据的位置索引
+- **layer_id** (int, 入参): 层编号，标识当前执行 KV 传输的 Transformer 层 ID
+- **item_size** (int, 入参): 单个 KV 数据项的尺寸，定义基础数据单元大小
+- **src_layout_dim** (int, 入参): 源 KV 张量的布局维度，描述张量的维度组织方式
+- **page_size** (int, 入参): 内存页大小，适配分页存储的尺寸参数
+- **head_num** (int, 入参): 注意力头数量，匹配 Transformer 模型的注意力头配置
+- **block_quota** (int, 入参): 计算块资源配额，限制单个 CUDA 块可使用的资源上限
+- **num_warps_per_block** (int, 入参): 每个 CUDA 计算块的 warp 数量，指定硬件执行单元的组织方式
+
+### 返回值
+
+无返回值，KV 数据传输结果直接写入 dst_k 和 dst_v 张量中
+
+### 约束与调用
+
+- 所有张量必须部署在 CUDA 设备上
+- src_indices/dst_indices 的元素值需在对应 KV 张量的有效索引范围内
+- page_size、item_size、src_layout_dim 需为正整数且维度匹配
+- head_num 需为正整数，符合 Transformer 模型的注意力头数量设计规范
+- block_quota 和 num_warps_per_block 需满足 CUDA 硬件的计算块资源限制
+- 支持的数据类型：float16, bfloat16, float32
+
+### 调用示例
+
+```python
+import torch
+import mcoplib.sgl_kernel
+# 设置计算设备
+device = "cuda"
+# 核心参数
+num_blocks = 16            # 本次搬运的页/块数量 (Indices length)
+layer_id = 3               # 当前处理的层级 ID (Layer ID)
+item_size = 128            # 单个元素的维度大小 (Head Dim)
+page_size = 16             # 每个页包含的 Token 数 (Page Size)
+head_num = 8               # 注意力头数 (Head Num)
+src_layout_dim = 100000    # 源数据层间跨度 (Layer Stride)
+block_quota = 64           # CUDA Block 配额
+num_warps = 4              # 每个 Block 的 Warp 数量
+# 计算单个 Page/Block 对应的行数或元素偏移 (用于构造张量形状)
+# 假设数据是平铺存储，每个 Block 包含 head_num * page_size 个 item_size 向量
+block_elem_count = page_size * head_num 
+# 1. 构造输入张量
+# Source Tensors: 模拟源显存池，需覆盖 layer_id 的偏移量
+# 形状足够大以容纳 src_layout_dim * (layer_id + 1)
+total_src_rows = src_layout_dim * (layer_id + 2) 
+src_k = torch.randn(
+    total_src_rows, item_size,
+    dtype=torch.float16, device=device, requires_grad=False
+)
+src_v = torch.randn(
+    total_src_rows, item_size,
+    dtype=torch.float16, device=device, requires_grad=False
+)
+# Destination Tensors: 模拟目标 Paged Attention 显存池
+# 假设总容量为 1024 个物理页
+max_physical_pages = 1024
+total_dst_rows = max_physical_pages * block_elem_count
+dst_k = torch.zeros(
+    total_dst_rows, item_size,
+    dtype=torch.float16, device=device, requires_grad=False
+)
+dst_v = torch.zeros(
+    total_dst_rows, item_size,
+    dtype=torch.float16, device=device, requires_grad=False
+)
+# Indices: 构造索引张量
+# src_indices: 源数据中的逻辑块索引
+src_indices = torch.arange(
+    0, num_blocks, 
+    dtype=torch.int64, device=device
+)
+# dst_indices: 目标显存池中的物理块索引 (随机指定位置)
+dst_indices = torch.randint(
+    0, max_physical_pages, (num_blocks,),
+    dtype=torch.int64, device=device
+)
+# 调用算子
+torch.ops.sgl_kernel.transfer_kv_per_layer_ph_lf(
+    src_k=src_k,
+    dst_k=dst_k,
+    src_v=src_v,
+    dst_v=dst_v,
+    src_indices=src_indices,
+    dst_indices=dst_indices,
+    layer_id=layer_id,
+    item_size=item_size,
+    src_layout_dim=src_layout_dim,
+    page_size=page_size,
+    head_num=head_num,
+    block_quota=block_quota,
+    num_warps_per_block=num_warps
+)
+# 输出结果
+print("transfer_kv_per_layer_ph_lf computation completed")
+print(f"Destination Key buffer shape: {dst_k.shape}")
+print(f"Destination Value buffer shape: {dst_v.shape}")
+print(f"Transferred blocks count: {num_blocks}")
+```
+
+## 40. transfer_kv_all_layer
+
+### 支持的产品型号
+
+- Metax C500/C550/C588/C600
+
+### 接口原型
+
+```python
+def transfer_kv_all_layer(
+    src_k_layers: torch.Tensor,
+    dst_k_layers: torch.Tensor,
+    src_v_layers: torch.Tensor,
+    dst_v_layers: torch.Tensor,
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    item_size: int,
+    num_layers: int,
+    block_quota: int,
+    num_warps_per_block: int
+) -> None
+```
+
+### 功能描述
+
+transfer_kv_all_layer 算子实现了跨所有层的 KV Cache（键值缓存）数据传输操作。该算子根据指定的源索引（`src_indices`）和目标索引（`dst_indices`），将 Key 和 Value 张量数据从源存储（`src`）复制到目标存储（`dst`）。这通常用于大模型推理过程中的显存管理、分页注意力机制（Paged Attention）或缓存整理。
+
+- 计算公式：
+	对于任意层索引 $l$ （ $0 \leq l < \text{num\\_layers}$ ）和任意索引位置 $idx$ （ $0 \leq idx < \text{block\\_quota}$ ），有：
+
+$$
+  \begin{cases}
+  \text{dst\\_k\\_layers}[l][\text{dst\\_indices}[idx]] = \text{src\\_k\\_layers}[l][\text{src\\_indices}[idx]] \\
+  \text{dst\\_v\\_layers}[l][\text{dst\\_indices}[idx]] = \text{src\\_v\\_layers}[l][\text{src\\_indices}[idx]]
+  \end{cases}
+$$
+
+  其中，单个 layer 内张量元素的线性索引与二维位置的映射关系为：
+
+$$
+  n = s \times \text{item\\_size} + f
+$$
+
+  各变量的维度与含义：
+
+- $\text{src\\_k\\_layers} \in \mathbb{T}^{\text{num\\_layers} \times S \times \text{item\\_size}}$ ：源 Key 张量集合，数据类型为 $\mathbb{T}$ ，包含 $\text{num\\_layers}$ 个 layer 的 Key 张量，每个 layer 的 Key 张量维度为 $S \times \text{item\\_size}$ （ $S$ 为源序列长度）
+- $\text{src\\_v\\_layers} \in \mathbb{T}^{\text{num\\_layers} \times S \times \text{item\\_size}}$ ：源 Value 张量集合，数据类型与 $\text{src\\_k\\_layers}$ 一致
+- $\text{dst\\_k\\_layers} \in \mathbb{T}^{\text{num\\_layers} \times D \times \text{item\\_size}}$ ：目标 Key 张量集合，数据类型与 $\text{src\\_k\\_layers}$ 一致，包含 $\text{num\\_layers}$ 个 layer 的 Key 张量，每个 layer 的 Key 张量维度为 $D \times \text{item\\_size}$ （ $D$ 为目标序列长度）
+- $\text{dst\\_v\\_layers} \in \mathbb{T}^{\text{num\\_layers} \times D \times \text{item\\_size}}$ ：目标 Value 张量集合，数据类型与 $\text{src\\_v\\_layers}$ 一致
+- $\text{src\\_indices} \in \mathbb{Z}^{\text{block\\_quota}}$ ：源张量的索引列表，每个元素对应 $\text{src\\_k\\_layers}/\text{src\\_v\\_layers}$ 单个 layer 内的线性索引
+- $\text{dst\\_indices} \in \mathbb{Z}^{\text{block\\_quota}}$ ：目标张量的索引列表，每个元素对应 $\text{dst\\_k\\_layers}/\text{dst\\_v\\_layers}$ 单个 layer 内的线性索引
+- $\text{item\\_size} \in \mathbb{Z}^+$ ：每个 Key/Value 元素的特征维度大小
+- $\text{num\\_layers} \in \mathbb{Z}^+$ ：张量集合包含的 layer 数量
+- $\text{block\\_quota} \in \mathbb{Z}^+$ ：单次传输的索引数量（即 $\text{src\\_indices}/\text{dst\\_indices}$ 的长度）
+- $\text{num\\_warps\\_per\\_block}$ ：CUDA 核函数的 warp 配置参数（不参与计算逻辑）
+- $n$ ：单个 layer 内张量元素的线性索引，范围为 $0 \leq n < S$ （源）或 $0 \leq n < D$ （目标）
+- $s$ ：单个 layer 内张量的序列维度索引，范围为 $0 \leq s < S$ （源）或 $0 \leq s < D$ （目标）
+- $f$ ：单个 layer 内张量的特征维度索引，范围为 $0 \leq f < \text{item\\_size}$
+
+### 参数说明
+
+- **src_k_layers** (torch.Tensor, 入参): 源 Key 缓存张量，包含所有层的数据。
+- **dst_k_layers** (torch.Tensor, 入参/出参): 目标 Key 缓存张量，数据将被写入此张量。
+- **src_v_layers** (torch.Tensor, 入参): 源 Value 缓存张量，包含所有层的数据。
+- **dst_v_layers** (torch.Tensor, 入参/出参): 目标 Value 缓存张量，数据将被写入此张量。
+- **src_indices** (torch.Tensor, 入参): 源数据的索引张量，指示从哪里读取数据。
+- **dst_indices** (torch.Tensor, 入参): 目标数据的索引张量，指示将数据写入何处。
+- **item_size** (int, 入参): 单个数据项的大小（通常对应 hidden_dim 或 head_dim 的字节大小或元素数量）。
+- **num_layers** (int, 入参): 模型 Transformer 层的总数。
+- **block_quota** (int, 入参): CUDA 核函数计算时的块配额或限制参数。
+- **num_warps_per_block** (int, 入参): 每个 CUDA 线程块（Block）中使用的 Warp 数量，用于配置并行计算粒度。
+
+### 返回值
+
+无返回值，计算结果直接写入 `dst_k_layers` 和 `dst_v_layers` 张量中。
+
+### 约束与调用
+
+- 设备限制: 所有输入张量必须位于 CUDA 设备上（由 `m.impl (..., torch::kCUDA, ...)` 决定）。
+- 数据一致性: `src` 和 `dst` 的张量维度应由 `item_size` 和 `num_layers` 及其对应的索引逻辑保证一致。
+- 底层实现: 该函数通过 PyTorch 的 C++ 扩展绑定到 CUDA 核函数实现，调用时需确保传入正确的设备上下文。
+
+### 调用示例
+
+```python
+import torch
+import numpy as np
+import mcoplib.sgl_kernel
+# Set computation device
+device = "cuda"
+# Core parameters
+num_layers = 2
+capacity = 1024
+item_size = 128
+idx_len = 16
+block_quota = 8
+num_warps = 4
+# 1. Construct Data Tensors (Float16)
+src_k = torch.randn(num_layers, capacity, item_size, dtype=torch.float16, device=device)
+dst_k = torch.zeros_like(src_k)
+src_v = torch.randn_like(src_k)
+dst_v = torch.zeros_like(src_k)
+# 2. Construct Pointer Tensors (UInt64)
+# The operator requires tensors containing memory addresses (pointers)
+def to_uint64_ptr(t):
+    return torch.tensor(
+        np.array([sub.data_ptr() for sub in t], dtype=np.uint64),
+        device=device, dtype=torch.uint64
+    )
+src_k_ptrs = to_uint64_ptr(src_k)
+dst_k_ptrs = to_uint64_ptr(dst_k)
+src_v_ptrs = to_uint64_ptr(src_v)
+dst_v_ptrs = to_uint64_ptr(dst_v)
+# 3. Construct Index Tensors
+src_idx = torch.arange(idx_len, device=device, dtype=torch.long)
+dst_idx = torch.arange(idx_len, device=device, dtype=torch.long)
+# Call the operator
+torch.ops.sgl_kernel.transfer_kv_all_layer(
+    src_k_ptrs,
+    dst_k_ptrs,
+    src_v_ptrs,
+    dst_v_ptrs,
+    src_idx,
+    dst_idx,
+    item_size,
+    num_layers,
+    block_quota,
+    num_warps
+)
+# Output results
+torch.cuda.synchronize()
+print("transfer_kv_all_layer computation completed")
+print(f"src_k_ptrs.shape: {src_k_ptrs.shape}")
+print(f"item_size: {item_size} | 张量dtype字节数: {src_k_ptrs.element_size()}")
+```
+
+## 41. transfer_kv_all_layer_lf_pf
+
+### 支持的产品型号
+
+- Metax C500/C550/C588/C600
+
+### 接口原型
+
+```python
+def transfer_kv_all_layer_lf_pf(
+    src_k_layers: torch.Tensor,
+    dst_k: torch.Tensor,
+    src_v_layers: torch.Tensor,
+    dst_v: torch.Tensor,
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    item_size: int,
+    dst_layout_dim: int,
+    num_layers: int,
+    block_quota: int,
+    num_warps_per_block: int
+) -> None
+```
+
+### 功能描述
+
+transfer_kv_all_layer_lf_pf 算子实现了多 layer 源 KV 张量到目标 KV 张量的索引式传输操作。该算子将包含`num_layers`个 layer 的源 Key/Value 张量集合（`src_k_layers`、`src_v_layers`），按照指定的源索引（`src_indices`）和目标索引（`dst_indices`），搬运到对应的目标 Key/Value 张量（`dst_k`、`dst_v`）中，常用于 Transformer 模型的 KV 缓存数据高效搬运场景。
+
+- 计算公式：
+	对于任意层索引 $l$ （ $0 \leq l < \text{num\\_layers}$ ）、任意索引位置 $idx$ （ $0 \leq idx < \text{block\\_quota}$ ），以及任意特征维度索引 $f$ （ $0 \leq f < \text{item\\_size}$ ），有：
+
+$$
+  \begin{cases}
+  \text{dst\\_k}\left[\text{dst\\_indices}[idx] \times \text{dst\\_layout\\_dim} + f\right] = \text{src\\_k\\_layers}[l]\left[\text{src\\_indices}[idx] \times \text{item\\_size} + f\right] \\
+  \text{dst\\_v}\left[\text{dst\\_indices}[idx] \times \text{dst\\_layout\\_dim} + f\right] = \text{src\\_v\\_layers}[l]\left[\text{src\\_indices}[idx] \times \text{item\\_size} + f\right]
+  \end{cases}
+$$
+
+  其中，源层内张量元素的线性索引与目标张量元素的线性索引映射关系分别为：
+
+$$
+  n_{\text{src}} = \text{src\\_indices}[idx] \times \text{item\\_size} + f
+$$
+
+  
+
+$$
+  n_{\text{dst}} = \text{dst\\_indices}[idx] \times \text{dst\\_layout\\_dim} + f
+$$
+
+  各变量的维度与含义：
+
+- $\text{src\\_k\\_layers} \in \mathbb{T}^{\text{num\\_layers} \times S \times \text{item\\_size}}$ ：源 Key 张量集合，数据类型为 $\mathbb{T}$ ，包含 $\text{num\\_layers}$ 个 layer 的 Key 张量，每个 layer 的 Key 张量维度为 $S \times \text{item\\_size}$ （ $S$ 为源序列长度）
+- $\text{src\\_v\\_layers} \in \mathbb{T}^{\text{num\\_layers} \times S \times \text{item\\_size}}$ ：源 Value 张量集合，数据类型与 $\text{src\\_k\\_layers}$ 一致
+- $\text{dst\\_k} \in \mathbb{T}^{D \times \text{dst\\_layout\\_dim}}$ ：目标 Key 张量，数据类型与 $\text{src\\_k\\_layers}$ 一致，维度为 $D \times \text{dst\\_layout\\_dim}$ （ $D$ 为目标序列长度， $\text{dst\\_layout\\_dim} \geq \text{item\\_size}$ 以保证内存对齐）
+- $\text{dst\\_v} \in \mathbb{T}^{D \times \text{dst\\_layout\\_dim}}$ ：目标 Value 张量，数据类型与 $\text{src\\_v\\_layers}$ 一致
+- $\text{src\\_indices} \in \mathbb{Z}^{\text{block\\_quota}}$ ：源张量的索引列表，每个元素对应 $\text{src\\_k\\_layers}/\text{src\\_v\\_layers}$ 单个 layer 内的序列维度索引
+- $\text{dst\\_indices} \in \mathbb{Z}^{\text{block\\_quota}}$ ：目标张量的索引列表，每个元素对应 $\text{dst\\_k}/\text{dst\\_v}$ 的序列维度索引
+- $\text{item\\_size} \in \mathbb{Z}^+$ ：每个 Key/Value 元素的特征维度大小
+- $\text{dst\\_layout\\_dim} \in \mathbb{Z}^+$ ：目标张量的内存步长（序列维度单步对应的内存间隔）
+- $\text{num\\_layers} \in \mathbb{Z}^+$ ：源张量集合包含的 layer 数量
+- $\text{block\\_quota} \in \mathbb{Z}^+$ ：单次传输的索引数量（即 $\text{src\\_indices}/\text{dst\\_indices}$ 的长度）
+- $\text{num\\_warps\\_per\\_block}$ ：CUDA 核函数的 warp 配置参数（不参与计算逻辑）
+- $n_{\text{src}}$ ：源层内张量元素的线性索引，范围为 $0 \leq n_{\text{src}} < S \times \text{item\\_size}$
+- $n_{\text{dst}}$ ：目标张量元素的线性索引，范围为 $0 \leq n_{\text{dst}} < D \times \text{dst\\_layout\\_dim}$
+- $S$ ：源序列长度，满足 $0 \leq \text{src\\_indices}[idx] < S$
+- $D$ ：目标序列长度，满足 $0 \leq \text{dst\\_indices}[idx] < D$
+
+### 参数说明
+
+- **src_k_layers** (torch.Tensor, 入参): 源 Key 张量集合，维度为`num_layers × 源序列长度 × item_size`，存储待传输的多 layer 源 Key 数据
+- **dst_k** (torch.Tensor, 入参/出参): 目标 Key 张量，维度为`目标序列长度 × dst_layout_dim`，传输后的 Key 数据会写入该张量
+- **src_v_layers** (torch.Tensor, 入参): 源 Value 张量集合，维度与`src_k_layers`一致，存储待传输的多 layer 源 Value 数据
+- **dst_v** (torch.Tensor, 入参/出参): 目标 Value 张量，维度与`dst_k`一致，传输后的 Value 数据会写入该张量
+- **src_indices** (torch.Tensor, 入参): 源索引列表，长度为`block_quota`，元素对应`src_k_layers/src_v_layers`单 layer 内的序列维度索引
+- **dst_indices** (torch.Tensor, 入参): 目标索引列表，长度为`block_quota`，元素对应`dst_k/dst_v`的序列维度索引
+- **item_size** (int, 入参): 单个 Key/Value 元素的特征维度大小
+- **dst_layout_dim** (int, 入参): 目标张量的内存步长（序列维度单步对应的内存间隔）
+- **num_layers** (int, 入参): 源 KV 张量集合包含的 layer 数量
+- **block_quota** (int, 入参): 单次传输的索引数量（即`src_indices`/`dst_indices`的长度）
+- **num_warps_per_block** (int, 入参): CUDA 核函数的 warp 配置参数，用于控制并行执行粒度
+
+### 返回值
+
+无返回值，传输结果直接写入`dst_k`和`dst_v`张量中
+
+### 约束与调用
+
+- 所有张量必须位于 CUDA 设备上（代码包含`DCHECK_CUDA`检查）
+- `src_k_layers`的 layer 数量必须等于`num_layers`（代码包含`DCHECK_EQ (src_k_layers.size (0), num_layers)`检查）
+- `src_indices`与`dst_indices`的长度必须等于`block_quota`
+- 支持的张量数据类型：CUDA 设备兼容的浮点类型（如 float16、bfloat16、float32 等）
+
+### 调用示例
+
+```python
+import torch
+import numpy as np
+import mcoplib.sgl_kernel
+# Set computation device
+device = "cuda"
+# Core parameters
+num_layers = 2
+capacity = 1024
+item_size = 128
+dst_layout_dim = capacity  # 新增参数，通常指显存布局的维度/跨度
+idx_len = 16
+block_quota = 8
+num_warps = 4
+# 1. Construct Source Tensors (Need Pointer Conversion)
+# src_k/v_layers: [num_layers, capacity, item_size]
+src_k_data = torch.randn(num_layers, capacity, item_size, dtype=torch.float16, device=device)
+src_v_data = torch.randn_like(src_k_data)
+# 2. Construct Destination Tensors (Direct Tensor, NO Pointer Conversion)
+# dst_k/v: The operator expects raw data tensors for destination, not a pointer table.
+# Shape usually matches the flat buffer or specific layout.
+dst_k = torch.zeros(num_layers, capacity, item_size, dtype=torch.float16, device=device)
+dst_v = torch.zeros_like(dst_k)
+# 3. Helper: Convert Source to UInt64 Pointer Tensor
+def to_uint64_ptr(t):
+    # Only for Source layers which require address table
+    return torch.tensor(
+        np.array([sub.data_ptr() for sub in t], dtype=np.uint64),
+        device=device, dtype=torch.uint64
+    )
+src_k_ptrs = to_uint64_ptr(src_k_data)
+src_v_ptrs = to_uint64_ptr(src_v_data)
+# 4. Construct Index Tensors
+src_idx = torch.arange(idx_len, device=device, dtype=torch.long)
+dst_idx = torch.arange(idx_len, device=device, dtype=torch.long)
+# Call the operator
+# Note argument order: src(Ptr), dst(Data), src(Ptr), dst(Data), indices...
+torch.ops.sgl_kernel.transfer_kv_all_layer_lf_pf(
+    src_k_ptrs,       # Source K: Pointer Tensor (UInt64)
+    dst_k,            # Dest K:   Data Tensor (Float16)
+    src_v_ptrs,       # Source V: Pointer Tensor (UInt64)
+    dst_v,            # Dest V:   Data Tensor (Float16)
+    src_idx,
+    dst_idx,
+    item_size,
+    dst_layout_dim,   # New int parameter
+    num_layers,
+    block_quota,
+    num_warps
+)
+# Output results
+torch.cuda.synchronize()
+print("transfer_kv_all_layer_lf_pf computation completed")
+```
+
+## 42. transfer_kv_all_layer_lf_ph
+
+### 支持的产品型号
+
+- Metax C500/C550/C588/C600
+
+### 接口原型
+
+```python
+def transfer_kv_all_layer_lf_ph(
+    const at::Tensor src_k_layers,
+    at::Tensor dst_k,
+    const at::Tensor src_v_layers,
+    at::Tensor dst_v,
+    const at::Tensor src_indices,
+    const at::Tensor dst_indices,
+    int64_t item_size,
+    int64_t dst_layout_dim,
+    int64_t num_layers,
+    int64_t page_size,
+    int64_t head_num,
+    int64_t block_quota,
+    int64_t num_warps_per_block
+) -> None
+```
+
+### 功能描述
+
+transfer_kv_all_layer_lf_ph 算子实现 KV 缓存跨层的数据传输功能：读取源 K/V 层张量（src_k_layers、src_v_layers）数据，基于源索引（src_indices）和目标索引（dst_indices），将对应数据传输并写入到目标 K/V 张量（dst_k、dst_v）中，同时完成层数校验、维度适配等逻辑处理，适用于 Transformer 模型 KV 缓存的跨层数据调度场景。
+
+- 计算公式：
+	对于索引张量的每个线性索引 $n$ （ $0 \leq n < \text{len}(\text{src\\_indices})$ ），执行 KV 张量的元素转移：
+
+$$
+  \text{dst\\_k}[\text{dst\\_indices}[n]] = \text{src\\_k\\_layers}[\text{src\\_indices}[n]]
+$$
+
+
+
+$$
+  \text{dst\\_v}[\text{dst\\_indices}[n]] = \text{src\\_v\\_layers}[\text{src\\_indices}[n]]
+$$
+
+  同时需满足以下约束：
+
+$$
+  \text{num\\_layers} = \text{src\\_k\\_layers.size}(0)
+$$
+
+
+
+$$
+  \text{item\\_size} \% 8 == 0
+$$
+
+  各变量的维度与含义：
+
+- $\text{src\\_k\\_layers} \in \mathbb{T}^{\text{num\\_layers} \times *}$ ：源 k 的层张量，数据类型为 $\mathbb{T}$ ，其第 0 维度长度等于 $\text{num\\_layers}$
+- $\text{dst\\_k} \in \mathbb{T}^{*}$ ：目标 k 张量，存储转移后的 k 数据，数据类型与 $\text{src\\_k\\_layers}$ 一致
+- $\text{src\\_v\\_layers} \in \mathbb{T}^{\text{num\\_layers} \times *}$ ：源 v 的层张量，数据类型与 $\text{src\\_k\\_layers}$ 一致，其第 0 维度长度等于 $\text{num\\_layers}$
+- $\text{dst\\_v} \in \mathbb{T}^{*}$ ：目标 v 张量，存储转移后的 v 数据，数据类型与 $\text{src\\_v\\_layers}$ 一致
+- $\text{src\\_indices} \in \text{long}^{\text{N}}$ ：源索引张量（CUDA 张量）， $\text{N}$ 为索引长度，每个元素对应源张量的索引
+- $\text{dst\\_indices} \in \text{long}^{\text{N}}$ ：目标索引张量（CUDA 张量），长度与 $\text{src\\_indices}$ 相同（ $\text{len}(\text{dst\\_indices}) = \text{len}(\text{src\\_indices})$ ），每个元素对应目标张量的索引
+- $\text{item\\_size}$ ：每个转移项的字节大小，需满足 $ \text{item\\_size} \% 8 == 0 $ 以保证内存对齐
+- $\text{dst\\_layoutdim}$ ：目标张量的布局维度，用于目标张量的内存布局计算
+- $\text{num\\_layers}$ ：参与转移的层数，与 $\text{src\\_k\\_layers}$ 的第 0 维度长度相等
+- $\text{page\\_size}$ ：页大小，用于张量的页式内存管理
+- $\text{head\\_num}$ ：多头注意力的头数量，对应 KV 张量的头维度
+- $\text{block\\_quota}$ ：CUDA 核函数的块资源配额，用于块级资源分配
+- $\text{num\\_warps\\_per\\_block}$ ：每个 CUDA 块分配的 warps 数量，用于核函数的线程调度
+- $n$ ：索引张量的线性索引，范围为 $0 \leq n < \text{N}$ ，其中 $\text{N} = \text{len}(\text{src\\_indices})$
+
+### 参数说明
+
+- **src_k_layers** (const at::Tensor, 入参): 源 K 层张量，存储各层 K 缓存数据
+- **dst_k** (at::Tensor, 入参/出参): 目标 K 张量，计算完成后会被传输后的 K 缓存数据覆盖
+- **src_v_layers** (const at::Tensor, 入参): 源 V 层张量，存储各层 V 缓存数据
+- **dst_v** (at::Tensor, 入参/出参): 目标 V 张量，计算完成后会被传输后的 V 缓存数据覆盖
+- **src_indices** (const at::Tensor, 入参): 源数据索引张量，用于定位 src_k_layers/src_v_layers 中待传输的数据位置
+- **dst_indices** (const at::Tensor, 入参): 目标位置索引张量，用于定位 dst_k/dst_v 中数据写入的位置
+- **item_size** (int64_t, 入参): 单个 KV 数据项的字节大小
+- **dst_layout_dim** (int64_t, 入参): 目标 K/V 张量的布局维度，用于适配数据写入的维度规则
+- **num_layers** (int64_t, 入参): 待处理的 KV 缓存层数，需与 src_k_layers 的实际层数匹配
+- **page_size** (int64_t, 入参): KV 缓存的页大小，用于数据分片传输的粒度控制
+- **head_num** (int64_t, 入参): 注意力头数量，适配 KV 缓存按头维度的传输逻辑
+- **block_quota** (int64_t, 入参): 块配额，用于限制 CUDA 核函数的块资源使用
+- **num_warps_per_block** (int64_t, 入参): 每个 CUDA 块的线程束数量，用于核函数的线程调度
+
+### 返回值
+
+无返回值，计算结果直接写入 dst_k 和 dst_v 张量中
+
+### 约束与调用
+
+- 所有张量必须位于 CUDA 设备上（算子基于 CUDA 实现）
+- src_k_layers 的实际层数必须与入参 num_layers 严格匹配（代码中通过 TORCH_CHECK 校验）
+- 支持的数据类型需与 CUDA 核函数兼容（如 float16、bfloat16 等常见深度学习张量类型）
+- dst_layout_dim 需与 dst_k/dst_v 的实际维度结构匹配，否则会导致数据写入位置错误
+- block_quota 和 num_warps_per_block 需符合 CUDA 设备的线程/块资源限制，避免核函数启动失败
+
+### 调用示例
+
+```python
+import torch
+import numpy as np
+import mcoplib.sgl_kernel
+# Set computation device
+device = "cuda"
+# Core parameters
+num_layers = 2
+capacity = 1024
+item_size = 128
+dst_layout_dim = capacity  # Layout dimension stride
+# Specific parameters for _ph (PageHeadLayout)
+page_size = 16
+head_num = 4
+idx_len = 16
+block_quota = 8
+num_warps = 4
+# 1. Construct Source Tensors (Need Pointer Conversion)
+# src_k/v_layers: [num_layers, capacity, item_size]
+src_k_data = torch.randn(num_layers, capacity, item_size, dtype=torch.float16, device=device)
+src_v_data = torch.randn_like(src_k_data)
+# 2. Construct Destination Tensors (Direct Tensor, NO Pointer Conversion)
+# dst_k/v: Raw data tensors. Shape depends on the specific layout, 
+# ensuring sufficient size for testing.
+dst_k = torch.zeros(num_layers, capacity, item_size, dtype=torch.float16, device=device)
+dst_v = torch.zeros_like(dst_k)
+# 3. Helper: Convert Source to UInt64 Pointer Tensor
+def to_uint64_ptr(t):
+    return torch.tensor(
+        np.array([sub.data_ptr() for sub in t], dtype=np.uint64),
+        device=device, dtype=torch.uint64
+    )
+src_k_ptrs = to_uint64_ptr(src_k_data)
+src_v_ptrs = to_uint64_ptr(src_v_data)
+# 4. Construct Index Tensors
+src_idx = torch.arange(idx_len, device=device, dtype=torch.long)
+dst_idx = torch.arange(idx_len, device=device, dtype=torch.long)
+# Call the operator
+# Signature: src_ptr, dst_data, src_ptr, dst_data, indices, ...
+# Extra args: dst_layout_dim, num_layers, page_size, head_num, ...
+torch.ops.sgl_kernel.transfer_kv_all_layer_lf_ph(
+    src_k_ptrs,       # Source K: Pointer Tensor (UInt64)
+    dst_k,            # Dest K:   Data Tensor (Float16)
+    src_v_ptrs,       # Source V: Pointer Tensor (UInt64)
+    dst_v,            # Dest V:   Data Tensor (Float16)
+    src_idx,
+    dst_idx,
+    item_size,
+    dst_layout_dim,   # arg 1
+    num_layers,       # arg 2
+    page_size,        # arg 3 (New)
+    head_num,         # arg 4 (New)
+    block_quota,
+    num_warps
+)
+# Output results
+torch.cuda.synchronize()
+print("transfer_kv_all_layer_lf_ph computation completed")
+```
+
+## 43. transfer_kv_per_layer_mla
+
+### 支持的产品型号
+
+- Metax C500/C550/C588/C600
+
+### 接口原型
+
+```python
+def transfer_kv_per_layer_mla(
+    src: torch.Tensor,
+    dst: torch.Tensor,
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    item_size: int,
+    block_quote: int,
+    num_warps_per_block: int
+) -> None
+```
+
+### 功能描述
+
+该算子基于 CUDA 实现**单一层的 KV（Key-Value）数据传输**，通过源索引张量（`src_indices`）和目标索引张量（`dst_indices`），将源张量（`src`）中的 KV 数据搬运到目标张量（`dst`）中，用于 KV 缓存相关的数据迁移操作。
+
+- 计算公式：
+	对于索引张量的每个线性索引 $n$ （ $0 \leq n < \text{len}(\text{src\\_indices})$ ），执行张量元素的转移操作：
+
+$$
+  \text{dst}[\text{dst\\_indices}[n]] = \text{src}[\text{src\\_indices}[n]]
+$$
+
+  同时需满足内存对齐约束：
+
+$$
+  \text{item\\_size} \% 8 == 0
+$$
+
+  各变量的维度与含义：
+
+- $\text{src} \in \mathbb{T}^{*}$ ：源张量，数据类型为 $\mathbb{T}$ ，存储待转移的原始数据
+- $\text{dst} \in \mathbb{T}^{*}$ ：目标张量，存储转移后的数据，数据类型与 $\text{src}$ 一致
+- $\text{src\\_indices} \in \text{long}^{\text{N}}$ ：源索引张量（CUDA 张量）， $\text{N}$ 为索引长度，每个元素对应 $\text{src}$ 中待转移元素的索引
+- $\text{dst\\_indices} \in \text{long}^{\text{N}}$ ：目标索引张量（CUDA 张量），长度与 $\text{src\\_indices}$ 相同（ $\text{len}(\text{dst\\_indices}) = \text{len}(\text{src\\_indices})$ ），每个元素对应 $\text{dst}$ 中存储转移元素的索引
+- $\text{item\\_size}$ ：每个转移项的字节大小，需满足 $ \text{item\\_size} \% 8 == 0 $ 以保证内存对齐
+- $\text{block\\_quota}$ ：CUDA 核函数的块资源配额，用于块级资源分配
+- $\text{num\\_warps\\_per\\_block}$ ：每个 CUDA 块分配的 warps 数量，用于核函数的线程调度
+- $n$ ：索引张量的线性索引，范围为 $0 \leq n < \text{N}$ ，其中 $\text{N} = \text{len}(\text{src\\_indices})$
+
+### 参数说明
+
+- **src** (const at::Tensor, 入参): 源 KV 数据张量，需存储于 CUDA 设备
+- **dst** (const at::Tensor, 入参/出参): 目标 KV 数据张量，需存储于 CUDA 设备；传输完成后，数据会写入此张量
+- **src_indices** (const at::Tensor, 入参): 源数据的索引张量，需存储于 CUDA 设备，用于指定从`src`中读取数据的位置
+- **dst_indices** (const at::Tensor, 入参): 目标数据的索引张量，需存储于 CUDA 设备，用于指定向`dst`中写入数据的位置
+- **item_size** (int64_t, 入参): 单个 KV 数据项的字节大小
+- **block_quote** (int64_t, 入参): 与 CUDA 块相关的配置参数
+- **num_warps_per_block** (int64_t, 入参): 每个 CUDA 块分配的 warp 数量
+
+### 返回值
+
+无返回值，计算结果直接写入 dst 和 dst 张量中
+
+### 约束与调用
+
+- 所有输入张量（`src`、`dst`、`src_indices`、`dst_indices`）必须位于 CUDA 设备上
+- `src_indices` 必须是 CUDA 张量，且数据类型为`long`
+- `dst_indices` 必须是 CUDA 张量，且数据类型为`long`
+- `src_indices` 与 `dst_indices` 的长度必须完全一致
+- `item_size` 必须能被 8 整除（即`item_size % 8 == 0`）
+
+### 调用示例
+
+```python
+import torch
+import mcoplib.sgl_kernel
+# 设置计算设备
+device = "cuda"
+# 核心参数
+item_size = 128
+idx_len = 16
+block_quota = 8
+num_warps = 4
+# 1. 构造输入输出张量 (直接使用数据 Tensor)
+# 假设数据形状为 [token_num, item_size]
+src = torch.randn(1024, item_size, dtype=torch.float16, device=device)
+dst = torch.zeros_like(src)
+# 2. 构造索引张量
+src_idx = torch.arange(idx_len, device=device, dtype=torch.long)
+dst_idx = torch.arange(idx_len, device=device, dtype=torch.long)
+# 调用算子
+torch.ops.sgl_kernel.transfer_kv_per_layer_mla(
+    src=src,
+    dst=dst,
+    src_indices=src_idx,
+    dst_indices=dst_idx,
+    item_size=item_size,
+    block_quota=block_quota,
+    num_warps_per_block=num_warps
+)
+# 输出结果
+torch.cuda.synchronize()
+print("transfer_kv_per_layer_mla computation completed")
+```
+
+## 44. transfer_kv_per_layer_mla_pf_lf
+
+### 支持的产品型号
+
+- Metax C500/C550/C588/C600
+
+### 接口原型
+
+```python
+def transfer_kv_per_layer_mla_pf_lf(
+    src: torch.Tensor,
+    dst: torch.Tensor,
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    layer_id: int,
+    item_size: int,
+    src_layout_dim: int,
+    block_quote: int,
+    num_warps_per_block: int
+) -> None
+```
+
+### 功能描述
+
+该算子基于 CUDA 实现**带布局维度与层标识的单一层 KV（Key-Value）数据传输**，通过源索引张量（`src_indices`）、目标索引张量（`dst_indices`）及层标识（`layer_id`），结合源数据布局维度（`src_layout_dim`），将源张量（`src`）中的 KV 数据搬运到目标张量（`dst`）中，用于 KV 缓存场景下的层内数据迁移。
+
+- 计算公式：
+	对于索引张量的每个线性索引 $n$ （ $0 \leq n < \text{len}(\text{src\\_indices})$ ），结合指定层编号 $\text{layer\\_id}$ 执行张量元素的转移操作：
+
+$$
+  \text{dst}[\text{dst\\_indices}[n]] = \text{src}[\text{src\\_indices}[n] + \text{layer\\_id} \times \text{src\\_layout\\_dim}]
+$$
+
+  同时需满足内存对齐约束：
+
+$$
+  \text{item\\_size} \% 8 == 0
+$$
+
+  各变量的维度与含义：
+
+- $\text{src} \in \mathbb{T}^{*}$ ：源张量，数据类型为 $\mathbb{T}$ ，包含多层数据（层间数据由 $\text{src\\_layout\\_dim}$ 分隔），存储待转移的原始数据
+- $\text{dst} \in \mathbb{T}^{*}$ ：目标张量，存储转移后的数据，数据类型与 $\text{src}$ 一致
+- $\text{src\\_indices} \in \text{long}^{\text{N}}$ ：源索引张量（CUDA 张量）， $\text{N}$ 为索引长度，每个元素对应 $\text{src}$ 中当前层内待转移元素的索引
+- $\text{dst\\_indices} \in \text{long}^{\text{N}}$ ：目标索引张量（CUDA 张量），长度与 $\text{src\\_indices}$ 相同（ $\text{len}(\text{dst\\_indices}) = \text{len}(\text{src\\_indices})$ ），每个元素对应 $\text{dst}$ 中存储转移元素的索引
+- $\text{layer\\_id}$ ：当前处理的层编号，用于定位 $\text{src}$ 中对应层的数据（当前层数据的起始偏移为 $\text{layer\\_id} \times \text{src\\_layout\\_dim}$ ）
+- $\text{item\\_size}$ ：每个转移项的字节大小，需满足 $ \text{item\\_size} \% 8 == 0 $ 以保证内存对齐
+- $\text{src\\_layout\\_dim}$ ：源张量的层内布局维度，用于计算当前层在 $\text{src}$ 中的数据偏移
+- $\text{block\\_quota}$ ：CUDA 核函数的块资源配额，用于块级资源分配
+- $\text{num\\_warps\\_per\\_block}$ ：每个 CUDA 块分配的 warps 数量，用于核函数的线程调度
+- $n$ ：索引张量的线性索引，范围为 $0 \leq n < \text{N}$ ，其中 $\text{N} = \text{len}(\text{src\\_indices})$
+
+### 参数说明
+
+- **src** (const at::Tensor, 入参): 源 KV 数据张量，需存储于 CUDA 设备，作为数据读取的数据源。
+- **dst** (const at::Tensor, 入参/出参): 目标 KV 数据张量，需存储于 CUDA 设备；数据传输完成后，结果直接写入此张量。
+- **src_indices** (const at::Tensor, 入参): 源数据索引张量，需存储于 CUDA 设备，用于指定从`src`中读取数据的位置。
+- **dst_indices** (const at::Tensor, 入参): 目标数据索引张量，需存储于 CUDA 设备，用于指定向`dst`中写入数据的位置。
+- **layer_id** (int64_t, 入参): 当前待处理的 KV 数据所属的层标识。
+- **item_size** (int64_t, 入参): 单个 KV 数据项的字节大小。
+- **src_layout_dim** (int64_t, 入参): 源 KV 数据张量的布局维度参数，用于匹配数据存储结构。
+- **block_quote** (int64_t, 入参): CUDA 核函数启动时的块级配置参数。
+- **num_warps_per_block** (int64_t, 入参): 每个 CUDA 块分配的 warp 数量，用于控制 CUDA 并行计算的调度逻辑。
+
+### 返回值
+
+无返回值，数据传输结果直接写入`dst`张量中。
+
+### 约束与调用
+
+- 所有输入张量（`src`、`dst`、`src_indices`、`dst_indices`）必须存储在 CUDA 设备上。
+- `src_indices` 需为 CUDA 张量，且数据类型为`long`（int64）。
+- `dst_indices` 需为 CUDA 张量，且数据类型为`long`（int64）。
+- `src_indices` 与 `dst_indices` 的张量长度必须完全一致。
+- `item_size` 必须满足`item_size % 8 == 0`（即能被 8 整除）。
+
+### 调用示例
+
+```python
+import torch
+import mcoplib.sgl_kernel
+# 设置计算设备
+device = "cuda"
+# 核心参数
+layer_id = 0
+item_size = 128
+src_layout_dim = 1024  # 源数据的布局维度跨度
+idx_len = 16
+block_quota = 8
+num_warps = 4
+# 1. 构造输入输出张量
+src = torch.randn(2048, item_size, dtype=torch.float16, device=device)
+dst = torch.zeros(1024, item_size, dtype=torch.float16, device=device)
+# 2. 构造索引张量
+src_idx = torch.arange(idx_len, device=device, dtype=torch.long)
+dst_idx = torch.arange(idx_len, device=device, dtype=torch.long)
+# 调用算子
+torch.ops.sgl_kernel.transfer_kv_per_layer_mla_pf_lf(
+    src=src,
+    dst=dst,
+    src_indices=src_idx,
+    dst_indices=dst_idx,
+    layer_id=layer_id,
+    item_size=item_size,
+    src_layout_dim=src_layout_dim,
+    block_quota=block_quota,
+    num_warps_per_block=num_warps
+)
+# 输出结果
+torch.cuda.synchronize()
+print("transfer_kv_per_layer_mla_pf_lf computation completed")
+```
+
+## 45. transfer_kv_all_layer_mla
+
+### 支持的产品型号
+
+- Metax C500/C550/C588/C600
+
+### 接口原型
+
+```python
+def transfer_kv_all_layer_mla(
+    src_layers: torch.Tensor,
+    dst_layers: torch.Tensor,
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    item_size: int,
+    num_layers: int,
+    block_quote: int,
+    num_warps_per_block: int
+) -> None
+```
+
+### 功能描述
+
+该算子基于 CUDA 实现**所有层的 KV（Key-Value）数据传输**：先校验源层张量（`src_layers`）的层数与指定总层数（`num_layers`）是否一致，再通过源索引张量（`src_indices`）、目标索引张量（`dst_indices`），将源层张量中的 KV 数据批量搬运到目标层张量（`dst_layers`）中，核心用于 KV 缓存场景下的多层数据迁移操作。
+
+- 计算公式：
+	对于索引张量的每个线性索引 $n$ （ $0 \leq n < \text{len}(\text{src\\_indices})$ ），执行多层张量的元素转移操作：
+
+$$
+  \text{dst\\_layers}[\text{dst\\_indices}[n]] = \text{src\\_layers}[\text{src\\_indices}[n]]
+$$
+
+  同时需满足层数匹配约束：
+
+$$
+  \text{num\\_layers} = \text{src\\_layers.size}(0)
+$$
+
+  及内存对齐约束：
+
+$$
+  \text{item\\_size} \% 8 == 0
+$$
+
+  各变量的维度与含义：
+
+- $\text{src\\_layers} \in \mathbb{T}^{\text{num\\_layers} \times *}$ ：源层张量，数据类型为 $\mathbb{T}$ ，其第 0 维度长度等于 $\text{num\\_layers}$ ，存储待转移的多层原始数据
+- $\text{dst\\_layers} \in \mathbb{T}^{\text{num\\_layers} \times *}$ ：目标层张量，存储转移后的多层数据，数据类型与 $\text{src\\_layers}$ 一致
+- $\text{src\\_indices} \in \text{long}^{\text{N}}$ ：源索引张量（CUDA 张量）， $\text{N}$ 为索引长度，每个元素对应 $\text{src\\_layers}$ 中待转移元素的索引
+- $\text{dst\\_indices} \in \text{long}^{\text{N}}$ ：目标索引张量（CUDA 张量），长度与 $\text{src\\_indices}$ 相同（ $\text{len}(\text{dst\\_indices}) = \text{len}(\text{src\\_indices})$ ），每个元素对应 $\text{dst\\_layers}$ 中存储转移元素的索引
+- $\text{item\\_size}$ ：每个转移项的字节大小，需满足 $ \text{item\\_size} \% 8 == 0 $ 以保证内存对齐
+- $\text{num\\_layers}$ ：参与转移的层数，与 $\text{src\\_layers}$ 的第 0 维度长度相等（ $\text{num\\_layers} = \text{src\\_layers.size}(0)$ ）
+- $\text{block\\_quota}$ ：CUDA 核函数的块资源配额，用于块级资源分配
+- $\text{num\\_warps\\_per\\_block}$ ：每个 CUDA 块分配的 warps 数量，用于核函数的线程调度
+- $n$ ：索引张量的线性索引，范围为 $0 \leq n < \text{N}$ ，其中 $\text{N} = \text{len}(\text{src\\_indices})$
+
+### 参数说明
+
+- **src_layers** (const at::Tensor, 入参): 源所有层的 KV 数据张量，需存储于 CUDA 设备，作为多层数据读取的数据源。
+- **dst_layers** (const at::Tensor, 入参/出参): 目标所有层的 KV 数据张量，需存储于 CUDA 设备；数据传输完成后，结果直接写入此张量。
+- **src_indices** (const at::Tensor, 入参): 源数据索引张量，需存储于 CUDA 设备，用于指定从`src_layers`中读取数据的位置。
+- **dst_indices** (const at::Tensor, 入参): 目标数据索引张量，需存储于 CUDA 设备，用于指定向`dst_layers`中写入数据的位置。
+- **item_size** (int64_t, 入参): 单个 KV 数据项的字节大小。
+- **num_layers** (int64_t, 入参): 待处理的 KV 数据总层数，需与`src_layers`的层数匹配。
+- **block_quote** (int64_t, 入参): CUDA 核函数启动时的块级配置参数。
+- **num_warps_per_block** (int64_t, 入参): 每个 CUDA 块分配的 warp 数量，用于控制 CUDA 并行计算的调度逻辑。
+
+### 返回值
+
+无返回值，数据传输结果直接写入`dst_layers`张量中。
+
+### 约束与调用
+
+- 所有输入张量（`src_layers`、`dst_layers`、`src_indices`、`dst_indices`）必须存储在 CUDA 设备上。
+- `num_layers`必须与`src_layers.size (0)`（即源层张量的层数）完全一致，否则会触发参数合法性校验失败。
+- `src_indices`需为 CUDA 张量，且数据类型为`long`（int64）。
+- `dst_indices`需为 CUDA 张量，且数据类型为`long`（int64）。
+- `src_indices`与`dst_indices`的张量长度必须完全一致。
+- `item_size`必须满足`item_size % 8 == 0`（即能被 8 整除）。
+
+### 调用示例
+
+```python
+import torch
+import numpy as np
+import mcoplib.sgl_kernel
+# 设置计算设备
+device = "cuda"
+# 核心参数
+num_layers = 2
+capacity = 1024
+item_size = 128
+idx_len = 16
+block_quota = 8
+num_warps = 4
+# 1. 构造基础数据张量 (Float16)
+src_data = torch.randn(num_layers, capacity, item_size, dtype=torch.float16, device=device)
+dst_data = torch.zeros_like(src_data)
+# 2. 构造 UInt64 指针张量 (用于多层寻址)
+def to_uint64_ptr(t):
+    return torch.tensor(
+        np.array([sub.data_ptr() for sub in t], dtype=np.uint64),
+        device=device, dtype=torch.uint64
+    )
+src_layers_ptrs = to_uint64_ptr(src_data)
+dst_layers_ptrs = to_uint64_ptr(dst_data)
+# 3. 构造索引张量
+src_idx = torch.arange(idx_len, device=device, dtype=torch.long)
+dst_idx = torch.arange(idx_len, device=device, dtype=torch.long)
+# 调用算子
+torch.ops.sgl_kernel.transfer_kv_all_layer_mla(
+    src_layers=src_layers_ptrs,  # UInt64 指针表
+    dst_layers=dst_layers_ptrs,  # UInt64 指针表
+    src_indices=src_idx,
+    dst_indices=dst_idx,
+    item_size=item_size,
+    num_layers=num_layers,
+    block_quota=block_quota,
+    num_warps_per_block=num_warps
+)
+# 输出结果
+torch.cuda.synchronize()
+print("transfer_kv_all_layer_mla computation completed")
+```
+
+## 46. transfer_kv_all_layer_mla_lf_pf
+
+### 支持的产品型号
+
+- Metax C500/C550/C588/C600
+
+### 接口原型
+
+```cpp
+def transfer_kv_all_layer_mla_lf_pf(
+    src_layers: torch.Tensor,
+    dst: torch.Tensor,
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    item_size: int,
+    dst_layout_dim: int,
+    num_layers: int,
+    block_quote: int,
+    num_warps_per_block: int
+) -> None
+```
+
+### 功能描述
+
+该算子基于 CUDA 实现**带目标布局维度的所有层 KV（Key-Value）数据传输**：先校验源层张量（`src_layers`）的层数与指定总层数（`num_layers`）是否一致，再结合目标布局维度（`dst_layout_dim`），通过源索引张量（`src_indices`）、目标索引张量（`dst_indices`），将源层张量中的 KV 数据批量搬运到目标张量（`dst`）中，用于 KV 缓存场景下的多层数据迁移。
+
+- 计算公式：
+	对于索引张量的每个线性索引 $n$ （ $0 \leq n < \text{len}(\text{src\\_indices})$ ），执行多层源张量到目标张量的元素转移操作：
+
+$$
+  \text{dst}[\text{dst\\_indices}[n]] = \text{src\\_layers}[\text{src\\_indices}[n]]
+$$
+
+  同时需满足层数匹配约束：
+
+$$
+  \text{num\\_layers} = \text{src\\_layers.size}(0)
+$$
+
+  及内存对齐约束：
+
+$$
+  \text{item\\_size} \% 8 == 0
+$$
+
+  各变量的维度与含义：
+
+- $\text{src\\_layers} \in \mathbb{T}^{\text{num\\_layers} \times *}$ ：源层张量，数据类型为 $\mathbb{T}$ ，其第 0 维度长度等于 $\text{num\\_layers}$ ，存储待转移的多层原始数据
+- $\text{dst} \in \mathbb{T}^{*}$ ：目标张量，存储转移后的多层数据，数据类型与 $\text{src\\_layers}$ 一致
+- $\text{src\\_indices} \in \text{long}^{\text{N}}$ ：源索引张量（CUDA 张量）， $\text{N}$ 为索引长度，每个元素对应 $\text{src\\_layers}$ 中待转移元素的索引
+- $\text{dst\\_indices} \in \text{long}^{\text{N}}$ ：目标索引张量（CUDA 张量），长度与 $\text{src\\_indices}$ 相同（ $\text{len}(\text{dst\\_indices}) = \text{len}(\text{src\\_indices})$ ），每个元素对应 $\text{dst}$ 中存储转移元素的索引
+- $\text{item\\_size}$ ：每个转移项的字节大小，需满足 $ \text{item\\_size} \% 8 == 0 $ 以保证内存对齐
+- $\text{dst\\_layout\\_dim}$ ：目标张量的布局维度，用于目标张量的内存布局计算
+- $\text{num\\_layers}$ ：参与转移的层数，与 $\text{src\\_layers}$ 的第 0 维度长度相等（ $\text{num\\_layers} = \text{src\\_layers.size}(0)$ ）
+- $\text{block\\_quota}$ ：CUDA 核函数的块资源配额，用于块级资源分配
+- $\text{num\\_warps\\_per\\_block}$ ：每个 CUDA 块分配的 warps 数量，用于核函数的线程调度
+- $n$ ：索引张量的线性索引，范围为 $0 \leq n < \text{N}$ ，其中 $\text{N} = \text{len}(\text{src\\_indices})$
+
+### 参数说明
+
+- **src_layers** (const at::Tensor, 入参): 源所有层的 KV 数据张量，需存储于 CUDA 设备，作为多层数据读取的数据源。
+- **dst** (const at::Tensor, 入参/出参): 目标 KV 数据张量，需存储于 CUDA 设备；数据传输完成后，结果直接写入此张量。
+- **src_indices** (const at::Tensor, 入参): 源数据索引张量，需存储于 CUDA 设备，用于指定从`src_layers`中读取数据的位置。
+- **dst_indices** (const at::Tensor, 入参): 目标数据索引张量，需存储于 CUDA 设备，用于指定向`dst`中写入数据的位置。
+- **item_size** (int64_t, 入参): 单个 KV 数据项的字节大小。
+- **dst_layout_dim** (int64_t, 入参): 目标 KV 数据张量的布局维度参数，用于匹配目标数据存储结构。
+- **num_layers** (int64_t, 入参): 待处理的 KV 数据总层数，需与`src_layers`的层数匹配。
+- **block_quote** (int64_t, 入参): CUDA 核函数启动时的块级配置参数。
+- **num_warps_per_block** (int64_t, 入参): 每个 CUDA 块分配的 warp 数量，用于控制 CUDA 并行计算的调度逻辑。
+
+### 返回值
+
+无返回值，数据传输结果直接写入`dst`张量中。
+
+### 约束与调用
+
+- 所有输入张量（`src_layers`、`dst`、`src_indices`、`dst_indices`）必须存储在 CUDA 设备上。
+- `num_layers`必须与`src_layers.size (0)`（即源层张量的层数）完全一致，否则会触发参数合法性校验失败。
+- `src_indices`需为 CUDA 张量，且数据类型为`long`（int64）。
+- `dst_indices`需为 CUDA 张量，且数据类型为`long`（int64）。
+- `src_indices`与`dst_indices`的张量长度必须完全一致。
+- `item_size`必须满足`item_size % 8 == 0`（即能被 8 整除）。
+
+### 调用示例
+
+```python
+import torch
+import numpy as np
+import mcoplib.sgl_kernel
+# 设置计算设备
+device = "cuda"
+# 核心参数
+num_layers = 2
+capacity = 1024
+item_size = 128
+dst_layout_dim = capacity  # 目标张量的布局维度
+idx_len = 16
+block_quota = 8
+num_warps = 4
+# 1. 构造源数据 (多层) 与 目标数据 (连续)
+src_data = torch.randn(num_layers, capacity, item_size, dtype=torch.float16, device=device)
+# 目标是一个连续的大张量 [num_layers, capacity, item_size]
+dst_tensor = torch.zeros(num_layers, capacity, item_size, dtype=torch.float16, device=device)
+# 2. 构造源指针张量 (UInt64)
+def to_uint64_ptr(t):
+    return torch.tensor(
+        np.array([sub.data_ptr() for sub in t], dtype=np.uint64),
+        device=device, dtype=torch.uint64
+    )
+src_layers_ptrs = to_uint64_ptr(src_data)
+# 3. 构造索引张量
+src_idx = torch.arange(idx_len, device=device, dtype=torch.long)
+dst_idx = torch.arange(idx_len, device=device, dtype=torch.long)
+# 调用算子
+torch.ops.sgl_kernel.transfer_kv_all_layer_mla_lf_pf(
+    src_layers=src_layers_ptrs,  # UInt64 指针表
+    dst=dst_tensor,              # 直接使用数据张量 (at::Tensor)
+    src_indices=src_idx,
+    dst_indices=dst_idx,
+    item_size=item_size,
+    dst_layout_dim=dst_layout_dim,
+    num_layers=num_layers,
+    block_quota=block_quota,
+    num_warps_per_block=num_warps
+)
+# 输出结果
+torch.cuda.synchronize()
+print("transfer_kv_all_layer_mla_lf_pf computation completed")
+```
+
+## 47. transfer_kv_direct
+
+### 支持的产品型号
+
+- Metax C500/C550/C588/C600
+
+### 接口原型
+
+```python
+def transfer_kv_direct(
+    src_layers: List[torch.Tensor],
+    dst_layers: List[torch.Tensor],
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    page_size: int
+) -> None
+```
+
+### 功能描述
+
+transfer_kv_direct 算子主要用于在不同的 KV Cache 层之间进行数据的直接传输与拷贝。其核心逻辑采用了贪婪策略来优化传输效率：算子会将索引数据移动到 CPU，遍历索引数组，自动检测“源索引（src）”和“目标索引（dst）”是否同时保持物理连续。如果检测到连续的块，它会将这些连续的页合并为一个大的批次，然后按层调用底层的 transfer_page_direct 函数进行批量传输。这种机制有效减少了碎片化的内存拷贝调用次数。
+
+- 计算公式：
+
+$$
+  \text{dst\\_layers}[l][\text{dst\\_index} + k] = \text{src\\_layers}[l][\text{src\\_index} + k], \quad k \in [0, \text{num\\_tokens})
+$$
+
+  其中批量划分规则为：
+
+$$
+  \text{end\\_index} = 
+  \begin{cases} 
+  i+1, & \text{当 } (\text{src\\_indices}[i+1] - \text{src\\_indices}[i] \neq 1) \lor (\text{dst\\_indices}[i+1] - \text{dst\\_indices}[i] \neq 1) \\
+  \text{num\\_indices}, & \text{当 } i = \text{num\\_indices} - 1
+  \end{cases}
+$$
+
+  算子执行前需满足的合法性约束：
+
+$$
+  \begin{cases}
+  \text{len}(\text{src\\_layers}) = \text{len}(\text{dst\\_layers}) \\
+  \text{num\\_indices} = \text{len}(\text{src\\_indices}) = \text{len}(\text{dst\\_indices}) \\
+  \text{page\\_size} > 0 \\
+  \text{num\\_indices} \% \text{page\\_size} = 0
+  \end{cases}
+$$
+
+  各变量的维度与含义：
+
+- $\text{src\\_layers} \in \mathbb{List}[\mathbb{T}^{*}]$ ：源 KV 缓存层张量列表，每个张量为任意维度的 KV 缓存数据，数据类型为 $\mathbb{T}$ ，列表长度为 $\text{num\\_layers}$
+- $\text{dst\\_layers} \in \mathbb{List}[\mathbb{T}^{*}]$ ：目标 KV 缓存层张量列表，与 $\text{src\\_layers}$ 的维度、数据类型、列表长度均一致，用于接收传输后的数据
+- $\text{src\\_indices} \in \mathbb{Z}^{\text{num\\_indices}}$ ：源 KV 缓存的位置索引张量，元素为整数类型，用于索引源数据的位置
+- $\text{dst\\_indices} \in \mathbb{Z}^{\text{num\\_indices}}$ ：目标 KV 缓存的位置索引张量，元素为整数类型，用于索引目标存储位置
+- $\text{page\\_size} \in \mathbb{Z}^+$ ：批量处理的页大小，为正整数
+- $\text{num\\_indices} \in \mathbb{Z}^+$ ：索引张量的元素总数，满足 $\text{num\\_indices} \% \text{page\\_size} = 0$
+- $\text{num\\_layers} \in \mathbb{Z}^+$ ：KV 缓存的层数，即 $\text{len}(\text{src\\_layers})$
+- $l$ ：KV 缓存层索引，范围为 $0 \leq l < \text{num\\_layers}$
+- $\text{start\\_index} \in \mathbb{Z}$ ：批量传输的起始索引，范围为 $0 \leq \text{start\\_index} < \text{num\\_indices}$
+- $\text{end\\_index} \in \mathbb{Z}$ ：批量传输的结束索引，范围为 $\text{start\\_index} < \text{end\\_index} \leq \text{num\\_indices}$
+- $\text{num\\_tokens} \in \mathbb{Z}^+$ ：单批次传输的 token 数量，满足 $\text{num\\_tokens} = \text{end\\_index} - \text{start\\_index}$
+- $\text{src\\_index} \in \mathbb{Z}$ ：单批次源数据的起始位置，即 $\text{src\\_indices}[\text{start\\_index}]$
+- $\text{dst\\_index} \in \mathbb{Z}$ ：单批次目标数据的起始位置，即 $\text{dst\\_indices}[\text{start\\_index}]$
+- $k$ ：单批次内的 token 偏移量，范围为 $0 \leq k < \text{num\\_tokens}$
+- $i$ ：全局索引遍历变量，范围为 $0 \leq i < \text{num\\_indices}$
+
+### 参数说明
+
+- **src_layers** (const std::vector<at::Tensor>&, 入参): 源 KV Cache 层的张量列表
+- **dst_layers** (std::vector<at::Tensor>, 入参/出参): 目标 KV Cache 层的张量列表，数据将被写入其中
+- **src_indices** (const at::Tensor, 入参): 源数据的页索引张量
+- **dst_indices** (const at::Tensor, 入参): 目标数据的页索引张量
+- **page_size** (int64_t, 入参): 每一页的大小（以元素数量或特定单位计，代码中用于校验索引整除性）
+
+### 返回值
+
+无返回值，计算结果直接更新到 dst_layers 所指向的内存中
+
+### 约束与调用
+
+- src_layers 的数量必须等于 dst_layers 的数量
+- src_indices 的元素个数必须等于 dst_indices 的元素个数
+- page_size 必须大于 0
+- src_indices 的元素总数必须能被 page_size 整除
+- src_indices 和 dst_indices 必须为 int64（Long）类型的张量
+- 索引张量会被显式拷贝到 CPU（. cpu ()）进行连续性判断，但实际的数据传输（transfer_page_direct）依然在原设备（通常是 GPU）上执行
+
+### 调用示例
+
+```python
+import torch
+import mcoplib.sgl_kernel
+# 设置计算设备
+device = "cuda" if torch.cuda.is_available() else "cpu"
+assert device == "cuda", "transfer_kv_direct 仅支持CUDA设备"
+# 核心参数
+num_layers = 2
+page_size = 16
+head_dim = 64
+num_heads = 8
+total_pages = 100
+# 1. 构造 KV Cache 层
+# 原始物理存储: [total_pages, num_heads, page_size, head_dim]
+src_layers = []
+dst_layers = []
+for _ in range(num_layers):
+    s = torch.randn(total_pages, num_heads, page_size, head_dim, dtype=torch.float16, device=device)
+    d = torch.zeros(total_pages, num_heads, page_size, head_dim, dtype=torch.float16, device=device)
+    src_layers.append(s)
+    dst_layers.append(d)
+# 【关键修复】算子需要 Token 级扁平视图: [Total_Tokens, Heads, Dim]
+src_layers_flat = [t.view(-1, num_heads, head_dim) for t in src_layers]
+dst_layers_flat = [t.view(-1, num_heads, head_dim) for t in dst_layers]
+# 2. 构造索引 (Indices)
+# 示例：Source Page 5 -> Dest Page 10
+src_page_ids = [5, 6]
+dst_page_ids = [10, 11]
+src_indices_list = []
+dst_indices_list = []
+for s_id, d_id in zip(src_page_ids, dst_page_ids):
+    # 计算扁平化后的 Token 索引范围
+    src_indices_list.append(torch.arange(s_id * page_size, (s_id + 1) * page_size, device=device))
+    dst_indices_list.append(torch.arange(d_id * page_size, (d_id + 1) * page_size, device=device))
+src_indices = torch.cat(src_indices_list).to(dtype=torch.int64)
+dst_indices = torch.cat(dst_indices_list).to(dtype=torch.int64)
+# 3. 调用算子
+torch.ops.sgl_kernel.transfer_kv_direct(
+    src_layers_flat,
+    dst_layers_flat,
+    src_indices,
+    dst_indices,
+    page_size
+)
+print("transfer_kv_direct computation completed")
+# 验证数据
+is_equal = torch.allclose(src_layers[0][5], dst_layers[0][10])
+print(f"Data verification (Source Page 5 == Dest Page 10): {is_equal}")
+#  打印维度信息 
+print("\n=== Tensor Dimensions Info ===")
+print(f"Original Layer Shape (Page-based):   {src_layers[0].shape}")
+print(f"Flattened Layer Shape (Token-based): {src_layers_flat[0].shape}")
+print(f"Source Indices Shape:                {src_indices.shape}")
+print(f"Dest Indices Shape:                  {dst_indices.shape}")
+```
+
+## 48. transfer_kv_per_layer_direct_pf_lf
+
+### 支持的产品型号
+
+- Metax C500/C550/C588/C600
+
+### 接口原型
+
+```python
+def transfer_kv_per_layer_direct_pf_lf(
+    src_ptrs: List[torch.Tensor],
+    dst_ptrs: List[torch.Tensor],
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    layer_id: int,
+    page_size: int
+) -> None
+```
+
+### 功能描述
+
+该算子是 `transfer_kv_page_first_direct_impl` 的一个特化封装版本。它通过将模板参数 `IsLf2Pf` 设置为 `false` 来调用底层实现。
+具体逻辑如下：
+
+1. **调用路径**：直接调用 `transfer_kv_page_first_direct_impl<false>(...)`。
+2. **核心逻辑**（源于其调用的 Impl 中的 `else` 分支）：
+
+ - 遍历页（Pages）和层（Layers）。
+ - 针对每一页和每一层，计算源和目标的偏移索引。
+ - 调用 `transfer_page_direct` 进行实际的数据搬运。
+ - **MLA 支持**：代码中包含针对 MLA（Multi-Head Latent Attention）的逻辑判断（通过检查 `src_ptrs.size () == 1`），如果不是 MLA (`! is_mla`)，则会进行额外的 `transfer_page_direct` 调用来处理后续数据。
+ - 从函数命名后缀 `_pf_lf` 和模板参数 `false` 推断，该算子用于处理与“Layer First to Page First”相反或特定的内存布局转换（可能是 Page First to Layer First）。
+ - 计算公式：
+
+$$
+  \text{dst\\_layer}[\text{dst\\_offset} + t] = \text{src\\_layer}[\text{src\\_offset} + t], \quad t \in [0, \text{batch\\_tokens})
+$$
+
+  其中批次偏移量与 token 数的计算规则：
+
+$$
+  \begin{cases}
+  \text{src\\_offset} = \text{src\\_indices}[\text{batch\\_start}] \\
+  \text{dst\\_offset} = \text{dst\\_indices}[\text{batch\\_start}] \\
+  \text{batch\\_tokens} = \text{batch\\_end} - \text{batch\\_start}
+  \end{cases}
+$$
+
+  批次划分的终止条件：
+
+$$
+  \text{batch\\_end} = 
+  \begin{cases} 
+  b+1, & \text{当 } (\text{src\\_indices}[b+1] - \text{src\\_indices}[b] \neq 1) \lor (\text{dst\\_indices}[b+1] - \text{dst\\_indices}[b] \neq 1) \\
+  \text{total\\_indices}, & \text{当 } b = \text{total\\_indices} - 1
+  \end{cases}
+$$
+
+  算子执行前的合法性约束：
+
+$$
+  \begin{cases}
+  \text{total\\_indices} = \text{len}(\text{src\\_indices}) = \text{len}(\text{dst\\_indices}) \\
+  \text{page\\_size} > 0 \\
+  \text{total\\_indices} \% \text{page\\_size} = 0
+  \end{cases}
+$$
+
+  各变量的维度与含义：
+
+- $\text{src\\_layer} \in \mathbb{T}^{*}$ ：单层级的源 KV 缓存张量，数据类型为 $\mathbb{T}$ ，维度为适配 KV 缓存存储的任意维度
+- $\text{dst\\_layer} \in \mathbb{T}^{*}$ ：单层级的目标 KV 缓存张量，数据类型、维度与 $\text{src\\_layer}$ 完全一致，用于接收当前层传输后的 KV 数据
+- $\text{src\\_indices} \in \mathbb{Z}^{\text{total\\_indices}}$ ：当前层源 KV 缓存的位置索引张量，元素为整数类型，用于索引源数据的位置
+- $\text{dst\\_indices} \in \mathbb{Z}^{\text{total\\_indices}}$ ：当前层目标 KV 缓存的位置索引张量，元素为整数类型，用于索引目标存储位置
+- $\text{page\\_size} \in \mathbb{Z}^+$ ：批量处理的页大小，为正整数
+- $\text{total\\_indices} \in \mathbb{Z}^+$ ：当前层索引张量的元素总数，满足 $\text{total\\_indices} \% \text{page\\_size} = 0$
+- $\text{batch\\_start} \in \mathbb{Z}$ ：单批次传输的起始索引，范围为 $0 \leq \text{batch\\_start} < \text{total\\_indices}$
+- $\text{batch\\_end} \in \mathbb{Z}$ ：单批次传输的结束索引，范围为 $\text{batch\\_start} < \text{batch\\_end} \leq \text{total\\_indices}$
+- $\text{batch\\_tokens} \in \mathbb{Z}^+$ ：单批次传输的 token 数量，满足 $\text{batch\\_tokens} = \text{batch\\_end} - \text{batch\\_start}$
+- $\text{src\\_offset} \in \mathbb{Z}$ ：单批次源数据在当前层 KV 缓存中的起始位置，即 $\text{src\\_indices}[\text{batch\\_start}]$
+- $\text{dst\\_offset} \in \mathbb{Z}$ ：单批次目标数据在当前层 KV 缓存中的起始位置，即 $\text{dst\\_indices}[\text{batch\\_start}]$
+- $t$ ：单批次内的 token 偏移量，范围为 $0 \leq t < \text{batch\\_tokens}$
+- $b$ ：全局索引遍历变量，范围为 $0 \leq b < \text{total\\_indices}$
+
+### 参数说明
+
+- **src_ptrs** (const std::vector<at::Tensor>&, 入参): 源 KV Cache 的张量指针列表（通常包含 K 和 V 的 cache）
+- **dst_ptrs** (std::vector<at::Tensor>, 入参/出参): 目标 KV Cache 的张量指针列表，数据将被写入其中
+- **src_indices** (const at::Tensor&, 入参): 源数据的页索引张量
+- **dst_indices** (const at::Tensor&, 入参): 目标数据的页索引张量
+- **layer_id** (int64_t, 入参): 当前操作的基础层 ID，用于计算 offset
+- **page_size** (int64_t, 入参): 页大小
+
+### 返回值
+
+- 无返回值 (void)。计算结果直接更新到 `dst_ptrs` 指向的内存中
+
+### 约束与调用
+
+- 底层校验（继承自 `transfer_kv_page_first_direct_impl`）：
+- `src_indices` 和 `dst_indices` 的元素数量必须相等
+- `page_size` 必须大于 0
+- `src_indices` 的元素总数必须能被 `page_size` 整除
+- 实现依赖：该函数是一个简单的 wrapper，所有具体的计算逻辑、循环遍历和 CUDA/CPU 索引处理均依赖于 `transfer_kv_page_first_direct_impl` 的实现
+
+### 调用示例
+
+```python
+import torch
+import mcoplib.sgl_kernel
+# 设置计算设备
+device = "cuda" if torch.cuda.is_available() else "cpu"
+assert device == "cuda", "此算子仅支持CUDA设备"
+# 核心参数
+num_layers = 2
+page_size = 16
+head_dim = 64
+num_heads = 8
+total_pages = 100
+total_tokens = total_pages * page_size
+# 1. 构造 KV Cache
+# Destination: 标准的分层存储 List[Tensor]
+# 物理存储: [total_pages, num_heads, page_size, head_dim] -> 展平为 [total_tokens, num_heads, head_dim]
+dst_layers = []
+for _ in range(num_layers):
+    d = torch.zeros(total_pages, num_heads, page_size, head_dim, dtype=torch.float16, device=device)
+    dst_layers.append(d)
+dst_layers_flat = [t.view(-1, num_heads, head_dim) for t in dst_layers]
+# Source: 聚合存储 (Fused)
+# [Total_Tokens, Num_Layers, Num_Heads, Head_Dim]
+src_fused = torch.randn(
+    total_tokens, num_layers, num_heads, head_dim,
+    dtype=torch.float16, device=device
+)
+# 算子要求 src_ptrs 是 vector<Tensor>，所以要把这个大张量包进列表
+src_ptrs = [src_fused]
+# 2. 构造索引 (Indices)
+# 示例：Source Page 5 -> Dest Page 10
+src_page_ids = [5, 6]
+dst_page_ids = [10, 11]
+src_indices_list = []
+dst_indices_list = []
+for s_id, d_id in zip(src_page_ids, dst_page_ids):
+    src_indices_list.append(torch.arange(s_id * page_size, (s_id + 1) * page_size, device=device))
+    dst_indices_list.append(torch.arange(d_id * page_size, (d_id + 1) * page_size, device=device))
+src_indices = torch.cat(src_indices_list).to(dtype=torch.int64)
+dst_indices = torch.cat(dst_indices_list).to(dtype=torch.int64)
+# 3. 调用算子
+# C++签名: transfer_kv_per_layer_direct_pf_lf(src_ptrs, dst_ptrs, src_indices, dst_indices, layer_id, page_size)
+torch.ops.sgl_kernel.transfer_kv_per_layer_direct_pf_lf(
+    src_ptrs,
+    dst_layers_flat,
+    src_indices,
+    dst_indices,
+    0, 
+    page_size
+)
+print("transfer_kv_per_layer_direct_pf_lf computation completed")
+#  打印维度信息 
+print("\n=== Tensor Dimensions Info ===")
+print(f"Source Fused Tensor Shape:     {src_fused.shape}")
+print(f"Dest Layer 0 Shape (Flat):     {dst_layers_flat[0].shape}")
+print(f"Source Indices Shape:          {src_indices.shape}")
+print(f"Dest Indices Shape:            {dst_indices.shape}")
+```
+
+## 49. transfer_kv_all_layer_direct_lf_pf
+
+### 支持的产品型号
+
+- Metax C500/C550/C588/C600
+
+### 接口原型
+
+```cpp
+def transfer_kv_all_layer_direct_lf_pf(
+    src_ptrs: List[torch.Tensor],
+    dst_ptrs: List[torch.Tensor],
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    page_size: int
+) -> None
+```
+
+### 功能描述
+
+该算子是 `transfer_kv_page_first_direct_impl` 的特化封装版本，专门用于执行 **Layer First 到 Page First (LF to PF)** 的数据布局转换与传输。
+具体逻辑如下：
+
+1. **调用路径**：内部直接调用了 `transfer_kv_page_first_direct_impl<true>(..., 0, page_size)`，其中模板参数 `true` 激活了 `IsLf2Pf`（Layer First to Page First）的代码分支。
+2. **核心逻辑**：
+
+ - **MLA 判断**：通过检查 `dst_ptrs.size () == 1` 来判断是否为 MLA（Multi-Head Latent Attention）模式。
+ - **层数计算**：如果是 MLA，层数等于 `src_ptrs.size ()`；否则等于 `src_ptrs.size () / 2`（暗示非 MLA 模式下 src 包含 K 和 V 两部分层数据）。
+ - **遍历与传输**：
+ - 算子遍历所有页（Pages）和层（Layers）。
+ - 从 CPU 端的索引张量中获取源索引和目标索引。
+ - **K Cache 传输**：将 `src_ptrs[j]`（Layer First）的数据传输到 `dst_ptrs[0]`（Page First，通过 `. select` 选定层）中。
+ - **V Cache 传输**（非 MLA 模式）：将 `src_ptrs[j + num_layers]` 的数据传输到 `dst_ptrs[1]` 中。
+- 计算公式：
+
+$$
+  \text{dst\\_ptrs}[j][\text{d\\_index} + t] = \text{src\\_ptrs}[j][\text{s\\_index} + t], \quad t \in [0, \text{page\\_size})
+$$
+
+  其中页批次的索引计算规则：
+
+$$
+  \begin{cases}
+  \text{s\\_index} = \frac{\text{src\\_indices}[i \times \text{page\\_size}]}{\text{page\\_size}} \\
+  \text{d\\_index} = \frac{\text{dst\\_indices}[i \times \text{page\\_size} + \text{num\\_layers} \times \text{page\\_size}]}{\text{page\\_size}} \\
+  \text{num\\_pages} = \frac{\text{src\\_indices.numel()}}{\text{page\\_size}}
+  \end{cases}
+$$
+
+  算子执行前的合法性约束：
+
+$$
+  \begin{cases}
+  \text{src\\_indices.numel()} = \text{dst\\_indices.numel()} \\
+  \text{page\\_size} > 0 \\
+  \text{src\\_indices.numel()} \% \text{page\\_size} = 0
+  \end{cases}
+$$
+
+  各变量的维度与含义：
+
+- $\text{src\\_ptrs} \in \mathbb{List}[\mathbb{T}^{*}]$ ：所有层的源 KV 缓存张量列表，每个张量为对应层的 KV 数据，数据类型为 $\mathbb{T}$
+- $\text{dst\\_ptrs} \in \mathbb{List}[\mathbb{T}^{*}]$ ：所有层的目标 KV 缓存张量列表，维度、数据类型与 $\text{src\\_ptrs}$ 一致，用于接收传输后的数据
+- $\text{src\\_indices} \in \mathbb{Z}^{\text{src\\_indices.numel ()}}$ ：源 KV 缓存的位置索引张量，元素为整数类型，用于定位源数据位置
+- $\text{dst\\_indices} \in \mathbb{Z}^{\text{dst\\_indices.numel ()}}$ ：目标 KV 缓存的位置索引张量，元素为整数类型，用于定位目标存储位置
+- $\text{page\\_size} \in \mathbb{Z}^+$ ：批量处理的页大小，为正整数
+- $\text{num\\_pages} \in \mathbb{Z}^+$ ：页批次的总数量，满足 $\text{num\\_pages} = \frac{\text{src\\_indices.numel ()}}{\text{page\\_size}}$
+- $\text{num\\_layers} \in \mathbb{Z}^+$ ：KV 缓存的层数，满足 $\text{num\\_layers} = \frac{\text{src\\_ptrs.size ()}}{2}$ （由代码中`src_ptrs.size () / 2`推导）
+- $i$ ：页批次的遍历索引，范围为 $0 \leq i < \text{num\\_pages}$
+- $j$ ：KV 层的遍历索引，范围为 $0 \leq j < \text{num\\_layers}$
+- $\text{s\\_index} \in \mathbb{Z}$ ：当前页批次在源 KV 缓存中的起始位置（按页划分后的索引）
+- $\text{d\\_index} \in \mathbb{Z}$ ：当前页批次在目标 KV 缓存中的起始位置（按页划分后的索引）
+- $t$ ：当前页批次内的 token 偏移量，范围为 $0 \leq t < \text{page\\_size}$
+
+### 参数说明
+
+- **src_ptrs** (const std::vector<at::Tensor>&, 入参): 源 KV Cache 张量列表（Layer First 布局，通常每个元素代表一层）
+- **dst_ptrs** (std::vector<at::Tensor>, 入参/出参): 目标 KV Cache 张量列表（Page First 布局，通常包含 K 和 V 的张量）
+- **src_indices** (const at::Tensor&, 入参): 源数据的页索引张量
+- **dst_indices** (const at::Tensor&, 入参): 目标数据的页索引张量
+- **page_size** (int64_t, 入参): 页大小，用于计算页数和校验索引
+
+### 返回值
+
+- 无返回值 (void)。计算结果直接写入 `dst_ptrs` 指向的内存中
+
+### 约束与调用
+
+- 底层校验（继承自实现函数）：
+- `src_indices` 和 `dst_indices` 的元素数量必须相等
+- `page_size` 必须大于 0
+- `src_indices` 的元素总数必须能被 `page_size` 整除
+- 输入输出布局假设：
+- 源数据 (`src_ptrs`) 被假定为按层分开的 Vector 结构（Layer First）
+- 目标数据 (`dst_ptrs`) 被假定为紧凑的 Tensor 结构，通过 `select` 操作访问特定层（Page First）
+- 参数传递：调用底层实现时，`layer_id` 被硬编码为 `0`
+
+### 调用示例
+
+```python
+import torch
+import mcoplib.sgl_kernel
+# 设置计算设备
+device = "cuda" if torch.cuda.is_available() else "cpu"
+assert device == "cuda", "此算子仅支持CUDA设备"
+# 核心参数
+num_layers = 2
+page_size = 16
+head_dim = 64
+num_heads = 8
+total_pages = 100
+# total_tokens = total_pages * page_size (这个变量在定义dst时暂时用不到)
+# 1. 构造 KV Cache
+# === Source: Layer First (LF) ===
+# 保持之前的扁平化处理，因为读取时是按 Token 索引读取的
+src_layers = []
+for _ in range(num_layers):
+    s = torch.randn(total_pages, num_heads, page_size, head_dim, dtype=torch.float16, device=device)
+    src_layers.append(s)
+# [Total_Tokens, Num_Heads, Head_Dim]
+src_layers_flat = [t.view(-1, num_heads, head_dim) for t in src_layers]
+# === Destination: Page First (PF) / Fused ===
+# 【关键修改】必须定义为 5D 张量，显式包含 Page_Size 维度
+# 结构: [Total_Pages, Num_Layers, Page_Size, Num_Heads, Head_Dim]
+dst_fused = torch.zeros(
+    total_pages, num_layers, page_size, num_heads, head_dim,
+    dtype=torch.float16, device=device
+)
+# 算子要求 dst_ptrs 是 vector<Tensor>
+dst_ptrs = [dst_fused]
+# 2. 构造索引 (Indices)
+# 示例：Source Page 5 -> Dest Page 10
+src_page_ids = [5, 6]
+dst_page_ids = [10, 11]
+src_indices_list = []
+dst_indices_list = []
+for s_id, d_id in zip(src_page_ids, dst_page_ids):
+    # 生成 Token 级索引
+    src_indices_list.append(torch.arange(s_id * page_size, (s_id + 1) * page_size, device=device))
+    dst_indices_list.append(torch.arange(d_id * page_size, (d_id + 1) * page_size, device=device))
+src_indices = torch.cat(src_indices_list).to(dtype=torch.int64)
+dst_indices = torch.cat(dst_indices_list).to(dtype=torch.int64)
+# 3. 调用算子
+# C++签名: transfer_kv_all_layer_direct_lf_pf(src_ptrs, dst_ptrs, src_indices, dst_indices, page_size)
+torch.ops.sgl_kernel.transfer_kv_all_layer_direct_lf_pf(
+    src_layers_flat,
+    dst_ptrs,
+    src_indices,
+    dst_indices,
+    page_size
+)
+print("transfer_kv_all_layer_direct_lf_pf computation completed")
+#  打印维度信息 
+print("\n=== Tensor Dimensions Info ===")
+print(f"Source Layer 0 Shape (Flat):   {src_layers_flat[0].shape}")
+# 这里的 shape 应该是 5 维的
+print(f"Dest Fused Tensor Shape:       {dst_fused.shape}") 
+print(f"Source Indices Shape:          {src_indices.shape}")
+```
+
+## 50. store_kv_cache
+
+### 支持的产品型号
+
+- Metax C500/C550/C588/C600
+
+### 接口原型
+
+```python
+def store_kv_cache(
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    out_loc: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor
+) -> None
+```
+
+### 功能描述
+
+store_kv_cache 算子用于将输入的 Key (k) 和 Value (v) 张量根据给定的索引位置 (out_loc) 存储到预分配的 KV 缓存（k_cache 和 v_cache）中。该算子通过 CUDA kernel 并行处理内存拷贝，支持高效的非连续缓存更新，是 LLM 推理框架中处理 KV Cache 动态存储的核心操作。
+
+- 计算公式：
+	对于键缓存与输入键张量的元素，满足：
+
+$$
+  \text{k\\_cache}[b, \text{out\\_loc}[b] + s, h, c] = \text{k}[b, s, h, c]
+$$
+
+  对于值缓存与输入值张量的元素，满足：
+
+$$
+  \text{v\\_cache}[b, \text{out\\_loc}[b] + s, h, c] = \text{v}[b, s, h, c]
+$$
+
+  各变量的维度与含义：
+
+- $\text{k\\_cache} \in \mathbb{T}^{M \times L \times H \times C}$ ：键缓存张量，数据类型为 $\mathbb{T}$ ，维度为[batch 数, 缓存最大序列长度, 注意力头数, 单头维度]
+- $\text{v\\_cache} \in \mathbb{T}^{M \times L \times H \times C}$ ：值缓存张量，数据类型与 $\text{k\\_cache}$ 一致，维度与 $\text{k\\_cache}$ 相同
+- $\text{out\\_loc} \in \mathbb{Z}^M$ ：每个 batch 在缓存中的起始序列位置张量，维度为[batch 数]
+- $\text{k} \in \mathbb{T}^{M \times S \times H \times C}$ ：输入键张量，数据类型与 $\text{k\\_cache}$ 一致，维度为[batch 数, 当前序列长度, 注意力头数, 单头维度]
+- $\text{v} \in \mathbb{T}^{M \times S \times H \times C}$ ：输入值张量，数据类型与 $\text{v\\_cache}$ 一致，维度与 $\text{k}$ 相同
+- $b$ ：batch 索引，范围为 $0 \leq b < M$
+- $s$ ：当前序列的步索引，范围为 $0 \leq s < S$
+- $h$ ：注意力头索引，范围为 $0 \leq h < H$
+- $c$ ：单头维度索引，范围为 $0 \leq c < C$
+- $M$ ：batch 的数量（ $\text{k\\_cache.size (0)} = \text{k.size (0)} = M$ ）
+- $L$ ：缓存的最大序列长度（ $\text{k\\_cache.size (1)} = L$ ）
+- $S$ ：当前输入序列的长度（ $\text{k.size (1)} = S$ ）
+- $H$ ：注意力头的数量（ $\text{k\\_cache.size (2)} = \text{k.size (2)} = H$ ）
+- $C$ ：每个注意力头的维度（ $\text{k\\_cache.size (3)} = \text{k.size (3)} = C$ ）
+
+### 参数说明
+
+- **k_cache** (torch.Tensor, 入参/出参): 全局 Key 缓存张量，形状通常为 [max_tokens, num_heads, head_size]
+- **v_cache** (torch.Tensor, 入参/出参): 全局 Value 缓存张量，形状与 k_cache 一致
+- **out_loc** (torch.Tensor, 入参): 一维整数张量（int32 或 int64），包含了当前输入 token 在缓存中对应的存储索引位置
+- **k** (torch.Tensor, 入参): 待存储的新 Key 张量
+- **v** (torch.Tensor, 入参): 待存储的新 Value 张量
+
+### 返回值
+
+无返回值，计算结果直接写入 k_cache 和 v_cache 张量对应的内存地址中
+
+### 约束与调用
+
+- 所有输入张量（k_cache, v_cache, out_loc, k, v）必须位于 CUDA 设备上
+- out_loc 必须是 1D 连续张量，且数据类型必须为 int32 或 int64
+- k 和 v 的最后一维字节数（size_bytes）必须至少能被 128 整除，以满足算子的内存访问粒度要求
+- k 和 v 必须具有相同的形状和步长（strides）
+- k_cache 和 v_cache 必须具有相同的形状和步长
+- k 的 head size 必须与 k_cache 的 head size 一致
+- 支持的数据类型：float16, bfloat16, float32
+
+### 调用示例
+
+```python
+import torch
+# 1. 基础配置
+device = "cuda"
+dtype = torch.bfloat16
+max_tokens, num_tokens, head_dim = 128, 4, 128
+# 2. 准备张量
+# Cache 模拟预分配的大显存
+k_cache = torch.zeros(max_tokens, head_dim, dtype=dtype, device=device)
+v_cache = torch.zeros(max_tokens, head_dim, dtype=dtype, device=device)
+# 输入数据 (待存储的 K 和 V)
+k = torch.randn(num_tokens, head_dim, dtype=dtype, device=device)
+v = torch.randn(num_tokens, head_dim, dtype=dtype, device=device)
+# 存储位置索引 (int32)，例如存储到索引 0, 5, 10, 15
+out_loc = torch.tensor([0, 5, 10, 15], dtype=torch.int32, device=device)
+# 3. 调用算子
+import mcoplib.sgl_kernel 
+torch.ops.sgl_kernel.store_kv_cache(k_cache, v_cache, out_loc, k, v)
+# 4. 打印结果
+print("="*40)
+print(f"k_cache shape: {k_cache.shape}")
+print(f"v_cache shape: {v_cache.shape}")
+print(f"Input k shape: {k.shape}")
+print(f"Indices used:  {out_loc.tolist()}")
+print("-" * 40)
+# 验证第一个位置的数据 (索引 out_loc[0])
+target_idx = out_loc[0].item()
+is_match = torch.allclose(k_cache[target_idx], k[0], atol=1e-3)
+print(f"Verification at index {target_idx}: {'PASS' if is_match else 'FAIL'}")
+print(f"K_cache snippet: {k_cache[target_idx, :4].tolist()}")
+print(f"Original K snippet: {k[0, :4].tolist()}")
+print("="*40)
+```
+
+## 51. apply_token_bitmask_inplace_cuda
+
+### 支持的产品型号
+
+- Metax C500/C550/C588/C600
+
+### 接口原型
+
+```python
+def apply_token_bitmask_inplace_cuda(
+    logits: torch.Tensor,
+    bitmask: torch.Tensor,
+    indices: Optional[torch.Tensor] = None
+) -> None
+```
+
+### 功能描述
+
+apply_token_bitmask_inplace_cuda 算子实现了基于位掩码（bitmask）的 Logits 原地屏蔽操作。该算子根据 bitmask 中对应位的状态（0 或 1），将 logits 张量中非法 token 的分值原地修改为负无穷（-INFINITY）。这种操作通过位运算（Bitwise operations）高效地实现了对词表（Vocabulary）的大规模并行过滤，常用于大语言模型推理中的受限解码（Grammar-guided decoding）或结构化输出约束。
+
+- 计算公式：
+	对于 logits 张量中位置为 $(b, t, v)$ 的元素，依据 bitmask 张量对应位的取值做 inplace 修改：
+
+$$
+  \text{logits}[b, t, v] = 
+  \begin{cases} 
+  \text{NegInf}(\mathbb{T}), & \text{当 } \text{bitmask}[b, t, \lfloor v / K \rfloor] \text{ 的第 } (v \mod K) \text{ 位为 } 0 \\
+  \text{logits}[b, t, v], & \text{当 } \text{bitmask}[b, t, \lfloor v / K \rfloor] \text{ 的第 } (v \mod K) \text{ 位为 } 1
+  \end{cases}
+$$
+
+  其中元素的线性索引与三维位置的映射关系为：
+
+$$
+  n = b \times S_{BT} + t \times S_{TV} + v
+$$
+
+  各变量的维度与含义：
+
+- $\text{logits} \in \mathbb{T}^{B \times T \times V}$ ：待掩码处理的 logits 张量（inplace 修改），数据类型为 $\mathbb{T}$ （float/half 等），维度为[批量数, 序列长度, 词表大小]
+- $\text{bitmask} \in \mathbb{U}^{B \times T \times \lceil V / K \rceil}$ ：掩码张量，数据类型为无符号整数 $\mathbb{U}$ ，每个元素存储 $K$ 位掩码，维度为[批量数, 序列长度, $\lceil V / K \rceil$]
+- $\text{indices}$ （可选） $\in \mathbb{Z}^{B \times T}$ ：指定待处理位置的索引张量，维度与 $\text{logits}$ 前两维匹配
+- $K$ ：每个 bitmask 元素对应的位数（即代码中 $\text{BITS\\_PER\\_BLOCK}$ ，如 75、256）
+- $\text{NegInf}(\mathbb{T})$ ：数据类型 $\mathbb{T}$ 对应的负无穷值（如 float 的极小值）
+- $n$ ： $\text{logits}$ 元素的线性索引，范围为 $0 \leq n < B \times S_{BT}$
+- $b$ ：批量索引，范围为 $0 \leq b < B$
+- $t$ ：序列位置索引，范围为 $0 \leq t < T$
+- $v$ ：词表索引，范围为 $0 \leq v < V$
+- $S_{BT}$ ： $\text{logits}$ 在批量维度的步长，即 $S_{BT} = T \times S_{TV}$
+- $S_{TV}$ ： $\text{logits}$ 在序列维度的步长（词表维度的内存步长，满足 $S_{TV} \geq V$ ）
+
+### 参数说明
+
+- **logits** (torch.Tensor, 入参/出参): 输入的原始得分张量（通常为 2D），计算完成后，被屏蔽位置的值会被原地替换为负无穷
+- **bitmask** (torch.Tensor, 入参): 位掩码张量，数据类型必须为 int32。每个 int32 元素包含 32 个 token 的掩码位
+- **indices** (torch.Tensor, 可选入参): 索引张量，数据类型为 int32。若提供，算子将仅根据索引对指定的行应用掩码；若为 None，则顺序处理所有行
+
+### 返回值
+
+无返回值，计算结果直接写入 logits 张量中
+
+### 约束与调用
+
+- 所有张量必须位于 CUDA 设备上
+- logits 和 bitmask 必须是连续张量（contiguous）
+- bitmask 的数据类型必须为 int32
+- logits 的词表维度（vocab_size）应与 bitmask 提供的总位数匹配
+- 支持的数据类型：float16, bfloat16, float32
+
+### 调用示例
+
+```python
+import torch
+# 1. 基础配置
+device = "cuda"
+batch_size = 2
+vocab_size = 64
+dtype = torch.float32  # 源码支持 float32, float16, bfloat16
+# 2. 准备张量
+# logits 必须是 CUDA 且连续的张量
+logits = torch.randn(batch_size, vocab_size, dtype=dtype, device=device)
+# bitmask 必须是 int32 类型
+# 使用 -1 修复 0xFFFFFFFF 导致的溢出报错
+# 每行 bitmask 的长度应为 (vocab_size + 31) // 32
+bitmask = torch.tensor([
+    [-1,  0], # Batch 0: 前 32 个 token 保留 (1)，后 32 个屏蔽 (0)
+    [ 0, -1]  # Batch 1: 前 32 个 token 屏蔽 (0)，后 32 个保留 (1)
+], dtype=torch.int32, device=device)
+# 3. 调用算子
+import mcoplib.sgl_kernel
+print("="*40)
+print(f"Input Logits Shape:  {logits.shape}")
+print(f"Input Bitmask Shape: {bitmask.shape}")
+print("-" * 40)
+try:
+    # 算子签名: (logits, bitmask, indices=None)
+    torch.ops.sgl_kernel.apply_token_bitmask_inplace_cuda(logits, bitmask)
+    # 4. 打印输出信息 (原地操作，logits 已被修改)
+    print("Execution Status: SUCCESS")
+    print(f"Logits shape after call: {logits.shape}")
+    # 验证 Batch 0 的后半部分是否变为负无穷
+    print(f"Batch 0 (index 31-32): {logits[0, 31:33].tolist()}")
+    print(f"Logits Min Value: {logits.min().item()}")
+except RuntimeError as e:
+    print(f"Execution Status: FAILED")
+    print(f"Error Detail: {e}")
+    # 根据异常信息排查设备、参数或环境问题
+    print("\n[提示] 请检查设备环境、输入参数与算子约束是否满足要求。")
+print("="*40)
+```
+
+## 52. causal_conv1d_update
+
+### 支持的产品型号
+
+- Metax C500/C550/C588/C600
+
+### 接口原型
+
+```cpp
+def causal_conv1d_update(
+    x: torch.Tensor,
+    conv_state: torch.Tensor,
+    weight: torch.Tensor,
+    bias_: Optional[torch.Tensor] = None,
+    silu_activation: bool = False,
+    cache_seqlen_: Optional[torch.Tensor] = None,
+    conv_state_indices_: Optional[torch.Tensor] = None,
+    pad_slot_id: int = 0
+) -> None
+```
+
+### 功能描述
+
+causal_conv1d_update 实现了**因果一维卷积的状态更新操作**，主要用于序列模型中因果卷积的状态维护：结合输入、卷积状态、权重（及可选偏置）完成计算，支持 SiLU 激活（可选），同时处理缓存序列长度、卷积状态索引与填充槽位，实现因果卷积过程中状态的高效更新。
+
+- 计算公式：
+
+$$
+  \text{ConvOut}(x) = \text{Conv1d}_{\text{causal}}(x, \text{conv\\_state}_{\text{prev}}, W) + b \quad (\text{若} \ bias\_ \text{存在})
+$$
+
+
+
+$$
+  \text{ConvOut}_{\text{act}}(x) =
+  \begin{cases}
+  \text{SiLU}(\text{ConvOut}(x)) & \text{若} \ \text{silu\\_activation} = \text{True} \\
+  \text{ConvOut}(x) & \text{否则}
+  \end{cases}
+$$
+
+  
+
+$$
+  \text{conv\\_state}_{\text{curr}} = \text{UpdateState}(\text{conv\\_state}_{\text{prev}}, \text{ConvOut}_{\text{act}}(x), \text{conv\\_state\\_indices}, \text{cache\\_seqlen}, \text{pad\\_slot\\_id})
+$$
+
+  其中各变量的维度与含义：
+
+- $x \in \mathbb{R}^{B \times C \times L}$ ：输入张量， $B$ 为批量大小， $C$ 为通道数， $L$ 为输入序列长度
+- $\text{conv\\_state}_{\text{prev}} \in \mathbb{R}^{B \times C \times K}$ ：更新前的卷积状态张量， $K$ 为因果卷积核大小
+- $\text{conv\\_state}_{\text{curr}} \in \mathbb{R}^{B \times C \times K}$ ：更新后的卷积状态张量（覆盖原 conv_state）
+- $W \in \mathbb{R}^{C_{\text{out}} \times C \times K}$ ：因果一维卷积权重张量， $C_{\text{out}}$ 为输出通道数（通常 $C_{\text{out}}=C$ ）
+- $b \in \mathbb{R}^{C_{\text{out}}}$ ：可选偏置张量（仅当 $bias\_$ 存在时参与计算）
+- $\text{SiLU}(z) = z \cdot \sigma (z)$ ：Sigmoid Linear Unit 激活函数， $\sigma (\cdot)$ 为 Sigmoid 函数
+- $\text{silu\\_activation} \in \{True, False\}$ ：是否启用 SiLU 激活函数的布尔标识
+- $\text{cache\\_seqlen} \in \mathbb{Z}^{B}$ （可选）：批量中每个样本的缓存序列长度张量
+- $\text{conv\\_state\\_indices} \in \mathbb{Z}^{B \times K}$ （可选）：卷积状态更新的索引张量，用于定位状态更新位置
+- $\text{pad\\_slot\\_id} \in \mathbb{Z}$ ：填充槽位标识，用于修正填充位置的缓存序列长度和状态索引取值
+- $\text{Conv1d}_{\text{causal}}(\cdot)$ ：因果一维卷积操作，输出仅依赖当前及之前的输入和卷积状态
+- $\text{UpdateState}(\cdot)$ ：卷积状态更新函数，根据激活后输出、索引、缓存长度和填充槽位更新卷积状态
+	补充单样本维度的状态更新细节公式：
+
+$$
+  \text{conv\\_state}[i, c, k] =
+  \begin{cases}
+  \text{ConvOut}_{\text{act}}[i, c, l] & \text{若} \ k = (\text{cache\\_seqlen}[i] + l) \mod K \\
+  \text{conv\\_state}[i, c, k] & \text{否则}
+  \end{cases}
+$$
+
+  其中：
+
+- $i \in [0, B-1]$ ：批量索引
+- $c \in [0, C-1]$ ：通道索引
+- $k \in [0, K-1]$ ：卷积核维度索引
+- $l \in [0, L-1]$ ：输入序列维度索引
+
+### 参数说明
+
+- **x** (at::Tensor, 入参): 参与因果一维卷积计算的输入张量
+- **conv_state** (at::Tensor, 入参/出参): 卷积状态张量，存储因果卷积的状态信息，计算后会被更新
+- **weight** (at::Tensor, 入参): 因果一维卷积的计算权重张量
+- **bias_** (std::optional<at::Tensor>, 入参): 可选偏置张量，若提供则参与因果卷积的偏置计算
+- **silu_activation** (bool, 入参): 是否启用 SiLU 激活函数，控制计算中是否添加 SiLU 操作
+- **cache_seqlen_** (std::optional<at::Tensor>, 入参): 可选缓存序列长度张量，记录缓存对应的序列长度信息
+- **conv_state_indices_** (std::optional<at::Tensor>, 入参): 可选卷积状态索引张量，用于定位卷积状态的目标位置
+- **pad_slot_id** (int64_t, 入参): 填充槽位标识，用于处理缓存/状态中的填充位置
+
+### 返回值
+
+无返回值，变换结果直接写入输出张量中
+
+### 约束与调用
+
+- 所有张量必须部署在 CUDA 设备上
+- 若提供`bias_`/`cache_seqlen_`/`conv_state_indices_`，其维度、数据类型需与其他张量匹配
+- 支持的数据类型：兼容 float16、bfloat16、float32（需与实际计算场景适配）
+
+### 调用示例
+
+```python
+import torch
+import mcoplib.sgl_kernel
+device = "cuda" if torch.cuda.is_available() else "cpu"
+# 核心参数
+bs = 2 
+C = 256  # dim
+K = 4    # width (卷积核大小)
+pad_slot_id = -1 # 通常默认为 -1 或具体索引
+silu_activation = True 
+x = torch.randn(bs, C, 1, dtype=torch.float32, device=device)
+weight = torch.randn(C, K, dtype=torch.float32, device=device)
+conv_state = torch.randn(bs, C, K, dtype=torch.float32, device=device)
+bias = torch.randn(C, dtype=torch.float32, device=device)
+cache_seqlens = torch.zeros(bs, dtype=torch.int32, device=device) 
+conv_state_indices = torch.arange(bs, dtype=torch.int32, device=device)
+# 调用算子
+torch.ops.sgl_kernel.causal_conv1d_update(
+    x,
+    conv_state,
+    weight,
+    bias,
+    silu_activation,
+    cache_seqlens,        
+    conv_state_indices,   
+    pad_slot_id
+)
+print("Computation completed successfully!")
+```
+
+## 53. causal_conv1d_fwd
+
+### 支持的产品型号
+
+- Metax C500/C550/C588/C600
+
+### 接口原型
+
+```cpp
+def causal_conv1d_fwd(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias_: Optional[torch.Tensor] = None,
+    conv_states: Optional[torch.Tensor] = None,
+    query_start_loc: Optional[torch.Tensor] = None,
+    cache_indices: Optional[torch.Tensor] = None,
+    has_initial_state: Optional[torch.Tensor] = None,
+    silu_activation: bool = False,
+    pad_slot_id: int = 0
+) -> None
+```
+
+### 功能描述
+
+causal_conv1d_fwd 算子实现**因果一维卷积的前向计算**，适用于时序类任务（如 Transformer 模型）。它在卷积过程中保证“因果性”（不利用未来时序的信息），同时集成了卷积状态缓存（conv_states）、初始状态标识（has_initial_state）、可选 SiLU 激活等逻辑，还支持缓存索引管理与填充槽位处理，减少时序任务中卷积计算的冗余操作，提升效率。
+
+- 计算公式：
+
+$$
+  d\text{ConvOut} = 
+  \begin{cases}
+  d\text{ConvOut}_{\text{act}} \cdot \left( \sigma(z) + z \cdot \sigma(z) \cdot (1 - \sigma(z)) \right) & \text{若} \ \text{silu\\_activation} = \text{True} \\
+  d\text{ConvOut}_{\text{act}} & \text{否则}
+  \end{cases}
+$$
+
+  其中 $z = \text{ConvOut}(x)$ ， $\sigma (\cdot)$ 为 Sigmoid 函数， $d\text{ConvOut}_{\text{act}}$ 为激活后输出的上游梯度。
+
+$$
+  dW = \sum_{b=0}^{B-1} \sum_{t=0}^{L-1} d\text{ConvOut}[b, t, :] \otimes x[b, t-K+1:t+1, :]
+$$
+
+  
+
+$$
+  db = \sum_{b=0}^{B-1} \sum_{t=0}^{L-1} d\text{ConvOut}[b, t, :] \quad (\text{若} \ bias\_ \text{存在})
+$$
+
+  
+
+$$
+  dx[b, t, :] = \sum_{k=0}^{K-1} \sum_{c_{\text{out}}=0}^{C_{\text{out}}-1} d\text{ConvOut}[b, t+k, c_{\text{out}}] \cdot W[c_{\text{out}}, k, :]
+$$
+
+  
+
+$$
+  d\text{conv\\_states}[b, k, :] = \sum_{c_{\text{out}}=0}^{C_{\text{out}}-1} d\text{ConvOut}[b, 0, c_{\text{out}}] \cdot W[c_{\text{out}}, K-1-k, :] \quad (\text{若} \ t-k < 0)
+$$
+
+  其中各变量的维度与含义：
+
+- $dx \in \mathbb{R}^{B \times C_{\text{in}} \times L}$ ：输入张量 $x$ 的梯度，与 $x$ 维度一致， $B$ 为批量大小， $C_{\text{in}}$ 为输入通道数， $L$ 为输入序列长度
+- $dW \in \mathbb{R}^{C_{\text{out}} \times C_{\text{in}} \times K}$ ：权重张量 $W$ 的梯度，与 $W$ 维度一致， $C_{\text{out}}$ 为输出通道数， $K$ 为因果卷积核大小
+- $db \in \mathbb{R}^{C_{\text{out}}}$ ：偏置张量 $b$ 的梯度（仅当 $bias\_$ 存在时计算），与 $b$ 维度一致
+- $d\text{ConvOut} \in \mathbb{R}^{B \times L \times C_{\text{out}}}$ ：卷积输出（未激活）的梯度
+- $d\text{ConvOut}_{\text{act}} \in \mathbb{R}^{B \times L \times C_{\text{out}}}$ ：激活后卷积输出的梯度，为反向传播的上游梯度
+- $d\text{conv\\_states} \in \mathbb{R}^{B \times C_{\text{in}} \times K}$ ：卷积状态张量的梯度，与 $\text{conv\\_states}$ 维度一致
+- $x \in \mathbb{R}^{B \times C_{\text{in}} \times L}$ ：前向传播的输入张量
+- $W \in \mathbb{R}^{C_{\text{out}} \times C_{\text{in}} \times K}$ ：前向传播的卷积权重张量
+- $b \in \mathbb{R}^{C_{\text{out}}}$ ：前向传播的可选偏置张量
+- $\text{silu\\_activation} \in \{True, False\}$ ：前向传播是否启用 SiLU 激活的布尔标识
+- $\sigma (z) = \frac{1}{1 + e^{-z}}$ ：Sigmoid 激活函数， $z \in \mathbb{R}$
+- $\otimes$ ：互相关运算（卷积反向传播的核心运算）
+- $B$ ：批量大小，取值范围 $B \geq 1$
+- $C_{\text{in}}$ ：输入通道数，取值范围 $C_{\text{in}} \geq 1$
+- $C_{\text{out}}$ ：输出通道数，通常 $C_{\text{out}} = C_{\text{in}}$
+- $K$ ：因果卷积核大小，取值范围 $K \geq 1$
+- $L$ ：输入序列长度，取值范围 $L \geq 1$
+- $b \in [0, B-1]$ ：批量索引
+- $t \in [0, L-1]$ ：序列长度索引
+- $k \in [0, K-1]$ ：卷积核维度索引
+- $c_{\text{in}} \in [0, C_{\text{in}}-1]$ ：输入通道索引
+- $c_{\text{out}} \in [0, C_{\text{out}}-1]$ ：输出通道索引
+
+### 参数说明
+
+- **x** (at::Tensor, 入参): 因果卷积的输入数据张量
+- **weight** (at::Tensor, 入参): 卷积核对应的权重张量
+- **bias_** (std::optional<at::Tensor>, 入参): 可选的卷积偏置张量
+- **conv_states** (std::optional<at::Tensor>, 入参): 可选的卷积状态缓存张量，用于存储/读取历史时序的卷积状态
+- **query_start_loc** (std::optional<at::Tensor>, 入参): 可选的查询起始位置张量，定位时序数据中当前查询的起始点
+- **cache_indices** (std::optional<at::Tensor>, 入参): 可选的缓存索引张量，用于管理卷积状态缓存的索引映射
+- **has_initial_state** (std::optional<at::Tensor>, 入参): 可选的标识张量，指示是否存在初始卷积状态
+- **silu_activation** (bool, 入参): 是否在卷积后启用 SiLU 激活函数
+- **pad_slot_id** (int64_t, 入参): 填充槽位的 ID，用于处理缓存中的填充区域
+
+### 返回值
+
+无返回值，变换结果直接写入输出张量中
+
+### 约束与调用
+
+- 所有参与计算的张量（若存在）必须部署在 CUDA 设备上
+- conv_states（若使用）需满足因果卷积的状态缓存形状要求（与输入、卷积核维度匹配）
+- query_start_loc（若使用）的取值需处于合法的时序范围之内
+- 支持的数据类型：float16、bfloat16、float32
+
+### 调用示例
+
+```python
+import torch
+import mcoplib.sgl_kernel
+# 设置计算设备
+device = "cuda" if torch.cuda.is_available() else "cpu"
+assert device == "cuda", "causal_conv1d_fwd only supports CUDA devices"
+# 核心参数
+batch_size = 1      
+C_in = 128          
+L = 64             
+K = 16            
+C_out = 128         
+pad_slot_id = 0      
+silu_activation = True 
+# 1. 构造符合算子要求的张量
+x = torch.randn(
+    batch_size, C_in, L, 
+    dtype=torch.float32, device=device, requires_grad=False
+)
+# 这是一个 depthwise 卷积操作，输入通道和输出通道通常是一致的
+weight = torch.randn(
+    C_out, K,  # 形状改为 (128, 16)
+    dtype=torch.float32, device=device, requires_grad=False
+)
+# 可选偏置
+bias = torch.randn(
+    C_out,
+    dtype=torch.float32, device=device, requires_grad=False
+)
+# 形状应为 (batch_size, dim, kernel_size)
+conv_states = torch.randn(
+    batch_size, C_in, K,
+    dtype=torch.float32, device=device, requires_grad=False
+)
+# 非必要的可选参数
+query_start_loc = None
+cache_indices = None
+has_initial_state = None
+# 调用算子
+torch.ops.sgl_kernel.causal_conv1d_fwd(
+    x=x,
+    weight=weight,
+    bias_=bias,
+    conv_states=conv_states,
+    query_start_loc=query_start_loc,
+    cache_indices=cache_indices,
+    has_initial_state=has_initial_state,
+    silu_activation=silu_activation,
+    pad_slot_id=pad_slot_id
+)
+# 输出结果
+print("causal_conv1d_fwd computation completed successfully!")
+print(f"Input tensor x shape: {x.shape}")
+print(f"Conv weight tensor shape: {weight.shape}")
+print(f"Conv states tensor shape: {conv_states.shape}")
+```
+
+## 54. fused_mla_RMS_rotary_emb
+
+### 支持的产品型号
+
+- Metax C500/C550/C588/C600
+
+### 接口原型
+
+```cpp
+def fused_mla_RMS_rotary_emb(
+    q: torch.Tensor,
+    latent_cache: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    norm_weight: torch.Tensor,
+    kv_a: torch.Tensor,
+    q_len: int,
+    num_local_heads: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    qk_nope_head_dim: int
+) -> int
+```
+
+### 功能描述
+
+融合多项操作：对输入张量`q`执行旋转位置编码（rotary_emb），对`latent_cache`执行 RMS 归一化，更新`latent_cache`与`kv_a`，最后再对`latent_cache`执行旋转位置编码。
+
+- 计算公式：
+
+$$
+  \begin{align*}
+  &\text{latent\\_cache}_{norm} = \text{norm\\_weight} \odot \frac{\text{latent\\_cache}_{:,0:kv\_lora\_rank}}{\sqrt{\frac{1}{\text{kv\\_lora\\_rank}} \sum_{i=0}^{\text{kv\\_lora\\_rank}-1} \text{latent\\_cache}_{:,i}^2 + \epsilon}} \\
+  &\text{q}_{rope} = \text{RoPE}(\text{q}_{:,:,\text{qk\\_nope\\_head\\_dim}:}, \cos\_\sin\_\text{cache}, \text{positions}) \\
+  &\text{latent\\_cache}_{update} = [\text{latent\\_cache}_{norm} + \text{kv}_a, \text{latent\\_cache}_{:,\text{kv\\_lora\\_rank}:}] \\
+  &\text{latent\\_cache}_{final} = \text{RoPE}(\text{latent\\_cache}_{update}, \cos\_\sin\_\text{cache}, \text{positions})
+  \end{align*}
+$$
+
+  其中：
+
+- $\text{latent\\_cache} \in \mathbb{R}^{q\_len \times (\text{kv\\_lora\\_rank} + \text{qk\\_rope\\_head\\_dim})}$ 是缓存张量，dtype=bf16
+- $\text{norm\\_weight} \in \mathbb{R}^{\text{kv\\_lora\\_rank}}$ 是 RMS 归一化权重，dtype=bf16
+- $\text{q} \in \mathbb{R}^{q\_len \times \text{num\\_local\\_heads} \times (\text{qk\\_nope\\_head\\_dim} + \text{qk\\_rope\\_head\\_dim})}$ 是查询张量，dtype=bf16
+- $\text{kv}_a \in \mathbb{R}^{q\_len \times \text{kv\\_lora\\_rank}}$ 是待更新张量，dtype=bf16
+- $\cos\_\sin\_\text{cache} \in \mathbb{R}^{\text{max} \times \text{qk\\_rope\\_head\\_dim}}$ 是 RoPE 的 cos/sin 缓存，dtype=float
+- $\text{positions} \in \mathbb{Z}^{bs}$ 是位置索引张量，dtype=int64
+- $\text{RoPE}(\cdot)$ 是旋转位置编码函数，定义为：
+
+$$
+    \begin{cases}
+    x_{rot,i} = x_i \cdot \cos(\theta_{pos,i}) - x_{i+\frac{d}{2}} \cdot \sin(\theta_{pos,i}) \\
+    x_{rot,i+\frac{d}{2}} = x_i \cdot \sin(\theta_{pos,i}) + x_{i+\frac{d}{2}} \cdot \cos(\theta_{pos,i})
+    \end{cases}
+$$
+
+    其中 $d=\text{qk\\_rope\\_head\\_dim}$ ， $\theta_{pos, i} = \cos\_\sin\_\text{cache}[\text{positions}[b], i]$ （ $b$ 为 batch 索引）
+
+- $\epsilon$ 是 RMS 归一化的数值稳定性参数（默认极小正值）
+- $q\_len$ 是序列长度， $\text{num\\_local\\_heads}$ 是本地注意力头数， $\text{kv\\_lora\\_rank}$ 是 LoRA 秩， $\text{qk\\_rope\\_head\\_dim}$ 是启用 RoPE 的头维度， $\text{qk\\_nope\\_head\\_dim}$ 是不启用 RoPE 的头维度
+- $\odot$ 表示逐元素乘法， $[:, a: b]$ 表示张量沿第二维度取 $a$ 到 $b$ 的切片， $+$ 表示逐元素加法
+
+### 参数说明
+
+- **q** (torch.Tensor, 入参): 输入张量，用于旋转位置编码计算，维度需匹配`q_len`、`num_local_heads`等参数
+- **latent_cache** (torch.Tensor, 入参/出参): 缓存张量，会被 RMS 归一化更新，后续需执行旋转位置编码
+- **cos_sin_cache** (torch.Tensor, 入参): 旋转位置编码的 cos/sin 预缓存张量，数据类型为 float
+- **positions** (torch.Tensor, 入参): 位置索引张量，用于匹配`cos_sin_cache`的对应位置
+- **norm_weight** (torch.Tensor, 入参): RMS 归一化的权重张量，维度为`kv_lora_rank`
+- **kv_a** (torch.Tensor, 入参/出参): 需更新的张量，维度为`[q_len, kv_lora_rank]`
+- **q_len** (int64_t, 入参): `q`、`latent_cache`、`kv_a`的第 0 维度长度
+- **num_local_heads** (int64_t, 入参): `q`的第 1 维度长度（本地头数）
+- **kv_lora_rank** (int64_t, 入参): LoRA 秩，对应`latent_cache`第 1 维度的部分长度
+- **qk_rope_head_dim** (int64_t, 入参): 启用旋转编码的头维度，对应`q`第 2 维度的部分长度
+- **qk_nope_head_dim** (int64_t, 入参): 不启用旋转编码的头维度，对应`q`第 2 维度的部分长度
+
+### 返回值
+
+返回值为 int64_t 类型
+
+### 约束与调用
+
+- 所有张量必须位于 CUDA 设备上
+- 各张量形状需满足代码中`TORCH_CHECK`的校验规则（如`q.size (0) == q_len`、`latent_cache.size (1) == kv_lora_rank + qk_rope_head_dim`等）
+- 支持的数据类型：bf16（`q`/`latent_cache`/`norm_weight`/`kv_a`）、float（`cos_sin_cache`）、int64（`positions`）
+
+### 调用示例
+
+```python
+import torch
+import mcoplib.sgl_kernel
+# 设置设备
+device = "cuda"
+# 定义核心参数
+q_len = 16             
+num_local_heads = 128  
+kv_lora_rank = 512     
+qk_rope_head_dim = 64   
+qk_nope_head_dim = 128   
+bs = 8                   
+max_cos_sin_len = 2048   
+# 构造输入张量
+q = torch.randn(
+    q_len, num_local_heads, qk_nope_head_dim + qk_rope_head_dim,
+    dtype=torch.bfloat16, device=device
+)
+latent_cache = torch.randn(
+    q_len, kv_lora_rank + qk_rope_head_dim,
+    dtype=torch.bfloat16, device=device
+)
+cos_sin_cache = torch.randn(
+    max_cos_sin_len, qk_rope_head_dim,
+    dtype=torch.float32, device=device 
+)
+positions = torch.randint(0, max_cos_sin_len, (q_len,), dtype=torch.int64, device=device)
+norm_weight = torch.randn(kv_lora_rank, dtype=torch.bfloat16, device=device)
+kv_a = torch.randn(q_len, kv_lora_rank, dtype=torch.bfloat16, device=device)
+# 调用fused_mla_RMS_rotary_emb算子
+ret_code = torch.ops.sgl_kernel.fused_mla_RMS_rotary_emb(
+    q=q,
+    latent_cache=latent_cache,
+    cos_sin_cache=cos_sin_cache,
+    positions=positions,
+    norm_weight=norm_weight,
+    kv_a=kv_a,
+    q_len=q_len,
+    num_local_heads=num_local_heads,
+    kv_lora_rank=kv_lora_rank,
+    qk_rope_head_dim=qk_rope_head_dim,
+    qk_nope_head_dim=qk_nope_head_dim
+)
+# 输出调用结果
+print("fused_mla_RMS_rotary_emb computation completed")
+print(f"Return code: {ret_code}")
+print(f"Updated latent_cache shape: {latent_cache.shape}")
+print(f"Updated kv_a shape: {kv_a.shape}")
+```
+
+## 55. fused_mla_normal_kv_element_wise
+
+### 支持的产品型号
+
+- Metax C500/C550/C588/C600
+
+### 接口原型
+
+```cpp
+def fused_mla_normal_kv_element_wise(
+    kv: torch.Tensor,
+    latent_cache: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q_len: int,
+    num_local_heads: int,
+    kv_lora_rank: int,
+    qk_nope_head_dim: int,
+    qk_rope_head_dim: int,
+    v_head_dim: int
+) -> int
+```
+
+### 功能描述
+
+在 prefill 阶段完成融合操作：包含数据拷贝、张量维度变换及逐元素运算，用于处理`kv`、`latent_cache`、`k`、`v`之间的数值交互逻辑。
+
+- 计算公式：
+
+$$
+  \begin{align*}
+  &\text{kv}_{reshape} = \text{reshape}(\text{kv}, [\text{bs}, \text{num\\_local\\_heads}, \text{qk\\_nope\\_head\\_dim} + \text{v\\_head\\_dim}]) \\
+  &\text{kv}_{k\_part} = \text{kv}_{reshape}[:,:,0:\text{qk\\_nope\\_head\\_dim}] \\
+  &\text{kv}_{v\_part} = \text{kv}_{reshape}[:,:,\text{qk\\_nope\\_head\\_dim}:] \\
+  &\text{kv}_{final} = \text{concat}([\text{kv}_{k\_part} + \text{latent\\_cache}_{:,\text{kv\\_lora\\_rank}:}, \text{kv}_{v\_part} \odot \text{k}_{:,:,\text{qk\\_rope\\_head\\_dim}:}], 2) \\
+  &\text{kv} = \text{reshape}(\text{kv}_{final}, [\text{bs}, \text{num\\_local\\_heads} \times (\text{qk\\_nope\\_head\\_dim} + \text{v\\_head\\_dim})])
+  \end{align*}
+$$
+
+  其中：
+
+- $\text{kv} \in \mathbb{R}^{\text{bs} \times (\text{num\\_local\\_heads} \times (\text{qk\\_nope\\_head\\_dim} + \text{v\\_head\\_dim}))}$ 是输出张量，dtype=bf16
+- $\text{latent\\_cache} \in \mathbb{R}^{q\_len \times (\text{kv\\_lora\\_rank} + \text{qk\\_rope\\_head\\_dim})}$ 是缓存张量，dtype=bf16
+- $\text{k} \in \mathbb{R}^{\text{bs} \times \text{num\\_local\\_heads} \times (\text{qk\\_nope\\_head\\_dim} + \text{qk\\_rope\\_head\\_dim})}$ 是键张量，dtype=bf16
+- $\text{v} \in \mathbb{R}^{\text{bs} \times \text{num\\_local\\_heads} \times \text{v\\_head\\_dim}}$ 是值张量，dtype=bf16
+- $\text{reshape}(\cdot, [d_1, d_2,...])$ 表示张量维度重塑操作
+- $\text{concat}([T_1, T_2], dim)$ 表示沿 $dim$ 维度拼接张量 $T_1$ 和 $T_2$
+- $\text{bs}$ 是 batch 大小， $\text{num\\_local\\_heads}$ 是本地注意力头数， $\text{kv\\_lora\\_rank}$ 是 LoRA 秩， $\text{qk\\_rope\\_head\\_dim}$ 是启用 RoPE 的头维度， $\text{qk\\_nope\\_head\\_dim}$ 是不启用 RoPE 的头维度， $\text{v\\_head\\_dim}$ 是值头维度
+- $\odot$ 表示逐元素乘法， $+$ 表示逐元素加法， $[:, a: b]$ 表示张量沿指定维度取 $a$ 到 $b$ 的切片
+- $q\_len$ 是 latent_cache 的序列长度维度，与 prefill 阶段的序列长度匹配
+
+### 参数说明
+
+- **kv** (torch.Tensor, 入参/出参): 输出张量，存储处理后的结果，维度为`[bs, num_local_heads * (qk_nope_head_dim + v_head_dim)]`
+- **latent_cache** (torch.Tensor, 入参): 缓存张量，提供运算所需的输入数据
+- **k** (torch.Tensor, 入参): 输入张量，维度为`[bs, num_local_heads, qk_nope_head_dim + qk_rope_head_dim]`
+- **v** (torch.Tensor, 入参): 输入张量，维度为`[bs, num_local_heads, v_head_dim]`
+- **q_len** (int64_t, 入参): `latent_cache`的第 0 维度长度
+- **num_local_heads** (int64_t, 入参): 本地头数（`k`、`v`的第 1 维度长度）
+- **kv_lora_rank** (int64_t, 入参): LoRA 秩（`latent_cache`第 1 维度的部分长度）
+- **qk_nope_head_dim** (int64_t, 入参): 不启用旋转编码的头维度（`k`第 2 维度的部分长度）
+- **qk_rope_head_dim** (int64_t, 入参): 启用旋转编码的头维度（`k`第 2 维度的部分长度）
+- **v_head_dim** (int64_t, 入参): `v`的第 2 维度长度
+
+### 返回值
+
+返回值为 int64_t 类型
+
+### 约束与调用
+
+- 所有张量必须位于 CUDA 设备上
+- 各张量形状需匹配参数维度要求（如`k.size (2) == qk_nope_head_dim + qk_rope_head_dim`、`v.size (2) == v_head_dim`等）
+- 支持的数据类型：bf16（`kv`/`latent_cache`/`k`/`v`）
+
+### 调用示例
+
+```python
+import torch
+import mcoplib.sgl_kernel
+# 设置设备
+device = "cuda"
+# 定义核心参数
+bs = 8             
+q_len = 16             
+num_local_heads = 128    
+kv_lora_rank = 512      
+qk_rope_head_dim = 64    
+qk_nope_head_dim = 128   
+v_head_dim = 128         
+# 构造输入张量（符合参数维度&类型要求）
+kv = torch.empty(
+    q_len, num_local_heads * (qk_nope_head_dim + v_head_dim),
+    dtype=torch.bfloat16, device=device
+)
+latent_cache = torch.randn(
+    q_len, kv_lora_rank + qk_rope_head_dim,
+    dtype=torch.bfloat16, device=device
+)
+k = torch.randn(
+    q_len, num_local_heads, qk_nope_head_dim + qk_rope_head_dim,
+    dtype=torch.bfloat16, device=device
+)
+v = torch.randn(
+    q_len, num_local_heads, v_head_dim,
+    dtype=torch.bfloat16, device=device
+)
+# 调用fused_mla_normal_kv_element_wise算子
+ret_code = torch.ops.sgl_kernel.fused_mla_normal_kv_element_wise(
+    kv=kv,
+    latent_cache=latent_cache,
+    k=k,
+    v=v,
+    q_len=q_len,
+    num_local_heads=num_local_heads,
+    kv_lora_rank=kv_lora_rank,
+    qk_nope_head_dim=qk_nope_head_dim,
+    qk_rope_head_dim=qk_rope_head_dim,
+    v_head_dim=v_head_dim
+)
+# 输出调用结果
+print("fused_mla_normal_kv_element_wise computation completed")
+print(f"Return code: {ret_code}")
+print(f"Updated kv shape: {kv.shape}")
+```
+
+## 56. per_token_cast_to_fp8
+
+### 支持的产品型号
+
+- Metax C500/C550/C588/C600
+
+### 接口原型
+
+```python
+def per_token_cast_to_fp8(
+    out: torch.Tensor,
+    scale: torch.Tensor,
+    input: torch.Tensor
+) -> None
+```
+
+### 功能描述
+
+per_token_cast_to_fp8 算子实现了按 Token（行）进行的动态 FP8 量化转换。该算子首先计算输入张量每一行（Token 维度）元素的绝对最大值（abs_max），根据 FP8 (E4M3) 的表示范围计算出对应的缩放因子（scale），然后将输入数据缩放并原地或异地转换为 FP8 格式。这种逐 Token 量化的方式能有效保留异常值信息，减少量化误差，提高 FP8 推理时的精度。
+
+- 计算公式：
+	首先逐 token 计算缩放因子（将输入缩放到 FP8 动态范围内）：
+
+$$
+  \text{scale}[i] = \frac{\max_{j \in [0, \text{dim}-1]} \left| \text{input}[i, j] \right|}{\text{max\\_fp8}}
+$$
+
+  （注： $\text{max\\_fp8}$ 为目标 FP8 格式的最大可表示正值，如 E4M3 格式对应 $65504.0$ ，E5M2 格式对应 $57344.0$ ）
+  再逐元素执行缩放与 FP8 量化：
+
+$$
+  \text{out}[i, j] = \text{quantize}_{\text{fp8}} \left( \frac{\text{input}[i, j]}{\text{scale}[i]} \right)
+$$
+
+  其中 $\text{quantize}_{\text{fp8}}(\cdot)$ 是将浮点值映射为目标 FP8 格式（E4M3/E5M2）的量化操作。
+  其中元素的线性索引与二维位置的映射关系为：
+
+$$
+  n = i \times \text{stride} + j
+$$
+
+  各变量的维度与含义：
+
+- $\text{input} \in \mathbb{T}^{\text{num\\_tokens} \times \text{dim}}$ ：输入张量，数据类型为 $\mathbb{T}$ （如 fp16/fp32），每行对应一个 token 的特征
+- $\text{out} \in \text{FP8}^{\text{num\\_tokens} \times \text{dim}}$ ：输出张量，数据类型为 FP8（E4M3/E5M2），维度与 $\text{input}$ 一致
+- $\text{scale} \in \mathbb{R}^{\text{num\\_tokens}}$ ：逐 token 的缩放因子张量，每个元素对应一个 token 的缩放系数
+- $\text{num\\_tokens}$ ：输入张量的 token 数量（行数）
+- $\text{dim}$ ：每个 token 的特征维度（列数）
+- $\text{max\\_fp8}$ ：目标 FP8 格式的最大可表示正值（由 FP8 子类型决定）
+- $\text{stride}$ ：输入/输出张量的内存步长（每行元素的实际内存间隔，满足 $\text{stride} \geq \text{dim}$ 以保证内存对齐）
+- $i$ ：token 的行索引，范围为 $0 \leq i < \text{num\\_tokens}$
+- $j$ ：token 的特征列索引，范围为 $0 \leq j < \text{dim}$
+- $n$ ：张量元素的线性索引，范围为 $0 \leq n < \text{num\\_elems}$ （ $\text{num\\_elems} = \text{num\\_tokens} \times \text{stride}$ ）
+
+### 参数说明
+
+- **out** (torch.Tensor, 出参): 转换后的 FP8 张量，类型为 torch.float8_e4m3fn
+- **scale** (torch.Tensor, 出参): 存储每一行计算得出的缩放因子张量，通常为 torch.float32 类型
+- **input** (torch.Tensor, 入参): 待转换的输入张量，通常为 bfloat16 类型
+
+### 返回值
+
+无返回值，计算结果直接写入 out 和 scale 张量中
+
+### 约束与调用
+
+- 所有张量必须位于 CUDA 设备上
+- input、scale 和 out 张量必须是内存连续的（contiguous）
+- 输入张量的最后一维（hidden_size）必须是 128 的整数倍
+- 算子内部采用 FP8 E4M3 标准，缩放因子计算逻辑中包含针对 448.0（E4M3 最大可表示值）的归一化处理
+- 支持的数据类型：输入目前仅支持 bfloat16，输出支持 float8_e4m3fn
+
+### 调用示例
+
+```python
+import torch
+# 1. 基础配置
+device = "cuda"  # 环境中可能是 MACA 设备，但 PyTorch 接口通常映射为 cuda
+num_tokens = 8
+hidden_size = 512  # 必须是 128 的倍数
+dtype_in = torch.bfloat16
+dtype_out = torch.float8_e4m3fn  # 对应源码中的 maca_fp8_e4m3
+# 2. 准备张量
+# 输入张量 (BF16)
+input_tensor = torch.randn(num_tokens, hidden_size, dtype=dtype_in, device=device)
+# 输出张量 (FP8) - 必须是连续的 (contiguous)
+out_tensor = torch.empty(num_tokens, hidden_size, dtype=dtype_out, device=device)
+# Scale 张量 (FP32) 
+# 源码逻辑：每 128 个元素计算一个 scale
+# 因此 scale 长度为 总元素量 / 128
+scale_size = (num_tokens * hidden_size) // 128
+scale_tensor = torch.empty(scale_size, dtype=torch.float32, device=device)
+# 3. 调用算子
+import mcoplib.sgl_kernel
+print("="*40)
+print(f"Input shape:  {input_tensor.shape} ({input_tensor.dtype})")
+print(f"Output shape: {out_tensor.shape} ({out_tensor.dtype})")
+print(f"Scale shape:  {scale_tensor.shape} ({scale_tensor.dtype})")
+print("-" * 40)
+try:
+    # 算子注册签名: (out, scale, input)
+    torch.ops.sgl_kernel.per_token_cast_to_fp8(out_tensor, scale_tensor, input_tensor)
+    print("Execution Status: SUCCESS")
+    # 打印部分结果
+    print(f"Scale snippet: {scale_tensor[:4].tolist()}")
+except Exception as e:
+    print(f"Execution Status: FAILED")
+    print(f"Error Detail: {e}")
+print("="*40)
+```
+
+## 57. topk_sigmoid
+
+### 支持的产品型号
+
+- Metax C500/C550/C588/C600
+
+### 接口原型
+
+```python
+def topk_sigmoid(
+    topk_weights: torch.Tensor,
+    topk_indices: torch.Tensor,
+    gating_output: torch.Tensor,
+    renormalize: bool,
+    correction_bias: Optional[torch.Tensor] = None
+) -> None
+```
+
+### 功能描述
+
+topk_sigmoid 是混合专家（MoE）模型门控阶段的融合算子，集成了门控输出校正、TopK 专家选择、Sigmoid 权重计算及重归一化功能。该算子先对门控输出（可选叠加校正偏置）执行 TopK 筛选，再对选中专家对应的门控值计算 Sigmoid 激活权重，同时支持对权重进行重归一化，通过融合多步操作减少内存交互开销，提升 MoE 门控阶段的计算效率。
+
+### 参数说明
+
+- **topk_weights** (torch.Tensor, 出参): 选中 TopK 专家对应的 Sigmoid 权重张量，形状为（B, topk）（B 为批大小，topk 为单样本选中的专家数），支持数据类型为 float16/bfloat16
+- **topk_indices** (torch.Tensor, 出参): 选中 TopK 专家的索引张量，形状为（B, topk），数据类型为 int32
+- **gating_output** (torch.Tensor, 入参): 门控网络的输出张量，形状为（B, num_experts）（num_experts 为专家总数），支持数据类型为 float16/bfloat16
+- **renormalize** (bool, 入参): 是否对 TopK 后的 Sigmoid 权重执行重归一化的标志位
+- **correction_bias** (Optional[torch.Tensor], 入参): 门控输出的校正偏置张量，形状为（num_experts），支持数据类型为 float16/bfloat16；若为 None，则不执行门控输出校正
+
+### 返回值
+
+该算子无返回值，所有输出（TopK 专家权重、TopK 专家索引）均通过指定的出参张量（topk_weights、topk_indices）返回。
+
+### 约束与调用
+
+- 所有输入/出参张量必须部署在 CUDA 设备上
+- gating_output 的最后一维维度需与 correction_bias 的形状（num_experts）匹配；若 correction_bias 为 None，则无此约束
+- topk_weights、topk_indices 的形状需为（B, topk），其中 topk 为实际筛选的专家数量（由门控逻辑确定）
+- 数据类型约束：gating_output、correction_bias、topk_weights 支持 float16/bfloat16；topk_indices 必须为 int32 类型
+- 若开启 renormalize，需保证 TopK 后的 Sigmoid 权重之和不为零，否则会导致重归一化计算数值不稳定
+
+### 调用示例
+
+```python
+import torch
+import mcoplib.sgl_kernel
+# --- 配置参数 ---
+DEVICE = "cuda"
+NUM_TOKENS = 64      
+NUM_EXPERTS = 8    
+TOP_K = 2           
+RENORMALIZE = True   
+DTYPE_IDX = torch.int32 
+DTYPE_VAL = torch.float32
+torch.set_default_device(DEVICE)
+print(f"Config: Tokens={NUM_TOKENS}, Experts={NUM_EXPERTS}, K={TOP_K}")
+# 1. 准备输入数据
+gating_output = torch.randn(NUM_TOKENS, NUM_EXPERTS, dtype=DTYPE_VAL)
+# correction_bias: 可选的偏置项 [Experts] (可以传 None)
+# 如果不需要 bias，可以将此变量设为 None
+correction_bias = torch.randn(NUM_EXPERTS, dtype=DTYPE_VAL) 
+# 2. 准备输出数据
+# 输出形状由 [Tokens, TOP_K] 决定，算子内部会根据这个形状确定 K 值
+topk_weights = torch.empty(NUM_TOKENS, TOP_K, dtype=DTYPE_VAL)
+topk_indices = torch.empty(NUM_TOKENS, TOP_K, dtype=DTYPE_IDX)
+# 3. 执行算子
+print("Running topk_sigmoid...")
+if torch.cuda.is_available():
+    torch.cuda.synchronize()
+torch.ops.sgl_kernel.topk_sigmoid(
+    topk_weights,       # Output Tensor!
+    topk_indices,       # Output Tensor!
+    gating_output,      # Input Tensor
+    RENORMALIZE,        # bool
+    correction_bias     # Input Tensor? (Optional)
+)
+if torch.cuda.is_available():
+    torch.cuda.synchronize()
+print("执行成功")
+print("-" * 30)
+# 4. 结果验证
+print("Sample Results (First Token):")
+print(f"Raw Logits:    {gating_output[0].tolist()}")
+print(f"Selected Idxs: {topk_indices[0].tolist()}")
+print(f"Selected Wgts: {topk_weights[0].tolist()}")
+```
+
+## 58. kimi_k2_moe_fused_gate
+
+### 支持的产品型号
+
+- Metax C500/C550/C588/C600
+
+### 接口原型
+
+```python
+def kimi_k2_moe_fused_gate(
+    gate_weights: torch.Tensor,
+    expert_indices: torch.Tensor,
+    input_logits: torch.Tensor,
+    gate_bias: torch.Tensor,
+    topk: int,
+    renormalize: bool = True,
+    scaling_factor: float = 1.0
+) -> None
+```
+
+### 功能描述
+
+kimi_k2_moe_fused_gate 算子是面向 MoE（混合专家）大模型的融合式门控核心算子，整合了 MoE 门控的全量核心逻辑。该算子先对输入的门控预测值张量叠加偏置项完成基础打分，再执行 topk 筛选得到每个 token 对应的最优 k 个专家索引及对应权重，支持对筛选后的专家权重做归一化处理，同时支持权重缩放系数的融合应用，所有计算逻辑一步融合完成，大幅减少显存的读写交互与中间张量的创建开销，显著提升 MoE 架构大模型的推理计算效率。
+
+- 计算公式：
+	输入张量与超参定义, 算子输入及超参说明：
+
+$$
+    \begin{cases}
+    \text{input} \in \mathbb{R}^{T \times E}, & T = B \times S \text{（}B\text{为batch size，}S\text{为序列长度，}T\text{为Token总数），}E\text{为专家总数} \\
+    \text{bias} \in \mathbb{R}^E, & \text{每个专家对应的偏置张量} \\
+    \text{topk} = K, & \text{激活专家数（正整数，}K \ll E\text{）} \\
+    \text{renormalize} \in \{\text{True}, \text{False}\}, & \text{是否对Top-K得分做归一化的布尔标识} \\
+    \text{routed\\_scaling\\_factor} \in \mathbb{R}, & \text{路由结果的缩放因子} \\
+    \text{apply\\_routed\\_scaling\\_factor\\_on\\_output} \in \{\text{True}, \text{False}\}, & \text{是否在输出上应用缩放因子的布尔标识}
+    \end{cases}
+$$
+
+    其中： $t \in [0, T-1]$ （Token 维度索引）， $e \in [0, E-1]$ （专家维度索引）， $k \in [0, K-1]$ （Top-K 维度索引）。
+    输入加偏置并计算 Sigmoid 原始得分, 对每个 Token 的每个专家，将输入与对应专家偏置相加后，通过 Sigmoid 激活得到原始门控得分：
+
+$$
+    \text{raw\\_score}_{t,e} = \sigma\left(\text{input}_{t,e} + \text{bias}_e\right) = \frac{1}{1 + \exp\left(-(\text{input}_{t,e} + \text{bias}_e)\right)}
+$$
+
+    其中： $\text{raw\\_score} \in \mathbb{R}^{T \times E}$ ， $\sigma (\cdot)$ 为 Sigmoid 函数， $\exp (\cdot)$ 为自然指数函数。
+    逐 Token 筛选 Top-K 得分与专家索引, 对每个 Token，在专家维度上筛选出原始得分中最大的 $K$ 个值，同时记录对应的专家索引：
+
+$$
+    \begin{cases}
+    \text{topk\\_score}_{t,k} = \text{TopK}(\text{raw\\_score}_{t,:}, K) \\
+    \text{topk\\_index}_{t,k} = \text{ArgTopK}(\text{raw\\_score}_{t,:}, K)
+    \end{cases}
+$$
+
+    其中： $\text{topk\\_score} \in \mathbb{R}^{T \times K}$ （Top-K 得分张量）， $\text{topk\\_index} \in \mathbb{Z}^{T \times K}$ （Top-K 对应的专家索引张量）， $\text{TopK}(\cdot)$ 为取前 K 大值函数， $\text{ArgTopK}(\cdot)$ 为取前 K 大值对应索引的函数。
+    Top-K 得分的可选归一化, 若 $\text{renormalize}$ 为 True，对每个 Token 的 Top-K 得分做求和归一化（加入稳定小量避免除零）；否则直接沿用 Top-K 得分：
+
+$$
+    \text{normed\\_score}_{t,k} = 
+    \begin{cases} 
+    \frac{\text{topk\\_score}_{t,k}}{\sum_{k'=0}^{K-1}\text{topk\\_score}_{t,k'} + \epsilon}, & \text{renormalize} = \text{True} \\
+    \text{topk\\_score}_{t,k}, & \text{renormalize} = \text{False}
+    \end{cases}
+$$
+
+    其中： $\text{normed\\_score} \in \mathbb{R}^{T \times K}$ ， $\epsilon > 0$ 为数值稳定小量（通常取 $10^{-6}$ ）。
+    输出的可选缩放因子应用, 若 $\text{apply\\_routed\\_scaling\\_factor\\_on\\_output}$ 为 True，将归一化后的得分乘以路由缩放因子；否则直接沿用归一化得分：
+
+$$
+    \text{final\\_weight}_{t,k} = 
+    \begin{cases} 
+    \text{normed\\_score}_{t,k} \times \text{routed\\_scaling\\_factor}, & \text{apply\\_routed\\_scaling\\_factor\\_on\\_output} = \text{True} \\
+    \text{normed\\_score}_{t,k}, & \text{apply\\_routed\\_scaling\\_factor\\_on\\_output} = \text{False}
+    \end{cases}
+$$
+
+    其中： $\text{final\\_weight} \in \mathbb{R}^{T \times K}$ ，为最终的专家门控权重张量。
+    算子最终双输出, 该融合算子输出两个张量，无额外中间张量：
+
+$$
+    \text{outputs} = (\text{final\\_weight}, \text{topk\\_index})
+$$
+
+    其中：主输出 $\text{final\\_weight}$ 为浮点型专家门控权重，用于后续专家输出的加权融合；辅输出 $\text{topk\\_index}$ 为整型专家索引，用于筛选激活的专家计算结果。
+
+### 参数说明
+
+- **gate_weights** (torch.Tensor, 出参): 每个 token 选中的 topk 个专家对应的归一化门控权重张量，形状为 B×S×K，数据类型为 float16/bfloat16
+- **expert_indices** (torch.Tensor, 出参): 每个 token 选中的 topk 个专家的索引张量，形状为 B×S×K，数据类型为 int32
+- **input_logits** (torch.Tensor, 入参): MoE 门控网络的原始输入预测张量，形状为 B×S×E，支持数据类型为 float16/bfloat16；其中 E 为专家总数，B 为批次维度，S 为序列长度维度
+- **gate_bias** (torch.Tensor, 入参): MoE 门控网络的偏置张量，形状为 E，与输入的专家维度严格匹配，支持数据类型为 float16/bfloat16
+- **topk** (int, 入参): 每个 token 需要选择的最优专家数量，为正整数，取值范围为 1 ≤ topk ≤ E
+- **renormalize** (bool, 入参): 布尔型开关，是否对选中的 topk 个专家的权重做归一化处理，使单 token 下选中专家的权重之和为 1，默认值为 True
+- **scaling_factor** (float, 入参): 门控权重的全局缩放系数，用于权重幅值的精细化调控，默认值为 1.0，无缩放效果
+
+### 返回值
+
+该算子无返回值，所有输出（选中专家的权重、专家索引）均通过指定的出参张量（gate_weights、expert_indices）返回。
+
+### 约束与调用
+
+- 所有输入/出参张量必须位于 CUDA 设备上
+- input_logits 的形状必须为 B×S×E，gate_bias 的形状必须为 E，二者的专家维度 E 必须完全一致
+- gate_weights、expert_indices 的形状必须为 B×S×K，与 input_logits 的批次维度 B、序列维度 S 保持一致，K 为入参 topk 的取值
+- input_logits、gate_bias、gate_weights 支持的数据类型为 float16/bfloat16，expert_indices 必须为 int32 类型
+- topk 必须为正整数，且数值不能超过专家总数 E，否则会触发索引越界错误
+- 若 renormalize 设置为 True，单 token 下输出的 gate_weights 对应维度的权重求和结果恒等于 1.0，保证专家路由的权重分配合理性
+
+### 调用示例
+
+```python
+import torch
+import mcoplib.sgl_kernel
+# --- 配置参数 ---
+DEVICE = "cuda"
+NUM_TOKENS = 64       
+NUM_EXPERTS = 384     
+TOP_K = 2           
+RENORMALIZE = True    
+ROUTED_SCALING_FACTOR = 1.0
+APPLY_SCALING = False
+DTYPE_VAL = torch.float32 
+DTYPE_IDX = torch.int32   
+torch.set_default_device(DEVICE)
+print(f"Config: Tokens={NUM_TOKENS}, Experts={NUM_EXPERTS}, K={TOP_K}")
+# 1. 准备输入数据
+# gating_output 形状变为 [64, 384]
+gating_output = torch.randn(NUM_TOKENS, NUM_EXPERTS, dtype=DTYPE_VAL)
+# bias 形状变为 [384]
+correction_bias = torch.randn(NUM_EXPERTS, dtype=DTYPE_VAL)
+# 2. 执行算子
+print(f"Running kimi_k2_moe_fused_gate (Op: {torch.ops.sgl_kernel.kimi_k2_moe_fused_gate})...")
+if torch.cuda.is_available():
+    torch.cuda.synchronize()
+results = torch.ops.sgl_kernel.kimi_k2_moe_fused_gate(
+    gating_output,    
+    correction_bias,  
+    TOP_K,            
+    RENORMALIZE,      
+    ROUTED_SCALING_FACTOR, 
+    APPLY_SCALING     
+)
+if torch.cuda.is_available():
+    torch.cuda.synchronize()
+print("执行成功")
+print("-" * 30)
+# 3. 结果验证与解包
+topk_weights = results[0]
+topk_indices = results[1]
+print("Sample Results (First Token):")
+# 打印前 10 个 logits 示例
+print(f"Raw Logits (first 10): {gating_output[0][:10].tolist()} ...")
+print(f"Selected Idxs: {topk_indices[0].tolist()}")
+print(f"Selected Wgts: {topk_weights[0].tolist()}")
+# 验证形状
+print(f"\nShape Verification:")
+print(f"Weights Shape: {topk_weights.shape} (Expected: [{NUM_TOKENS}, {TOP_K}])")
+print(f"Indices Shape: {topk_indices.shape} (Expected: [{NUM_TOKENS}, {TOP_K}])")
+```
+
+## 59. fused_qk_norm_rope
+
+### 支持的产品型号
+
+- Metax C500/C550/C588/C600
+
+### 接口原型
+
+```python
+def fused_qk_norm_rope(
+    gkv: torch.Tensor,
+    num_heads_q: int,
+    num_heads_k: int,
+    num_heads_v: int,
+    head_dim: int,
+    eps: float,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    base: float,
+    is_neox: bool,
+    position_ids: torch.Tensor,
+    factor: float,
+    low: float,
+    high: float,
+    attention_factor: float
+) -> None
+```
+
+### 功能描述
+
+fused_qk_norm_rope 算子是面向 GPU 优化的融合计算算子，将 Query/Key 的权重映射、归一化操作与 RoPE（旋转位置编码）计算合并执行，减少 GPU 显存的读写开销，常用于大语言模型注意力机制模块的训练与推理流程。
+
+- 计算公式：
+	当前版本中，fused_qk_norm_rope 算子仅支持输入张量位于 CUDA 设备上
+
+$$
+\text{output}[b, s, idx] = 
+\begin{cases} 
+\text{RoPE}\left( \frac{\text{qkv}[b, s, idx] \cdot w_q}{\sqrt{\text{mean}(\text{qkv}[b, s, \text{q\\_range}]^2) + \text{eps}}}, \text{pos}_s \right) & idx \in \text{q\\_range} \\
+\text{RoPE}\left( \frac{\text{qkv}[b, s, idx] \cdot w_k}{\sqrt{\text{mean}(\text{qkv}[b, s, \text{k\\_range}]^2) + \text{eps}}}, \text{pos}_s \right) & idx \in \text{k\\_range} \\
+\text{qkv}[b, s, idx] & idx \in \text{v\\_range}
+\end{cases}
+$$
+
+其中：
+
+- $\text{qkv}$ ：输入张量，需位于 CUDA 设备上，形状记为 $S = (\text{batch\\_size}, \text{seq\\_len}, D)$ ， $D = (\text{num\\_heads\\_q}+\text{num\\_heads\\_k}+\text{num\\_heads\\_v}) \cdot \text{head\\_dim}$ ，为包含查询、键、值的融合张量
+- $\text{num\\_heads\\_q}$ ：查询注意力头的数量，非负整数
+- $\text{num\\_heads\\_k}$ ：键注意力头的数量，非负整数
+- $\text{num\\_heads\\_v}$ ：值注意力头的数量，非负整数
+- $\text{head\\_dim}$ ：单个注意力头的维度，正整数
+- $\text{q\\_range}$ ： $\text{qkv}$ 中查询部分的索引范围，即 $[0, \text{num\\_heads\\_q} \cdot \text{head\\_dim})$
+- $\text{k\\_range}$ ： $\text{qkv}$ 中键部分的索引范围，即 $[\text{num\\_heads\\_q} \cdot \text{head\\_dim}, (\text{num\\_heads\\_q}+\text{num\\_heads\\_k}) \cdot \text{head\\_dim})$
+- $\text{v\\_range}$ ： $\text{qkv}$ 中值部分的索引范围，即 $[(\text{num\\_heads\\_q}+\text{num\\_heads\\_k}) \cdot \text{head\\_dim}, D)$
+- $w_q$ ：查询头对应的权重张量，形状与 $\text{q\\_range}$ 维度匹配
+- $w_k$ ：键头对应的权重张量，形状与 $\text{k\\_range}$ 维度匹配
+- $\text{eps}$ ：防止除零的小常数，正浮点数
+- $\text{pos}_s$ ：序列位置 $s$ 对应的位置索引，来自 $\text{position\\_ids}$ 张量
+- $\text{Norm}(x) = \frac{x}{\sqrt{\text{mean}(x^2) + \text{eps}}}$ ：归一化操作，对张量对应部分的元素计算均值平方后做标准化
+- $\text{RoPE}(\cdot, \text{pos}_s)$ ：旋转位置编码操作，基于位置索引 $\text{pos}_s$ 对张量进行旋转编码
+- $\text{output}$ ：输出张量，形状与 $\text{qkv}$ 完全一致（即 $S = (\text{batch\\_size}, \text{seq\\_len}, D)$ ），存储融合处理后的结果
+- $[b, s, idx]$ ：张量的多维索引， $b$ 为批次索引（ $0 \leq b < \text{batch\\_size}$ ）、 $s$ 为序列位置索引（ $0 \leq s < \text{seq\\_len}$ ）、 $idx$ 为维度索引（ $0 \leq idx < D$ ）
+- $\cdot$ ：张量与权重的逐元素（或匹配维度）乘法运算
+
+### 参数说明
+
+- **gkv** (torch.Tensor, 入参/出参): 输入输出张量，用于承载融合计算后的 Q/K/V 相关结果，需部署在 CUDA 设备上
+- **num_heads_q** (int, 入参): Query 对应的注意力头数量
+- **num_heads_k** (int, 入参): Key 对应的注意力头数量
+- **num_heads_v** (int, 入参): Value 对应的注意力头数量
+- **head_dim** (int, 入参): 单个注意力头的特征维度，需满足算子内部的对齐约束（如特定数值的倍数）
+- **eps** (float, 入参): 归一化操作中用于避免除零的微小平滑值
+- **q_weight** (torch.Tensor, 入参): Query 对应的权重张量，形状需与 num_heads_q、head_dim 匹配，需部署在 CUDA 设备上
+- **k_weight** (torch.Tensor, 入参): Key 对应的权重张量，形状需与 num_heads_k、head_dim 匹配，需部署在 CUDA 设备上
+- **base** (float, 入参): RoPE 编码中的基数值，用于计算位置编码的缩放因子
+- **is_neox** (bool, 入参): 是否采用 GPT-NeoX 风格的 RoPE 编码实现逻辑
+- **position_ids** (torch.Tensor, 入参): 序列的位置索引张量，用于提供 RoPE 编码的位置信息，需部署在 CUDA 设备上
+- **factor** (float, 入参): 融合计算流程中的缩放因子参数
+- **low** (float, 入参): 计算过程中的数值下界参数
+- **high** (float, 入参): 计算过程中的数值上界参数
+- **attention_factor** (float, 入参): 注意力计算环节的缩放因子参数
+
+### 返回值
+
+计算结果通过入参`gkv`（引用传递）输出，无独立返回张量
+
+### 约束与调用
+
+- 所有输入张量必须部署在 CUDA 设备上
+- 各张量的形状需满足注意力头数、头维度的匹配关系（如 q_weight 的形状需与 num_heads_q×head_dim 对齐）
+- head_dim 需满足算子内部静态断言的对齐要求（如为特定数值的整数倍）
+- 支持的数据类型：float16（torch.float16）、bfloat16（torch.bfloat16）
+- position_ids 的形状需与输入序列的长度维度匹配
+
+### 调用示例
+
+```python
+import torch
+import mcoplib.sgl_kernel
+# 配置参数
+SEED = 42
+DEVICE = "cuda"
+# 维度设置
+BATCH_SIZE = 2
+SEQ_LEN = 128
+HEAD_DIM = 128
+NUM_HEADS_Q = 32
+NUM_HEADS_K = 32
+NUM_HEADS_V = 32
+# 初始化环境
+torch.manual_seed(SEED)
+torch.set_default_device(DEVICE)
+TOTAL_TOKENS = BATCH_SIZE * SEQ_LEN
+HIDDEN_SIZE_QKV = (NUM_HEADS_Q + NUM_HEADS_K + NUM_HEADS_V) * HEAD_DIM
+# 1. 准备数据
+qkv = torch.randn((TOTAL_TOKENS, HIDDEN_SIZE_QKV), dtype=torch.bfloat16, device=DEVICE)
+# 准备权重 (Weight)
+q_weight = torch.randn((HEAD_DIM,), dtype=torch.bfloat16, device=DEVICE)
+k_weight = torch.randn((HEAD_DIM,), dtype=torch.bfloat16, device=DEVICE)
+position_ids = torch.arange(SEQ_LEN, device=DEVICE).unsqueeze(0).expand(BATCH_SIZE, -1).reshape(-1).to(torch.int)
+# 其他标量参数
+eps = 1e-5
+base = 10000.0
+is_neox = True
+factor = 1.0
+low = 0.0
+high = 0.0
+attention_factor = 1.0
+# 2. 调用算子
+print(f"Running fused_qk_norm_rope...")
+print(f"Input shape: {qkv.shape}")
+print(f"Position_ids dtype: {position_ids.dtype}") 
+torch.ops.sgl_kernel.fused_qk_norm_rope(
+    qkv,                
+    NUM_HEADS_Q,
+    NUM_HEADS_K,
+    NUM_HEADS_V,
+    HEAD_DIM,
+    eps,
+    q_weight,           
+    k_weight,         
+    base,
+    is_neox,
+    position_ids,       
+    factor,
+    low,
+    high,
+    attention_factor
+)
+print("执行成功 (Execution Success).")
+if torch.cuda.is_available():
+    torch.cuda.synchronize()
+# 3. 验证结果
+print(f"Output Mean: {qkv.float().mean().item():.4f}")
+print(f"Output Std:  {qkv.float().std().item():.4f}")
+```
+
+## 60. weak_ref_tensor
+
+### 支持的产品型号
+
+- Metax C500/C550/C588/C600
+
+### 接口原型
+
+```python
+def weak_ref_tensor(
+    input: at::Tensor
+) -> at::Tensor
+```
+
+### 功能描述
+
+weak_ref_tensor 算子是面向 CUDA 张量的内存复用工具算子：基于输入 CUDA 张量的原始数据指针，复用其形状、步幅、数据类型等属性，创建一个共享原张量内存的新张量视图（不拷贝数据），用于避免不必要的显存数据拷贝，提升 CUDA 张量的内存复用效率，常用于大语言模型等显存敏感场景的张量内存管理。
+
+- 计算公式：
+	当前版本中，weak_ref_tensor 算子仅支持输入张量位于 CUDA 设备上
+
+$$
+\text{output}[i_1, i_2, ..., i_n] = \text{input}[i_1, i_2, ..., i_n]
+$$
+
+其中：
+
+- $\text{input}$ ：输入张量，需位于 CUDA 设备上，形状记为 $S = (s_1, s_2, ..., s_n)$ ， $n$ 为张量维度数
+- $\text{output}$ ：输出张量，形状与 $\text{input}$ 完全一致（即 $S = (s_1, s_2, ..., s_n)$ ），与 $\text{input}$ 共享数据存储
+- $[i_1, i_2, ..., i_n]$ ：张量任意位置的多维索引，满足 $0 \leq i_k < s_k$ （ $k = 1, 2, ..., n$ ），覆盖张量所有元素
+- $=$ ：表示输出张量对应位置元素与输入张量对应位置元素取值相同
+
+### 参数说明
+
+- **input** (at::Tensor, 入参): 输入的 CUDA 张量，算子会基于其数据指针、形状、步幅等属性创建新张量视图，必须是位于 CUDA 设备上的合法张量。
+
+### 返回值
+
+at::Tensor: 输出的新张量，与输入张量共享数据内存，形状、步幅、数据类型、设备等属性均与输入张量完全一致。
+
+### 约束与调用
+
+- 输入张量**必须位于 CUDA 设备上**，非 CUDA 张量会触发错误
+- 新张量与输入张量共享内存，输入张量的生命周期需覆盖新张量的使用周期，否则会出现悬空指针风险
+- 支持的张量数据类型与输入张量一致（如 float16（at::ScalarType::Half）、bfloat16（at::ScalarType::BFloat16）、float32 等）
+- 输入张量需保持数据指针有效，非法或已释放的张量会导致新张量访问异常
+
+### 调用示例
+
+```python
+import torch
+import mcoplib.sgl_kernel
+# 1. 准备数据 (必须在 CUDA 上)
+torch.set_default_device("cuda")
+input_tensor = torch.randn(4, 4096)
+# 2. 算子执行
+# 这里的 weak_ref_tensor 返回一个新的 Tensor，指向相同的显存
+output_tensor = torch.ops.sgl_kernel.weak_ref_tensor(input_tensor)
+# 3. 打印结果
+print(f"Input Shape:  {input_tensor.shape}")
+print(f"Output Shape: {output_tensor.shape}")
+```
+
+## 61. per_token_group_quant_8bit_packed
+
+### 支持的产品型号
+
+- Metax C500/C550/C588/C600/C600U/C600UL
+
+### 接口原型
+
+```python
+def per_token_group_quant_8bit_packed(
+    input: torch.Tensor,
+    output_q: torch.Tensor,
+    output_s_packed: torch.Tensor,
+    group_size: int,
+    eps: float,
+    min_8bit: float,
+    max_8bit: float
+) -> None
+```
+
+### 功能描述
+
+per_token_group_quant_8bit_packed 算子实现逐 Token 分组 8-bit 动态量化功能，支持缩放因子的打包存储（UE8M0 格式）。该算子将输入张量沿特征维度按固定分组大小（group_size=128）分组，对每组计算动态缩放因子，并将输入值量化到 8-bit 数据类型（FP8 或 INT8），同时将缩放因子以 UE8M0 格式打包存储到 int32 张量中，提升存储效率，常用于大模型推理中的权重量化或激活量化。
+
+- 计算公式：
+
+分组缩放因子计算，对输入张量的每组计算动态缩放因子：
+
+$$
+\text{scale}_{t,g} = \max_{j \in \text{group}_g} |\text{input}_{t,j}|
+$$
+
+8-bit 量化，使用计算出的缩放因子对每组进行量化：
+
+$$
+\text{output\_q}_{t,j} = \text{clamp}\left(\frac{\text{input}_{t,j}}{\text{scale}_{t,g}}, \text{min\_8bit}, \text{max\_8bit}\right), \quad j \in \text{group}_g
+$$
+
+缩放因子打包，将每组缩放因子转换为 UE8M0 格式（8 位无符号指数），并将 4 组打包到一个 int32 元素中：
+
+$$
+\text{output\_s\_packed}[t, p] = \text{pack4}\left(\text{UE8M0}(\text{scale}_{t,4p}), \text{UE8M0}(\text{scale}_{t,4p+1}), \text{UE8M0}(\text{scale}_{t,4p+2}), \text{UE8M0}(\text{scale}_{t,4p+3})\right)
+$$
+
+其中：
+
+- $t \in [0, T)$ ：token 索引，$T$ 为 token 总数
+- $j \in [0, H)$ ：特征维度索引，$H$ 为隐藏层维度
+- $g \in [0, G)$ ：组索引，$G = H / 128$ 为组数（group_size 固定为 128）
+- $p \in [0, \lceil G/4 \rceil)$ ：打包索引，每 4 组打包到一个 int32
+- $\text{input} \in \mathbb{R}^{T \times H}$ ：输入张量，bf16/fp16
+- $\text{output\_q} \in \mathbb{F}^{T \times H}$ ：8-bit 量化输出张量，FP8 或 INT8
+- $\text{output\_s\_packed} \in \mathbb{Z}^{T \times \lceil G/4 \rceil}$ ：打包缩放因子张量，int32
+- $\text{min\_8bit}, \text{max\_8bit}$ ：8-bit 量化范围约束
+
+### 参数说明
+
+- **input** (torch.Tensor, 入参): 原始输入张量，形状为 [T, H]，数据类型为 bfloat16 或 float16，存储待量化的数据，需为连续张量
+- **output_q** (torch.Tensor, 出参): 8-bit 量化输出张量，形状与 input 一致（[T, H]），数据类型为 FP8 或 INT8，存储量化后的结果，需为连续张量
+- **output_s_packed** (torch.Tensor, 出参): 打包缩放因子张量，形状为 [T, ceil(H/128/4)]，数据类型为 int32，存储 UE8M0 格式打包的缩放因子，要求 stride 为 [1, tma_aligned_mn]
+- **group_size** (int, 入参): 分组量化大小，仅支持 128
+- **eps** (float, 入参): 数值稳定小量，用于防止缩放因子计算中除零
+- **min_8bit** (float, 入参): 8-bit 量化下界，用于约束量化值范围
+- **max_8bit** (float, 入参): 8-bit 量化上界，用于约束量化值范围
+
+### 返回值
+
+无返回值，计算结果直接写入出参张量 output_q 与 output_s_packed 中。
+
+### 约束与调用
+
+- 所有输入/输出张量必须位于 CUDA 设备上
+- 输入张量 input 支持的数据类型：bfloat16、float16
+- 输出张量 output_q 支持的数据类型：FP8（float8_e4m3fn）或 INT8
+- 打包缩放因子张量 output_s_packed 的数据类型必须为 int32
+- group_size 仅支持 128
+- 输入张量必须连续（is_contiguous()），hidden_size 必须能被 128 整除
+- output_s_packed 形状必须为 [mn, k_num_packed_sfk]，其中 k_num_packed_sfk = ceil(groups_per_row / 4)
+- output_s_packed 的 stride 必须为 [1, tma_aligned_mn]，其中 tma_aligned_mn = ceil(mn/4)*4
+- 算子内部通过 PDL（Programmatic Dependent Launch）机制优化 kernel 启动延迟
+
+### 调用示例
+
+```python
+import torch
+import mcoplib.op as op
+
+# 定义运行设备
+device = "cuda"
+
+# 定义算子所需的参数
+num_tokens = 8          # T (mn)
+hidden_size = 512       # H (k)
+group_size = 128        # 固定为 128
+num_groups = hidden_size // group_size  # G
+num_packed = (num_groups + 3) // 4      # 打包后的组数
+
+# 创建输入张量
+input_tensor = torch.randn(num_tokens, hidden_size, dtype=torch.bfloat16, device=device)
+
+# 创建输出张量
+output_q = torch.empty(num_tokens, hidden_size, dtype=torch.float8_e4m3fn, device=device)
+
+# 创建打包缩放因子张量（注意 stride 要求）
+tma_aligned_mn = ((num_tokens + 3) // 4) * 4
+output_s_packed = torch.empty(num_packed, tma_aligned_mn, dtype=torch.int32, device=device)
+output_s_packed = output_s_packed.t()  # 转置以满足 stride [1, tma_aligned_mn]
+output_s_packed = output_s_packed.contiguous()
+
+# 定义 8-bit 范围（FP8 示例）
+min_8bit = -448.0
+max_8bit = 448.0
+eps = 1e-10
+
+# 调用 per_token_group_quant_8bit_packed 算子
+op.per_token_group_quant_8bit_packed(
+    input_tensor,
+    output_q,
+    output_s_packed,
+    group_size,
+    eps,
+    min_8bit,
+    max_8bit
+)
+
+print("per_token_group_quant_8bit_packed computation completed")
+print(f"input shape: {input_tensor.shape}, dtype: {input_tensor.dtype}")
+print(f"output_q shape: {output_q.shape}, dtype: {output_q.dtype}")
+print(f"output_s_packed shape: {output_s_packed.shape}, dtype: {output_s_packed.dtype}")
+```
+
+# Common
+
+## 1. fused_bias_dropout
+
+### 支持的产品型号
+
+- Metax C500/C550/C588/C600
+### 接口原型
+```python
+def fused_bias_dropout(
+    input: at::Tensor,
+    residual: at::Tensor,
+    dropout_prob: float
+) -> at::Tensor
+```
+### 功能描述
+fused_bias_dropout 算子是面向 GPU 优化的融合计算算子，将残差逐元素相加与 dropout 操作合并执行，减少 GPU 显存的读写开销，常用于大语言模型的训练和推理（当前版本中 dropout 功能暂未实现，仅支持 dropout_prob=0.0 的场景）
+- 计算公式：
+当前版本中，fused_bias_dropout 算子仅支持 dropout_prob=0.0
+
+$$
+\text{output}[i_1, i_2, ..., i_n] = \text{input}[i_1, i_2, ..., i_n] + \text{residual}[i_1, i_2, ..., i_n]
+$$
+
+其中：
+- $\text{input}$ ：输入张量，形状记为 $S = (s_1, s_2, ..., s_n)$ ， $n$ 为张量维度数
+- $\text{residual}$ ：残差张量，形状与 $\text{input}$ 完全一致（即 $S = (s_1, s_2, ..., s_n)$ ），用于与输入张量执行逐元素相加
+- $\text{output}$ ：输出张量，形状与 $\text{input}$ 完全一致（即 $S = (s_1, s_2, ..., s_n)$ ），存储逐元素相加的结果
+- $[i_1, i_2, ..., i_n]$ ：张量任意位置的多维索引，满足 $0 \leq i_k < s_k$ （ $k = 1, 2, ..., n$ ），覆盖张量所有元素
+- $+$ ：逐元素加法运算符号
+### 参数说明
+
+- **input** (at:: Tensor, 入参): 基础输入张量，用于参与逐元素相加运算，形状需与 residual 完全一致
+- **residual** (at:: Tensor, 入参): 残差/偏置张量，用于与 input 执行逐元素相加，形状、数据类型需与 input 完全匹配
+- **dropout_prob** (float, 入参): dropout 随机丢弃概率，当前版本仅支持取值为 0.0
+### 返回值
+
+at::Tensor: 输出张量，形状与 input、residual 完全一致，存储 input 与 residual 逐元素相加的结果（当前无 dropout 处理）
+### 约束与调用
+
+- 所有张量必须位于 CUDA 设备上
+- input 与 residual 的形状、数据类型必须完全一致
+- dropout_prob 仅支持取值为 0.0，非 0 值的 dropout 功能暂未实现
+- 支持的数据类型：float16（at::ScalarType::Half）、bfloat16（at::ScalarType::BFloat16）
+- 当 input 的元素总数为 8 的倍数时，算子会启用更高效的向量化处理路径
+### 调用示例
+```python
+import torch
+import mcoplib.op as op
+# 设置计算设备
+device = "cuda"
+# 定义张量形状
+batch_size = 8
+seq_len = 512
+hidden_size = 4096
+# 创建输入张量：需保证input和residual形状、数据类型完全一致
+input_tensor = torch.randn(
+    batch_size, seq_len, hidden_size,
+    dtype=torch.float16,
+    device=device,
+    requires_grad=True  
+)
+residual_tensor = torch.randn_like(input_tensor)  
+# 调用fused_bias_dropout算子
+dropout_prob = 0.0
+output_tensor = op.fused_bias_dropout(input_tensor, residual_tensor, dropout_prob)
+print("fused_bias_dropout computation completed")
+print(f"Input shape: {input_tensor.shape}")
+print(f"Residual shape: {residual_tensor.shape}")
+print(f"Output shape: {output_tensor.shape}")
+print(f"Data type: {output_tensor.dtype}")
+```
+
+## 2. fused_rope_fwd
+### 支持的产品型号
+- Metax C500/C550/C588/C600
+### 接口原型
+```python
+def fused_rope_fwd(
+    qkv: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    indexes: Optional[torch.Tensor] = None,
+    force_bf16_attn: bool = False
+) -> torch.Tensor
+```
+### 功能描述
+fused_rope_fwd 算子实现 RoPE 旋转位置编码的前向计算，是 Transformer 模型中位置编码的核心操作之一。该算子融合了 QKV 张量中 Query（Q）与 Key（K）的旋转逻辑，通过 cos、sin 张量对 Q、K 进行旋转变换，最终输出处理后的 QKV 张量。
+- 计算公式：
+  对 $QKV$ 张量中的 Query（ $Q$ ）和 Key（ $K$ ）分别执行旋转位置编码变换，核心公式如下：
+
+$$
+  \begin{cases}
+  q'_0 = q_0 \cdot \cos(\theta) - q_1 \cdot \sin(\theta) \\
+  q'_1 = q_0 \cdot \sin(\theta) + q_1 \cdot \cos(\theta) \\
+  k'_0 = k_0 \cdot \cos(\theta) - k_1 \cdot \sin(\theta) \\
+  k'_1 = k_0 \cdot \sin(\theta) + k_1 \cdot \cos(\theta)
+  \end{cases}
+$$
+
+  其中：
+- $qkv \in \mathbb{R}^{\text{seq} \times \text{qkv\\_num} \times \text{num\\_head} \times \text{head\\_dim}}$ ：输入的 $QKV$ 融合张量
+- $q_0, q_1 \in \mathbb{R}^{\text{seq} \times \text{num\\_head} \times \text{head\\_dim\\_half}}$ ： $Q$ 张量在 $\text{head\\_dim}$ 维度拆分后的两部分（ $\text{head\\_dim\\_half} = \text{head\\_dim}/2$ ）
+- $k_0, k_1 \in \mathbb{R}^{\text{seq} \times \text{num\\_head} \times \text{head\\_dim\\_half}}$ ： $K$ 张量在 $\text{head\\_dim}$ 维度拆分后的两部分
+- $\cos (\theta), \sin (\theta) \in \mathbb{R}^{\text{seq} \times \text{head\\_dim\\_half}}$ ：对应位置的余弦、正弦位置编码张量
+- $\text{seq}$ ：序列长度， $\text{qkv\\_num}$ ： $Q/K/V$ 的数量（通常为 $3$ ）， $\text{num\\_head}$ ：注意力头数， $\text{head\\_dim}$ ：单头维度
+  变换后合并结果并更新至原 $QKV$ 张量：
+
+$$
+  \text{qkv}[..., :\text{head\\_dim\\_half}] = q'_0, \quad \text{qkv}[..., \text{head\\_dim\\_half}:] = q'_1
+$$
+
+
+
+$$
+  \text{qkv}[..., :\text{head\\_dim\\_half}] = k'_0, \quad \text{qkv}[..., \text{head\\_dim\\_half}:] = k'_1
+$$
+
+### 参数说明
+- **qkv** (torch.Tensor, 入参/出参): 输入的 QKV 融合张量，形状为[seq, qkv_num, num_head, head_dim]，处理后的结果直接写入该张量并作为返回值
+- **cos** (torch.Tensor, 入参): RoPE 对应的余弦值张量，其第二维度需与 head_dim 的一半（head_dim_half）匹配
+- **sin** (torch.Tensor, 入参): RoPE 对应的正弦值张量，维度要求与 cos 完全一致
+- **indexes** (Optional[torch.Tensor], 入参): 可选的序列索引张量，数据类型需为 long，若传入则用于定位当前序列对应的 cos/sin 值
+- **force_bf16_attn** (bool, 入参): 是否强制使用 bfloat16 精度执行计算，默认值为 False
+### 返回值
+返回处理后的 QKV 张量（与输入 qkv 为同一张量，结果已直接写入）
+### 约束与调用
+- 所有输入/输出张量必须分配在 GPU 显存中
+- 张量在物理内存中必须是连续排列的
+- 支持的数据类型：float16（Half）、bfloat16
+- qkv 维度约束：seq=qkv.size (0)、qkv_num=qkv.size (1)、num_head=qkv.size (2)、head_dim=qkv.size (3)，且 head_dim=2*cos.size (1)
+- 若传入 indexes，其数据类型必须为 at::scalar_type::long
+### 调用示例
+```python
+import torch
+import mcoplib.op as op
+device = "cuda"
+# 定义张量维度
+seq = 4096  # qkv.size(0)
+qkv_num = 4  # qkv.size(1)
+num_head = 64  # qkv.size(2)
+head_dim = 128  # qkv.size(3)
+head_dim_half = head_dim // 2  # 64，对应cos.size(1)
+# 创建输入张量
+qkv = torch.randn(seq, qkv_num, num_head, head_dim, dtype=torch.float16, device=device)
+cos = torch.randn(seq, head_dim_half, dtype=torch.float16, device=device)
+sin = torch.randn(seq, head_dim_half, dtype=torch.float16, device=device)
+# 可选的indexes张量
+indexes = torch.randint(0, seq, (seq,), dtype=torch.long, device=device)
+# 若不需要indexes，可设为None：indexes = None
+# 调用fused_rope_fwd算子
+output_qkv = op.fused_rope_fwd(
+    qkv,
+    cos,
+    sin,
+    indexes,
+    False
+)
+print("fused_rope_fwd computation completed")
+print(f"Output QKV shape: {output_qkv.shape}")  # 应与输入qkv形状一致
+```
+
+## 3. fused_rope_bwd
+### 支持的产品型号
+- Metax C500/C550/C588/C600
+### 接口原型
+```python
+def fused_rope_bwd(
+    qkv: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    indexes: Optional[torch.Tensor] = None,
+    force_bf16_attn: bool = False
+) -> torch.Tensor
+```
+### 功能描述
+fused_rope_bwd 算子实现 RoPE（旋转位置编码）的反向传播计算，对应 fused_rope_fwd 的梯度回传逻辑。该算子通过 cos、sin 张量对 QKV 梯度张量执行反向旋转变换，完成梯度的反向传播处理
+- 计算公式：
+  对 $QKV$ 梯度张量中的 Query 梯度（ $\nabla q$ ）和 Key 梯度（ $\nabla k$ ）执行反向旋转变换，核心公式如下：
+
+$$
+  \begin{cases}
+  \nabla q'_0 = \nabla q_0 \cdot \cos(\theta) + \nabla q_1 \cdot \sin(\theta) \\
+  \nabla q'_1 = -\nabla q_0 \cdot \sin(\theta) + \nabla q_1 \cdot \cos(\theta) \\
+  \nabla k'_0 = \nabla k_0 \cdot \cos(\theta) + \nabla k_1 \cdot \sin(\theta) \\
+  \nabla k'_1 = -\nabla k_0 \cdot \sin(\theta) + \nabla k_1 \cdot \cos(\theta)
+  \end{cases}
+$$
+
+  其中：
+- $\nabla \text{qkv} \in \mathbb{R}^{\text{seq} \times \text{qkv\\_num} \times \text{num\\_head} \times \text{head\\_dim}}$ ：输入的 $QKV$ 融合梯度张量
+- $\nabla q_0, \nabla q_1 \in \mathbb{R}^{\text{seq} \times \text{num\\_head} \times \text{head\\_dim\\_half}}$ ： $\nabla q$ 在 $\text{head\\_dim}$ 维度拆分后的两部分
+- $\nabla k_0, \nabla k_1 \in \mathbb{R}^{\text{seq} \times \text{num\\_head} \times \text{head\\_dim\\_half}}$ ： $\nabla k$ 在 $\text{head\\_dim}$ 维度拆分后的两部分
+- $\cos (\theta), \sin (\theta) \in \mathbb{R}^{\text{seq} \times \text{head\\_dim\\_half}}$ ：对应位置的余弦、正弦位置编码张量（与前向一致）
+- $\text{seq}$ ：序列长度， $\text{qkv\\_num}$ ： $Q/K/V$ 的数量， $\text{num\\_head}$ ：注意力头数， $\text{head\\_dim}$ ：单头维度
+  变换后合并结果并更新至原 $QKV$ 梯度张量：
+
+$$
+  \nabla \text{qkv}[..., :\text{head\\_dim\\_half}] = \nabla q'_0, \quad \nabla \text{qkv}[..., \text{head\\_dim\\_half}:] = \nabla q'_1
+$$
+
+
+
+$$
+  \nabla \text{qkv}[..., :\text{head\\_dim\\_half}] = \nabla k'_0, \quad \nabla \text{qkv}[..., \text{head\\_dim\\_half}:] = \nabla k'_1
+$$
+
+### 参数说明
+- **qkv** (torch.Tensor, 入参/出参): 输入的 QKV 梯度张量，形状为[seq, qkv_num, num_head, head_dim]；处理后的梯度结果直接写入该张量并作为返回值
+- **cos** (torch.Tensor, 入参): RoPE 对应的余弦值张量，其第二维度需与 head_dim 的一半（head_dim_half）匹配
+- **sin** (torch.Tensor, 入参): RoPE 对应的正弦值张量，维度要求与 cos 完全一致
+- **indexes** (Optional[torch.Tensor], 入参): 可选的序列索引张量，数据类型需为 long，若传入则用于定位当前序列对应的 cos/sin 值
+- **force_bf16_attn** (bool, 入参): 是否强制使用 bfloat16 精度执行计算，默认值为 False
+### 返回值
+返回处理后的 QKV 梯度张量，与输入`qkv 为同一张量，结果已直接写入
+### 约束与调用
+- 所有输入张量必须部署在 CUDA 设备上
+- 张量在物理内存中必须是连续排列的
+- 支持的数据类型：float16（Half）、bfloat16
+- qkv 维度约束：seq=qkv.size (0)、qkv_num=qkv.size (1)、num_head=qkv.size (2)、head_dim=qkv.size (3)，且`ead_dim = 2 * cos.size (1)
+- 若传入 indexes，其数据类型必须为 at::scalar_type::long
+### 调用示例
+```python
+import torch
+import mcoplib.op as op
+device = "cuda"
+# 定义与前向一致的张量维度
+seq = 4096
+qkv_num = 4
+num_head = 64
+head_dim = 128
+head_dim_half = head_dim // 2
+# 创建反向传播的输入张量
+qkv_grad = torch.randn(seq, qkv_num, num_head, head_dim, dtype=torch.float16, device=device)
+# 复用前向的cos/sin
+cos = torch.randn(seq, head_dim_half, dtype=torch.float16, device=device)
+sin = torch.randn(seq, head_dim_half, dtype=torch.float16, device=device)
+# 可选的indexes张量
+indexes = torch.randint(0, seq, (seq,), dtype=torch.long, device=device)
+# 调用fused_rope_bwd算子
+output_qkv_grad = op.fused_rope_bwd(
+    qkv_grad,
+    cos,
+    sin,
+    indexes,
+    False
+)
+print("fused_rope_bwd computation completed")
+print(f"Output QKV gradient shape: {output_qkv_grad.shape}")
+```
+
+## 4. fused_bias_swiglu_fwd
+### 支持的产品型号
+- Metax C500/C550/C588/C600
+### 接口原型
+```python
+def fused_bias_swiglu_fwd(
+    input: at::Tensor
+) -> at::Tensor
+```
+### 功能描述
+fused_bias_swiglu_fwd 算子实现融合 Bias 的 SwiGLU 激活前向计算，是大模型（Transformer 类）中高效处理中间特征的算子。算子将张量沿最后一个维度分成两部分，并行计算 SwiGLU 激活，拆分后第一部分与 sigmoid (拆分后第二部分) 相乘，并通过算子融合减少内存读写开销
+- 计算公式：
+
+$$
+  \sigma(z) = \frac{1}{1 + e^{-z}}
+$$
+
+
+
+$$
+  x_1 = \text{input}[..., :d] + b_1
+$$
+
+
+
+$$
+  x_2 = \text{input}[..., d:] + b_2
+$$
+
+
+
+$$
+  \text{output} = x_1 \odot \sigma(x_2)
+$$
+
+  其中：
+- $\text{input} \in \mathbb{R}^{N \times M \times 2d}$ 是 CUDA 设备上的半精度（half/bfloat16）连续张量， $N$ 为 batch 维度， $M$ 为序列长度维度
+- $d = \frac{\text{input.size (-1)}}{2}$ ，即输入最后一维长度的 1/2（hidden_size 的 1/2）
+- $x_1$ 是输入张量沿最后一维拆分的前半部分， $x_2$ 是拆分的后半部分
+- $b_1, b_2$ 为对应维度的偏置项（当前实现中暂未启用，默认为 0）
+- $\sigma (z)$ 是 sigmoid 激活函数
+- $\odot$ 表示逐元素乘法
+- $\text{output} \in \mathbb{R}^{N \times M \times d}$ 是输出张量，与输入同设备、同数据类型
+### 参数说明
+- **input** (at:: Tensor, 入参): 前向计算的原始输入张量，用于执行融合 Bias 的 SwiGLU 激活计算。最后一维长度需为偶数，用于拆分为两等份，形状通常为「N×M×2d」（N 为 batch 维度、M 为序列长度维度、d 为 hidden_size 的 1/2）。
+### 返回值
+at::Tensor: 前向计算输出张量，与输入 input 同设备、同数据类型；形状为「N×M×d」（最后一维长度为 input 的 1/2），存储 input 经 SwiGLU 激活（拆分后前半部分×sigmoid (拆分后后半部分)）计算后的结果。
+### 约束与调用
+- 所有张量必须位于 CUDA 设备上
+- input 张量需为连续内存
+- input 最后一维长度必须为偶数，需拆分为两等份用于 SwiGLU 计算
+- 支持的数据类型：float16（at::ScalarType::Half）和 bfloat16（at::ScalarType::BFloat16）
+- 当 input 的元素总数为 8 的倍数时，算子会启用更高效的向量化批量处理
+- 偏置项（b1、b2）当前实现暂未启用，默认按 0 参与计算
+### 调用示例
+```python
+import torch
+import mcoplib.op as op
+# 设置计算设备
+device = "cuda"
+# 定义张量形状
+batch_size = 8
+seq_len = 512
+hidden_size = 4096 
+# 创建前向输入张量
+input_tensor = torch.randn(
+    batch_size, seq_len, hidden_size,
+    dtype=torch.float16,
+    device=device,
+    requires_grad=True
+)
+# 调用fused_bias_swiglu_fwd算子
+output_tensor = op.fused_bias_swiglu_fwd(input_tensor)
+print("fused_bias_swiglu_fwd computation completed")
+print(f"Input shape: {input_tensor.shape}")
+print(f"Output shape: {output_tensor.shape}") 
+print(f"Data type: {output_tensor.dtype}")
+print(f"Device: {output_tensor.device}")
+```
+
+## 5. fused_bias_swiglu_bwd
+### 支持的产品型号
+- Metax C500/C550/C588/C600
+### 接口原型
+```python
+def fused_bias_swiglu_bwd(
+    input: at::Tensor,
+    grad_output: at::Tensor
+) -> at::Tensor
+```
+### 功能描述
+fused_bias_swiglu_bwd 算子实现 SwiGLU 激活对应的反向梯度计算，是大模型训练中保障梯度传播的关键算子。算子接收前向计算的原始输入张量和输出梯度张量，通过 CUDA 多线程并行，结合链式法则推导输入梯度，利用原输入计算 sigmoid 导数并与输出梯度相乘，输出与原输入维度一致的半精度梯度张量，为模型参数更新提供支撑
+- 计算公式：
+
+$$
+  \sigma(z) = \frac{1}{1 + e^{-z}}
+$$
+
+
+
+$$
+  \sigma'(z) = \sigma(z) \cdot (1 - \sigma(z))
+$$
+
+
+
+$$
+  x_1 = \text{input}[..., :d] + b_1
+$$
+
+
+
+$$
+  x_2 = \text{input}[..., d:] + b_2
+$$
+
+
+
+$$
+  \nabla x_1 = G \odot \sigma(x_2)
+$$
+
+
+
+$$
+  \nabla x_2 = G \odot x_1 \odot \sigma'(x_2)
+$$
+
+
+
+$$
+  \nabla \text{input} = \text{concat}(\nabla x_1, \nabla x_2, \text{dim}=-1)
+$$
+
+  其中：
+- $\text{input} \in \mathbb{R}^{N \times M \times 2d}$ 是前向计算的原始输入张量（CUDA 设备、半精度、连续）
+- $G \in \mathbb{R}^{N \times M \times d}$ 是前向输出张量对应的梯度张量（与输入同设备、同数据类型）
+- $d = \frac{\text{input.size (-1)}}{2}$ ，与前向计算中 $d$ 的定义一致
+- $x_1, x_2$ 是输入张量沿最后一维拆分的两部分， $b_1, b_2$ 为偏置项（暂未启用，默认为 0）
+- $\sigma (z)$ 是 sigmoid 函数， $\sigma' (z)$ 是 sigmoid 函数的导数
+- $\nabla x_1$ 是拆分前半部分 $x_1$ 的梯度， $\nabla x_2$ 是拆分后半部分 $x_2$ 的梯度
+- $\odot$ 表示逐元素乘法， $\text{concat}(\cdot, \cdot, \text{dim}=-1)$ 表示沿最后一维拼接
+- $\nabla \text{input} \in \mathbb{R}^{N \times M \times 2d}$ 是输出的输入梯度张量，与原始输入 $\text{input}$ 维度、设备、数据类型完全一致
+### 参数说明
+- **input** (at:: Tensor, 入参): 前向计算时的原始输入张量，用于反向梯度推导的基础数据，需连续内存，形状为[N×M×2d]，与前向计算的 input 完全一致
+- **grad_output** (at:: Tensor, 入参): 前向输出张量对应的梯度张量，用于传递反向传播的梯度信号, 需与 input 同设备、同数据类型且为连续内存. 形状与前向输出张量形状一致，最后一维长度为 input 的 1/2
+### 返回值
+at::Tensor: 输入梯度输出张量，与原始输入 input 同设备、同数据类型、同形状[N×M×2d], 存储通过链式法则推导的 input 对应的梯度值，为模型参数更新提供支撑
+### 约束与调用
+- 所有张量必须位于 CUDA 设备上，且 input 与 grad_output 需在同一设备
+- input 和 grad_output 均需为连续内存，数据类型必须完全一致，仅支持 float16、bfloat16
+- input 最后一维长度必须是 grad_output 最后一维长度的 2 倍，与前向计算的拆分逻辑匹配
+- 当 grad_output 的元素总数为 8 的倍数时，算子会启用更高效的向量化批量处理
+- 偏置项（b1、b2）当前实现暂未启用，梯度计算中默认按偏置为 0 推导
+### 调用示例
+```python
+import torch
+import mcoplib.op as op
+# 设置计算设备
+device = "cuda"
+# 定义张量形状
+batch_size = 8
+seq_len = 512
+hidden_size = 4096  
+output_hidden_size = hidden_size // 2  
+# 先执行前向计算
+input_tensor = torch.randn(
+    batch_size, seq_len, hidden_size,
+    dtype=torch.float16,
+    device=device,
+    requires_grad=True
+)
+forward_output = fused_bias_swiglu_fwd(input_tensor)
+# 创建输出梯度张量
+grad_output = torch.randn_like(forward_output)
+# 调用fused_bias_swiglu_bwd算子
+grad_input = op.fused_bias_swiglu_bwd(input_tensor, grad_output)
+print("fused_bias_swiglu_bwd computation completed")
+print(f"Original input shape: {input_tensor.shape}")
+print(f"Grad output shape: {grad_output.shape}")
+print(f"Input gradient shape: {grad_input.shape}")  
+print(f"Data type: {grad_input.dtype}")
+print(f"Device: {grad_input.device}")
+```
+
+## 6. fused_repeat_kv_fwd
+### 支持的产品型号
+- Metax C500/C550/C588/C600
+### 接口原型
+```python
+def fused_repeat_kv_fwd(
+    input: at::Tensor,
+    q_num_head: int,
+    kv_num_head: int,
+    head_dim: int
+) -> at::Tensor
+```
+### 功能描述
+fused_repeat_kv_fwd 是多查询注意力和组查询注意力场景下的前向融合算子，该算子将数量较少的 KV 头，重复扩展至与查询头相同的数量，同时拆分出 Q、K、V 三类张量，通过 CUDA 核融合操作替代 PyTorch 原生的多步操作，提升计算与内存访问效率
+- 计算公式：
+输入张量形状：
+
+$$
+\text{input} \in \mathbb{R}^{\text{seq} \times \text{bs} \times \text{partition} \times (\text{q\\_num\\_head} + 2 \cdot \text{kv\\_num\\_head}) \cdot \text{head\\_dim}}
+$$
+
+输出张量形状：
+
+$$
+\text{output} \in \mathbb{R}^{\text{seq} \times \text{bs} \times 3 \times \text{q\\_num\\_head} \times \text{head\\_dim}}
+$$
+
+拆分输入为 Q、K、V 分量：
+
+$$
+\begin{cases}
+\text{Q}_{\text{input}} = \text{input}[..., :\text{q\\_num\\_head} \cdot \text{head\\_dim}] \\
+\text{K}_{\text{input}} = \text{input}[..., \text{q\\_num\\_head} \cdot \text{head\\_dim} : (\text{q\\_num\\_head} + \text{kv\\_num\\_head}) \cdot \text{head\\_dim}] \\
+\text{V}_{\text{input}} = \text{input}[..., (\text{q\\_num\\_head} + \text{kv\\_num\\_head}) \cdot \text{head\\_dim} :]
+\end{cases}
+$$
+
+KV 头重复次数：
+
+$$
+\text{repeat} = \frac{\text{q\\_num\\_head}}{\text{kv\\_num\\_head}}
+$$
+
+重复 KV 分量至匹配 Q 头数：
+
+$$
+\begin{cases}
+\text{K}_{\text{repeated}} = \text{repeat}(\text{K}_{\text{input}}, \text{dim}=3, \text{repeats}=\text{repeat}) \\
+\text{V}_{\text{repeated}} = \text{repeat}(\text{V}_{\text{input}}, \text{dim}=3, \text{repeats}=\text{repeat})
+\end{cases}
+$$
+
+映射至输出张量：
+
+$$
+\begin{cases}
+\text{output}[..., 0, :, :] = \text{reshape}(\text{Q}_{\text{input}}, [\text{seq}, \text{bs}, \text{q\\_num\\_head}, \text{head\\_dim}]) \\
+\text{output}[..., 1, :, :] = \text{reshape}(\text{K}_{\text{repeated}}, [\text{seq}, \text{bs}, \text{q\\_num\\_head}, \text{head\\_dim}]) \\
+\text{output}[..., 2, :, :] = \text{reshape}(\text{V}_{\text{repeated}}, [\text{seq}, \text{bs}, \text{q\\_num\\_head}, \text{head\\_dim}])
+\end{cases}
+$$
+
+其中：
+- $\text{seq}$ 是序列长度
+- $\text{bs}$ 是 batch 大小
+- $\text{partition}$ 是张量在头维度的分片数
+- $\text{q\\_num\\_head}$ 是查询头总数
+- $\text{kv\\_num\\_head}$ 是键/值头总数
+- $\text{head\\_dim}$ 是单个注意力头的维度
+- $\text{repeat}$ 是 KV 头需要重复的次数
+### 参数说明
+- **input** (at:: Tensor, 入参): 合并的 QKV 输入张量，形状为`[seq, bs, partition, (q_num_head+2*kv_num_head)*head_dim]`
+- **q_num_head** (int, 入参): 查询头总数，需为 kv_num_head 的整数倍, 保证 KV 头可均匀重复扩展
+- **kv_num_head** (int, 入参): 键/值头总数，与 q_num_head 配合确定 KV 头的重复次数
+- **head_dim** (int, 入参): 单个注意力头的维度，用于计算输入/输出张量的维度大小
+### 返回值
+返回拆分并重复后的 QKV 张量（at::Tensor），形状为`[seq, bs, 3, q_num_head, head_dim]`，其中第 2 维的 3 分别对应 Q、K、V 三个分量
+### 约束与调用
+- 所有输入张量必须位于 CUDA 设备上
+- 输入张量需为 4 维连续存储的张量
+- 支持的数据类型：仅 float16（Half）、bfloat16
+- 查询头数 q_num_head 必须是 KV 头数 kv_num_head 的整数倍
+- partition 参数需为合法分片数
+- 输入/输出的维度需匹配，输入：`[seq, bs, partition, (q_num_head+kv_num_head*2)*head_dim]`，输出：`[seq, bs, 3, q_num_head, head_dim]`）
+### 调用示例
+```python
+import torch
+import mcoplib.op as op
+device = "cuda"
+# 定义算子参数
+seq_len = 4096       
+batch_size = 2       
+partition = 2       
+q_num_head = 128     
+kv_num_head = 8      
+head_dim = 128      
+dtype = torch.bfloat16  
+# 计算输入张量形状：
+input_dim = (q_num_head // partition + 2 * (kv_num_head // partition)) * head_dim
+qkv_input = torch.randn(
+    seq_len, batch_size, partition, input_dim,
+    dtype=dtype, device=device
+)
+# 调用fused_repeat_kv_fwd算子
+output_fwd = op.fused_repeat_kv_fwd(
+    qkv_input,
+    q_num_head=q_num_head,
+    kv_num_head=kv_num_head,
+    head_dim=head_dim
+)
+print("fused_repeat_kv_fwd computation completed")
+print(f"输入张量形状: {qkv_input.shape}")
+print(f"输出张量形状: {output_fwd.shape}") 
+```
+
+## 7. fused_repeat_kv_bwd
+### 支持的产品型号
+- Metax C500/C550/C588/C600
+### 接口原型
+```python
+def fused_repeat_kv_bwd(
+    input: at::Tensor,
+    q_num_head: int,
+    kv_num_head: int,
+    partition: int
+) -> at::Tensor
+```
+### 功能描述
+fused_repeat_kv_bwd 是 fused_repeat_kv_fwd 对应的反向传播算子，用于多查询注意力和组查询注意力场景下的梯度传递，该算子将前向扩展后的 KV 头维度对应的输出梯度累加汇总回原始 KV 头数量对应的输入梯度形状，实现自动微分的链式法则逻辑，通过 CUDA 核融合提升反向计算效率
+- 计算公式：
+输入张量形状（前向输出梯度）：
+
+$$
+\text{input} \in \mathbb{R}^{\text{seq} \times \text{bs} \times 3 \times \text{q\\_num\\_head} \times \text{head\\_dim}}
+$$
+
+输出张量形状（前向输入梯度）：
+
+$$
+\text{output} \in \mathbb{R}^{\text{seq} \times \text{bs} \times \text{partition} \times \frac{(\text{q\\_num\\_head} + 2 \cdot \text{kv\\_num\\_head}) \cdot \text{head\\_dim}}{\text{partition}}}
+$$
+
+拆分输入为 Q、K、V 梯度分量：
+
+$$
+\begin{cases}
+\text{Q}_{\text{grad}} = \text{input}[..., 0, :, :] \\
+\text{K}_{\text{grad}} = \text{input}[..., 1, :, :] \\
+\text{V}_{\text{grad}} = \text{input}[..., 2, :, :]
+\end{cases}
+$$
+
+KV 头重复次数（与前向一致）：
+
+$$
+\text{repeat} = \frac{\text{q\\_num\\_head}}{\text{kv\\_num\\_head}}
+$$
+
+累加 KV 梯度至原始头数：
+
+$$
+\begin{cases}
+\text{K}_{\text{grad\\_agg}} = \text{sum}\left( 
+    \text{reshape}(\text{K}_{\text{grad}}, [\text{seq}, \text{bs}, \text{repeat}, \text{kv\\_num\\_head}, \text{head\\_dim}]), 
+    \text{dim}=2 
+\right) \\
+\text{V}_{\text{grad\\_agg}} = \text{sum}\left( 
+    \text{reshape}(\text{V}_{\text{grad}}, [\text{seq}, \text{bs}, \text{repeat}, \text{kv\\_num\\_head}, \text{head\\_dim}]), 
+    \text{dim}=2 
+\right)
+\end{cases}
+$$
+
+将各梯度分量展平为 2D（最后一维合并）：
+
+$$
+\text{Q}_{\text{grad\\_flat}} = \text{reshape}(\text{Q}_{\text{grad}}, [\text{seq}, \text{bs}, \text{q\\_num\\_head} \cdot \text{head\\_dim}])
+$$
+
+
+
+$$
+\text{K}_{\text{grad\\_agg\\_flat}} = \text{reshape}(\text{K}_{\text{grad\\_agg}}, [\text{seq}, \text{bs}, \text{kv\\_num\\_head} \cdot \text{head\\_dim}])
+$$
+
+
+
+$$
+\text{V}_{\text{grad\\_agg\\_flat}} = \text{reshape}(\text{V}_{\text{grad\\_agg}}, [\text{seq}, \text{bs}, \text{kv\\_num\\_head} \cdot \text{head\\_dim}])
+$$
+
+拼接展平后的梯度分量（沿最后一维）：
+
+$$
+\text{concat\\_grad} = \text{concat}(\text{Q}_{\text{grad\\_flat}}, \text{K}_{\text{grad\\_agg\\_flat}}, \text{V}_{\text{grad\\_agg\\_flat}}, \text{dim}=-1)
+$$
+
+分片输出梯度（还原为输入张量的形状）：
+
+$$
+\text{output} = \text{reshape}(\text{concat\\_grad}, [
+    \text{seq}, \text{bs}, \text{partition}, \\
+    \frac{(\text{q\\_num\\_head} + 2 \cdot \text{kv\\_num\\_head}) \cdot \text{head\\_dim}}{\text{partition}}
+])
+$$
+
+约束条件：
+
+$$
+(\text{q\\_num\\_head} + 2 \cdot \text{kv\\_num\\_head}) \cdot \text{head\\_dim} \quad \text{必须能被} \quad \text{partition} \quad \text{整除}
+$$
+
+其中：
+- $\text{seq}$ 是序列长度
+- $\text{bs}$ 是 batch 大小
+- $\text{partition}$ 是张量在头维度的分片数（用于张量并行）
+- $\text{q\\_num\\_head}$ 是查询头总数
+- $\text{kv\\_num\\_head}$ 是键/值头总数
+- $\text{head\\_dim}$ 是单个注意力头的维度
+- $\text{repeat}$ 是 KV 头在前向过程中重复的次数（必须为整数）
+- $\text{concat\\_grad}$ 是拼接后的梯度张量（展平状态）
+- $\text{K}_{\text{grad\\_agg}}$ 、 $\text{V}_{\text{grad\\_agg}}$ 是累加后的 KV 梯度（还原至原始 KV 头数）
+- $\text{Q}_{\text{grad\\_flat}}$ 、 $\text{K}_{\text{grad\\_agg\\_flat}}$ 、 $\text{V}_{\text{grad\\_agg\\_flat}}$ 是各梯度展平后的中间变量
+### 参数说明
+- **input** (at:: Tensor, 入参): 前向输出张量的梯度，形状为[seq, bs, 3, q_num_head, head_dim]，与 fused_repeat_kv_fwd 的输出形状一致
+- **q_num_head** (int, 入参): 查询头总数，需为 kv_num_head 的整数倍，与前向算子保持一致
+- **kv_num_head** (int, 入参): 键/值头总数，用于确定梯度累加的分组数量
+- **partition** (int, 入参): 张量在头维度的分片数，用于张量并行，需满足`(q_num_head+2*kv_num_head)*head_dim` 能被其整除
+### 返回值
+返回前向输入张量的梯度（at::Tensor），形状为`[seq, bs, partition, (q_num_head+2*kv_num_head)*head_dim/partition]`，与 `fused_repeat_kv_fwd` 的输入形状匹配
+### 约束与调用
+- 所有输入张量必须位于 CUDA 设备上
+- 输入张量需为 5 维连续存储的张量
+- 支持的数据类型：仅 float16（Half）、bfloat16
+- 查询头数 q_num_head 必须是 KV 头数 kv_num_head 的整数倍
+- 输入张量的最后一维维度需与 head_dim 匹配
+- 输出张量的维度由输入维度与 partition 参数计算生成，需满足 `(q_num_head+kv_num_head*2)*head_dim/partition` 的合法性
+- 输入/输出的维度需匹配，输入：`[seq, bs, partition, (q_num_head+kv_num_head*2)*head_dim]`，输出：`[seq, bs, partition, (q_num_head+kv_num_head*2)*head_dim/partition]`
+### 调用示例
+```python
+import torch
+import mcoplib.op as op
+device = "cuda"
+# 复用fused_repeat_kv_fwd的参数配置
+seq_len = 4096
+batch_size = 2
+partition = 2
+q_num_head = 128
+kv_num_head = 8
+head_dim = 128
+dtype = torch.bfloat16
+# 先获取fused_repeat_kv_fwd的输出（作为反向算子的输入）
+fwd_output = torch.randn(
+    seq_len, batch_size, 3, q_num_head, head_dim,
+    dtype=dtype, device=device
+)
+# 调用fused_repeat_kv_bwd算子
+output_bwd = op.fused_repeat_kv_bwd(
+    fwd_output,
+    q_num_head,
+    kv_num_head,
+    partition
+)
+print("fused_repeat_kv_bwd computation completed")
+print(f"输入张量形状: {fwd_output.shape}")
+print(f"输出张量形状: {output_bwd.shape}")  
+```
+
+## 8. fused_gelu_fwd
+### 支持的产品型号
+- Metax C500/C550/C588/C600
+### 接口原型
+```python
+def fused_gelu_fwd(
+    input: torch.Tensor,
+    bias: torch.Tensor
+) -> torch.Tensor
+```
+### 功能描述
+fused_gelu_fwd 算子实现了加偏置和 GELU 激活的融合计算操作。该算子首先将偏置张量按 input 的 hidden 维度对应叠加到输入张量上，随后对叠加结果应用 GELU 激活函数。融合操作减少了中间结果的内存读写次数，提升计算效率，常用于神经网络激活层前的偏置叠加与激活组合流程。
+- 计算公式：
+加偏置操作：  
+
+$$
+T_{b, s, h} = \text{input}_{b, s, h} + \text{bias}_h
+$$
+
+GELU 激活操作，标准正态分布累积分布函数近似：  
+
+$$
+\text{output}_{b, s, h} = T_{b, s, h} \cdot 0.5 \cdot \left(1 + \text{erf}\left(\frac{T_{b, s, h}}{\sqrt{2}}\right)\right)
+$$
+
+其中：  
+- $\text{input} \in \mathbb{R}^{B \times S \times H}$ 为输入张量（ $B$=batchsize， $S$=序列长度， $H$=hidden 维度）；  
+- $\text{bias} \in \mathbb{R}^H$ 为偏置张量，通过广播机制匹配 $\text{input}$ 的 $H$ 维度；  
+- $T$ 为加偏置后的中间张量（形状与 $\text{input}$ 一致）；  
+- $\text{erf}(\cdot)$ 为误差函数；  
+- $\text{output} \in \mathbb{R}^{B \times S \times H}$ 为最终输出张量，形状与 $\text{input}$ 一致。  
+### 参数说明
+- **input** (torch.Tensor, 入参): 待处理的输入张量，需进行加偏置与 GELU 激活计算
+- **bias** (torch.Tensor, 入参): 偏置张量，形状需匹配 input 的 hidden 维度
+### 返回值
+返回 torch.Tensor 类型的输出张量，形状与 input 完全一致，存储计算结果
+### 约束与调用
+- 所有张量必须位于 CUDA 设备上
+- input 需包含 hidden 维度
+- bias 的形状需与 input 的 hidden 维度匹配
+- 支持的数据类型：float32, float16, bfloat16
+### 调用示例
+```python
+import torch
+import mcoplib.op as op
+device = "cuda"
+# 参数配置
+batch_size = 2
+seq_len = 1024
+hidden_size = 768  
+dtype = torch.bfloat16 
+# 创建输入张量
+input = torch.randn(
+    batch_size, seq_len, hidden_size,
+    dtype=dtype, device=device
+)
+bias = torch.randn(
+    hidden_size,  
+    dtype=dtype, device=device
+)
+# 调用fused_gelu_fwd算子
+output_fwd = op.fused_gelu_fwd(input, bias)
+# 验证输出
+print("fused_gelu_fwd computation completed")
+print(f"输入input形状: {input.shape}")
+print(f"输入bias形状: {bias.shape}")
+print(f"输出output_fwd形状: {output_fwd.shape}")
+```
+
+## 9. fused_gelu_bwd
+### 支持的产品型号
+- Metax C500/C550/C588/C600
+### 接口原型
+```python
+def fused_gelu_bwd(
+    input: torch.Tensor,
+    input1: torch.Tensor,
+    bias: torch.Tensor
+) -> torch.Tensor
+```
+### 功能描述
+fused_gelu_bwd 算子实现了加偏置和 GELU 激活的反向传播融合计算。该算子根据前向计算的输入张量、偏置张量，以及上游传递的梯度张量，计算得到对应前向输入的梯度结果。融合操作减少了反向传播的内存交互开销，提升计算效率，是 fused_gelu_fwd 算子的配套反向算子
+- 计算公式：
+前向加偏置的中间张量：  
+
+$$
+T_{b, s, h} = \text{input}_{b, s, h} + \text{bias}_h
+$$
+
+GELU 函数在 $T$ 处的导数，链式法则中间项：  
+
+$$
+\text{gelu\\_deriv}_{b, s, h} = 0.5 \cdot \left(1 + \text{erf}\left(\frac{T_{b, s, h}}{\sqrt{2}}\right)\right) + \frac{T_{b, s, h}}{\sqrt{2\pi}} \cdot \exp\left(-\frac{T_{b, s, h}^2}{2}\right)
+$$
+
+输入张量 $\text{input}$ 的梯度，链式法则传递上游梯度：  
+
+$$
+\text{output}_{b, s, h} = \text{input1}_{b, s, h} \cdot \text{gelu\\_deriv}_{b, s, h}
+$$
+
+其中：  
+- $\text{input} \in \mathbb{R}^{B \times S \times H}$ 为前向输入张量；  
+- $\text{input1} \in \mathbb{R}^{B \times S \times H}$ 为上游传递的梯度张量（对应前向输出 $\text{output}$ 的梯度）；  
+- $\text{bias} \in \mathbb{R}^H$ 为前向使用的偏置张量；  
+- $T$ 为前向加偏置后的中间张量（形状与 $\text{input}$ 一致）；  
+- $\text{gelu\\_deriv}$ 为 GELU 函数在 $T$ 处的导数张量（形状与 $\text{input}$ 一致）；  
+- $\text{output} \in \mathbb{R}^{B \times S \times H}$ 为最终输出张量（对应前向输入 $\text{input}$ 的梯度，形状与 $\text{input}$ 一致）；  
+- $\text{erf}(\cdot)$ 为误差函数， $\exp (\cdot)$ 为指数函数。
+### 参数说明
+- **input** (torch.Tensor, 入参): 前向计算时的输入张量
+- **input1** (torch.Tensor, 入参): 上游传递的梯度张量，对应 fused_gelu_fwd 输出的梯度
+- **bias** (torch.Tensor, 入参): 前向计算时使用的偏置张量，形状需匹配 input 的 hidden 维度
+### 返回值
+返回 torch.Tensor 类型的输出张量，形状与 input 完全一致，存储对应前向输入的梯度计算结果
+### 约束与调用
+- 所有张量必须位于 CUDA 设备上
+- input 与 input1 的形状必须完全相同
+- bias 的形状需与 input 的 hidden 维度匹配
+- 支持的数据类型：float32, float16, bfloat16
+### 调用示例
+```python
+import torch
+import mcoplib.op as op
+device = "cuda"
+# 复用fused_gelu_fwd的参数配置
+batch_size = 2
+seq_len = 1024
+hidden_size = 768
+dtype = torch.bfloat16
+# 创建输入张量
+input = torch.randn( 
+    batch_size, seq_len, hidden_size,
+    dtype=dtype, device=device
+)
+input1 = torch.randn( 
+    batch_size, seq_len, hidden_size,
+    dtype=dtype, device=device
+)
+bias = torch.randn(  
+    hidden_size,
+    dtype=dtype, device=device
+)
+# 调用fused_gelu_bwd算子
+output_bwd = op.fused_gelu_bwd(input, input1, bias)
+# 验证输出
+print("fused_gelu_bwd computation completed")
+print(f"前向input形状: {input.shape}")
+print(f"上游梯度input1形状: {input1.shape}")
+print(f"输出output_bwd形状: {output_bwd.shape}")
+```
+
+## 10. moe_swiglu_dynamic_quantize
+### 支持的产品型号
+- Metax C500/C550/C588/C600
+### 接口原型
+```python
+def moe_swiglu_dynamic_quantize(
+    scatter_tokens: torch.Tensor,
+    smooth_scale: torch.Tensor,
+    experts_tokens_start: torch.Tensor,
+    experts_tokens_count: torch.Tensor,
+    y: torch.Tensor,
+    per_tokens_scale: torch.Tensor,
+    total_experts_num: int
+) -> None
+```
+### 功能描述
+moe_swiglu_dynamic_quantize 算子实现混合专家（MoE）架构下 SwigLU 计算的动态量化逻辑。该算子针对分散的 tokens 数据，结合各专家对应的 tokens 分布信息（起始位置、数量）与平滑缩放因子，执行动态量化处理，输出量化后的结果张量及每个 token 对应的缩放因子，以此提升 MoE 模块的计算效率并降低内存开销。
+- 计算公式：
+对于第 $k$ 个专家（ $k \in \{0, 1, ..., K-1\}$ ， $K = \text{total\\_experts\\_num}$ ）：
+
+$$
+X_k = \text{scatter\\_tokens}[s_k : s_k + c_k, :]
+$$
+
+其中：
+- $s_k = \text{experts\\_tokens\\_start}[k]$ ：第 $k$ 个专家的 tokens 在 $\text{scatter\\_tokens}$ 中的起始索引
+- $c_k = \text{experts\\_tokens\\_count}[k]$ ：第 $k$ 个专家包含的 tokens 数量
+平滑缩放处理，对专家 $k$ 的 tokens 子集应用平滑缩放因子：
+
+$$
+X_k' = X_k \odot S_k
+$$
+
+其中：
+- $S_k = \text{smooth\\_scale}[k, :] \in \mathbb{R}^D$ （ $D = \text{hidden\\_size}$ 为隐藏层维度）
+- $\odot$ 表示逐元素乘法（ $S_k$ 广播至 $X_k$ 的形状 $[c_k, D]$ ）
+逐 token 动态缩放因子计算，对于 $X_k'$ 中的第 $i$ 个 token $x'_i \in \mathbb{R}^D$ （ $i \in \{0, 1, ..., c_k-1\}$ ），计算其缩放因子：
+
+$$
+\text{scale}_i = \max_{j=1..D} |x'_{i,j}|
+$$
+
+动态量化输出，将缩放后的 token 值归一化到缩放因子范围内，得到量化结果：
+
+$$
+y_{s_k + i, :} = \frac{x'_{i, :}}{\text{scale}_i}
+$$
+
+同时记录该 token 对应的缩放因子：
+
+$$
+\text{per\\_tokens\\_scale}[s_k + i] = \text{scale}_i
+$$
+
+融合操作的单步表达式：
+
+$$
+\text{moe\\_swiglu\\_dynamic\\_quantize}(\text{scatter\\_tokens}, \text{smooth\\_scale}, \text{experts\\_tokens\\_start}, \text{experts\\_tokens\\_count}, K) = \left( y, \text{per\\_tokens\\_scale} \right)
+$$
+
+其中，
+- $K = \text{total\\_experts\\_num}$ ：混合专家架构的专家总数
+- $\text{scatter\\_tokens} \in \mathbb{R}^{N \times D}$ ：所有专家的分散 tokens 集合（ $N$ 为总 token 数）
+- $D = \text{hidden\\_size}$ ：tokens 的隐藏层维度
+- $y \in \mathbb{R}^{N \times D}$ ：量化后的输出张量（结果写入出参）
+- $\text{per\\_tokens\\_scale} \in \mathbb{R}^N$ ：每个 token 对应的动态缩放因子（结果写入出参）
+### 参数说明
+- **scatter_tokens** (torch.Tensor, 入参): 分散的 tokens 输入张量，形状为[总 token 数, hidden_size]，存储待量化的 MoE tokens 数据
+- **smooth_scale** (torch.Tensor, 入参): 平滑缩放因子张量，形状为[total_experts_num, hidden_size]，用于 SwigLU 计算中的缩放调整
+- **experts_tokens_start** (torch.Tensor, 入参): 各专家对应的 tokens 起始位置张量，形状为[total_experts_num]，标记每个专家的 tokens 在 scatter_tokens 中的起始索引
+- **experts_tokens_count** (torch.Tensor, 入参): 各专家对应的 tokens 数量张量，形状为[total_experts_num]，标记每个专家包含的 tokens 数量
+- **y** (torch.Tensor, 出参): 量化后的输出张量，形状与 scatter_tokens 一致（[总 token 数, hidden_size]），存储动态量化后的结果
+- **per_tokens_scale** (torch.Tensor, 出参): 每个 token 对应的缩放因子张量，形状为[总 token 数]，存储动态量化过程中每个 token 对应的缩放系数
+- **total_experts_num** (int, 入参): 混合专家架构中的专家总数量
+### 返回值
+无返回值，量化结果直接写入出参张量 y，每个 token 的缩放因子直接写入出参张量 per_tokens_scale 中
+### 约束与调用
+- 所有输入/输出张量必须位于 CUDA 设备上
+- 输入张量需满足连续存储约束
+- scatter_tokens 的维度需为 2 维, 总 token 数×hidden_size
+- experts_tokens_start、experts_tokens_count 的长度必须与 total_experts_num 一致
+- 支持的数据类型：float16、bfloat16、float32, 对应代码中类型转换逻辑支持的类型
+- smooth_scale 的形状需匹配[total_experts_num, hidden_size]，与 scatter_tokens 的 hidden_size 维度一致
+### 调用示例
+```python
+import torch
+import mcoplib.op as op
+device = "cuda"
+# 定义参数
+total_experts_num = 8  
+num_tokens = 2048    
+hidden_size = 4096     
+# 输入张量：scatter_tokens（待量化的token特征）
+scatter_tokens = torch.randn(
+    num_tokens, hidden_size,
+    dtype=torch.float16, 
+    device=device, 
+    requires_grad=True
+)
+# 输入张量：smooth_scale（量化的平滑缩放系数）
+smooth_scale = torch.randn(
+    total_experts_num, 3, hidden_size//2, 2,
+    dtype=torch.float32,
+    device=device,
+    requires_grad=True
+)
+# 元数据：每个专家的token数量（experts_token_count）
+experts_token_count = torch.randint(
+    low=1, high=10,
+    size=(total_experts_num,),
+    dtype=torch.int32,
+    device=device
+)
+# 确保总token数不超过num_tokens，调整最后一个专家的count
+experts_token_count[-1] = num_tokens - experts_token_count[:-1].sum()
+# 元数据：每个专家的token起始索引（experts_token_start）
+experts_token_start = torch.zeros_like(experts_token_count)
+for i in range(1, total_experts_num):
+    experts_token_start[i] = experts_token_start[i-1] + experts_token_count[i-1]
+# 输出张量：量化后的token（y）
+y = torch.empty(
+    num_tokens, hidden_size//2,
+    dtype=torch.int8,
+    device=device
+)
+# 输出张量：每个token的量化缩放系数（per_tokens_scale）
+per_tokens_scale = torch.empty(
+    num_tokens, hidden_size//2,
+    dtype=torch.float32,
+    device=device
+)
+# 调用moe_swiglu_dynamic_quantize算子
+op.moe_swiglu_dynamic_quantize(
+    scatter_tokens=scatter_tokens,
+    smooth_scale=smooth_scale,
+    experts_token_start=experts_token_start,
+    experts_token_count=experts_token_count,
+    y=y,
+    per_tokens_scale=per_tokens_scale,
+    total_experts_num=total_experts_num
+)
+print("moe_swiglu_dynamic_quantize computation completed")
+print(f"Output y shape: {y.shape}, data type: {y.dtype}")
+print(f"Output per_tokens_scale shape: {per_tokens_scale.shape}, data type: {per_tokens_scale.dtype}")
+```
+
+## 11. moe_softmax_topk
+### 支持的产品型号
+- Metax C500/C550/C588/C600
+### 接口原型
+```python
+def moe_softmax_topk(
+    topk_weights: torch.Tensor,
+    topk_indices: torch.Tensor,
+    gating_output: torch.Tensor,
+    pre_softmax: bool
+) -> None
+```
+### 功能描述
+moe_softmax_topk 算子实现混合专家（MoE）架构下 gating 网络输出的 Top-K Softmax 处理逻辑。该算子接收 gating 网络的输出张量，根据 pre_softmax 标记判断是否对输入执行 Softmax 计算，随后筛选出每个 token 对应的 Top-K 个专家的权重与索引，最终将结果写入指定的输出张量，为 MoE 架构的专家选择环节提供核心的 Top-K 专家信息。
+- 计算公式
+对于第 $k$ 个专家（ $k \in \{0, 1, ..., K-1\}$ ，其中 $K = \text{total\\_experts\\_num}$ ），从输入张量 scatter_tokens 中提取属于该专家的 tokens 子集 $X_k$ ：
+
+$$
+X_k = \text{scatter\\_tokens}[s_k : s_k + c_k, :]
+$$
+
+其中：
+- $s_k = \text{experts\\_tokens\\_start}[k]$ ：第 $k$ 个专家的 tokens 在 scatter_tokens 中的起始索引。
+- $c_k = \text{experts\\_tokens\\_count}[k]$ ：第 $k$ 个专家包含的 tokens 数量。
+- 提取后， $X_k$ 的形状为 $[c_k, D]$ ，其中 $D = \text{hidden\\_size}$ 是隐藏层维度。
+对提取出的专家 $k$ 的 tokens 子集 $X_k$ 应用平滑缩放因子 $S_k$ ：
+
+$$
+X_k' = X_k \odot S_k
+$$
+
+其中：
+- $S_k = \text{smooth\\_scale}[k, :] \in \mathbb{R}^D$ ：第 $k$ 个专家的平滑缩放因子，其形状为 $[D]$ 。
+- $\odot$ ：表示逐元素（element-wise）乘法。由于 $S_k$ 的形状为 $[D]$ ，它会被广播（broadcast）到与 $X_k$ 相同的形状 $[c_k, D]$ 后再进行乘法运算。
+- 运算后， $X_k'$ 的形状仍为 $[c_k, D]$ 。
+对于 $X_k'$ 中的第 $i$ 个 token（ $i \in \{0, 1, ..., c_k-1\}$ ），即向量 $x'_i \in \mathbb{R}^D$ ，计算其动态缩放因子 $\text{scale}_i$ ：
+
+$$
+\text{scale}_i = \max_{j=1..D} |x'_{i,j}|
+$$
+
+其中 $x'_{i, j}$ 是向量 $x'_i$ 的第 $j$ 个元素。 $\text{scale}_i$ 是该 token 在所有维度上绝对值的最大值。
+使用计算出的缩放因子 $\text{scale}_i$ 对 token $x'_i$ 进行量化，并将结果写入输出张量 y 的对应位置。同时，记录该 token 的缩放因子。
+量化输出：
+
+$$
+y_{s_k + i, :} = \frac{x'_{i, :}}{\text{scale}_i}
+$$
+
+这个操作将 $x'_i$ 的每个元素值归一化到 $[-1, 1]$ 的范围内（假设原始数据为浮点型）。结果写入 y 中从索引 $s_k + i$ 开始的行。
+记录缩放因子：
+
+$$
+\text{per\\_tokens\\_scale}[s_k + i] = \text{scale}_i
+$$
+
+将计算出的 $\text{scale}_i$ 存入 per_tokens_scale 张量的对应位置，以便后续可能的反量化操作。
+算子对所有专家（从 $k=0$ 到 $k=K-1$ ）重复上述步骤 1 到步骤 4。最终，y 张量将包含所有量化后的 tokens，per_tokens_scale 张量将包含每个 token 对应的缩放因子。
+整个过程可以概括为：
+
+$$
+(\text{y}, \text{per\\_tokens\\_scale}) = \text{moe\\_swiglu\\_dynamic\\_quantize}(\text{scatter\\_tokens}, \text{smooth\\_scale}, \text{experts\\_tokens\\_start}, \text{experts\\_tokens\\_count}, K)
+$$
+
+其中：
+- $\text{scatter\\_tokens} \in \mathbb{R}^{N \times D}$ ：输入，所有专家的 tokens 分散存储， $N$ 为总 token 数。
+- $\text{y} \in \mathbb{R}^{N \times D}$ ：输出，量化后的 tokens，与 scatter_tokens 形状相同。
+- $\text{per\\_tokens\\_scale} \in \mathbb{R}^N$ ：输出，每个 token 对应的动态缩放因子。
+### 参数说明
+- **topk_weights** (torch.Tensor, 出参): 输出的 Top-K 专家权重张量，形状为[num_tokens, topk]，存储每个 token 对应的 Top-K 专家的归一化权重
+- **topk_indices** (torch.Tensor, 出参): 输出的 Top-K 专家索引张量，形状为[num_tokens, topk]，存储每个 token 对应的 Top-K 专家在所有专家中的索引
+- **gating_output** (torch.Tensor, 入参): gating 网络的原始输出张量，形状为[num_tokens, num_experts]，存储每个 token 对应所有专家的原始评分
+- **pre_softmax** (bool, 入参): 布尔标记，若为 True 表示 gating_output 是未经过 Softmax 的 logits，需先执行 Softmax 计算；若为 False 则认为 gating_output 已完成 Softmax 归一化
+### 返回值
+无返回值，Top-K 专家的权重与索引结果直接写入出参张量 topk_weights、topk_indices 中
+### 约束与调用
+- 所有输入/输出张量必须位于 CUDA 设备上
+- 输入/输出张量需满足连续存储（contiguous）约束
+- gating_output 需为 2 维张量，维度为[num_tokens, num_experts], num_tokens 为 token 总数，num_experts 为专家总数
+- topk_weights 与 topk_indices 需为 2 维张量，维度为[num_tokens, topk], topk 为需筛选的专家数量
+- 支持的数据类型：float16、bfloat16、float32, 对应代码中 scalar_t 模板支持的浮点类型
+- pre_softmax 需为合法布尔值，用于区分 gating_output 是否已执行 Softmax
+### 调用示例
+```python
+import torch
+import mcoplib.op as op
+# 定义设备
+device = "cuda"
+# 定义参数
+num_tokens = 1000  
+num_experts = 8   
+topk = 2           
+# 创建输入张量
+gating_output = torch.randn(num_tokens, num_experts, dtype=torch.float32, device=device)
+# 创建输出张量（预先分配内存）
+topk_weights = torch.empty(num_tokens, topk, dtype=torch.float32, device=device)
+topk_indices = torch.empty(num_tokens, topk, dtype=torch.int32, device=device)
+# 是否需要对 gating_output 进行 softmax
+pre_softmax = True
+# 调用 moe_softmax_topk 算子
+op.moe_softmax_topk(
+    topk_weights,
+    topk_indices,
+    gating_output,
+    pre_softmax
+)
+# 输出结果信息
+print("moe_softmax_topk computation completed.")
+print(f"Number of tokens: {num_tokens}")
+print(f"Number of experts: {num_experts}")
+print(f"Top-k: {topk}")
+print(f"pre_softmax: {pre_softmax}")
+print(f"Shape of topk_weights: {topk_weights.shape}")
+print(f"Shape of topk_indices: {topk_indices.shape}")
+# 打印部分结果示例
+print("\nSample topk_weights (first 2 tokens):")
+print(topk_weights[:2])
+print("\nSample topk_indices (first 2 tokens):")
+print(topk_indices[:2])
+```
+
+## 12. rms_norm_dynamic_per_token_quant
+### 支持的产品型号
+- Metax C500/C550/C588/C600
+### 接口原型
+```python
+def rms_norm_dynamic_per_token_quant(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    smooth_scale: torch.Tensor,
+    scales: torch.Tensor,
+    var_epsilon: float,
+    after_res: torch.Tensor,
+    after_norm: torch.Tensor,
+    residual: Optional[torch.Tensor] = None
+) -> None
+```
+### 功能描述
+rms_norm_dynamic_per_token_quant 算子是融合逐 Token 动态量化的 RMS 归一化算子，支持可选残差连接. 该算子先对输入张量做残差融合（若有残差），再通过 RMS 归一化、权重缩放实现特征标准化，最后通过逐 Token 动态量化生成 int8 输出张量, 同时输出残差融合中间结果、归一化中间结果和逐 Token 量化缩放因子，减少内存交互开销，提升大模型推理效率
+- 计算公式：
+残差连接（可选）, 若输入 residual 不为 None，计算残差融合结果, 否则直接沿用输入张量：  
+
+$$
+\text{after\\_res}_{b,s,h} = 
+\begin{cases} 
+\text{input}_{b,s,h} + \text{residual}_{b,s,h}, & \text{residual} \neq \text{None} \\
+\text{input}_{b,s,h}, & \text{residual} = \text{None}
+\end{cases}
+$$
+
+其中： $\text{after\\_res} \in \mathbb{R}^{B \times S \times H}$ ， $B$ 为 batch size， $S$ 为序列长度， $H$ 为单个 Token 的特征维度。
+逐 Token 计算平方和, 对 after_res 的每个 Token（即每个 $(b, s)$ 位置），计算特征维度上的平方和：  
+
+$$
+\text{sum\\_sq}_{b,s} = \sum_{h=0}^{H-1} \text{after\\_res}_{b,s,h}^2
+$$
+
+其中： $\text{sum\\_sq} \in \mathbb{R}^{B \times S}$ 。
+逐 Token 计算平方均值, 将平方和除以特征维度 $H$ ，得到每个 Token 的平方均值：  
+
+$$
+\text{mean\\_sq}_{b,s} = \frac{\text{sum\\_sq}_{b,s}}{H}
+$$
+
+其中： $\text{mean\\_sq} \in \mathbb{R}^{B \times S}$ 。
+计算逐 Token RMS 值, 为避免除零，给平方均值加上数值稳定小量 var_epsilon 后开根号，得到每个 Token 的 RMS（Root Mean Square）值：  
+
+$$
+\text{rms}_{b,s} = \sqrt{\text{mean\\_sq}_{b,s} + \text{var\\_epsilon}}
+$$
+
+其中： $\text{rms} \in \mathbb{R}^{B \times S}$ ， $\text{var\\_epsilon} > 0$ （通常取 $10^{-6}$ ）。
+逐 Token 量化缩放因子, 计算每个 Token 的缩放因子（用于后续量化），即 RMS 值的倒数：  
+
+$$
+\text{scales}_{b,s} = \frac{1}{\text{rms}_{b,s}}
+$$
+
+其中： $\text{scales} \in \mathbb{R}^{B \times S}$ （需保留该张量用于后续反量化）。
+RMS 归一化, 将 after_res 除以逐 Token 的 RMS 值（通过广播匹配维度），实现逐 Token 的 RMS 归一化：  
+
+$$
+\text{normed}_{b,s,h} = \frac{\text{after\\_res}_{b,s,h}}{\text{rms}_{b,s}}
+$$
+
+其中： $\text{normed} \in \mathbb{R}^{B \times S \times H}$ （ $\text{rms}$ 通过`unsqueeze (-1)`扩展为 $B \times S \times 1$ ，与 $\text{after\\_res}$ 广播）。
+权重与平滑缩放, 用 weight（特征维度权重）和 smooth_scale（特征维度平滑因子）对归一化结果做缩放，得到最终归一化中间结果：  
+
+$$
+\text{after\\_norm}_{b,s,h} = \text{normed}_{b,s,h} \cdot \text{weight}_h \cdot \text{smooth\\_scale}_h
+$$
+
+其中： $\text{weight} \in \mathbb{R}^H$ ， $\text{smooth\\_scale} \in \mathbb{R}^H$ （均通过广播匹配 $B \times S \times H$ 维度）。
+逐 Token 动态量化, 将 after_norm 按逐 Token 的 scales 缩放到 int8 范围（ $-128 \sim 127$ ）: 
+
+$$
+\text{out}_{b,s,h} = \text{clamp}\left( \text{round}\left( \text{after\\_norm}_{b,s,h} \cdot \text{scales}_{b,s} \right), -128, 127 \right)
+$$
+
+其中： $\text{out} \in \mathbb{Z}^{B \times S \times H}$ （int8 类型），round () 为四舍五入函数，clamp () 为区间限制函数。
+### 参数说明
+- **out** (torch.Tensor, 出参): 动态量化后的输出张量，数据类型为 int8，形状与 input 一致（B×S×H）
+- **input** (torch.Tensor, 入参): 原始输入张量，形状为 B×S×H，支持数据类型为 float16/bfloat16
+- **weight** (torch.Tensor, 入参): 特征维度的缩放权重张量，形状为 H，支持数据类型为 float16/bfloat16
+- **smooth_scale** (torch.Tensor, 入参): 特征维度的平滑缩放因子张量，形状为 H，支持数据类型为 float16/bfloat16
+- **scales** (torch.Tensor, 出参): 逐 Token 的量化缩放因子张量，形状为 B×S，数据类型为 float32（保证量化精度）
+- **var_epsilon** (float, 入参): 数值稳定小量，用于避免 RMS 计算中出现除零或数值溢出（通常取 10^-6）
+- **after_res** (torch.Tensor, 出参): 残差连接后的中间张量，形状与 input 一致（B×S×H），数据类型与 input 相同
+- **after_norm** (torch.Tensor, 出参): 权重缩放后的归一化中间张量，形状与 input 一致（B×S×H），数据类型与 input 相同
+- **residual** (Optional[torch.Tensor], 入参): 可选残差张量，形状需与 input 完全一致（B×S×H），支持数据类型为 float16/bfloat16；若为 None，则不进行残差连接
+### 返回值
+该算子无返回值，所有输出（量化结果、中间结果、缩放因子）均通过指定的出参张量（out、scales、after_res、after_norm）返回。
+### 约束与调用
+- 所有输入/出参张量必须位于 CUDA 设备上
+- input、after_res、after_norm、out 的形状必须完全一致
+- weight、smooth_scale 的形状必须与 input 的最后一维匹配
+- scales 的形状必须与 input 的前两维匹配；
+- 若 residual 不为 None，其形状必须与 input 完全一致。
+- input、weight、smooth_scale、residual、after_res、after_norm 支持 float16/bfloat16，out 必须为 int8 类型，scales 必须为 float32 类型
+- var_epsilon`必须为正数，否则会导致 RMS 计算数值不稳定或除零错误。
+### 调用示例
+```python
+import torch
+import mcoplib.op as op
+# 定义运行设备
+device = "cuda"
+#定义算子所需的参数
+B = 4
+S = 128
+H = 4096 
+#创建输入张量
+input_tensor = torch.randn(B, S, H, dtype=torch.float16, device=device)
+weight = torch.randn(H, dtype=torch.float16, device=device)
+smooth_scale = torch.randn(H, dtype=torch.float16, device=device)
+residual = torch.randn(B, S, H, dtype=torch.float16, device=device)
+#创建输出张量
+out = torch.empty(B, S, H, dtype=torch.int8, device=device)
+scales = torch.empty(B, S, dtype=torch.float32, device=device)
+after_res = torch.empty(B, S, H, dtype=torch.float16, device=device)
+after_norm = torch.empty(B, S, H, dtype=torch.float16, device=device)
+var_epsilon = 1e-6 
+op.rms_norm_dynamic_per_token_quant(
+    out,
+    input_tensor,
+    weight,
+    smooth_scale,
+    scales,
+    var_epsilon,
+    after_res,
+    after_norm,
+    residual 
+)
+print("rms_norm_dynamic_per_token_quant computation completed.")
+print(f"Output tensor 'out' shape: {out.shape}, dtype: {out.dtype}")
+print(f"Scales tensor shape: {scales.shape}, dtype: {scales.dtype}")
+print(f"After-residual tensor shape: {after_res.shape}")
+print(f"After-normalization tensor shape: {after_norm.shape}")
+```
+
+## 13. head_rms_norm
+### 支持的产品型号
+- Metax C500/C550/C588/C600
+### 接口原型
+```python
+def head_rms_norm(
+    out: torch.Tensor,
+    hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+    var_epsilon: float,
+    head_offset: int,
+    head_norm: int
+) -> None
+```
+### 功能描述
+head_rms_norm 算子是针对多头注意力机制优化的 RMS（Root Mean Square）归一化算子，该算子将输入的多头隐藏状态按 Head 维度拆分，对每个 Head 单独执行 RMS 归一化和权重缩放，最后将结果拼接输出，避免跨 Head 的归一化干扰，提升注意力机制的计算效率和模型性
+- 计算公式：
+多头隐藏状态拆分，设输入 hidden_states 的形状为 $B \times S \times N \times D$ （ $B$=batch size， $S$=序列长度， $N$=总 Head 数， $D$=单个 Head 的特征维度），或展平形状 $B \times S \times (N \times D)$ 。算子首先按 Head 维度拆分，得到单个 Head 的隐藏状态张量：  
+
+$$
+\text{head\\_hidden}_{b,s,:} = \text{hidden\\_states}_{b,s,\text{head\\_idx} \times D : (\text{head\\_idx}+1) \times D}
+$$
+
+其中： $\text{head\\_idx}$ 为当前处理的 Head 索引（范围 $0 \sim N-1$ ）， $\text{head\\_hidden} \in \mathbb{R}^{B \times S \times D}$ 。
+对每个 Head 的隐藏状态，在特征维度（ $D$ 维）上计算平方和：  
+
+$$
+\text{sum\\_sq}_{b,s} = \sum_{d=0}^{D-1} \text{head\\_hidden}_{b,s,d}^2
+$$
+
+其中： $\text{sum\\_sq} \in \mathbb{R}^{B \times S}$ 。
+将平方和除以特征维度 $D$ ，得到每个 Token（ $b, s$ 位置）在该 Head 下的平方均值：  
+
+$$
+\text{mean\\_sq}_{b,s} = \frac{\text{sum\\_sq}_{b,s}}{D}
+$$
+
+其中： $\text{mean\\_sq} \in \mathbb{R}^{B \times S}$ 。
+为避免除零，给平方均值加上数值稳定小量 var_epsilon 后开根号，得到每个 Token 的 RMS 值：  
+
+$$
+\text{rms}_{b,s} = \sqrt{\text{mean\\_sq}_{b,s} + \text{var\\_epsilon}}
+$$
+
+其中： $\text{rms} \in \mathbb{R}^{B \times S}$ ， $\text{var\\_epsilon} > 0$ （通常取 $10^{-6}$ ）。
+将该 Head 的隐藏状态除以其 RMS 值，通过广播匹配维度，实现归一化：  
+
+$$
+\text{normed}_{b,s,d} = \frac{\text{head\\_hidden}_{b,s,d}}{\text{rms}_{b,s}}
+$$
+
+其中： $\text{normed} \in \mathbb{R}^{B \times S \times D}$ （ $\text{rms}$ 扩展为 $B \times S \times 1$ 后与 $\text{head\\_hidden}$ 广播）。
+获取当前 Head 对应的权重，head_offset 定位，对归一化结果做缩放：  
+
+$$
+\text{scaled}_{b,s,d} = \text{normed}_{b,s,d} \times \text{weight}_{\text{head\\_idx},d}
+$$
+
+其中： $\text{weight} \in \mathbb{R}^{N \times D}$ （ $N$ 为总 Head 数）， $\text{scaled} \in \mathbb{R}^{B \times S \times D}$ 。
+将所有 Head 的缩放后结果按原 Head 顺序拼接，得到最终输出张量：  
+
+$$
+\text{out}_{b,s,:} = \text{concat}\left( \text{scaled}_{\text{head\\_idx}=0}, \text{scaled}_{\text{head\\_idx}=1}, \dots, \text{scaled}_{\text{head\\_idx}=N-1} \right)
+$$
+
+其中： $\text{out} \in \mathbb{R}^{B \times S \times (N \times D)}$ ，与输入 hidden_states 形状一致）
+### 参数说明
+- **out** (torch.Tensor, 出参): 多头归一化后的输出张量，形状与 hidden_states 一致，支持数据类型为 float16/bfloat16
+- **hidden_states** (torch.Tensor, 入参): 多头注意力的隐藏状态张量，支持数据类型为 float16/bfloat16
+- **weight** (torch.Tensor, 入参): 分 Head 的权重张量，支持数据类型为 float16/bfloat16
+- **var_epsilon** (float, 入参): 数值稳定小量，用于避免 RMS 计算中除零或数值溢出
+- **head_offset** (int, 入参): 当前处理的 Head 在 weight 中的起始偏移索引，用于定位目标 Head 的权重
+- **head_norm** (int, 入参): 多头注意力的总 Head 数，用于拆分和拼接多头张量
+### 返回值
+该算子无返回值，返回类型为 None，归一化后的结果通过出参张量 out 返回。
+### 约束与调用
+- 所有输入/出参张量必须位于 CUDA 设备上
+- out 与 hidden_states 的形状必须完全一致，weight`的形状必须为 N×D（N=head_norm，D=单个 Head 的特征维度）
+- 若`hidden_states 为展平形状 B×S×(N×D)，则 N×D 必须等于其最后一维的大小；若为未展平形状 B×S×N×D，则其第三维必须等于 N（head_norm），第四维必须等于 D
+- hidden_states、weight、out 支持 float16/bfloat16，不支持 float32
+- head_offset 必须为非负整数，且满足 0≤head_offset<head_norm
+- var_epsilon 必须为正数，否则会导致 RMS 计算数值不稳定
+### 调用示例
+```python
+import torch
+import mcoplib.op as op
+# 定义运行设备
+device = "cuda"
+# 定义算子所需的参数
+B = 4  
+S = 128  
+N = 32  
+D = 128  
+# 创建输入张量
+hidden_states = torch.randn(B, S, N * D, dtype=torch.float16, device=device)
+weight = torch.randn(N, D, dtype=torch.float16, device=device)
+# 创建输出张量
+out = torch.empty(B, S, N * D, dtype=torch.float16, device=device)
+# 其他参数
+var_epsilon = 1e-6
+head_offset = 0  
+head_norm = N   
+# 调用 head_rms_norm 算子
+op.head_rms_norm(
+    out,
+    hidden_states,
+    weight,
+    var_epsilon,
+    head_offset,
+    head_norm
+)
+print("head_rms_norm computation completed.")
+print(f"Output tensor 'out' shape: {out.shape}, dtype: {out.dtype}")
+```
+
+## 14. rms_norm
+### 支持的产品型号
+- Metax C500/C550/C588/C600
+### 接口原型
+```python
+def rms_norm(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    var_epsilon: float,
+    after_res: Optional[torch.Tensor] = None,
+    residual: Optional[torch.Tensor] = None,
+    rms_div: bool
+) -> None
+```
+### 功能描述
+rms_norm 算子是基础 RMS（Root Mean Square）归一化算子，支持可选残差连接与两种归一化计算方式，该算子先通过残差连接融合输入与残差张量（若有），再对融合结果计算 RMS 归一化，最后通过权重缩放生成输出，同时支持将残差融合中间结果存入 after_res（可选），并通过 rms_div 参数灵活切换归一化计算逻辑（除法/乘法），适配不同硬件效率需求。
+- 计算公式：
+残差连接（可选），若输入 residual 不为 None，计算残差融合结果；否则直接沿用输入张量 input，若 after_res 为非 None 张量，则将融合结果存入 after_res：  
+
+$$
+\text{after\\_res}_{b,s,h} = 
+\begin{cases} 
+\text{input}_{b,s,h} + \text{residual}_{b,s,h}, & \text{residual} \neq \text{None} \\
+\text{input}_{b,s,h}, & \text{residual} = \text{None}
+\end{cases}
+$$
+
+其中： $\text{after\\_res} \in \mathbb{R}^{B \times S \times H}$ （ $B$=batch size， $S$=序列长度， $H$=特征维度），若`after_res`为 None 则仅在内部使用该融合结果。
+对残差融合后的张量（记为 $X$ ，即 $\text{after\\_res}$ 或内部融合结果），在**特征维度（ $H$ 维）** 计算每个 $(b, s)$ 位置的平方和：  
+
+$$
+\text{sum\\_sq}_{b,s} = \sum_{h=0}^{H-1} X_{b,s,h}^2
+$$
+
+其中： $\text{sum\\_sq} \in \mathbb{R}^{B \times S}$ 。
+将平方和除以特征维度 $H$ ，得到每个 $(b, s)$ 位置的平方均值：  
+
+$$
+\text{mean\\_sq}_{b,s} = \frac{\text{sum\\_sq}_{b,s}}{H}
+$$
+
+其中： $\text{mean\\_sq} \in \mathbb{R}^{B \times S}$ 。
+为避免除零，给平方均值加上数值稳定小量 var_epsilon 后开根号，得到每个 $(b, s)$ 位置的 RMS 值：  
+
+$$
+\text{rms}_{b,s} = \sqrt{\text{mean\\_sq}_{b,s} + \text{var\\_epsilon}}
+$$
+
+其中： $\text{rms} \in \mathbb{R}^{B \times S}$ ， $\text{var\\_epsilon} > 0$ （通常取 $10^{-6}$ ）。
+根据 rms_div 参数选择归一化计算方式（核心差异为“除法”或“乘法”，乘法更适配硬件指令优化）：  
+- 当 $\text{rms\\_div} = \text{True}$ （除法模式）：  
+
+$$
+  \text{normed}_{b,s,h} = \frac{X_{b,s,h}}{\text{rms}_{b,s}}
+$$
+
+- 当 $\text{rms\\_div} = \text{False}$ （乘法模式，硬件友好）：  
+
+$$
+  \text{normed}_{b,s,h} = X_{b,s,h} \cdot \frac{1}{\text{rms}_{b,s}}
+$$
+
+  其中： $\text{normed} \in \mathbb{R}^{B \times S \times H}$ （ $\text{rms}$ 通过`unsqueeze (-1)`扩展为 $B \times S \times 1$ ，与 $X$ 广播匹配）。
+  将归一化结果乘以特征维度的权重 weight，最终结果存入 out：  
+
+$$
+\text{out}_{b,s,h} = \text{normed}_{b,s,h} \cdot \text{weight}_h
+$$
+
+其中： $\text{weight} \in \mathbb{R}^H$ （通过广播匹配 $B \times S \times H$ 维度）。
+### 参数说明
+- **out** (torch.Tensor, 出参): 归一化后的输出张量，形状与 input 完全一致（B×S×H），支持数据类型为 float16/bfloat16
+- **input** (torch.Tensor, 入参): 原始输入张量，形状为 B×S×H，支持数据类型为 float16/bfloat16
+- **weight** (torch.Tensor, 入参): 特征维度的缩放权重张量，形状为 H，支持数据类型为 float16/bfloat16
+- **var_epsilon** (float, 入参): 数值稳定小量，用于避免 RMS 计算中除零或数值溢出（通常取 10^-6）
+- **after_res** (Optional[torch.Tensor], 出参): 可选残差融合中间结果张量，形状与 input 一致（B×S×H），数据类型与 input 相同；若为 None，则不保存该中间结果
+- **residual** (Optional[torch.Tensor], 入参): 可选残差张量，形状需与 input 完全一致（B×S×H），支持数据类型为 float16/bfloat16；若为 None，则不进行残差连接
+- **rms_div** (bool, 入参): 归一化计算模式开关：True 表示“除以 RMS 值”，False 表示“乘以 RMS 倒数”，后者更适配硬件指令，效率更高
+### 返回值
+该算子无返回值（返回类型为 None），核心归一化结果通过出参 out 返回，如果需要残差融合中间结果，通过 after_res 返回
+### 约束与调用
+- 所有输入/出参张量必须位于 CUDA 设备上
+- out、input、after_res、residual 的形状必须完全一致（B×S×H），weight 的形状必须与 input 的最后一维（特征维度 H）匹配，input、weight、out、after_res（若有）、residual（若有）仅支持 float16/bfloat16，不支持 float32
+- var_epsilon 必须为正数，否则会导致 RMS 计算数值不稳定，rms_div 必须为布尔值
+### 调用示例
+```python
+import torch
+import mcoplib.op as op
+# 定义运行设备
+device = "cuda"
+# 1. 定义算子所需的参数
+B = 4 
+S = 128  
+H = 4096  
+# 创建输入张量
+input_tensor = torch.randn(B, S, H, dtype=torch.float16, device=device)
+weight = torch.randn(H, dtype=torch.float16, device=device)
+residual = torch.randn(B, S, H, dtype=torch.float16, device=device)
+# 创建输出张量和可选的中间结果张量
+out = torch.empty(B, S, H, dtype=torch.float16, device=device)
+after_res = torch.empty(B, S, H, dtype=torch.float16, device=device)
+# 其他参数
+var_epsilon = 1e-6
+rms_div = False 
+# 调用 rms_norm 算子
+op.rms_norm(
+    out,
+    input_tensor,
+    weight,
+    var_epsilon,
+    after_res,   
+    residual,      
+    rms_div
+)
+print("rms_norm computation completed.")
+print(f"Output tensor 'out' shape: {out.shape}, dtype: {out.dtype}")
+print(f"After-residual tensor shape: {after_res.shape}")
+```
+
+## 15. all_reduce_max
+### 支持的产品型号
+- Metax C500/C550/C588/C600
+### 接口原型
+```python
+def all_reduce_max(
+    input: torch.Tensor,
+    output: torch.Tensor
+) -> None
+```
+### 功能描述
+all_reduce_max 算子是基于 CUDA 实现的执行最大规约操作的算子，针对`bfloat16`类型张量，为每个 token 执行规约操作，支持向量化访存加速
+- 计算公式：
+
+$$
+    \text{all\\_reduce\\_max}(\mathbf{X}) = \left[ \max_{j=1}^D X_{i,j} \right]_{i=1}^N
+$$
+
+  其中：
+- $\mathbf{X} \in \mathbb{R}^{N \times D}$ 是输入张量（形状为 [num_tokens, hidden_size]）
+- $\text{all\\_reduce\\_max}(\mathbf{X}) \in \mathbb{R}^N$ 是输出张量（形状为 [num_tokens]）
+- $V \in \mathbb{R}^{B \times H_k \times D \times S}$ 是分页值缓存
+- $N$ 是 token 数量，对应代码中的 $\text{num\\_tokens}$
+- $D$ 是隐藏维度，对应代码中的 $\text{hidden\\_size}$
+- $X_{i, j}$ 表示输入张量 $\mathbf{X}$ 中第 $i$ 个 token 对应的第 $j$ 个隐藏维度元素
+    **主要功能包括**：
+- 基于 CUDA 实现张量聚合计算，支持求和与最大值两种核心操作
+- 适配分布式计算场景自动选择向量版或普通版 CUDA 核函数
+- 通过线程协同，完成跨设备/进程的张量元素聚合，保障数据一致
+### 参数说明
+- **input** (torch.Tensor, 入参): 输入张量，需位于 CUDA 设备上，形状为[num_tokens, hidden_size]，数据类型仅支持 bfloat16，存储待归约的 bfloat16 数据
+- **output** (torch.Tensor, 出参): 输出张量，需位于 CUDA 设备上，形状为[num_tokens]，用于存储每个 token 对应的 hidden_size 维度的求和结果
+### 返回值
+无返回值，结果直接写入输出张量 output 中
+### 约束与调用
+- 所有输入/输出张量必须位于 CUDA 设备上
+- 仅兼容 bfloat16 数据类型
+- 输入张量为连续存储的 2D 张量，形状固定为[num_tokens, hidden_size]
+- 根据 hidden_size 是否对齐自动选择是否使用向量化加速
+### 调用示例
+```python
+import torch
+import mcoplib.op as op
+device = "cuda"
+# 定义参数
+num_tokens = 4096
+hidden_size = 4096
+dtype = torch.bfloat16
+error_threshold = 1e-3  # 误差阈值
+# 创建输入/输出张量
+input_tensor = torch.randn((num_tokens, hidden_size), dtype=dtype, device=device)
+output_tensor = torch.zeros(num_tokens, dtype=dtype, device=device)
+op.all_reduce_max(input_tensor, output_tensor)
+# 简单精度检查：用PyTorch原生函数做基准对比
+standard_output = torch.max(input_tensor, dim=1).values 
+max_error = torch.max(torch.abs(output_tensor - standard_output)).item()  
+is_correct = max_error < error_threshold 
+print("all_reduce_max computation completed")
+print(f"Input shape: {output_tensor.shape}, Output shape: {output_tensor.shape}")
+print(f"\nPrecision check: {'PASSED' if is_correct else 'FAILED'}")
+print(f"Maximum absolute error: {max_error:.6f} (threshold: {error_threshold})")
+print(f"\nFirst 5 results comparison:")
+print(f"Operator output: {output_tensor[:5].cpu()}")
+print(f"Standard output: {standard_output[:5].cpu()}")
+```
+
+## 16. all_reduce_sum
+### 支持的产品型号
+- Metax C500/C550/C588/C600
+### 接口原型
+```python
+def all_reduce_sum(
+    input: torch.Tensor,
+    output: torch.Tensor
+) -> None
+```
+### 功能描述
+all_reduce_sum 算子是基于 CUDA 实现的执行求和规约操作的算子，针对`bfloat16`类型张量，为每个 token 执行 hidden_size 维度的求和规约，支持向量化访存加速
+- 计算公式：
+
+$$
+    \text{all\\_reduce\\_sum}(\mathbf{X}) = \left[ \sum_{j=1}^D X_{i,j} \right]_{i=1}^N
+$$
+
+  其中：
+- $\mathbf{X} \in \mathbb{R}^{N \times D}$ 是输入张量（形状为 [num_tokens, hidden_size]）
+- $\text{all\\_reduce\\_sum}(\mathbf{X}) \in \mathbb{R}^N$ 是输出张量（形状为 [num_tokens]）
+- $N$ 是 token 数量，对应代码中的 $\text{num\\_tokens}$
+- $D$ 是隐藏维度，对应代码中的 $\text{hidden\\_size}$
+- $X_{i, j}$ 表示输入张量 $\mathbf{X}$ 中第 $i$ 个 token 对应的第 $j$ 个隐藏维度元素
+    **主要功能包括：**
+- 基于 CUDA 实现张量聚合计算，支持求和的核心规约操作
+- 适配分布式计算场景自动选择向量版或普通版 CUDA 核函数
+- 通过线程协同完成计算，结合向量化访存优化提升执行效率
+### 参数说明
+- **input** (torch.Tensor, 入参): 输入张量，需位于 CUDA 设备上，形状为[num_tokens, hidden_size]，数据类型仅支持 bfloat16，存储待归约的 bfloat16 数据
+- **output** (torch.Tensor, 出参): 输出张量，需位于 CUDA 设备上，形状为[num_tokens]，用于存储每个 token 对应的 hidden_size 维度的求和结果
+### 返回值
+无返回值，结果直接写入输出张量 output 中
+### 约束与调用
+- 所有输入/输出张量必须位于 CUDA 设备上
+- 仅兼容 bfloat16 数据类型
+- 输入张量为连续存储的 2D 张量，形状固定为[num_tokens, hidden_size]
+- 根据 hidden_size 是否对齐自动选择是否使用向量化加速
+### 调用示例
+```python
+import torch
+import mcoplib.op as op
+# 设置设备
+device = "cuda"
+# 定义参数
+num_tokens = 4096
+hidden_size = 4096
+dtype = torch.bfloat16
+error_threshold = 1e-3  
+# 创建输入/输出张量
+input_tensor = torch.randn((num_tokens, hidden_size), dtype=dtype, device=device)
+output_tensor = torch.zeros(num_tokens, dtype=dtype, device=device)  # 输出是num_tokens长度的向量
+# 调用目标算子
+op.all_reduce_sum(input_tensor, output_tensor)
+# 简单精度检查：用PyTorch原生sum做基准对比
+standard_output = torch.sum(input_tensor, dim=1) 
+max_error = torch.max(torch.abs(output_tensor - standard_output)).item()  
+is_correct = max_error < error_threshold 
+# 打印结果
+print("all_reduce_sum computation completed")
+print(f"Input shape: {input_tensor.shape}, Output shape: {output_tensor.shape}")
+print(f"\nPrecision check: {'PASSED' if is_correct else 'FAILED'}")
+print(f"Maximum absolute error: {max_error:.6f} (threshold: {error_threshold})")
+print(f"\nFirst 5 results comparison:")
+print(f"Operator output: {output_tensor[:5].cpu()}")
+print(f"Standard output: {standard_output[:5].cpu()}")
+```
+
+## 17. moe_gather
+### 支持的产品型号
+- Metax C500/C550/C588/C600
+### 接口原型
+```python
+def moe_gather(
+    scatter_tokens: torch.Tensor,
+    scatter_tokens_offset: torch.Tensor,
+    convergent_tokens: torch.Tensor
+) -> None
+```
+### 功能描述
+moe_gather 算子实现混合专家（MoE）架构中的令牌聚合操作，将分散存储的专家输出令牌（scatter_tokens），按照偏移信息（scatter_tokens_offset）汇聚到目标张量（convergent_tokens）中，用于完成 MoE 模型中不同专家输出的令牌整合流程
+- 计算公式
+
+$$
+  \text{convergent\\_tokens}[\text{offset}_i, :] = \text{scatter\\_tokens}[i, :] \quad (i = 0, 1, ..., \text{num\\_tokens} - 1)
+$$
+
+  其中：
+- $i$ ：分散令牌的索引，范围为 $[0, \text{num\\_tokens} - 1]$
+- $\text{num\\_tokens}$ ：分散令牌的总数，即 $\text{scatter\\_tokens}$ 的第一维长度（ $\text{scatter\\_tokens.size}(0)$ ）
+- $\text{hidden\\_size}$ ：令牌的隐藏层维度，即 $\text{scatter\\_tokens}$ 的第二维长度（ $\text{scatter\\_tokens.size}(1)$ ）
+- $\text{offset}_i$ ：第 $i$ 个分散令牌对应的聚合位置偏移，即 $\text{scatter\\_tokens\\_offset}[i]$ ，需满足 $0 \leq \text{offset}_i < \text{convergent\\_tokens.size}(0)$ （聚合后令牌数）
+- $\text{scatter\\_tokens}[i, :]$ ：第 $i$ 个分散令牌的完整向量（维度为 $[\text{hidden\\_size}]$ ）
+- $\text{convergent\\_tokens}[\text{offset}_i, :]$ ：聚合后张量中对应偏移位置的令牌向量（维度为 $[\text{hidden\\_size}]$ ）
+  算子核心逻辑为按偏移索引的逐行赋值，实现分散令牌到聚合张量的定向汇聚，且保持令牌内部的维度结构不变
+### 参数说明
+- **scatter_tokens** (torch.Tensor, 入参): 分散的专家输出令牌张量，形状为`[num_tokens, hidden_size]`，存储待聚合的令牌数据
+- **scatter_tokens_offset** (torch.Tensor, 入参): 令牌聚合偏移张量，形状为`[num_tokens]`，存储每个分散令牌对应的目标聚合位置偏移信息
+- **convergent_tokens** (torch.Tensor, 出参): 聚合后的令牌张量，形状通常为`[聚合后令牌数, hidden_size]`，存储最终的令牌聚合结果
+### 返回值
+无返回值，聚合结果直接写入出参 convergent_tokens 中
+### 约束与调用
+- 所有输入、输出张量必须位于 CUDA 设备上
+- 支持的数据类型：float16、bfloat16
+- scatter_tokens 的元素总数需为 hidden_size 的整数倍，即 num_tokens = scatter_tokens.numel () / hidden_size
+- scatter_tokens_offset 的长度需与 scatter_tokens 的 num_tokens 维度一致
+- 输入张量需满足连续存储的内存布局要求
+### 调用示例
+```python
+import torch
+import mcoplib.op as op
+device = "cuda"
+# 定义参数
+num_tokens = 128 
+hidden_size = 512  
+convergent_num_tokens = 64  
+# 创建输入张量
+scatter_tokens = torch.randn(num_tokens, hidden_size, dtype=torch.bfloat16, device=device)
+scatter_tokens_offset = torch.randint(0, convergent_num_tokens, (num_tokens,),dtype=torch.int32,device=device)
+# 创建输出张量
+convergent_tokens = torch.empty(convergent_num_tokens, hidden_size, dtype=torch.bfloat16, device=device)
+# 调用moe_gather算子
+op.moe_gather(
+    scatter_tokens,
+    scatter_tokens_offset,
+    convergent_tokens
+)
+print("MoE gather computation completed")
+print(f"Scatter tokens shape: {scatter_tokens.shape}")
+print(f"Scatter tokens offset shape: {scatter_tokens_offset.shape}")
+print(f"Convergent tokens shape: {convergent_tokens.shape}")
+```
+
+## 18. store_kv_cache_cuda_interface
+### 支持的产品型号
+- Metax C500/C550/C588/C600
+### 接口原型
+```python
+def store_kv_cache_cuda_interface(
+    packed_qkv: torch.Tensor,
+    q_lens: torch.Tensor,
+    accum_q_lens: torch.Tensor,
+    cache_lens: torch.Tensor,
+    cache_slot_ids: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+    batch_size: int,
+    q_head_num: int,
+    kv_head_num: int
+) -> None
+```
+### 功能描述
+store_kv_cache_cuda_interface 算子实现了 CUDA 端 KV 缓存的存储操作：基于序列长度、缓存槽位等信息，将打包好的 packed_qkv 数据分发并存储到对应的 K 缓存与 V 缓存中，同时结合缩放张量完成数据处理。该算子常用于大模型推理的 KV 缓存管理，可减少内存交互、提升缓存写入效率。
+- 计算公式
+
+$$
+\text{k\\_cache}[b, h_k, \text{cache\\_slot\\_ids}[i], d] = \text{packed\\_K}[i, h_q, d] \times \text{k\\_scale}[h_k]
+$$
+
+
+
+$$
+\text{v\\_cache}[b, h_k, \text{cache\\_slot\\_ids}[i], d] = \text{packed\\_V}[i, h_q, d] \times \text{v\\_scale}[h_k]
+$$
+
+packed_qkv 为打包的 Q/K/V 复合张量，首先拆分出参与缓存写入的 K、V 分量（Q 分量不写入 KV 缓存）：
+
+$$
+\text{packed\\_K} = \text{packed\\_qkv}[..., 0:d_k],\quad \text{packed\\_V} = \text{packed\\_qkv}[..., d_k:2d_k]
+$$
+
+其中单头特征维度 $d_k$ 满足：
+
+$$
+d_k = \frac{\text{packed\\_qkv}.\text{size}(-1)}{3}
+$$
+
+（packed_qkv 最后一维维度为 $3d_k$ ，分别对应 Q、K、V 各占 $d_k$ 维度）
+查询头（ $h_q$ ）与 KV 头（ $h_k$ ）的映射关系（适配 GQA/MQA 配置）：
+
+$$
+h_k = h_q \times \frac{\text{kv\\_head\\_num}}{\text{q\\_head\\_num}}
+$$
+
+其中：
+- $h_q \in [0, \text{q\\_head\\_num}-1]$ ：查询头索引
+- $h_k \in [0, \text{kv\\_head\\_num}-1]$ ：KV 头索引
+MQA 是 GQA 的特例（ $\text{kv\\_head\\_num}=1$ ），此时所有查询头映射到同一个 KV 头。
+对于第 $b$ 个 batch（ $b \in [0, \text{batch\\_size}-1]$ ），其对应的 token 索引范围由累积长度和查询长度确定：
+
+$$
+i \in [\text{accum\\_q\\_lens}[b], \text{accum\\_q\\_lens}[b] + \text{q\\_lens}[b])
+$$
+
+所有 batch 的 token 总数满足：
+
+$$
+\sum_{b=0}^{\text{batch\\_size}-1} \text{q\\_lens}[b] = \text{packed\\_K}.\text{size}(0) = \text{packed\\_V}.\text{size}(0)
+$$
+
+cache_slot_ids 的元素值需满足缓存长度边界约束：
+
+$$
+0 \leq \text{cache\\_slot\\_ids}[i] < \text{k\\_cache}.\text{size}(2)
+$$
+
+且单 batch 缓存写入后长度需匹配：
+
+$$
+\text{cache\\_lens}[b] + \text{q\\_lens}[b] = \max(\text{cache\\_slot\\_ids}[i \in \text{batch}_b]) + 1
+$$
+
+其中：
+- $b$ ：批维度索引， $b \in \mathbb{Z}, 0 \leq b < \text{batch\\_size}$
+- $h_q$ ：查询头维度索引， $h_q \in \mathbb{Z}, 0 \leq h_q < \text{q\\_head\\_num}$
+- $h_k$ ：KV 头维度索引， $h_k \in \mathbb{Z}, 0 \leq h_k < \text{kv\\_head\\_num}$
+- $d$ ：单头特征维度索引， $d \in \mathbb{Z}, 0 \leq d < d_k$
+- $i$ ：packed_K/packed_V 的 token 维度索引， $i \in \mathbb{Z}, 0 \leq i < T$ （ $T$ 为总 token 数）
+- $d_k$ ：单头特征维度（键/值头维度）， $d_k = \frac{\text{模型总特征维度}}{\text{q\\_head\\_num}}$
+- $\text{packed\\_K} \in \mathbb{R}^{T \times \text{q\\_head\\_num} \times d_k}$ ：拆解后的键数据张量
+- $\text{packed\\_V} \in \mathbb{R}^{T \times \text{q\\_head\\_num} \times d_k}$ ：拆解后的值数据张量
+- $\text{k\\_cache} \in \mathbb{R}^{\text{batch\\_size} \times \text{kv\\_head\\_num} \times L_{\text{max}} \times d_k}$ ：K 缓存张量（ $L_{\text{max}}$ 为缓存最大长度）
+- $\text{v\\_cache} \in \mathbb{R}^{\text{batch\\_size} \times \text{kv\\_head\\_num} \times L_{\text{max}} \times d_k}$ ：V 缓存张量
+- $\text{cache\\_slot\\_ids} \in \mathbb{Z}^T$ ：缓存槽位索引张量（指定每个 token 写入缓存的位置）
+- $\text{k\\_scale} \in \mathbb{R}^{\text{kv\\_head\\_num}}$ ：K 缓存数据缩放张量（支持广播至 $\mathbb{R}^{1 \times \text{kv\\_head\\_num} \times 1 \times 1}$ ）
+- $\text{v\\_scale} \in \mathbb{R}^{\text{kv\\_head\\_num}}$ ：V 缓存数据缩放张量（支持广播至 $\mathbb{R}^{1 \times \text{kv\\_head\\_num} \times 1 \times 1}$ ）
+### 参数说明
+- **packed_qkv** (torch.Tensor, 入参): 打包后的     QKV 数据张量，是待写入缓存的源数据
+- **q_lens** (torch.Tensor, 入参): 查询序列长度的张量，用于确定数据的序列维度范围
+- **accum_q_lens** (torch.Tensor, 入参): 累积的 Q 序列长度张量，用于定位数据在 packed_qkv 中的偏移
+- **cache_lens** (torch.Tensor, 入参): 缓存当前长度的张量，用于确定缓存的写入起始位置
+- **cache_slot_ids** (torch.Tensor, 入参): 缓存槽位 ID 的张量，用于指定数据写入的缓存槽位
+- **k_cache** (torch.Tensor, 入参/出参): K 缓存张量，计算后会被写入对应的 KV 数据
+- **v_cache** (torch.Tensor, 入参/出参): V 缓存张量，计算后会被写入对应的 KV 数据
+- **k_scale** (torch.Tensor, 入参): K 数据的缩放张量，用于对写入 K 缓存的数据做缩放处理
+- **v_scale** (torch.Tensor, 入参): V 数据的缩放张量，用于对写入 V 缓存的数据做缩放处理
+- **batch_size** (int, 入参): 批处理大小，对应数据的批维度规模
+- **q_head_num** (int, 入参): 查询头的数量，对应模型中查询注意力头的维度配置
+- **kv_head_num** (int, 入参): KV 头的数量，对应模型中 KV 注意力头的维度配置
+### 返回值
+无返回值，计算结果直接写入 k_cache 与 v_cache 张量中。
+### 约束与调用
+- 所有输入张量（packed_qkv、q_lens、accum_q_lens、cache_lens、cache_slot_ids、k_cache、v_cache、k_scale、v_scale）必须位于 CUDA 设备上
+- 数值型张量 packed_qkv、k_cache、v_cache、k_scale、v_scale）支持 float16、bfloat16, 整型张量 q_lens、accum_q_lens、cache_lens、cache_slot_ids 支持 int32、int64
+- batch_size、q_head_num、kv_head_num 必须为正整数，且 q_head_num 需为 kv_head_num 的整数倍（符合大模型 KV 注意力头映射逻辑）
+- q_lens、accum_q_lens、cache_lens 的张量长度需与 batch_size 一致
+- cache_slot_ids 的元素总数需匹配 packed_qkv 中待写入缓存的 token 总数，且其元素值需小于 k_cache/v_cache 缓存长度维度的最大值
+- k_cache 与 v_cache 的维度需匹配 kv_head_num 配置，且二者形状完全一致（如 k_cache.shape = v_cache.shape = (batch_size, kv_head_num, cache_max_len, head_dim)，head_dim 为单头特征维度）
+- packed_qkv 的元素总数需满足：packed_qkv.numel () = sum (q_lens) * q_head_num * head_dim（head_dim 为单头特征维度，与 kv_head_num、模型总特征维度适配）
+- k_scale、v_scale 的形状需与 k_cache/v_cache 的头维度兼容（如 k_scale.shape = (kv_head_num,) 或 (1, kv_head_num, 1, 1)），支持广播计算
+- 所有输入张量需满足连续存储（contiguous）的内存布局要求
+- k_cache、v_cache 需具备可写权限，且内存空间足够容纳本次写入的 KV 缓存数据
+### 调用示例
+```python
+import torch
+import mcoplib.op as op
+# 定义运行设备
+device = "cuda"
+# 定义算子所需的参数
+batch_size = 4
+q_head_num = 32
+kv_head_num = 8      
+head_dim = 128
+seq_len = 128        
+total_tokens = batch_size * seq_len
+max_cache_size = 4096 
+#  关键修正点 
+# 1. 创建输入张量
+# 必须显式展开 Head 维度，使 shape 变为 [Total_Tokens, Num_Heads, Head_Dim]
+# 这样算子读取 size(2) 时才能得到正确的 128 (head_dim)，而不是 6144 (hidden_dim)
+num_all_heads = q_head_num + 2 * kv_head_num  # 32 + 8 + 8 = 48
+packed_qkv = torch.randn(total_tokens, num_all_heads, head_dim, dtype=torch.float16, device=device)
+# 
+# q_lens: 保持 int32
+q_lens = torch.full((batch_size,), seq_len, dtype=torch.int32, device=device)
+# accum_q_lens: 保持 int32
+accum_q_lens = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
+accum_q_lens[1:] = torch.cumsum(q_lens, dim=0)
+# cache_lens: 保持 int32
+cache_lens = torch.randint(0, 100, (batch_size,), dtype=torch.int32, device=device)
+# cache_slot_ids: 保持 int32，一维扁平索引
+cache_slot_ids = torch.randperm(max_cache_size, device=device)[:total_tokens].to(torch.int32)
+# 2. 创建输出/Cache张量
+# 保持 int8 (量化存储)
+k_cache = torch.zeros(max_cache_size, kv_head_num, head_dim, dtype=torch.int8, device=device)
+v_cache = torch.zeros(max_cache_size, kv_head_num, head_dim, dtype=torch.int8, device=device)
+k_scale = torch.ones(max_cache_size, kv_head_num, dtype=torch.float32, device=device)
+v_scale = torch.ones(max_cache_size, kv_head_num, dtype=torch.float32, device=device)
+# 为了确保能捕捉到异步错误，加入同步操作
+torch.cuda.synchronize()
+print("Calling store_kv_cache_cuda_interface...")
+# 3. 调用算子
+op.store_kv_cache_cuda_interface(
+    packed_qkv,
+    q_lens,
+    accum_q_lens,
+    cache_lens,
+    cache_slot_ids,
+    k_cache,      
+    v_cache,      
+    k_scale,
+    v_scale,
+    batch_size,
+    q_head_num,
+    kv_head_num
+)
+# 再次同步，确保算子真正执行完毕且无报错
+torch.cuda.synchronize()
+print("store_kv_cache_cuda_interface computation completed successfully.")
+print(f"Packed QKV shape: {packed_qkv.shape}")
+print(f"K Cache shape: {k_cache.shape}")
+```
+
+## 19. moe_scatter_dynamic_quant
+### 支持的产品型号
+- Metax C500/C550/C588/C600
+### 接口原型
+```python
+def moe_scatter_dynamic_quant(
+    hidden_status: torch.Tensor,
+    selected_experts: torch.Tensor,
+    moe_weights: torch.Tensor,
+    smooth_scale: torch.Tensor,
+    scatter_tokens: torch.Tensor,
+    scatter_per_token_scale: torch.Tensor,
+    scatter_tokens_offset: torch.Tensor,
+    experts_token_count: torch.Tensor,
+    experts_token_start: torch.Tensor,
+    experts_per_rank: int,
+    shared_experts_per_rank: int,
+    shared_tokens_per_sp: int
+) -> None
+```
+### 功能描述
+moe_scatter_dynamic_quant 算子实现了混合专家 MoE 模型中 token 到对应专家的分散分配操作。该算子结合 token 选中的专家索引、权重等信息，将输入隐藏状态张量的 token 特征分散到各专家对应的存储区域，并同步处理缩放因子、token 偏移量、专家 token 计数等辅助信息，减少 MoE 层中数据搬运的开销，提升计算效率，常用于 MoE 架构的模型推理或训练流程
+- 计算公式
+
+$$
+\text{scatter\\_tokens}[e, t, :] = \text{dequantize}\left(\text{quantize}\left(\text{hidden\\_status}[i, :] \times \text{moe\\_weights}[i, e] \times \text{smooth\\_scale}[i], s_q^{(i,e)}\right), s_q^{(i,e)}\right)
+$$
+
+
+
+$$
+\text{scatter\\_per\\_token\\_scale}[e, t] = s_q^{(i,e)} \times \text{moe\\_weights}[i, e] \times \text{smooth\\_scale}[i]
+$$
+
+
+
+$$
+\text{experts\\_token\\_count}[e] = \sum_{i=0}^{N-1} \mathbb{I}\left(\text{selected\\_experts}[i] = e\right)
+$$
+
+
+
+$$
+\text{experts\\_token\\_start}[e] = \sum_{e'=0}^{e-1} \text{experts\\_token\\_count}[e']
+$$
+
+
+
+$$
+\text{scatter\\_tokens\\_offset}[e] = \text{experts\\_token\\_start}[e]
+$$
+
+动态量化缩放因子计算：
+
+$$
+s_q^{(i,e)} = \frac{\max\left(|\text{hidden\\_status}[i, :] \times \text{moe\\_weights}[i, e] \times \text{smooth\\_scale}[i]|\right)}{127}
+$$
+
+量化/反量化操作定义：
+
+$$
+\text{quantize}(x, s) = \text{clip}\left(\lfloor \frac{x}{s} \rfloor, -128, 127\right) \quad (\text{int8动态量化})
+$$
+
+
+
+$$
+\text{dequantize}(x_q, s) = x_q \times s \quad (\text{int8反量化})
+$$
+
+其中：
+- $i$ : 全局 token 索引， $i \in [0, N-1]$ ，其中 $N$ 为输入总 token 数量
+- $e$ : 专家索引， $e \in [0, E_{\text{rank}}-1]$ ，其中 $E_{\text{rank}} = \text{experts\\_per\\_rank}$ （单 rank 专家数）
+- $t$ : 专家 $e$ 内的局部 token 索引， $t \in [0, C_e-1]$ ，其中 $C_e = \text{experts\\_token\\_count}[e]$ （专家 $e$ 分配到的 token 数）
+- $\text{hidden\\_status}[i, :] \in \mathbb{R}^{D}$ : 第 $i$ 个 token 的浮点型隐藏状态张量， $D$ 为特征维度
+- $\text{selected\\_experts}[i] \in \mathbb{N}$ : 第 $i$ 个 token 选中的目标专家索引
+- $\text{moe\\_weights}[i, e] \in \mathbb{R}$ : 第 $i$ 个 token 对应专家 $e$ 的权重系数
+- $\text{smooth\\_scale}[i] \in \mathbb{R}$ : 第 $i$ 个 token 的数值平滑缩放因子
+- $s_q^{(i, e)} \in \mathbb{R}$ : 第 $i$ 个 token 分配到专家 $e$ 时的动态量化缩放因子（int8 量化）
+- $\mathbb{I}(\cdot)$ : 指示函数，条件为真时返回 1，否则返回 0
+- $E_{\text{shared}} = \text{shared\\_experts\\_per\\_rank}$ : 单 rank 部署的共享专家数量
+- $T_{\text{shared}} = \text{shared\\_tokens\\_per\\_sp}$ : 单个共享专家支持的最大 token 数量
+- $\text{clip}(\cdot, a, b)$ : 裁剪函数，将输入值限制在 $[a, b]$ 范围内
+- $\lfloor \cdot \rfloor$ : 向下取整函数
+对于共享专家 $e \in [E_{\text{rank}} - E_{\text{shared}}, E_{\text{rank}} - 1]$ ，需满足 token 数量上限约束：
+
+$$
+\text{experts\\_token\\_count}[e] \leq T_{\text{shared}}
+$$
+
+### 参数说明
+- **hidden_status** (torch.Tensor, 入参): MoE 层的输入 token 隐藏状态张量，存储待分配的 token 特征数据
+- **selected_experts** (torch.Tensor, 入参): 每个 token 对应的选中专家索引张量，指定 token 需分配到的目标专家
+- **moe_weights** (torch.Tensor, 入参): 每个 token 对应选中专家的权重张量，用于对 token 特征进行加权
+- **smooth_scale** (torch.Tensor, 入参): 数值平滑缩放因子张量，用于提升 token 特征计算的稳定性
+- **scatter_tokens** (torch.Tensor, 入参/出参): 输出张量，存储分散到各专家后的 token 特征数据
+- **scatter_per_token_scale** (torch.Tensor, 入参/出参): 输出张量，存储每个分散后 token 对应的缩放因子
+- **scatter_tokens_offset** (torch.Tensor, 入参/出参): 输出张量，存储各专家对应的 token 在 scatter_tokens 中的起始偏移位置
+- **experts_token_count** (torch.Tensor, 入参/出参): 输出张量，存储每个专家实际分配到的 token 数量
+- **experts_token_start** (torch.Tensor, 入参/出参): 输出张量，存储每个专家对应的 token 在 scatter_tokens 中的起始位置索引
+- **experts_per_rank** (int, 入参): 单个计算设备（rank）上部署的专家数量
+- **shared_experts_per_rank** (int, 入参): 单个计算设备（rank）上部署的共享专家数量
+- **shared_tokens_per_sp** (int, 入参): 每个共享专家支持处理的最大 token 数量
+### 返回值
+无返回值，计算结果直接写入 scatter_tokens、scatter_per_token_scale 等输出型张量中
+### 约束与调用
+- 所有张量必须部署在 CUDA 设备上
+- selected_experts 中的专家索引需在当前设备的专家数量范围内，不超出 experts_per_rank 等参数定义的范围
+- scatter_tokens、experts_token_count 等输出张量需提前分配足够的内存空间
+- 支持的数据类型：float16、bfloat16、float32，需与 hidden_status 的张量类型保持一致
+### 调用示例
+```python
+import torch
+import mcoplib.op as op
+device = "cuda"
+batch_size = 4                
+seq_len = 64                  
+hidden_dim = 4096             
+topk = 2                    
+experts_per_rank = 8          
+shared_experts_per_rank = 2  
+shared_tokens_per_sp = 1024  
+total_tokens = batch_size * seq_len 
+total_expert_tokens = total_tokens * topk
+#创建输入数据
+hidden_status = torch.randn(
+    total_tokens, hidden_dim,
+    dtype=torch.bfloat16, device=device
+)
+selected_experts = torch.randint(
+    0, experts_per_rank, (total_tokens, topk),
+    dtype=torch.int32, device=device
+)
+moe_weights = torch.softmax(
+    torch.randn(total_tokens, topk, dtype=torch.float32, device=device),
+    dim=-1
+)
+smooth_scale = torch.randn(
+    hidden_dim, dtype=torch.float32, device=device
+)
+scatter_tokens = torch.randint(
+-128, 127, (total_expert_tokens, hidden_dim),
+    dtype=torch.int8, device=device
+)
+scatter_per_token_scale = torch.randn(
+    total_expert_tokens, dtype=torch.float32, device=device
+)
+scatter_tokens_offset = torch.randint(
+-128, 127, (total_expert_tokens,),
+    dtype=torch.int32, device=device
+)
+experts_token_count = torch.full(
+    (experts_per_rank,), total_expert_tokens // experts_per_rank,
+    dtype=torch.int32, device=device
+)
+remainder = total_expert_tokens % experts_per_rank
+experts_token_count[:remainder] += 1  
+experts_token_start = torch.cumsum(
+    torch.cat([torch.tensor([0], dtype=torch.int32, device=device), experts_token_count[:-1]]),
+    dim=0
+).to(torch.int32)
+# 调用算子
+op.moe_scatter_dynamic_quant(
+    hidden_status,
+    selected_experts,
+    moe_weights,
+    smooth_scale,
+    scatter_tokens,
+    scatter_per_token_scale,
+    scatter_tokens_offset,
+    experts_token_count,
+    experts_token_start,
+    experts_per_rank,
+    shared_experts_per_rank,
+    shared_tokens_per_sp
+)
+print("MOE scatter dynamic quant computation completed")
+print(f"hidden_status shape: {hidden_status.shape}, dtype: {hidden_status.dtype}")
+print(f"selected_experts shape: {selected_experts.shape}, dtype: {selected_experts.dtype}")
+print(f"moe_weights shape: {moe_weights.shape}, dtype: {moe_weights.dtype}")
+print(f"experts_token_count shape: {experts_token_count.shape}, sum: {experts_token_count.sum().item()}")
+print(f"experts_token_start shape: {experts_token_start.shape}, last start: {experts_token_start[-1].item()}")
+print(f"Static params: experts_per_rank={experts_per_rank}, shared_experts_per_rank={shared_experts_per_rank}, shared_tokens_per_sp={shared_tokens_per_sp}")
+```
+
+## 20. scale_dynamic_quant
+
+### 支持的产品型号
+
+- Metax C500/C550/C588/C600
+
+### 接口原型
+
+```python
+def scale_dynamic_quant(
+    hidden_states: torch.Tensor,
+    smooth_scales: torch.Tensor,
+    dst_dtype: torch.dtype = torch.int8
+) -> tuple[torch.Tensor, torch.Tensor]
+```
+
+### 功能描述
+
+scale_dynamic_quant 算子实现了动态量化与尺度计算的融合操作。该算子首先基于输入的 hidden_states 和 smooth_scales 计算量化尺度 scales，然后将 hidden_states 量化到指定的目标数据类型（默认 int8）。这种融合操作可减少中间变量存储，提高量化过程的计算效率，常用于神经网络中张量的动态量化场景
+
+- 计算公式：
+
+$$
+  \text{scales} = \frac{\max(|\text{hidden\\_states}|, \epsilon)}{\text{qmax} \times \text{smooth\\_scales}}
+$$
+
+
+
+$$
+  \text{quantized\\_tensor} = \text{clip}\left(\text{round}\left(\frac{\text{hidden\\_states}}{\text{scales}}\right), \text{qmin}, \text{qmax}\right)
+$$
+
+  其中：
+
+- $\text{hidden\\_states} \in \mathbb{R}^{B \times S \times D}$ 是输入隐藏状态张量， $B$ 为批次大小， $S$ 为序列长度， $D$ 为特征维度
+- $\text{smooth\\_scales} \in \mathbb{R}^{D}$ 是平滑尺度张量（与特征维度对齐）
+- $\text{scales} \in \mathbb{R}^{D}$ 是计算得到的量化尺度张量（与特征维度对齐）
+- $\text{quantized\\_tensor} \in \mathbb{Z}^{B \times S \times D}$ 是量化后的整数张量，数据类型由 $\text{dst\\_dtype}$ 指定
+- $\epsilon$ 是数值稳定性参数（默认取 $10^{-8}$ ），避免分母为 0
+- $\text{qmin}$ 和 $\text{qmax}$ 是目标数据类型 $\text{dst\\_dtype}$ 的取值范围边界：
+- 若 $\text{dst\\_dtype} = \text{int8}$ ，则 $\text{qmin} = -128$ ， $\text{qmax} = 127$
+- 其他整数类型按对应 dtype 的固有范围确定
+- $\max (|\text{hidden\\_states}|)$ 表示对 $\text{hidden\\_states}$ 在 $B \times S$ 维度上取绝对值后的最大值（按特征维度 $D$ 独立计算）
+- $\text{round}(\cdot)$ 表示四舍五入取整操作
+- $\text{clip}(\cdot, \text{qmin}, \text{qmax})$ 表示将数值裁剪到 $\text{qmin}$ 和 $\text{qmax}$ 之间，确保符合目标 dtype 范围
+	补充说明：
+- 当 $\text{smooth\\_scales}$ 为标量时，自动广播为 $\mathbb{R}^{D}$ 维度（所有特征维度使用相同平滑系数）
+- 量化尺度计算采用"特征维度独立"策略，每个特征维度对应一个独立的量化尺度
+- 输入 $\text{hidden\\_states}$ 的数据类型支持 $\text{float16}$ 、 $\text{bfloat16}$ 、 $\text{float32}$ ，计算过程中统一转换为 $\text{float32}$ 进行精度保证
+
+### 参数说明
+
+- **hidden_states** (torch.Tensor, 入参): 输入的隐藏状态张量，为量化的原始数据
+- **smooth_scales** (torch.Tensor, 入参): 平滑尺度张量，用于辅助计算量化尺度
+- **dst_dtype** (torch.dtype, 入参, 可选): 目标量化数据类型，默认值为 torch.int8
+
+### 返回值
+
+返回一个元组 (torch.Tensor, torch.Tensor)，其中：
+
+- 第一个元素为量化后的张量，数据类型为 dst_dtype
+- 第二个元素为计算得到的量化尺度张量 scales
+
+### 约束与调用
+
+- 所有张量必须位于 CUDA 设备上
+- 输入 hidden_states 支持的数据类型：float16、bfloat16、float32
+- 目标数据类型 dst_dtype 通常为整数类型（如 int8）
+- smooth_scales 的形状需与 hidden_states 的相关维度匹配，以确保尺度计算的有效性
+
+### 调用示例
+
+```Python
+import torch
+import mcoplib.op as op
+device = "cuda"
+# 定义参数
+batch_size = 8          
+seq_len = 1024          
+hidden_dim = 4096      
+dst_dtype = torch.int8 
+# 创建输入张量
+hidden_states = torch.randn(batch_size, seq_len, hidden_dim, dtype=torch.bfloat16, device=device)
+smooth_scales = torch.randn(hidden_dim, dtype=torch.float32, device=device)  # 特征维度对齐的平滑尺度
+# 调用scale_dynamic_quant算子
+quantized_hidden_states, scales = op.scale_dynamic_quant(
+    hidden_states=hidden_states,
+    smooth_scales=smooth_scales,
+    dst_dtype=dst_dtype
+)
+# 打印执行结果
+print("Scale dynamic quantization computation completed")
+print(f"Quantized hidden states shape: {quantized_hidden_states.shape}, dtype: {quantized_hidden_states.dtype}")
+print(f"Computed scales shape: {scales.shape}, dtype: {scales.dtype}")
+```
+
+## 21. rotary_pos_emb_forward
+
+### 支持的产品型号
+
+- Metax C500/C550/C588/C600
+
+### 接口原型
+
+```python
+def rotary_pos_emb_forward(
+    input: torch.Tensor,
+    sin: torch.Tensor,
+    cos: torch.Tensor,
+    cumsum_len: torch.Tensor,
+    batch_size: int,
+    cut_head_dim: int = 0
+) -> torch.Tensor
+```
+
+### 功能描述
+
+rotary_pos_emb_forward 算子实现旋转位置编码的前向计算，结合输入张量、预计算的正弦/余弦位置编码张量，以及批次样本的累积长度信息，对输入进行旋转位置编码处理，用于增强 Transformer 类模型中序列的位置信息表示。
+
+- 计算公式：
+
+$$
+  \text{rotary\\_pos\\_emb\\_forward}(\mathbf{X}, \sin, \cos, \text{cumsum\\_len}, B, D_{cut}) = \mathbf{X}'
+$$
+
+  其中 $\mathbf{X}'$ 的元素计算遵循旋转位置编码（RoPE）规则：
+
+$$
+  \begin{cases}
+  x'_{b,l,h,d} = x_{b,l,h,d}, & d < D_{cut} \\
+  x'_{b,l,h,2m} = x_{b,l,h,2m} \cdot \cos(\theta_{m, pos_{b,l}}) - x_{b,l,h,2m+1} \cdot \sin(\theta_{m, pos_{b,l}}), & d = 2m \geq D_{cut} \\
+  x'_{b,l,h,2m+1} = x_{b,l,h,2m} \cdot \sin(\theta_{m, pos_{b,l}}) + x_{b,l,h,2m+1} \cdot \cos(\theta_{m, pos_{b,l}}), & d = 2m+1 \geq D_{cut}
+  \end{cases}
+$$
+
+  位置编码的角度参数定义为：
+
+$$
+  \theta_{m, pos} = \frac{pos}{10000^{2m/D'}}, \quad D' = D - D_{cut}
+$$
+
+  批次中第 $b$ 个样本第 $l$ 个位置的绝对位置：
+
+$$
+  pos_{b,l} = \text{cumsum\\_len}[b] + l
+$$
+
+  其中：
+
+- $\mathbf{X} \in \mathbb{R}^{B \times L \times H \times D}$ 是输入张量（ $B$ 为批次大小， $L$ 为序列长度， $H$ 为注意力头数， $D$ 为头维度）
+- $\sin \in \mathbb{R}^{L_{max} \times D'/2}$ 是预计算的正弦位置编码张量（ $L_{max}$ 为最大序列长度）
+- $\cos \in \mathbb{R}^{L_{max} \times D'/2}$ 是预计算的余弦位置编码张量
+- $\text{cumsum\\_len} \in \mathbb{Z}^B$ 是批次中各样本的累积长度张量，用于确定局部位置的绝对偏移
+- $D_{cut} \in \mathbb{N}$ 是裁剪的头维度长度，默认值为 0
+- $D'$ 是参与旋转编码的有效头维度长度
+- $pos_{b, l}$ 是第 $b$ 个样本第 $l$ 个位置的绝对序列位置
+- $\theta_{m, pos}$ 是位置 $pos$ 下第 $m$ 组维度对的旋转角度
+
+### 参数说明
+
+- **input** (torch.Tensor, 入参): 待施加旋转位置编码的输入张量
+- **sin** (torch.Tensor, 入参): 预计算的正弦位置编码张量
+- **cos** (torch.Tensor, 入参): 预计算的余弦位置编码张量
+- **cumsum_len** (torch.Tensor, 入参): 批次中各样本的累积长度张量，用于确定每个样本的局部序列位置
+- **batch_size** (int, 入参): 输入数据的批次大小
+- **cut_head_dim** (int, 入参，默认 0): 需裁剪的头维度长度，仅对裁剪后的剩余头维度执行旋转编码
+
+### 返回值
+
+torch.Tensor，经过旋转位置编码处理后的输出张量
+
+### 约束与调用
+
+- 所有张量必须位于 CUDA 设备上
+- cut_head_dim 的值必须小于输入张量的头维度长度
+- 支持的数据类型：float16、bfloat16、float32
+- cumsum_len 需与批次内各样本的长度信息匹配
+
+### 调用示例
+
+```python
+import torch
+import mcoplib.op
+device = "cuda"
+# 定义参数
+batch_size = 4  
+seq_len = 64    
+num_heads = 32  
+head_dim = 128  
+cut_head_dim = 32 
+max_seq_len = 2048  
+# 计算参与旋转编码的有效头维度
+effective_head_dim = head_dim - cut_head_dim
+assert effective_head_dim % 2 == 0, "Effective head dimension must be even for RoPE"
+# 创建输入张量
+input_tensor = torch.randn(batch_size, seq_len, num_heads, head_dim, dtype=torch.float16, device=device)
+# 创建预计算的sin/cos位置编码张量
+sin = torch.randn(max_seq_len, effective_head_dim // 2, dtype=torch.float16, device=device)
+cos = torch.randn(max_seq_len, effective_head_dim // 2, dtype=torch.float16, device=device)
+# 创建批次累积长度张量
+cumsum_len = torch.tensor([0, 512, 1024, 1536], dtype=torch.int64, device=device)
+# 调用rotary_pos_emb_forward算子
+output = op.rotary_pos_emb_forward(
+    input_tensor,
+    sin,
+    cos,
+    cumsum_len,
+    batch_size,
+    cut_head_dim
+)
+# 打印结果信息
+print("Rotary position embedding forward computation completed")
+print(f"Input tensor shape: {input_tensor.shape}")
+print(f"Output tensor shape: {output.shape}")
+print(f"Output tensor dtype: {output.dtype}")
+```
+
+## 22. rotary_pos_emb_backward
+
+### 支持的产品型号
+
+- Metax C500/C550/C588/C600
+
+### 接口原型
+
+```python
+def rotary_pos_emb_backward(
+    input: torch.Tensor,
+    sin: torch.Tensor,
+    cos: torch.Tensor,
+    cumsum_len: torch.Tensor,
+    batch_size: int,
+    cut_head_dim: int = 0
+) -> torch.Tensor
+```
+
+### 功能描述
+
+rotary_pos_emb_backward 算子实现旋转位置编码的反向传播计算，基于前向过程的输入、正弦/余弦位置编码及累积长度信息，计算对应输入的梯度，用于模型训练中的反向梯度传递
+
+- 计算公式：
+
+$$
+  \text{rotary\\_pos\\_emb\\_backward}(\mathbf{G}, \sin, \cos, \text{cumsum\\_len}, B, D_{cut}) = \nabla \mathbf{X}
+$$
+
+  其中梯度 $\nabla \mathbf{X}$ 的元素由输出梯度 $\mathbf{G}$ 反向推导得到：
+
+$$
+  \begin{cases}
+  \nabla x_{b,l,h,d} = g_{b,l,h,d}, & d < D_{cut} \\
+  \nabla x_{b,l,h,2m} = g_{b,l,h,2m} \cdot \cos(\theta_{m, pos_{b,l}}) + g_{b,l,h,2m+1} \cdot \sin(\theta_{m, pos_{b,l}}), & d = 2m \geq D_{cut} \\
+  \nabla x_{b,l,h,2m+1} = -g_{b,l,h,2m} \cdot \sin(\theta_{m, pos_{b,l}}) + g_{b,l,h,2m+1} \cdot \cos(\theta_{m, pos_{b,l}}), & d = 2m+1 \geq D_{cut}
+  \end{cases}
+$$
+
+  角度参数 $\theta_{m, pos}$ 和绝对位置 $pos_{b, l}$ 的定义与前向过程一致：
+
+$$
+  \theta_{m, pos} = \frac{pos}{10000^{2m/D'}}, \quad pos_{b,l} = \text{cumsum\\_len}[b] + l, \quad D' = D - D_{cut}
+$$
+
+  其中：
+
+- $\mathbf{G} \in \mathbb{R}^{B \times L \times H \times D}$ 是旋转编码输出的梯度张量（即损失函数对前向输出 $\mathbf{X}'$ 的梯度）
+- $\nabla \mathbf{X} \in \mathbb{R}^{B \times L \times H \times D}$ 是损失函数对前向输入 $\mathbf{X}$ 的梯度张量（算子返回值）
+- $\sin \in \mathbb{R}^{L_{max} \times D'/2}$ 是与前向过程一致的预计算正弦位置编码张量
+- $\cos \in \mathbb{R}^{L_{max} \times D'/2}$ 是与前向过程一致的预计算余弦位置编码张量
+- $\text{cumsum\\_len} \in \mathbb{Z}^B$ 是与前向过程一致的批次累积长度张量
+- $B \in \mathbb{N}$ 是批次大小（与前向过程一致）
+- $D_{cut} \in \mathbb{N}$ 是裁剪的头维度长度（与前向过程一致）
+- $D'$ 是参与旋转编码的有效头维度长度
+- $pos_{b, l}$ 是第 $b$ 个样本第 $l$ 个位置的绝对序列位置
+- $\theta_{m, pos}$ 是位置 $pos$ 下第 $m$ 组维度对的旋转角度
+- $g_{b, l, h, d}$ 是梯度张量 $\mathbf{G}$ 在 $(b, l, h, d)$ 位置的元素
+- $\nabla x_{b, l, h, d}$ 是梯度张量 $\nabla \mathbf{X}$ 在 $(b, l, h, d)$ 位置的元素
+
+### 参数说明
+
+- **input** (torch.Tensor, 入参): 反向传播中待计算梯度的输入张量，通常为前向输出的梯度张量
+- **sin** (torch.Tensor, 入参): 预计算的正弦位置编码张量，与前向过程使用的张量一致
+- **cos** (torch.Tensor, 入参): 预计算的余弦位置编码张量，与前向过程使用的张量一致
+- **cumsum_len** (torch.Tensor, 入参): 批次中各样本的累积长度张量，与前向过程使用的张量一致
+- **batch_size** (int, 入参): 输入数据的批次大小，与前向过程的批次大小一致
+- **cut_head_dim** (int, 入参，默认 0): 需裁剪的头维度长度，与前向过程的裁剪长度一致
+
+### 返回值
+
+torch.Tensor，经过反向传播计算得到的梯度张量
+
+### 约束与调用
+
+- 所有张量必须位于 CUDA 设备上
+- cut_head_dim 的值必须小于输入张量的头维度长度
+- 支持的数据类型：float16、bfloat16、float32
+- 所有参数（sin、cos、cumsum_len 等）需与前向过程对应的参数保持一致
+
+### 调用示例
+
+```python
+import torch
+import mcoplib.op as op
+device = "cuda"
+# 定义参数（与前向保持一致）
+batch_size = 4
+seq_len = 64
+num_heads = 32
+head_dim = 128
+cut_head_dim = 32
+max_seq_len = 2048
+# 计算参与旋转编码的有效头维度
+effective_head_dim = head_dim - cut_head_dim
+assert effective_head_dim % 2 == 0, "Effective head dimension must be even for RoPE"
+# 创建反向传播的输入张量（前向输出的梯度）：[batch_size, seq_len, num_heads, head_dim]
+grad_input = torch.randn(batch_size, seq_len, num_heads, head_dim, dtype=torch.float16, device=device)
+# 创建与前向一致的sin/cos位置编码张量：[max_seq_len, effective_head_dim//2]
+sin = torch.randn(max_seq_len, effective_head_dim // 2, dtype=torch.float16, device=device)
+cos = torch.randn(max_seq_len, effective_head_dim // 2, dtype=torch.float16, device=device)
+# 创建与前向一致的批次累积长度张量：[batch_size]
+cumsum_len = torch.tensor([0, 512, 1024, 1536], dtype=torch.int64, device=device)
+# 调用rotary_pos_emb_backward算子
+grad_output = op.rotary_pos_emb_backward(
+    grad_input,
+    sin,
+    cos,
+    cumsum_len,
+    batch_size,
+    cut_head_dim
+)
+# 打印结果信息
+print("Rotary position embedding backward computation completed")
+print(f"Gradient input shape: {grad_input.shape}")
+print(f"Gradient output shape: {grad_output.shape}")
+print(f"Gradient output dtype: {grad_output.dtype}")
+```
+
+## 23. fused_add_rms_norm_dynamic_per_token_quant_padding_output
+
+### 支持的产品型号
+
+- Metax C500/C550/C588/C600
+
+### 接口原型
+
+```python
+def fused_add_rms_norm_dynamic_per_token_quant_padding_output(
+    output: torch.Tensor,         
+    output_rms:torch.Tensor,
+    output_quant_int8: torch.Tensor,  
+    out_scales: torch.Tensor,     
+    input: torch.Tensor,          
+    residual: torch.Tensor,       
+    weight: torch.Tensor,       
+    pad_size: int,                
+    epsilon: float             
+) -> None
+```
+
+### 功能描述
+
+add_rms_norm_dynamic_per_token_quant_padding_output 算子实现带 RMS 归一化、残差连接的动态逐 Token 量化计算与输出填充。该算子先对输入执行 RMS 归一化，结合残差与权重完成运算，再基于每个 Token 的激活特征动态生成量化缩放因子并执行量化，对输出进行填充适配，用于需要填充场景的高效量化推理加速。
+
+- 计算公式：
+
+$$
+  \hat{Y} = \text{Quant}\left( (X \cdot W) + R, \frac{\max_{d}|(X \cdot W + R)_{n,d}| + \epsilon}{Q_{\text{max}}} \right)
+$$
+
+  其中 $\text{Quant}(x, S_n)$ 表示按缩放因子 $S_n$ 对 $x$ 执行量化操作
+  矩阵乘加和残差连接：
+
+$$
+  P_{n,d} = (X_n \cdot W_d) + R_{n,d}
+$$
+
+  向量优化：
+
+$$
+  \mathbf{P}_{n,v} = (X_{n,v} \odot W_v) + R_{n,v}
+$$
+
+  计算 Token 级最大激活幅度：
+
+$$
+  M_n = \max_{d \in [1,D]} |P_{n,d}|
+$$
+
+  计算 Token 级缩放因子：
+
+$$
+  S_n = \frac{M_n + \epsilon}{Q_{\text{max}}}
+$$
+
+  浮点数量化为整数：
+
+$$
+  \hat{Y}_{n,d} = \text{round}\left( \text{clamp}\left( \frac{P_{n,d}}{S_n}, -Q_{\text{max}}, Q_{\text{max}} \right) \right)
+$$
+
+  其中：
+
+- $X \in \mathbb{R}^{N \times D}$ 是输入 Token 特征张量（ $N$=num_tokens， $D$=hidden_size）
+- $W \in \mathbb{R}^{D \times D}$ 是隐藏层权重张量
+- $R \in \mathbb{R}^{N \times D}$ 是残差连接张量，维度与输入一致
+- $P \in \mathbb{R}^{N \times D}$ 是乘加+残差后的中间结果张量
+- $\mathbf{P}_{n, v}$ 是向量优化版中间结果（ $v$ 为向量索引，向量长度 $L$=vec_len）
+- $X_n$ 是输入第 $n$ 个 Token 的特征向量（ $1 \times D$ ）， $W_d$ 是权重第 $d$ 列向量（ $D \times 1$ ）
+- $X_{n, v}/W_v/R_{n, v}$ 是长度为 $L$ 的向量， $\odot$ 表示逐元素乘法， $\cdot$ 表示向量点积
+- $M_n$ 是第 $n$ 个 Token 中间结果的最大绝对值（块内归约得到）
+- $S \in \mathbb{R}^N$ 是 Token 级动态量化缩放因子张量
+- $Q_{\text{max}}$ 是量化类型最大值
+- $\epsilon$ 是防止除零的小值（默认 $10^{-6}$ ）
+- $\hat{Y} \in \mathbb{Z}^{N \times D}$ 是量化后的输出张量（整数类型）
+- $\text{clamp}(x, a, b)$ 表示将 $x$ 截断到 $[a, b]$ 范围， $\text{round}(x)$ 表示四舍五入取整
+	算子优化目标：
+
+$$
+  \min_{\hat{Y}} \sum_{n=1}^N \sum_{d=1}^D \left| P_{n,d} - \hat{Y}_{n,d} \cdot S_n \right|^2
+$$
+
+  量化误差约束：
+
+$$
+  \max_{n,d} \left| P_{n,d} - \hat{Y}_{n,d} \cdot S_n \right| \leq Q_{\text{max}} \cdot \epsilon
+$$
+
+  其中 $\hat{Y}_{n, d} \cdot S_n$ 是量化结果的反量化值，约束量化前后的最大绝对误差不超过阈值。
+  **主要功能包括：**
+
+- 基于 CUDA 实现 RMS 归一化预处理，稳定输入特征数值范围
+- 支持残差连接与矩阵乘加融合计算，保留原始特征并完成线性变换
+- 实现动态逐 Token 量化，基于激活最大绝对值生成专属缩放因子
+- 提供输出填充适配能力，满足固定维度或边界对齐的推理场景
+- 结合向量化访存与线程协同优化，提升 CUDA 核函数执行效率
+
+### 参数说明
+
+- **input** (torch.Tensor, 入参): 形状为[num_tokens, hidden_size]，存储待处理的 Token 特征张量
+- **weight** (torch.Tensor, 入参): 形状为[hidden_size, hidden_size]，存储隐藏层权重张量
+- **residual** (torch.Tensor, 入参): 形状为[num_tokens, hidden_size]，存储残差连接张量
+- **epsilon** (float, 入参): 标量，防止计算 RMS 归一化时除零的极小值
+- **pad_size** (int, 入参): 标量，输出张量的填充尺寸，用于对齐输出维度
+
+### 返回值
+
+无返回值，结果直接写到输出张量 output 中，输出张量包含：output, output_rms, output_quant_int8, out_scales 和 residual
+
+- **output**：形状为[num_tokens, hidden_size + pad_size]，数据类型为 bfloat16，存储 RMS 归一化+矩阵乘加+残差后的中间结果张量
+- **output_rms**：形状为 [num_tokens, hidden_size]，数据类型为 bfloat16，存储输入张量经过 RMS 归一化后的中间结果张量
+- **output_quant_int8**：形状为[num_tokens, hidden_size + pad_size]，数据类型为 int8，存储动态逐 Token 量化后的输出张量
+- **out_scales**：形状为[num_tokens]，数据类型为 float，存储每个 Token 对应的量化缩放因子
+	residual：保持不变
+
+### 约束与调用
+
+- 所有张量必须位于 CUDA 设备上
+- 输入张量仅支持 bfloat16，输出张量：output_quant_int8 为 int8，out_scale 为 float，output 为 bfloat16
+- 张量形状约束：input 与 residual 形状需一致为[num_tokens, hidden_size]，weight 形状需为[hidden_size, hidden_size]，与 input 的特征维度匹配
+- pad_size 必须为非负整数，epsilon 必须为正数
+- 仅支持 int8 动态逐 Token 量化，不支持其他量化位宽
+
+### 调用示例
+
+```python
+import torch
+import mcoplib.op as op
+device = "cuda"
+# 1. 定义维度
+batch_size = 1      # 或者是 num_tokens 的维度，视具体实现而定
+seq_len = 128
+hidden_size = 4096
+pad_size = 0        # 根据业务需求设置，通常为0或者对齐所需的padding
+epsilon = 1e-6      # RMS Norm 的 epsilon
+# 2. 准备输入数据 (Inputs)
+# 注意：residual 通常需要与 input 形状一致
+input_tensor = torch.randn(batch_size, seq_len, hidden_size, dtype=torch.bfloat16, device=device)
+residual = torch.randn(batch_size, seq_len, hidden_size, dtype=torch.bfloat16, device=device)
+weight = torch.randn(hidden_size, dtype=torch.bfloat16, device=device) # RMS Norm Gamma
+# 3. 准备输出容器 (Outputs)
+# output: BF16 (用于存放非量化的 Add 结果，或者 Padding Output)
+output = torch.empty_like(input_tensor)
+# output_rms: BF16 (RMS Norm 后的结果)
+output_rms = torch.empty_like(input_tensor)
+# output_quant_int8: Int8 (量化结果)
+output_quant_int8 = torch.empty(batch_size, seq_len, hidden_size, dtype=torch.int8, device=device)
+# out_scales: Float32
+out_scales = torch.empty(batch_size, seq_len, 1, dtype=torch.float32, device=device)
+# 4. 调用算子 (修改顺序)
+print("Calling fused_add_rms_norm_dynamic_per_token_quant_padding_output...")
+# 这里的关键修改是：将 Int8 张量作为第一个参数传入
+op.fused_add_rms_norm_dynamic_per_token_quant_padding_output(
+    output_quant_int8,      # [Arg 0] 此时传入 Int8，满足 "Expected output.dtype() == kInt8"
+    output_rms,             # [Arg 1] RMS 输出 (BF16)
+    output,                 # [Arg 2] 剩下的这个 BF16 输出放在这里 (原签名中的 output_quant_int8 位置)
+    out_scales,             # [Arg 3] Scales
+    input_tensor,           # [Arg 4] Input
+    residual,               # [Arg 5] Residual
+    weight,                 # [Arg 6] Weight
+    pad_size,               # [Arg 7] Pad Size
+    epsilon                 # [Arg 8] Epsilon
+)
+torch.cuda.synchronize()
+print("Call successful.")
+print(f"Quantized Output Shape: {output_quant_int8.shape}")
+```
+
+## 24. rms_norm_dynamic_per_token_quant_custom
+
+### 支持的产品型号
+
+- Metax C500/C550/C588/C600
+
+### 接口原型
+
+```python
+def rms_norm_dynamic_per_token_quant_custom(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    scales: torch.Tensor,
+    var_epsilon: float,
+    scale_ub: Optional[torch.Tensor] = None,
+    residual: Optional[torch.Tensor] = None
+) -> None
+```
+
+### 功能描述
+
+rms_norm_dynamic_per_token_quant_custom 算子实现了 RMS 归一化与动态逐 token 量化的融合操作。该算子首先对输入（可选叠加残差）进行 RMS 归一化计算，过程中引入动态逐 token 尺度调整，结合量化尺度参数完成量化操作，最终将结果输出到指定张量，通过融合计算减少内存交互，提升处理效率，适用于量化场景下的 Transformer 模型层。
+
+- 计算公式：
+
+$$
+  \text{input\\_merged} =
+  \begin{cases}
+  \text{input} + \text{residual}, & \text{residual} \neq \text{None} \\
+  \text{input}, & \text{residual} = \text{None}
+  \end{cases}
+$$
+
+  
+
+$$
+  \text{rms} = \sqrt{\frac{1}{D} \sum_{d=1}^D \text{input\\_merged}_{(\cdot, d)}^2 + \text{var\\_epsilon}}
+$$
+
+  
+
+$$
+  \text{scale\\_dynamic} =
+  \begin{cases}
+  \text{scales}, & \text{scale\\_ub} = \text{None} \\
+  \min(\text{scales}, \text{scale\\_ub}), & \text{scale\\_ub} \neq \text{None}
+  \end{cases}
+$$
+
+  
+
+$$
+  \text{out} = \frac{\text{input\\_merged}}{\text{rms}} \odot \text{weight} \odot \text{scale\\_dynamic}
+$$
+
+  其中：
+
+- $\text{input} \in \mathbb{R}^{B \times L \times D}$ 是输入张量， $B$ 为批次大小， $L$ 为序列长度， $D$ 为特征维度（hidden_size）
+- $\text{residual} \in \mathbb{R}^{B \times L \times D}$ （可选）是残差张量，与 input 形状一致，用于元素级叠加
+- $\text{input\\_merged} \in \mathbb{R}^{B \times L \times D}$ 是输入与残差叠加后的中间张量
+- $\text{weight} \in \mathbb{R}^D$ 是 RMS 归一化的权重张量，沿特征维度缩放
+- $\text{var\\_epsilon} \in \mathbb{R}^+$ 是数值稳定性参数，避免均方根计算时分母为零（通常取 $10^{-6}$ 量级）
+- $\text{scales} \in \mathbb{R}^{B \times L}$ 是动态逐 token 量化尺度张量，为每个 token 提供独立的量化尺度
+- $\text{scale\\_ub} \in \mathbb{R}^{B \times L}$ （可选）是尺度上界张量，约束动态尺度的最大值
+- $\text{scale\\_dynamic} \in \mathbb{R}^{B \times L}$ 是经过上界约束后的最终动态量化尺度
+- $\text{rms} \in \mathbb{R}^{B \times L}$ 是输入合并张量的均方根值，沿特征维度 $D$ 计算
+- $\text{out} \in \mathbb{R}^{B \times L \times D}$ 是最终输出张量，存储量化后的 RMS 归一化结果
+- $\odot$ 表示元素级乘法（Hadamard 积），维度不匹配时自动广播（如 $D$ 维 $\text{weight}$ 广播至 $B \times L \times D$ ， $B \times L$ 维 $\text{scale\\_dynamic}$ 广播至 $B \times L \times D$ ）
+- $D$ 需满足对齐约束（如 $D \% 4 = 0$ ），以保证 CUDA 设备上的计算效率
+
+### 参数说明
+
+- **out** (torch.Tensor, 出参): 输出张量，用于存储最终的量化归一化结果
+- **input** (torch.Tensor, 入参): 输入张量，为待进行 RMS 归一化和量化的原始数据
+- **weight** (torch.Tensor, 入参): 权重张量，用于 RMS 归一化过程中的缩放调整，形状与归一化维度匹配
+- **scales** (torch.Tensor, 入参): 量化尺度张量，用于动态逐 token 量化的尺度计算
+- **var_epsilon** (float, 入参): 数值稳定性参数，用于避免 RMS 计算中分母为零，通常取极小正值（如 1e-6）
+- **scale_ub** (Optional[torch.Tensor], 入参): 尺度上界张量，可选参数，用于约束动态尺度的上限范围
+- **residual** (Optional[torch.Tensor], 入参): 残差张量，可选参数，若存在则先与 input 叠加后再进行后续计算
+
+### 返回值
+
+无返回值，计算结果直接写入 out 张量中
+
+### 约束与调用
+
+- 所有张量必须位于 CUDA 设备上
+- 张量在物理内存中必须是连续排列的（
+- 支持的数据类型：float16、bfloat16、float32
+- 当 residual 存在时，其形状需与 input 匹配以支持元素级相加
+- hidden_size 需与输入张量的特征维度匹配，且需满足向量对齐要求, 如代码中提到的 hidden_size % 4 == 0 等对齐约束
+
+### 调用示例
+
+```Python
+import torch
+import mcoplib.op as op
+device = "cuda"
+# 1. 定义维度
+batch_size = 1
+seq_len = 128
+hidden_size = 4096
+epsilon = 1e-6
+# 2. 准备输入数据
+# input: [Batch, Seq, Hidden]
+input_tensor = torch.randn(batch_size, seq_len, hidden_size, dtype=torch.bfloat16, device=device)
+# weight: [Hidden] (RMS Norm 的 Gamma 参数)
+weight = torch.randn(hidden_size, dtype=torch.bfloat16, device=device)
+# 3. 准备输出容器
+# out: 根据函数名含有 "quant"，且是第一个参数，通常这里存放 Int8 结果
+out = torch.empty(batch_size, seq_len, hidden_size, dtype=torch.int8, device=device)
+# scales: 注释说是 [num_tokens]，即 [Batch * Seq] 或者 [Batch, Seq]
+# 为了保险，我们创建与 Batch, Seq 对应的形状。Float32 是量化 scale 的标准类型。
+scales = torch.empty(batch_size, seq_len, dtype=torch.float32, device=device)
+# 4. 准备可选参数 (Optional Arguments)
+# 如果不需要 residual 或 scale_ub，直接传 None
+# 如果需要 residual，通常需要传入一个形状与 input 相同的 Tensor
+residual = None 
+# residual = torch.randn_like(input_tensor) # 如果需要测试 residual add
+scale_ub = None
+# 5. 调用算子
+print("Calling rms_norm_dynamic_per_token_quant_custom...")
+# 确保内存连续
+if not input_tensor.is_contiguous(): input_tensor = input_tensor.contiguous()
+if not weight.is_contiguous(): weight = weight.contiguous()
+# 参数顺序必须严格对应 C++ 签名：
+# (out, input, weight, scales, epsilon, scale_ub, residual)
+op.rms_norm_dynamic_per_token_quant_custom(
+    out,            # at::Tensor& out
+    input_tensor,   # at::Tensor const& input
+    weight,         # at::Tensor const& weight
+    scales,         # at::Tensor& scales
+    epsilon,        # double const var_epsilon
+    scale_ub,       # c10::optional<at::Tensor> scale_ub
+    residual        # c10::optional<at::Tensor> residual
+)
+torch.cuda.synchronize()
+print("Call successful.")
+print(f"Output (Int8) shape: {out.shape}")
+print(f"Scales shape: {scales.shape}")
+# 简单验证一下数据是否被写入 (不全为0)
+print(f"Output max val: {out.max().item()}, Output min val: {out.min().item()}")
+```
+
+## 25. recv_from_attention_node_post_process
+
+### 支持的产品型号
+
+- Metax C500/C550/C588/C600
+
+### 接口原型
+
+```python
+def recv_from_attention_node_post_process(
+    hidden_status: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    ori_index: torch.Tensor,
+    new_index: torch.Tensor,
+    deep_hidden_status: torch.Tensor,
+    deeper_topk_weights: torch.Tensor,
+    expert_cnt: torch.Tensor,
+    valid_idx_size: torch.Tensor,
+    begin_expert_id: int,
+    num_local_experts: int,
+    max_index_size: int,
+    work_count: int
+) -> None
+```
+
+### 功能描述
+
+recv_from_attention_node_post_process 算子实现了从注意力节点接收数据后的后处理操作。该算子主要处理注意力机制输出的 topk 结果，包含索引和权重，通过索引映射更新隐藏状态和深层隐藏状态，并结合专家分配信息（起始专家 ID、本地专家数量等）完成专家相关的计数与权重处理，常用于混合专家模型 MoE 中注意力模块与专家模块的衔接流程
+
+- 计算公式
+
+$$
+\text{new\\_index}[i] = \text{ori\\_index}[\text{topk\\_ids}[i]] \quad (0 \leq i < \text{valid\\_idx\\_size})
+$$
+
+
+
+$$
+\text{expert\\_cnt}[e] = \text{expert\\_cnt}[e] + \sum_{i=0}^{\text{valid\\_idx\\_size}-1} \mathbb{I}\left(
+    \text{topk\\_ids}[i] \in [\text{begin\\_expert\\_id} + e \cdot \text{max\\_index\\_size}, \text{begin\\_expert\\_id} + (e+1) \cdot \text{max\\_index\\_size} - 1]
+\right)
+$$
+
+
+
+$$
+\text{hidden\\_status}[j] = \text{hidden\\_status}[j] + \sum_{i=0}^{\text{valid\\_idx\\_size}-1} \text{topk\\_weights}[i] \cdot \text{hidden\\_status}[\text{new\\_index}[i]]
+$$
+
+
+
+$$
+\text{deeper\\_topk\\_weights}[i] = \text{deeper\\_topk\\_weights}[i] \cdot \text{topk\\_weights}[i] \cdot \frac{1}{\text{work\\_count}}
+$$
+
+
+
+$$
+\text{deep\\_hidden\\_status}[j] = \text{deep\\_hidden\\_status}[j] + \sum_{i=0}^{\text{valid\\_idx\\_size}-1} \text{deeper\\_topk\\_weights}[i] \cdot \text{hidden\\_status}[\text{new\\_index}[i]]
+$$
+
+其中：
+
+- $\text{hidden\\_status} \in \mathbb{R}^{M \times D_h}$ ：隐藏状态张量， $M$ 为序列维度， $D_h$ 为隐藏层特征维度
+- $\text{topk\\_ids} \in \mathbb{Z}^{K \times 1}$ ：注意力机制输出的 topk 索引张量， $K$ 为 topk 候选数量
+- $\text{topk\\_weights} \in \mathbb{R}^{K \times 1}$ ：注意力机制输出的 topk 权重张量
+- $\text{ori\\_index} \in \mathbb{Z}^{T \times 1}$ ：原始索引映射张量， $T$ 为总索引数量
+- $\text{new\\_index} \in \mathbb{Z}^{K \times 1}$ ：映射后的新索引张量
+- $\text{deep\\_hidden\\_status} \in \mathbb{R}^{M \times D_{dh}}$ ：深层隐藏状态张量， $D_{dh}$ 为深层隐藏层特征维度
+- $\text{deeper\\_topk\\_weights} \in \mathbb{R}^{K \times 1}$ ：更深层 topk 权重张量
+- $\text{expert\\_cnt} \in \mathbb{Z}^{E \times 1}$ ：专家计数张量， $E$ 为本地专家总数（ $E = \text{num\\_local\\_experts}$ ）
+- $\text{valid\\_idx\\_size} \in \mathbb{Z}$ ：有效索引数量（标量），满足 $0 < \text{valid\\_idx\\_size} \leq \text{max\\_index\\_size}$
+- $\text{begin\\_expert\\_id} \in \mathbb{Z}$ ：起始专家 ID（标量）
+- $\text{num\\_local\\_experts} \in \mathbb{Z}$ ：本地专家数量（标量）
+- $\text{max\\_index\\_size} \in \mathbb{Z}$ ：单专家最大索引容量（标量）
+- $\text{work\\_count} \in \mathbb{Z}$ ：工作任务计数（标量），用于权重归一化
+- $\mathbb{I}(\cdot)$ ：指示函数，满足条件时取值为 1，否则为 0
+- $e$ ：专家索引，满足 $0 \leq e < \text{num\\_local\\_experts}$
+- $i$ ：索引遍历维度，满足 $0 \leq i < \text{valid\\_idx\\_size}$
+- $j$ ：隐藏状态序列维度，满足 $0 \leq j < M$
+	补充约束公式：
+
+$$
+\text{valid\\_idx\\_size} \leq \text{max\\_index\\_size}, \quad \text{begin\\_expert\\_id} + \text{num\\_local\\_experts} \leq E_{\text{total}}
+$$
+
+其中 $E_{\text{total}}$ 为全局专家总数。
+
+### 参数说明
+
+- **hidden_status** (torch.Tensor, 入参/出参): 输入的隐藏状态张量，经后处理后会被更新
+- **topk_ids** (torch.Tensor, 入参): 注意力机制输出的 topk 索引张量，存储选中的候选索引
+- **topk_weights** (torch.Tensor, 入参): 注意力机制输出的 topk 权重张量，对应 topk_ids 的权重值
+- **ori_index** (torch.Tensor, 入参): 原始索引张量，用于索引映射的原始标识
+- **new_index** (torch.Tensor, 入参/出参): 新索引张量，存储映射后的索引，会被更新
+- **deep_hidden_status** (torch.Tensor, 入参/出参): 深层隐藏状态张量，经后处理后会被更新
+- **deeper_topk_weights** (torch.Tensor, 入参/出参): 更深层的 topk 权重张量，会被更新
+- **expert_cnt** (torch.Tensor, 入参/出参): 专家计数张量，记录各专家的处理数量，会被更新
+- **valid_idx_size** (torch.Tensor, 入参): 有效索引大小张量，存储有效索引的数量
+- **begin_expert_id** (int, 入参): 起始专家 ID，标识当前处理的专家起始编号
+- **num_local_experts** (int, 入参): 本地专家数量，当前节点包含的专家总数
+- **max_index_size** (int, 入参): 最大索引大小，限制索引的最大长度
+- **work_count** (int, 入参): 工作计数，标识当前处理的任务数量
+
+### 返回值
+
+无返回值，计算结果直接写入 hidden_status、new_index、deep_hidden_status、deeper_topk_weights、expert_cnt 等张量中
+
+### 约束与调用
+
+- 所有张量必须位于 CUDA 设备上
+- 支持的数据类型：float16、bfloat16、float32
+- valid_idx_size 的值必须小于等于 max_index_size
+- topk_ids 的范围必须在有效索引范围内
+- begin_expert_id 与 num_local_experts 需匹配，确保专家 ID 不越界
+- 张量在物理内存中必须是连续排列的，最后维度连续
+
+### 调用示例
+
+```Python
+import torch
+import mcoplib.op as op
+device = "cuda"
+# 定义核心参数
+seq_dim = 1024             
+hidden_dim = 4096      
+topk_size = 64            
+total_index_size = 8192     
+num_local_experts = 8    
+begin_expert_id = 0        
+max_index_size = 1024    
+work_count = 4            
+valid_idx_size_val = 50     
+# 创建输入/输出张量
+hidden_status = torch.randn(seq_dim, hidden_dim, dtype=torch.float16, device=device)
+topk_ids = torch.randint(0, total_index_size, (topk_size,), dtype=torch.int64, device=device)
+topk_weights = torch.randn(topk_size, dtype=torch.float16, device=device)
+ori_index = torch.randint(0, total_index_size, (total_index_size,), dtype=torch.int64, device=device)
+new_index = torch.empty(topk_size, dtype=torch.int64, device=device)
+deep_hidden_status = torch.randn(seq_dim, hidden_dim, dtype=torch.float16, device=device)
+deeper_topk_weights = torch.randn(topk_size, dtype=torch.float16, device=device)
+expert_cnt = torch.zeros(num_local_experts, dtype=torch.int64, device=device)
+valid_idx_size = torch.tensor([valid_idx_size_val], dtype=torch.int64, device=device)
+# 调用recv_from_attention_node_post_process算子
+op.recv_from_attention_node_post_process(
+    hidden_status,
+    topk_ids,
+    topk_weights,
+    ori_index,
+    new_index,
+    deep_hidden_status,
+    deeper_topk_weights,
+    expert_cnt,
+    valid_idx_size,
+    begin_expert_id,
+    num_local_experts,
+    max_index_size,
+    work_count
+)
+# 打印执行完成提示及关键张量信息
+print("recv_from_attention_node_post_process computation completed")
+print(f"Hidden status shape: {hidden_status.shape}")
+print(f"New index shape: {new_index.shape}")
+print(f"Expert count shape: {expert_cnt.shape}")
+print(f"Valid index size: {valid_idx_size.item()}")
+```
+
+## 26. send_to_attention_node_pre_process
+
+### 支持的产品型号
+
+- Metax C500/C550/C588/C600
+
+### 接口原型
+
+```python
+def send_to_attention_node_pre_process(
+    moe_hidden_status: torch.Tensor,
+    deep_topk_weights: torch.Tensor,
+    ori_index: torch.Tensor,
+    new_index: torch.Tensor,
+    output: torch.Tensor,
+    valid_idx_size: torch.Tensor,
+    max_index_size: const int
+) -> None
+```
+
+### 功能描述
+
+send_to_attention_node_pre_process 算子主要用于为将数据发送至注意力节点做预处理操作。该算子涉及混合专家模型的隐藏状态、深度 TopK 权重以及索引（原始索引与新索引）的处理，通过计算有效张量维度、验证数据类型等操作，为后续注意力节点的计算准备输入输出数据，确保数据格式与规模符合处理要求。
+
+- 计算公式：
+
+$$
+\text{output}[i] = 
+\begin{cases} 
+\text{moe\\_hidden\\_status}[\text{new\\_index}[i]] \times \text{deep\\_topk\\_weights}[\text{new\\_index}[i]], & 0 \leq i < \text{valid\\_idx\\_size}[0] \text{ 且 } \text{new\\_index}[i] < \text{max\\_index\\_size} \\
+0, & \text{其他情况}
+\end{cases}
+$$
+
+其中：
+
+- $\text{moe\\_hidden\\_status} \in \mathbb{R}^{M \times D_h}$ 是混合专家模型的隐藏状态张量， $M$ 为隐藏状态的样本数量， $D_h$ 为隐藏状态的特征维度
+- $\text{deep\\_topk\\_weights} \in \mathbb{R}^{M \times 1}$ 是深度 TopK 选择的权重张量， $M$ 与 $\text{moe\\_hidden\\_status}$ 的样本数量一致
+- $\text{ori\\_index} \in \mathbb{Z}^{I}$ 是原始索引张量， $I$ 为索引总数，元素为非负整数，表征数据的原始位置
+- $\text{new\\_index} \in \mathbb{Z}^{I}$ 是新索引张量，维度与 $\text{ori\\_index}$ 完全一致，满足索引映射关系：
+
+$$
+  \text{new\\_index}[i] = \text{ori\\_index}[i] - \min(\text{ori\\_index}) \quad (0 \leq i < \text{valid\\_idx\\_size}[0])
+$$
+
+- $\text{output} \in \mathbb{R}^{\text{max\\_index\\_size} \times D_h}$ 是预处理输出张量，第一维度由最大索引大小约束，第二维度与 $\text{moe\\_hidden\\_status}$ 的特征维度一致
+- $\text{valid\\_idx\\_size} \in \mathbb{Z}^{1}$ 是有效索引大小张量，仅包含一个标量元素（记为 $V = \text{valid\\_idx\\_size}[0]$ ），表示参与有效计算的索引数量
+- $\text{max\\_index\\_size} \in \mathbb{Z}^+$ 是最大索引大小，为正整数，用于约束索引的合法范围，满足：
+
+$$
+  V \leq \text{max\\_index\\_size}
+$$
+
+### 参数说明
+
+- **moe_hidden_status** (at::Tensor, 入参): 混合专家模型的隐藏状态张量，作为预处理的输入数据之一
+- **deep_topk_weights** (at::Tensor, 入参): 深度 TopK 选择的权重张量，参与预处理过程中的权重相关计算
+- **ori_index** (at::Tensor, 入参): 原始索引张量，用于记录数据的原始位置信息
+- **new_index** (at::Tensor, 入参): 新索引张量，用于记录数据经过处理后的新位置信息
+- **output** (at::Tensor, 出参): 预处理后的输出张量，存储预处理的结果
+- **valid_idx_size** (at::Tensor, 入参): 有效索引大小张量，记录有效索引的数量信息
+- **max_index_size** (const int, 入参): 最大索引大小，用于约束索引的范围
+
+### 返回值
+
+无返回值，预处理结果直接写入 output 张量中
+
+### 约束与调用
+
+- 所有张量需位于 CUDA 设备上
+- 仅支持可 blittable 类型的数据（ blittable 类型指可直接在设备间进行内存拷贝的数据类型）
+- 张量的维度与规模需匹配计算需求，如 moe_hidden_status 的大小需与索引规模、权重规模相适配
+- 输入张量需保证连续性或符合特定的内存布局要求（根据底层设备计算需求）
+
+### 调用示例
+
+```Python
+import torch
+import mcoplib.op as op
+# 定义运行设备
+device = "cuda"
+# 定义算子所需的参数
+num_local_experts = 8  # 专家数量
+num_tokens = 128       # Token 数量
+hidden_size = 4096     # Hidden Dimension
+max_index_size = num_tokens * 2 # Grid size
+# 1. 创建输入张量
+# moe_hidden_status: [Experts, Tokens, Hidden]
+# 必须是 BFloat16
+moe_hidden_status = torch.randn(num_local_experts, num_tokens, hidden_size, dtype=torch.bfloat16, device=device)
+# deepep_topk_weights: [Experts * Tokens]
+# 必须是 Float32
+deepep_topk_weights = torch.randn(num_local_experts * num_tokens, dtype=torch.float32, device=device)
+#  关键修正点开始 
+# 构造 new_index: [max_index_size, 2]
+# 第0列是 Expert Index，必须小于 num_local_experts (8)
+# 第1列是 Token Index，必须小于 num_tokens (128)
+new_index_col0 = torch.randint(0, num_local_experts, (max_index_size, 1), dtype=torch.int32, device=device)
+new_index_col1 = torch.randint(0, num_tokens, (max_index_size, 1), dtype=torch.int32, device=device)
+new_index = torch.cat([new_index_col0, new_index_col1], dim=1).contiguous()
+# 构造 ori_index: [max_index_size, 2]
+# Kernel 中使用了 ori_index[... + 1] 作为 output 的 row index
+# 所以第1列必须小于 num_tokens (output 的第0维)
+ori_index_col0 = torch.randint(0, num_local_experts, (max_index_size, 1), dtype=torch.int32, device=device)
+ori_index_col1 = torch.randint(0, num_tokens, (max_index_size, 1), dtype=torch.int32, device=device)
+ori_index = torch.cat([ori_index_col0, ori_index_col1], dim=1).contiguous()
+#  关键修正点结束 
+# valid_idx_size: 实际要处理的任务数量
+# 必须 <= max_index_size
+valid_idx_size = torch.tensor([num_tokens], dtype=torch.int32, device=device)
+# 2. 创建输出张量
+# output: [Tokens, Hidden]
+output = torch.zeros(num_tokens, hidden_size, dtype=torch.bfloat16, device=device)
+# 同步以捕获之前的异步错误
+torch.cuda.synchronize()
+print("Calling send_to_attention_node_pre_process...")
+# 3. 调用算子
+op.send_to_attention_node_pre_process(
+    moe_hidden_status,    # Input (BFloat16)
+    deepep_topk_weights,  # Input (Float32)
+    ori_index,            # Input (Int32)
+    new_index,            # Input (Int32)
+    output,               # Output (BFloat16)
+    valid_idx_size,       # Input (Int32 scalar tensor)
+    max_index_size        # Int scalar
+)
+# 再次同步确保完成
+torch.cuda.synchronize()
+print("send_to_attention_node_pre_process computation completed successfully.")
+print(f"MoE Hidden Status shape: {moe_hidden_status.shape}")
+print(f"Output shape: {output.shape}")
+```
+
+## 27. fused_silu_mul_dq_mask_quant
+
+### 支持的产品型号
+
+- Metax C500/C550/C588/C600
+
+### 接口原型
+
+```python
+def fused_silu_mul_dq_mask_quant(
+    out:torch.Tensor,
+    input:torch.Tensor,
+    mask:torch.Tensor
+) -> None
+```
+
+### 功能描述
+
+fused_silu_mul_dq_mask_quant 算子是一个针对 MoE 结构优化的高性能融合算子。该算子主要用于处理门控激活函数（SwiGLU）计算、专家掩码（Masking）应用以及动态量化和数据打包。算子接收包含 Gate 和 Up 投影的输入张量，计算 SiLU 激活与逐元素乘法，应用专家掩码将无效专家的输出置零，然后计算每行的最大绝对值以生成量化 Scale，最后将数据量化为 int8 格式并进行打包，以便后续的矩阵乘法（GEMM）计算。
+
+- 计算公式：
+
+$$
+\text{temp\\_h}[i] = (\text{SiLU}(\text{input}[i]_{0:D_h}) \odot \text{input}[i]_{D_h:2D_h}) \odot \text{mask}[i]
+$$
+
+
+
+$$
+\text{scale}[i] = \frac{\max_{j}(|\text{temp\\_h}[i, j]|)}{127.0}
+$$
+
+
+
+$$
+\text{out}[i, j] = \text{Clamp}\left(\text{Round}\left(\frac{temp\_h[i, j]}{\text{scale}[i]}\right), -128, 127\right)
+$$
+
+其中：
+
+- $\text{input} \in \mathbb{R}^{N \times 2D_h}$ 是输入张量， $N$ 为 Token 数量， $2D_h$ 为两倍的隐藏层维度（包含 Gate 和 Up 两部分投影）
+- $\text{mask} \in \mathbb{R}^{N \times 1}$ 是专家掩码张量，用于指示 Token 是否激活对应专家，支持广播
+- $\text{temp\\_h} \in \mathbb{R}^{N \times D_h}$ 是激活与掩码后的中间状态张量
+- $\text{scale} \in \mathbb{R}^{N}$ 是行级量化缩放因子（在内部计算，通常用于量化过程）
+- $\text{out} \in \mathbb{Z}^{N \times D_h}$ 是量化后的输出张量，数据类型为 int8
+- $\odot$ 表示逐元素乘法
+- $\text{SiLU}(x) = \frac{x}{1 + e^{-x}}$ 是激活函数
+
+### 参数说明
+
+- **out** (at::Tensor, 出参): 输出张量，存储量化及打包后的结果，数据类型通常为 int8。
+- **input** (at::Tensor, 入参): 输入张量，形状通常为 [num_tokens, 2 * hidden_size]，包含 Gate 和 Up 的投影结果。
+- **mask** (at::Tensor, 入参): 掩码张量，用于指示 Token 与专家的对应关系，形状需与 batch/token 维度广播兼容。
+
+### 返回值
+
+无返回值，计算结果直接写入输出张量 out 中
+
+### 约束与调用
+
+- 输入张量必须位于 CUDA 设备上。
+- input 的最后一维必须是 hidden\_size 的两倍（用于 SwiGLU split）。
+- out 张量需预先分配足够的内存空间以存储量化后的数据。
+- mask 的维度必须与 input 的 token 维度匹配或可广播。
+- 仅支持连续内存布局的张量。
+
+### 调用示例
+
+```python
+import torch
+import mcoplib.op as op
+device = "cuda"
+# 定义张量维度
+num_tokens = 128
+hidden_size = 4096
+input_dim = hidden_size * 2
+# 创建输入张量
+input_tensor = torch.randn(num_tokens, input_dim, dtype=torch.float16, device=device)
+mask = torch.ones(num_tokens, 1, dtype=torch.float16, device=device)
+out = torch.empty(num_tokens, hidden_size, dtype=torch.int8, device=device)
+# 调用fused_silu_mul_dq_mask_quant算子
+op.fused_silu_mul_dq_mask_quant(
+    out,
+    input_tensor,
+    mask
+)
+print("fused_silu_mul_dq_mask_quant computation completed")
+print(f"Output shape: {out.shape}")
+```
+
+## 28. fused_silu_mul_dq_reorder_quant
+
+### 支持的产品型号
+
+- Metax C500/C550/C588/C600
+
+### 接口原型
+
+```python
+def fused_silu_mul_dq_reorder_quant(
+    out: torch.Tensor,
+    scale: torch.Tensor,
+    input: torch.Tensor,
+    reorder_topk_ids: torch.Tensor,
+    w2_scale: torch.Tensor,
+    start_expert_id: int64_t,
+    end_expert_id: int64_t
+) -> None
+```
+
+### 功能描述
+
+fused_silu_mul_dq_reorder_quant 算子实现了 SiLU 激活函数、乘法、反量化（dequantization）、量化（quantization）以及基于 TopK 的重排序操作的融合。通过将多个操作融合为一个算子，减少了中间结果的内存读写次数，提升了计算效率，适用于需要高效处理量化模型中多步计算的场景（如 Transformer 模型的专家系统等）
+
+- 计算公式：
+
+$$
+  \text{out}[i] = \text{quant}\left( \text{mul}\left( \text{SiLU}\left( \text{dq}\left( \text{input}[\text{reorder\\_topk\\_ids}[i]] \right) \right), \text{w2\\_scale} \right) \right), \quad \forall i \in [0, L)
+$$
+
+  其中核心基础操作定义：
+
+$$
+  \text{SiLU}(x) = x \cdot \sigma(x) = x \cdot \frac{1}{1 + e^{-x}}
+$$
+
+
+
+$$
+  \text{dq}(x, s) = x \times s \quad (\text{反量化操作，其中缩放因子} \ s=\text{scale})
+$$
+
+
+
+$$
+  \text{mul}(a, b) = a \times b \quad (\text{逐元素乘法操作})
+$$
+
+
+
+$$
+  \text{quant}(y) = \text{clip}\left( \text{round}\left( \frac{y}{\text{quant\\_scale}} \right), \text{quant\\_min}, \text{quant\\_max} \right) \quad (\text{量化操作})
+$$
+
+  计算范围由专家 ID 限定（仅有效专家维度参与计算）：
+
+$$
+  \text{input}_{\text{valid}} = \text{input}[..., e] \quad \text{其中} \ \text{start\\_expert\\_id} \leq e < \text{end\\_expert\\_id}
+$$
+
+  变量说明：
+
+- $\text{input} \in \mathbb{R}^{B \times T \times D \times E}$ ：输入张量，其中 $B$ 为批量大小， $T$ 为序列长度， $D$ 为特征维度， $E$ 为专家总数；
+- $\text{scale} \in \mathbb{R}^{D}$ ：反量化缩放因子张量，用于输入张量的反量化数值校准；
+- $\text{w2\\_scale} \in \mathbb{R}^{D}$ ：权重缩放因子张量，参与乘法阶段的逐元素数值调整；
+- $\text{reorder\\_topk\\_ids} \in \mathbb{Z}^{L}$ ：TopK 重排序索引张量， $L$ 为输出张量总元素数，索引值范围为 $[0, B \times T \times D \times E)$ ；
+- $\text{out} \in \mathbb{Z}^{L}$ （或 $\mathbb{R}^{L}$ ）：输出张量，存储融合操作的最终结果，数据类型由量化策略决定；
+- $\sigma (x) = \frac{1}{1 + e^{-x}}$ ：Sigmoid 激活函数，是 SiLU 操作的核心子函数；
+- $\text{quant\\_scale} \in \mathbb{R}^{+}$ ：量化缩放因子，用于将浮点结果映射为量化值；
+- $\text{quant\\_min} \in \mathbb{Z}$ 、 $\text{quant\\_max} \in \mathbb{Z}$ ：量化值的上下限，用于裁剪超出范围的量化结果；
+- $\text{start\\_expert\\_id} \in \mathbb{Z}$ 、 $\text{end\\_expert\\_id} \in \mathbb{Z}$ ：专家范围边界，满足 $0 \leq \text{start\\_expert\\_id} < \text{end\\_expert\\_id} \leq E$ ， $e$ 为专家维度的索引；
+- $i \in [0, L)$ ：输出张量的元素索引，遍历所有输出元素以完成逐元素计算；
+- $\text{round}(\cdot)$ ：四舍五入函数，将浮点值转换为整数；
+- $\text{clip}(x, \text{min}, \text{max})$ ：裁剪函数，将 $x$ 限制在 $[\text{min}, \text{max}]$ 范围内。
+
+### 参数说明
+
+- **out** (torch.Tensor, 出参): 输出张量，用于存储融合操作的最终结果
+- **scale** (torch.Tensor, 入参): 缩放因子张量，用于量化/反量化过程中的数值调整
+- **input** (torch.Tensor, 入参): 输入张量，作为整个融合操作的原始输入数据
+- **reorder_topk_ids** (torch.Tensor, 入参): 用于重排序的 TopK 索引张量，指定元素的重新排列顺序
+- **w2_scale** (torch.Tensor, 入参): 权重缩放因子张量，参与乘法和量化过程的数值调整
+- **start_expert_id** (int64_t, 入参): 起始专家 ID，用于限定处理的专家范围
+- **end_expert_id** (int64_t, 入参): 结束专家 ID，与 start_expert_id 共同划定处理的专家范围
+
+### 返回值
+
+无返回值，计算结果直接写入 out 张量中
+
+### 约束与调用
+
+- 所有张量必须位于 CUDA 设备上
+- 支持的数据类型需匹配量化/反量化要求（如 float16、bfloat16、float32 等）
+- reorder_topk_ids 的索引值需在有效范围内，且与输入张量的维度匹配
+- start_expert_id 和 end_expert_id 需满足合法范围（0 ≤ start_expert_id < end_expert_id ≤ 专家总数）
+
+### 调用示例
+
+```python
+import torch
+import mcoplib.op as op
+device = "cuda"
+# 定义张量维度
+total_tokens = 1024
+hidden_size = 4096
+num_selected = 512
+input_dim = hidden_size * 2  
+start_expert = 0
+end_expert = 4
+# 创建输入张量
+input_tensor = torch.randn(total_tokens, input_dim, dtype=torch.float32, device=device)
+reorder_ids = torch.randint(0, total_tokens, (num_selected,), dtype=torch.long, device=device)
+w2_scale = torch.ones(1, dtype=torch.float32, device=device)
+out = torch.empty(num_selected, hidden_size, dtype=torch.int8, device=device)
+scale = torch.empty(num_selected, 1, dtype=torch.float32, device=device)
+# 调用fused_silu_mul_dq_reorder_quant算子
+op.fused_silu_mul_dq_reorder_quant(
+    out,
+    scale,
+    input_tensor,
+    reorder_ids,
+    w2_scale,
+    start_expert,
+    end_expert
+)
+print("fused_silu_mul_dq_reorder_quant computation completed")
+print(f"Output shape: {out.shape}")
+```
+
+## 29. gptq_marlin_gemm_legacy
+
+### 支持的产品型号
+
+- Metax C500/C550/C588/C600
+
+### 接口原型
+
+```python
+def gptq_marlin_gemm_legacy(
+    a: torch.Tensor,
+    b_q_weight: torch.Tensor,
+    b_scales: torch.Tensor,
+    g_idx: torch.Tensor,
+    perm: torch.Tensor,
+    workspace: torch.Tensor,
+    num_bits: int,
+    size_m: int,
+    size_n: int,
+    size_k: int,
+    is_k_full: bool,
+    dtype: torch.dtype = torch.bfloat16,
+    use_atomic_cache: bool = True
+) -> torch.Tensor
+```
+
+### 功能描述
+
+gptq_marlin_gemm_legacy 是 gptq_marlin_gemm 的旧版本实现，功能与前者一致，结合 GPTQ 量化的 Marlin 风格矩阵乘法，用于大语言模型量化推理的线性层加速，仅简化了参数，移除了 size_m_tensor 和 sms，适配旧版调用逻辑。
+
+- 计算公式：
+	定义核心变量：
+- 激活矩阵： $A \in \mathbb{R}^{\text{size\\_m} \times \text{size\\_k}}$
+- 量化权重分组块： $B_q^g \in \mathbb{Z}^{\text{group\\_size} \times \text{size\\_n}}$ （ $\text{group\\_size}$ 为分组维度，由 $\text{g\\_idx}$ 决定）
+- 分组缩放因子： $S_g \in \mathbb{R}^{1 \times \text{size\\_n}}$ （第 $g$ 个分组对应的缩放因子）
+	量化权重还原，对每个权重分组 $g$ ，将量化权重块乘以对应缩放因子，还原为浮点权重：
+
+$$
+B^g = B_q^g \cdot S_g
+$$
+
+其中 $B^g \in \mathbb{R}^{\text{group\\_size} \times \text{size\\_n}}$ ，完整权重矩阵 $B$ 是所有分组块的拼接：
+
+$$
+B = \left[ B^1; B^2; \dots; B^{\text{num\\_groups}} \right] \in \mathbb{R}^{\text{size\\_k} \times \text{size\\_n}}
+$$
+
+矩阵乘法，激活矩阵与还原后权重矩阵执行矩阵乘法，得到输出：
+
+$$
+C = A \cdot B
+$$
+
+其中 $C \in \mathbb{R}^{\text{size\\_m} \times \text{size\\_n}}$ ，即算子的返回张量。
+
+### 参数说明
+
+- **a** (torch.Tensor, 入参): 输入激活张量，形状为[size_m, size_k]，需位于 CUDA 设备且为连续张量
+- **b_q_weight** (torch.Tensor, 入参): GPTQ 量化后的权重张量，形状需匹配量化 tile 尺寸要求，需位于 CUDA 设备且为连续张量
+- **b_scales** (torch.Tensor, 入参): 量化权重对应的缩放因子张量，形状与分组量化维度匹配，需位于 CUDA 设备且为连续张量
+- **g_idx** (torch.Tensor, 入参): 分组量化的索引张量，用于定位分组参数，需位于 CUDA 设备且为连续张量
+- **perm** (torch.Tensor, 入参): 维度置换张量，用于维度调整，需位于 CUDA 设备且为连续张量
+- **workspace** (torch.Tensor, 入参): 临时工作空间张量，需满足最小尺寸要求
+- **num_bits** (int, 入参): 量化位数，仅支持 4 或 8 位
+- **size_m** (int, 入参): 输入张量 a 的行数（矩阵乘左矩阵的行数）
+- **size_n** (int, 入参): 输出张量的列数（矩阵乘右矩阵的列数）
+- **size_k** (int, 入参): 矩阵乘的公共维度（左矩阵的列数、右矩阵的行数）
+- **is_k_full** (bool, 入参): 标志 size_k 是否为量化 tile 尺寸的完整倍数
+- **dtype** (torch.dtype, 入参, 默认 torch.bfloat16): 输出张量的数据类型，支持 bfloat16、float16
+- **use_atomic_cache** (bool, 入参, 默认 True): 是否启用原子缓存优化
+
+### 返回值
+
+返回 torch.Tensor 类型的矩阵乘结果，形状为[size_m, size_n]，数据类型为指定的 dtype
+
+### 约束与调用
+
+与 gptq_marlin_gemm 的约束完全一致：
+
+- 所有输入张量需位于 CUDA 设备且连续
+- num_bits 仅支持 4 或 8 位
+- 量化权重形状需匹配 tile 尺寸、workspace 满足最小尺寸
+- 支持 bfloat16、float16 数据类型
+
+### 调用示例
+
+```python
+import torch
+import mcoplib.op as op
+device = "cuda"
+# 定义张量维度
+size_m = 4096 
+size_n = 4096  
+size_k = 4096  
+num_bits = 4  
+is_k_full = True  
+dtype = torch.bfloat16 
+# 创建输入张量a
+a = torch.randn(size_m, size_k, dtype=dtype, device=device).contiguous()
+pack_factor = 32 // num_bits
+b_q_weight = torch.randint(0, 2**num_bits, (size_n, size_k // pack_factor), dtype=torch.int32, device=device).contiguous()
+group_size = 128  
+b_scales = torch.randn(size_k // group_size, size_n, dtype=dtype, device=device).contiguous()
+g_idx = torch.arange(0, size_k, group_size, dtype=torch.int32, device=device).repeat_interleave(group_size)
+g_idx = g_idx[:size_k].contiguous() 
+perm = torch.arange(size_k, dtype=torch.int32, device=device).contiguous() 
+workspace_size = size_m * size_n // 1024
+workspace = torch.empty(workspace_size, dtype=torch.int8, device=device).contiguous()
+output = op.gptq_marlin_gemm_legacy(
+    a=a,
+    b_q_weight=b_q_weight,
+    b_scales=b_scales,
+    g_idx=g_idx,
+    perm=perm,
+    workspace=workspace,
+    num_bits=num_bits,
+    size_m=size_m,
+    size_n=size_n,
+    size_k=size_k,
+    is_k_full=is_k_full,
+    dtype=dtype,
+    use_atomic_cache=True
+)
+print("gptq_marlin_gemm_legacy computation completed")
+print(f"Output shape: {output.shape}") 
+```
+
+## 30. gptq_marlin_gemm
+
+### 支持的产品型号
+
+- Metax C500/C550/C588/C600
+
+### 接口原型
+
+```python
+def gptq_marlin_gemm(
+    a: torch.Tensor,
+    b_q_weight: torch.Tensor,
+    b_scales: torch.Tensor,
+    g_idx: torch.Tensor,
+    perm: torch.Tensor,
+    workspace: torch.Tensor,
+    num_bits: int,
+    size_m_tensor: torch.Tensor,
+    size_m: int,
+    size_n: int,
+    size_k: int,
+    sms: int,
+    is_k_full: bool,
+    dtype: torch.dtype = torch.bfloat16,
+    use_atomic_cache: bool = True
+) -> torch.Tensor
+```
+
+### 功能描述
+
+gptq_marlin_gemm 算子实现了结合 GPTQ 量化的 Marlin 风格高效矩阵乘法，用于大语言模型量化推理中的线性层加速。该算子针对 GPTQ 量化后的权重 b_q_weight，配合缩放因子、分组索引等量化参数，通过 Marlin 的 CUDA 优化内核完成矩阵乘计算，同时支持原子缓存等策略提升计算性能
+
+- 计算公式：
+	定义核心变量：
+- 激活矩阵： $A \in \mathbb{R}^{\text{size\\_m} \times \text{size\\_k}}$
+- 量化权重分组块： $B_q^g \in \mathbb{Z}^{\text{group\\_size} \times \text{size\\_n}}$ （ $\text{group\\_size}$ 为分组维度，由 $\text{g\\_idx}$ 决定）
+- 分组缩放因子： $S_g \in \mathbb{R}^{1 \times \text{size\\_n}}$ （第 $g$ 个分组对应的缩放因子）
+	量化权重还原，对每个权重分组 $g$ ，将量化权重块乘以对应缩放因子，还原为浮点权重：
+
+$$
+B^g = B_q^g \cdot S_g
+$$
+
+其中 $B^g \in \mathbb{R}^{\text{group\\_size} \times \text{size\\_n}}$ ，完整权重矩阵 $B$ 是所有分组块的拼接：
+
+$$
+B = \left[ B^1; B^2; \dots; B^{\text{num\\_groups}} \right] \in \mathbb{R}^{\text{size\\_k} \times \text{size\\_n}}
+$$
+
+矩阵乘法，激活矩阵与还原后权重矩阵执行矩阵乘法，得到输出：
+
+$$
+C = A \cdot B
+$$
+
+其中 $C \in \mathbb{R}^{\text{size\\_m} \times \text{size\\_n}}$ ，即算子的返回张量。
+
+### 参数说明
+
+- **a** (torch.Tensor, 入参): 输入激活张量，形状为[size_m, size_k]，需位于 CUDA 设备且为连续张量
+- **b_q_weight** (torch.Tensor, 入参): GPTQ 量化后的权重张量，形状需匹配量化 tile 尺寸要求，需位于 CUDA 设备且为连续张量
+- **b_scales** (torch.Tensor, 入参): 量化权重对应的缩放因子张量，形状与分组量化维度匹配，需位于 CUDA 设备且为连续张量
+- **g_idx** (torch.Tensor, 入参): 分组量化的索引张量，用于定位分组对应的量化参数，需位于 CUDA 设备且为连续张量
+- **perm** (torch.Tensor, 入参): 维度置换张量，用于权重/激活的维度调整，需位于 CUDA 设备且为连续张量
+- **workspace** (torch.Tensor, 入参): 临时工作空间张量，用于内核计算的临时存储，需满足最小尺寸要求
+- **num_bits** (int, 入参): 量化位数，仅支持 4 或 8 位
+- **size_m_tensor** (torch.Tensor, 入参): size_m 对应的张量形式，用于 CUDA 内核的参数传递
+- **size_m** (int, 入参): 输入张量 a 的行数（矩阵乘左矩阵的行数）
+- **size_n** (int, 入参): 输出张量的列数（矩阵乘右矩阵的列数）
+- **size_k** (int, 入参): 矩阵乘的公共维度（左矩阵的列数、右矩阵的行数）
+- **sms** (int, 入参): 用于内核计算的计算单元数量
+- **is_k_full** (bool, 入参): 标志 size_k 是否为量化 tile 尺寸的完整倍数
+- **dtype** (torch.dtype, 入参, 默认 torch.bfloat16): 输出张量的数据类型，支持 bfloat16、float16
+- **use_atomic_cache** (bool, 入参, 默认 True): 是否启用原子缓存优化，提升内核计算效率
+
+### 返回值
+
+返回 torch.Tensor 类型的矩阵乘结果，形状为[size_m, size_n]，数据类型为指定的 dtype
+
+### 约束与调用
+
+- 所有输入张量必须位于 CUDA 设备上，且为连续张量
+- num_bits 仅支持 4 或 8 位量化
+- size_m 需满足小于 FULL_M_BLOCK 或能被 FULL_M_BLOCK 整除
+- 量化权重 b_q_weight 的形状需与 GPTQ 量化的 tile 尺寸匹配（如能被 tile_size 整除）
+- workspace 张量的尺寸需不小于要求的最小工作空间大小
+- 支持的数据类型：bfloat16、float16（half）
+
+### 调用示例
+
+```python
+import torch
+import mcoplib.op as op
+#设置设备
+device = "cuda"
+# 定义张量维度
+size_m = 4096  
+size_n = 4096  
+size_k = 4096  
+num_bits = 4 
+sms = -1      
+is_k_full = True 
+dtype = torch.bfloat16  
+# 创建输入张量a
+a = torch.randn(size_m, size_k, dtype=dtype, device=device).contiguous()
+pack_factor = 32 // num_bits
+b_q_weight = torch.randint(0, 2**num_bits, (size_n, size_k // pack_factor), dtype=torch.int32, device=device).contiguous()
+group_size = 128  
+b_scales = torch.randn(size_k // group_size, size_n, dtype=dtype, device=device).contiguous()
+g_idx = torch.arange(0, size_k, group_size, dtype=torch.int32, device=device).repeat_interleave(group_size)
+g_idx = g_idx[:size_k].contiguous()
+perm = torch.arange(size_k, dtype=torch.int32, device=device).contiguous()
+workspace_size = size_m * size_n // 1024  
+workspace = torch.empty(workspace_size, dtype=torch.int8, device=device).contiguous()
+size_m_tensor = torch.tensor([size_m], dtype=torch.int32, device=device)
+# 调用gptq_marlin_gemm算子
+output = op.gptq_marlin_gemm(
+    a=a,
+    b_q_weight=b_q_weight,
+    b_scales=b_scales,
+    g_idx=g_idx,
+    perm=perm,
+    workspace=workspace,
+    num_bits=num_bits,
+    size_m_tensor=size_m_tensor,
+    size_m=size_m,
+    size_n=size_n,
+    size_k=size_k,
+    sms=sms,
+    is_k_full=is_k_full,
+    dtype=dtype,
+    use_atomic_cache=True
+)
+print("gptq_marlin_gemm computation completed")
+print(f"Output shape: {output.shape}")
+```
+
+## 31. fused_moe_gate_deepseek
+
+### 支持的产品型号
+
+- Metax C500/C550/C588/C600系列
+
+### 接口原型
+
+```python
+def fused_moe_gate_deepseek(
+    gating_outputs: torch.Tensor,
+    correction_bias: torch.Tensor,
+    out_routing_weights: torch.Tensor,
+    out_selected_experts: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+    num_expert_group: int,
+    topk_group: int,
+    num_fused_shared_experts: int,
+    scale_factor: float,
+    moegate_type: Optional[int] = None
+) -> None
+```
+
+### 功能描述
+
+fused_moe_gate_deepseek 是 DeepSeek 混合专家（MoE）模型的融合门控算子，集成了门控输出校正、TopK 专家选择、路由权重计算及重归一化等步骤。该算子通过融合 MoE 门控阶段的多个子操作，减少内存交互开销，提升大模型 MoE 层门控阶段的计算效率，是 MoE 模型推理中的核心门控计算组件。
+
+- 计算公式：
+	输入门控对数概率张量定义, 算子核心输入为 MoE 专家的门控对数概率张量，无额外残差输入：
+
+$$
+    \text{gate\\_logits}_{b,s,e} \in \mathbb{R}^{B \times S \times E}
+$$
+
+    其中： $B$ 为 batch size， $S$ 为序列长度， $E$ 为 MoE 结构的专家总数， $b \in [0, B-1], s \in [0, S-1], e \in [0, E-1]$ 。算子超参包含： $K$ 为激活专家数 $\text{top\\_k}$ （正整数， $K \ll E$ ）， $\epsilon$ 为数值稳定小量（ $\epsilon>0$ ，通常取 $10^{-6}$ ）。
+    逐 Token 筛选 Top-K 门控对数概率与专家索引, 对每个 Token（即每个 $(b, s)$ 位置），在专家维度 $E$ 上筛选出数值最大的 $K$ 个门控对数概率值，同时获取其对应的专家索引：
+
+$$
+    \begin{cases}
+    \text{topk\\_logits}_{b,s,k} = \text{TopK}(\text{gate\\_logits}_{b,s,:}, K) \\
+    \text{topk\\_indices}_{b,s,k} = \text{ArgTopK}(\text{gate\\_logits}_{b,s,:}, K)
+    \end{cases}
+$$
+
+    其中： $\text{topk\\_logits} \in \mathbb{R}^{B \times S \times K}$ ，为筛选后的 Top-K 门控对数概率； $\text{topk\\_indices} \in \mathbb{Z}^{B \times S \times K}$ ，为对应 Top-K 概率的专家编号（整数类型）， $k \in [0, K-1]$ 。
+    逐 Token 数值稳定的 Top-K Softmax 归一化, 为避免指数运算数值溢出，对每个 Token 的 Top-K 门控对数概率做去中心化处理后，执行 Softmax 计算，得到原始专家权重，同时加入稳定小量防止除零：
+
+$$
+    \begin{align}
+    \text{shifted\\_logits}_{b,s,k} &= \text{topk\\_logits}_{b,s,k} - \max_{k'=0}^{K-1}\text{topk\\_logits}_{b,s,k'} \\
+    \text{exp\\_logits}_{b,s,k} &= \exp(\text{shifted\\_logits}_{b,s,k}) \\
+    \text{raw\\_weights}_{b,s,k} &= \frac{\text{exp\\_logits}_{b,s,k}}{\sum_{k'=0}^{K-1}\text{exp\\_logits}_{b,s,k'} + \epsilon}
+    \end{align}
+$$
+
+    其中： $\text{raw\\_weights} \in \mathbb{R}^{B \times S \times K}$ ，为 Softmax 归一化后的原始专家权重，权重取值范围 $[0,1]$ ， $\exp (\cdot)$ 为自然指数函数， $\max (\cdot)$ 为取最大值函数。
+    逐 Token 门控权重归一化校准, 对原始专家权重做二次归一化，保证每个 Token 的激活专家权重之和严格为 1，是 DeepSeek-MoE 门控的核心融合逻辑，进一步提升数值稳定性：
+
+$$
+    \text{gate\\_weights}_{b,s,k} = \frac{\text{raw\\_weights}_{b,s,k}}{\sum_{k'=0}^{K-1}\text{raw\\_weights}_{b,s,k'} + \epsilon}
+$$
+
+    其中： $\text{gate\\_weights} \in \mathbb{R}^{B \times S \times K}$ ，为算子最终输出的专家门控权重，满足 $\sum_{k=0}^{K-1}\text{gate\\_weights}_{b, s, k} \approx 1$ 。
+    算子最终双输出, 该融合算子为**双输出张量**，无额外中间张量输出，最终输出为：
+
+$$
+    \text{outputs} = (\text{gate\\_weights}, \text{topk\\_indices})
+$$
+
+    其中：主输出 $\text{gate\\_weights}$ 为浮点型专家权重，用于后续 MoE 专家输出的加权融合；辅输出 $\text{topk\\_indices}$ 为整型专家索引，用于筛选激活的 MoE 专家计算结果。
+
+### 参数说明
+
+- **gating_outputs** (torch.Tensor, 入参): 门控网络的输出张量，形状通常为（B, num_experts）（B 为批大小，num_experts 为专家总数），支持数据类型为 float16/bfloat16
+- **correction_bias** (torch.Tensor, 入参): 门控输出的校正偏置张量，形状为（num_experts），支持数据类型为 float16/bfloat16
+- **out_routing_weights** (torch.Tensor, 出参): 输出的专家路由权重张量，形状为（B, num_selected_experts）（num_selected_experts 为单样本选中的专家数），数据类型为 float16/bfloat16
+- **out_selected_experts** (torch.Tensor, 出参): 输出的选中专家索引张量，形状为（B, num_selected_experts），数据类型为 int32
+- **topk** (int, 入参): 单样本全局选择的专家数量
+- **renormalize** (bool, 入参): 是否对路由权重执行重归一化的标志位
+- **num_expert_group** (int, 入参): 专家的分组数量
+- **topk_group** (int, 入参): 每个专家分组内选择的专家数量
+- **num_fused_shared_experts** (int, 入参): 融合的共享专家数量
+- **scale_factor** (float, 入参): 路由权重的缩放因子
+- **moegate_type** (Optional[int], 入参): MoE 门控类型标识，仅支持取值 0（DEEPSEEK）或 1（SOFTMAX）；默认值为 0
+
+### 返回值
+
+该算子无返回值，所有输出（路由权重、选中专家索引）均通过指定的出参张量（out_routing_weights、out_selected_experts）返回。
+
+### 约束与调用
+
+- 所有输入/出参张量必须部署在 CUDA 设备上
+- gating_outputs 的形状需与 correction_bias 的形状（num_experts）匹配，即 gating_outputs 最后一维为 num_experts
+- out_routing_weights、out_selected_experts 的形状需为（B, num_selected_experts），其中 num_selected_experts 由 topk、topk_group 等参数共同确定
+- 数据类型约束：gating_outputs、correction_bias 支持 float16/bfloat16；out_routing_weights 支持 float16/bfloat16；out_selected_experts 必须为 int32 类型
+- moegate_type 仅允许取值 0 或 1，传入其他值会触发参数校验错误
+- topk 的取值需符合逻辑约束（如 num_fused_shared_experts>0 时，topk 需为 0），具体以代码内的 TORCH_CHECK 校验规则为准
+- scale_factor 需为有效的浮点数值，用于路由权重的缩放计算
+
+### 调用示例
+
+```python
+import torch
+import mcoplib.op as op
+# 设置计算设备
+device = "cuda"
+# 1. 定义超参数 
+batch_size = 4
+seq_len = 1024
+num_tokens = batch_size * seq_len
+num_experts = 256    
+num_expert_group = 8      
+topk = 8                  
+topk_group = 3           
+num_shared_experts = 0    
+moegate_type = 0     
+# 2. 创建输入张量
+gating_outputs = torch.randn(
+    num_tokens, num_experts,
+    dtype=torch.float16,
+    device=device,
+    requires_grad=True
+)
+# correction_bias: [num_experts], 用于修正 gating 的偏置
+correction_bias = torch.zeros(
+    num_experts,
+    dtype=torch.float16,
+    device=device
+)
+# 3. 预分配输出张量 (根据 C++ 签名，需要传入 output buffer)
+out_routing_weights = torch.empty(
+    num_tokens, topk,
+    dtype=torch.float32,
+    device=device
+)
+# out_selected_experts: [tokens, topk], 索引必须是 int32
+out_selected_experts = torch.empty(
+    num_tokens, topk,
+    dtype=torch.int32,
+    device=device
+)
+# 其他标量参数
+renormalize = True
+scale_factor = 1.0 # 缩放因子，moegate_type=0 时通常配合使用
+# 4. 调用算子
+op.fused_moe_gate_deepseek(
+    gating_outputs,         # 输入：门控分数
+    correction_bias,        # 输入：偏置
+    out_routing_weights,    # 输出：路由权重 (In-place 修改)
+    out_selected_experts,   # 输出：选中专家索引 (In-place 修改)
+    topk,                   # int: TopK 数量
+    renormalize,            # bool: 是否重新归一化
+    num_expert_group,       # int: 专家组数
+    topk_group,             # int: 组内 TopK
+    num_shared_experts,     # int: 共享专家数
+    scale_factor,           # float: 缩放因子
+    moegate_type            # int: Gate 类型 (0=DeepSeek)
+)
+print("fused_moe_gate_deepseek computation completed")
+print(f"Input shape: {gating_outputs.shape}")
+print(f"Output Weights shape: {out_routing_weights.shape}, dtype: {out_routing_weights.dtype}")
+print(f"Output Indices shape: {out_selected_experts.shape}, dtype: {out_selected_experts.dtype}")
+# 结果验证
+print(f"\nExample output (first token):")
+print(f"Selected Experts: {out_selected_experts[0].tolist()}")
+print(f"Routing Weights: {out_routing_weights[0].tolist()}")
+```
+
+# LMDeploy
+
+## 1. reshape_and_cache_new
+
+### 支持的产品型号
+
+- Metax C500/C550/C588/C600
+
+### 接口原型
+
+```cpp
+def reshape_and_cache_new(
+    torch::Tensor& key,
+    torch::Tensor& value,
+    torch::Tensor& key_cache,
+    torch::Tensor& value_cache,
+    torch::Tensor& slot_mapping,
+    const std::string& kv_cache_dtype,
+    const double kv_scale,
+    const double v_scale
+) -> None
+```
+
+### 功能描述
+
+reshape_and_cache_new 算子用于 Transformer 注意力机制的 KV 缓存管理：对输入的 key、value 张量进行形状重塑，通过 kv_scale、v_scale 完成缩放处理，再借助 slot_mapping 映射到对应缓存位置，最终将处理结果写入 key_cache 和 value_cache。该算子融合了重塑、缩放、缓存映射流程，减少了内存交互开销，提升了 KV 缓存的存储与访问效率。
+
+### 参数说明
+
+- **key** (torch.Tensor, 入参): 注意力机制的 key 输入张量
+- **value** (torch.Tensor, 入参): 注意力机制的 value 输入张量
+- **key_cache** (torch.Tensor, 入参/出参): 存储处理后 key 的缓存张量，计算结果会写入其中
+- **value_cache** (torch.Tensor, 入参/出参): 存储处理后 value 的缓存张量，计算结果会写入其中
+- **slot_mapping** (torch.Tensor, 入参): 缓存位置映射张量，用于定位 key/value 在缓存中的存储地址
+- **kv_cache_dtype** (std::string, 入参): KV 缓存使用的数据类型描述字符串
+- **kv_scale** (double, 入参): key 与 value 的通用缩放因子
+- **v_scale** (double, 入参): value 张量的额外精细化缩放因子
+
+### 约束与调用
+
+- 所有张量必须部署在目标加速设备（如 CUDA/Metax 硬件）上
+- kv_cache_dtype 需与 key_cache/value_cache 的实际类型一致，支持 float16、bfloat16、float32
+- slot_mapping 的形状需与 key/value、缓存张量的维度匹配，确保映射关系有效
+- key、value 的维度需符合 Transformer 注意力机制中 key/value 的标准形状规范
+- 计算公式：
+
+$$
+  \begin{align*}
+  \text{key}_{\text{reshaped}} &= \text{reshape}(\text{key}, [B, H_k, D, L]) \\
+  \text{value}_{\text{reshaped}} &= \text{reshape}(\text{value}, [B, H_k, D, L]) \\
+  \text{key}_{\text{scaled}} &= \text{key}_{\text{reshaped}} \times \text{kv\\_scale} \\
+  \text{value}_{\text{scaled}} &= \text{value}_{\text{reshaped}} \times \text{kv\\_scale} \times \text{v\\_scale} \\
+  \text{key\\_cache}[\text{slot\\_mapping}] &= \text{key}_{\text{scaled}} \\
+  \text{value\\_cache}[\text{slot\\_mapping}] &= \text{value}_{\text{scaled}}
+  \end{align*}
+$$
+
+  其中：
+
+- $\text{key} \in \mathbb{R}^{B_{\text{in}} \times L_{\text{in}} \times H_k \times D}$ 是输入键张量（重塑前）
+- $\text{value} \in \mathbb{R}^{B_{\text{in}} \times L_{\text{in}} \times H_k \times D}$ 是输入值张量（重塑前）
+- $\text{key}_{\text{reshaped}} \in \mathbb{R}^{B \times H_k \times D \times L}$ 是重塑后的键张量
+- $\text{value}_{\text{reshaped}} \in \mathbb{R}^{B \times H_k \times D \times L}$ 是重塑后的值张量
+- $\text{kv\\_scale} \in \mathbb{R}$ 是 key/value 通用缩放因子（标量）
+- $\text{v\\_scale} \in \mathbb{R}$ 是 value 张量的额外精细化缩放因子（标量）
+- $\text{key}_{\text{scaled}} \in \mathbb{R}^{B \times H_k \times D \times L}$ 是缩放后的键张量
+- $\text{value}_{\text{scaled}} \in \mathbb{R}^{B \times H_k \times D \times L}$ 是缩放后的值张量
+- $\text{slot\\_mapping} \in \mathbb{Z}^{B \times H_k \times D \times L}$ 是缓存位置映射张量，元素为缓存张量的索引（整数型）
+- $\text{key\\_cache} \in \mathbb{R}^{B_{\text{cache}} \times H_k \times D \times L_{\text{cache}}}$ 是键缓存张量
+- $\text{value\\_cache} \in \mathbb{R}^{B_{\text{cache}} \times H_k \times D \times L_{\text{cache}}}$ 是值缓存张量
+- $B_{\text{in}}$ 是输入批次维度， $L_{\text{in}}$ 是输入序列长度维度
+- $B$ 是重塑后批次维度， $H_k$ 是键值头数（kv_head_num）， $D$ 是头维度（head_size）， $L$ 是重塑后序列长度维度
+- $B_{\text{cache}}$ 是缓存批次维度， $L_{\text{cache}}$ 是缓存序列长度维度
+	形状重塑的具体操作（Transformer 标准 KV 张量维度转换）：
+
+$$
+  \text{reshape}(X, [B, H_k, D, L]) = \text{transpose}(\text{view}(X, [B, L, H_k, D]), 1, 2)
+$$
+
+  其中 $X$ 代表 $\text{key}$ 或 $\text{value}$ ， $\text{view}(\cdot)$ 为张量维度重塑操作（不改变数据顺序）， $\text{transpose}(\cdot, 1, 2)$ 为维度转置操作（交换第 1 维和第 2 维，维度索引从 0 开始）。
+  对于 GQA（Grouped Query Attention）配置兼容场景：
+
+$$
+  H_k = \frac{H}{G}
+$$
+
+  其中 $H$ 是查询头数（q_head_num）， $G$ 是 GQA 分组数（MQA 时 $G=H$ ，此时 $H_k=1$ ；Multi-Head Attention 时 $G=1$ ，此时 $H_k=H$ ）。
+
+### 调用示例
+
+```python
+import torch
+import mcoplib.lmdeploy as lmdeploy
+# 设置计算设备
+device = "cuda" if torch.cuda.is_available() else "cpu"
+# 1. 定义维度参数
+num_tokens = 2       # 当前batch的token数量
+num_heads = 32       # 注意力头数
+head_size = 128      # 每个头的维度
+block_size = 16      # PagedAttention的块大小
+num_blocks = 1024    # 预分配的显存块数量
+x = 16 
+assert head_size % x == 0, "head_size must be divisible by x"
+# 2. 创建输入张量 (Key 和 Value)
+key = torch.randn(
+    num_tokens, num_heads, head_size,
+    dtype=torch.float16,
+    device=device
+)
+value = torch.randn_like(key)
+# 3. 创建KV Cache (输出/更新目标)
+# Key Cache 形状: [num_blocks, num_heads, head_size/x, block_size, x]
+key_cache_shape = (num_blocks, num_heads, head_size // x, block_size, x)
+key_cache = torch.zeros(
+    key_cache_shape,
+    dtype=torch.float16,
+    device=device
+)
+# Value Cache 形状: [num_blocks, num_heads, head_size, block_size]
+value_cache_shape = (num_blocks, num_heads, head_size, block_size)
+value_cache = torch.zeros(
+    value_cache_shape,
+    dtype=torch.float16,
+    device=device
+)
+# 4. 创建 Slot Mapping
+slot_mapping = torch.tensor([0, 1], dtype=torch.long, device=device)
+# 5. 其他标量参数
+kv_cache_dtype = "auto"
+kv_scale = 1.0
+v_scale = 1.0
+# 6. 调用算子
+# void reshape_and_cache_new(...)
+lmdeploy.reshape_and_cache_new(
+    key, 
+    value, 
+    key_cache, 
+    value_cache, 
+    slot_mapping, 
+    kv_cache_dtype, 
+    kv_scale, 
+    v_scale
+)
+print("reshape_and_cache_new computation completed")
+print(f"Key Input shape: {key.shape}")
+print(f"Key Cache shape: {key_cache.shape}")
+print(f"Slot Mapping: {slot_mapping}")
+print("Cache updated successfully.")
+```
+
+---
+
+# cv
+
+## 1. CalSumOp
+
+### 支持的产品型号
+
+- Metax C500/C550/C588/C600
+
+### 接口原型
+
+```cpp
+template<typename T, typename D>
+void CalSumOp(
+    const T* __restrict input,
+    const unsigned char* __restrict mask,
+    D* __restrict dst,
+    int width,
+    int height,
+    int stride,
+    cudaStream_t stream
+);
+```
+
+### 功能描述
+
+CalSumOp 是基于 CUDA 并行实现的**带掩码筛选的张量求和算子**。该算子先通过`unsigned char`类型的 mask 筛选输入张量中的有效元素，再对有效元素进行求和计算，最终将结果写入输出张量。同时利用`cudaStream_t`管理异步执行，减少内存访问开销，提升计算效率，适用于需要按掩码过滤后求和的张量处理场景（如特征筛选后的聚合计算）。
+
+- 计算公式：
+
+$$
+  \text{dst}[0] = \sum_{i=0}^{\text{height}-1} \sum_{j=0}^{\text{width}-1} \left( \text{input}[i \times \text{stride} + j] \times \mathbb{I}\{\text{mask}[i \times \text{stride} + j] \neq 0\} \right)
+$$
+
+  其中：
+
+- $\text{input} \in \mathbb{R}^{\text{height} \times \text{width}}$ 是二维输入张量（实际内存布局由 stride 决定，支持非连续存储）
+- $\text{mask} \in \{0, 1\}^{\text{height} \times \text{width}}$ 是二进制掩码张量，与 input 的维度和内存布局完全对齐
+- $\text{dst} \in \mathbb{R}^1$ 是标量输出张量，唯一元素存储掩码筛选后的求和结果
+- $\text{width} \in \mathbb{N}^+$ 是输入张量的宽度维度（列数），表示每行的元素数量
+- $\text{height} \in \mathbb{N}^+$ 是输入张量的高度维度（行数），表示张量的总行数
+- $\text{stride} \in \mathbb{N}^+$ 是输入/掩码张量的内存步长，即相邻行首元素的内存偏移量（以元素个数为单位）
+- $\mathbb{I}\{\cdot\}$ 是指示函数，满足 $\mathbb{I}\{P\}=1$ （当条件 $P$ 为真）， $\mathbb{I}\{P\}=0$ （当条件 $P$ 为假）
+- $i \times \text{stride} + j$ 是张量中位置 $(i, j)$ 对应的一维内存偏移索引（ $i$ 为行索引， $j$ 为列索引）
+	CUDA 并行计算的线程映射规则：
+
+$$
+  \text{global\\_tid} = \text{blockIdx.x} \times \text{blockDim.x} + \text{threadIdx.x}
+$$
+
+
+
+$$
+  i = \lfloor \text{global\\_tid} / \text{width} \rfloor, \quad j = \text{global\\_tid} \bmod \text{width}
+$$
+
+
+
+$$
+  \text{partial\\_sum}[\text{global\\_tid}] = \text{input}[i \times \text{stride} + j] \times \mathbb{I}\{\text{mask}[i \times \text{stride} + j] \neq 0\}
+$$
+
+
+
+$$
+  \text{dst}[0] = \text{blockReduceSum}(\text{partial\\_sum}, \text{stream})
+$$
+
+  其中：
+
+- $\text{global\\_tid} \in \mathbb{N}$ 是 CUDA 线程的全局唯一索引
+- $\text{blockIdx.x} \in \mathbb{N}$ 是 CUDA 线程块的一维索引
+- $\text{blockDim.x} \in \mathbb{N}^+$ 是每个 CUDA 线程块的线程数量
+- $\text{threadIdx.x} \in \mathbb{N}$ 是线程块内的线程索引
+- $\text{partial\\_sum}$ 是线程级局部求和缓存张量
+- $\text{blockReduceSum}(\cdot, \cdot)$ 是 CUDA 块级归约求和函数，基于指定的`stream`异步执行全局求和
+
+### 参数说明
+
+- **input** (const T* __restrict, 入参): 输入张量（模板类型 T），存储待求和的原始数据。
+- **mask** (const unsigned char* __restrict, 入参): 掩码张量，通过元素值标记`input`中参与求和的有效元素（通常非 0 为有效）。
+- **dst** (D* __restrict, 出参): 输出张量（模板类型 D），存储掩码筛选后的求和结果。
+- **width** (int, 入参): 输入张量的宽度维度，用于确定维度范围。
+- **height** (int, 入参): 输入张量的高度维度，用于确定维度范围。
+- **stride** (int, 入参): 输入张量的步长，用于计算元素的内存偏移地址。
+- **stream** (cudaStream_t, 入参): CUDA 流，用于管理算子的异步执行流程。
+
+### 约束与调用
+
+- 所有张量（`input`/`mask`/`dst`）必须存储在 CUDA 设备内存中。
+- 支持的模板类型：`T`（输入类型）包括`char`、`short`、`float`等；`D`（输出类型）包括`double`等（以实际模板实例化为准）。
+- `mask`的元素类型固定为`unsigned char`，有效元素的标记规则需与业务逻辑一致。
+- `width`/`height`/`stride`的取值需匹配输入张量的实际维度布局，避免内存越界。
+- 需依赖 CUDA 运行时环境，支持 CUDA 流操作及并行核函数执行。
+
+### 调用示例
+
+```C++
+#include <iostream>
+#include <vector>
+#include <cuda_runtime.h>
+#include "utils.h"
+#include "calsum.h"  
+// 封装CUDA错误检查宏（避免隐藏bug）
+#define CHECK_CUDA_ERR(err) \
+    do { \
+        if (err != cudaSuccess) { \
+            std::cerr << "CUDA Error: " << cudaGetErrorString(err) \
+                      << " at line " << __LINE__ << std::endl; \
+            exit(1); \
+        } \
+    } while (0)
+int main() {
+    // 1. 定义输入参数（示例：3x2的矩阵，连续存储，stride=宽度）
+    const int width = 2;     // 每行元素个数
+    const int height = 3;    // 总行数
+    const int stride = width;// 行步长（连续存储时等于width）
+    const int num_elems = stride * height; // 总元素数（内存维度）
+    // 2. 构造Host端输入数据
+    // input: [1,2, 3,4, 5,6] → 3行2列的矩阵
+    std::vector<float> input_h = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f};
+    // mask: [1,0, 1,1, 0,1] → 仅标记部分元素参与求和
+    std::vector<unsigned char> mask_h = {1, 0, 1, 1, 0, 1};
+    std::vector<double> dst_h(1, 0.0); // 输出为标量（仅1个元素）
+    // 3. 分配Device端内存（带错误检查）
+    float* input_d = nullptr;
+    unsigned char* mask_d = nullptr;
+    double* dst_d = nullptr;
+    CHECK_CUDA_ERR(cudaMalloc(&input_d, num_elems * sizeof(float)));
+    CHECK_CUDA_ERR(cudaMalloc(&mask_d, num_elems * sizeof(unsigned char)));
+    CHECK_CUDA_ERR(cudaMalloc(&dst_d, dst_h.size() * sizeof(double)));
+    // 4. Host → Device 拷贝数据（带错误检查）
+    CHECK_CUDA_ERR(cudaMemcpy(input_d, input_h.data(), num_elems * sizeof(float), cudaMemcpyHostToDevice));
+    CHECK_CUDA_ERR(cudaMemcpy(mask_d, mask_h.data(), num_elems * sizeof(unsigned char), cudaMemcpyHostToDevice));
+    // 初始化输出显存为0（可选，确保初始值干净）
+    CHECK_CUDA_ERR(cudaMemset(dst_d, 0, dst_h.size() * sizeof(double)));
+    // 5. 调用CalSumOp<float, double>算子（指定输入float，输出double，使用默认流）
+    CalSumOp<float, double>(
+        input_d,
+        mask_d,
+        dst_d,
+        width,
+        height,
+        stride,
+        (cudaStream_t)0  // 使用CUDA默认流
+    );
+    // 等待CUDA核函数执行完成（必须加，避免结果未计算完成就读取）
+    CHECK_CUDA_ERR(cudaDeviceSynchronize());
+    // 6. Device → Host 拷贝结果（带错误检查）
+    CHECK_CUDA_ERR(cudaMemcpy(dst_h.data(), dst_d, dst_h.size() * sizeof(double), cudaMemcpyDeviceToHost));
+    // 7. 验证结果（预期求和：1 + 3 + 4 + 6 = 14）
+    std::cout << "CalSumOp<float, double> 运算结果：" << std::endl;
+    std::cout << "掩码筛选后的求和值 = " << dst_h[0] << std::endl;
+    // 8. 释放Device内存
+    cudaFree(input_d);
+    cudaFree(mask_d);
+    cudaFree(dst_d);
+    return 0;
+}
+```
+
+## 2. CountNoZeroOp
+
+### 支持的产品型号
+
+- - Metax C500/C550/C588/C600
+
+### 接口原型
+
+```cpp
+template<typename T, typename D>
+void CountNoZeroOp(
+    const T* __restrict input,
+    const unsigned char* __restrict mask,
+    D* __restrict dst,
+    int width,
+    int height,
+    int stride,
+    cudaStream_t stream
+);
+```
+
+### 功能描述
+
+CountNoZeroOp 算子实现了输入张量中非零元素的并行统计功能，支持结合掩码（mask）筛选特定位置后统计对应区域的非零元素数量。算子通过双版本 CUDA 核函数（带 mask/不带 mask）、共享内存缓存、线程同步与归约等优化手段，减少全局内存访问开销，提升并行计算效率，适用于张量有效元素计数的场景。
+
+- 计算公式：
+
+$$
+  \text{count}_{\text{non-zero}} = \sum_{i=0}^{\text{height}-1} \sum_{j=0}^{\text{width}-1} \mathbb{I}\left( \text{input}[i \times \text{stride} + j] \neq 0 \right)
+$$
+
+  若启用掩码（mask）筛选统计区域，计算公式为：
+
+$$
+  \text{count}_{\text{non-zero}}^{\text{masked}} = \sum_{i=0}^{\text{height}-1} \sum_{j=0}^{\text{width}-1} \mathbb{I}\left( \text{mask}[i \times \text{stride} + j] = 1 \land \text{input}[i \times \text{stride} + j] \neq 0 \right)
+$$
+
+  其中：
+
+- $\mathbb{I}(\cdot)$ 是指示函数，满足条件时取值为 $1$ ，否则为 $0$
+- $\text{input}[i \times \text{stride} + j] \in \mathbb{T}$ 是输入张量在 $(i, j)$ 位置的元素， $\mathbb{T}$ 为支持的数值类型（int、short、float、double、unsigned char 等）
+- $\text{mask}[i \times \text{stride} + j] \in \{0,1\}$ 是掩码张量在 $(i, j)$ 位置的元素， $1$ 表示统计该位置， $0$ 表示跳过
+- $\text{count}_{\text{non-zero}} \in \mathbb{D}$ 是无掩码时的非零元素总数， $\mathbb{D}$ 为整数类型（如 int32、int64）
+- $\text{count}_{\text{non-zero}}^{\text{masked}} \in \mathbb{D}$ 是带掩码时的非零元素总数
+- $\text{height} \in \mathbb{N}^+$ 是输入张量的高度维度大小
+- $\text{width} \in \mathbb{N}^+$ 是输入张量的宽度维度大小
+- $\text{stride} \in \mathbb{N}^+$ 是输入张量的内存步长（单行列数对应的内存偏移量，满足 $\text{stride} \geq \text{width}$ ）
+	并行计算时，算子将二维统计任务拆分到线程块/线程中，单线程负责的子区域计数归约公式为：
+
+$$
+  \text{count}_{\text{thread}} = \sum_{(i,j) \in \Omega_{\text{thread}}} \mathbb{I}\left( \text{cond}(i,j) \right)
+$$
+
+
+
+$$
+  \text{count}_{\text{non-zero}} = \sum_{\text{thread} \in \text{all\\_threads}} \text{count}_{\text{thread}}
+$$
+
+  其中：
+
+- $\Omega_{\text{thread}}$ 是单个线程负责统计的 $(i, j)$ 位置集合
+- $\text{cond}(i, j)$ 是统计条件（无掩码时为 $\text{input}[i \times \text{stride} + j] \neq 0$ ，带掩码时为 $\text{mask}[i \times \text{stride} + j] = 1 \land \text{input}[i \times \text{stride} + j] \neq 0$ ）
+- $\text{count}_{\text{thread}} \in \mathbb{D}$ 是单个线程统计得到的子区域非零元素数
+
+### 参数说明
+
+- **input** (const T* __restrict, 入参): 待统计的输入张量设备指针，存储原始数据
+- **mask** (const unsigned char* __restrict, 入参): 掩码张量设备指针，用于指定需统计的元素位置（可选，未启用时执行全量非零统计）
+- **dst** (D* __restrict, 出参): 输出张量设备指针，存储最终统计得到的非零元素总数
+- **width** (int, 入参): 输入张量的宽度维度大小
+- **height** (int, 入参): 输入张量的高度维度大小
+- **stride** (int, 入参): 输入张量的内存步长（单行列数对应的内存偏移量）
+- **stream** (cudaStream_t, 入参): CUDA 异步流，用于控制算子的执行流
+
+### 返回值
+
+无返回值，统计结果直接写入`dst`指针指向的设备存储区域
+
+### 约束与调用
+
+- 所有张量（input、mask、dst）必须分配在 CUDA 设备内存上
+- 模板参数`T`支持的数据类型：int、short、float、double、unsigned char 等（需与输入数据类型匹配）
+- 模板参数`D`需为整数类型（用于存储计数结果）
+- 若使用 mask，mask 的元素数量需与 input 的统计区域维度匹配
+- stride 需大于等于 width，确保张量内存布局的有效性
+- 核函数线程配置需符合模板参数（如 NM_THREADS）的约束
+
+### 调用示例
+
+```C++
+#include <iostream>
+#include <vector>
+#include <cuda_runtime.h>
+#include "utils.h"
+#include "count_nozero.h"  
+// 封装CUDA错误检查宏
+#define CHECK_CUDA_ERR(err) \
+    do { \
+        if (err != cudaSuccess) { \
+            std::cerr << "CUDA Error: " << cudaGetErrorString(err) \
+                      << " at line " << __LINE__ << std::endl; \
+            exit(1); \
+        } \
+    } while (0)
+int main() {
+    // 1. 定义输入参数
+    const int width = 3;    // 每行3个元素
+    const int height = 2;   // 共2行
+    const int stride = width;
+    const int num_elems = stride * height;
+    // 2. 构造Host端输入数据
+    // Input: [ 0.0, 1.5, 0.0, 
+    // -2.0, 0.0, 3.0 ]
+    std::vector<float> input_h = {0.0f, 1.5f, 0.0f, -2.0f, 0.0f, 3.0f};
+    // Mask: [ 1, 1, 1,
+    //         1, 1, 0 ]-> 最后一个元素(3.0)被mask掉，应该不参与计数
+    std::vector<unsigned char> mask_h = {1, 1, 1, 1, 1, 0};
+    // Output: 注意这里改为 int，因为截图显示 CountNoZeroOp<float, int>
+    std::vector<int> dst_h(1, 0); 
+    // 3. 分配Device端内存
+    float* input_d = nullptr;
+    unsigned char* mask_d = nullptr;
+    int* dst_d = nullptr;
+    CHECK_CUDA_ERR(cudaMalloc(&input_d, num_elems * sizeof(float)));
+    CHECK_CUDA_ERR(cudaMalloc(&mask_d, num_elems * sizeof(unsigned char)));
+    CHECK_CUDA_ERR(cudaMalloc(&dst_d, dst_h.size() * sizeof(int)));
+    // 4. Host → Device 拷贝数据
+    CHECK_CUDA_ERR(cudaMemcpy(input_d, input_h.data(), num_elems * sizeof(float), cudaMemcpyHostToDevice));
+    CHECK_CUDA_ERR(cudaMemcpy(mask_d, mask_h.data(), num_elems * sizeof(unsigned char), cudaMemcpyHostToDevice));
+    CHECK_CUDA_ERR(cudaMemset(dst_d, 0, dst_h.size() * sizeof(int))); // 初始化输出为0
+    // 5. 调用 CountNoZeroOp<float, int> 算子
+    // 根据截图第157行：template void CountNoZeroOp<float, int>(...)
+    CountNoZeroOp<float, int>(
+        input_d,
+        mask_d,     // 如果传 nullptr，则对应截图代码里的 else 分支（无mask模式）
+        dst_d,
+        width,
+        height,
+        stride,
+        (cudaStream_t)0
+    );
+    // 等待核函数完成
+    CHECK_CUDA_ERR(cudaDeviceSynchronize());
+    // 6. Device → Host 拷贝结果
+    CHECK_CUDA_ERR(cudaMemcpy(dst_h.data(), dst_d, dst_h.size() * sizeof(int), cudaMemcpyDeviceToHost));
+    // 预期结果: 2
+    std::cout << "CountNoZeroOp<float, int> 运算结果：" << std::endl;
+    std::cout << "非零元素个数 (经过Mask筛选) = " << dst_h[0] << std::endl;
+    // 8. 释放内存
+    cudaFree(input_d);
+    cudaFree(mask_d);
+    cudaFree(dst_d);
+    return 0;
+}
+```
+
+## 3. MeanStdevOp
+
+### 支持的产品型号
+
+- Metax C500/C550/C588/C600
+
+### 接口原型
+
+```cpp
+template<typename T, typename D>
+void MeanStdevOp(
+    const T* __restrict input,
+    D* __restrict mean,
+    D* __restrict std,
+    int width,
+    int height,
+    int stride,
+    cudaStream_t stream
+);
+```
+
+### 功能描述
+
+MeanStdevOp 算子实现了输入张量的**均值与标准差**的 CUDA 并行计算。该算子分两步完成：
+
+1. 对输入数据做并行求和，计算出张量的均值；
+2. 基于均值计算每个元素与均值差的平方和，进一步得到标准差。
+	这种并行化实现减少了计算耗时，常用于数据预处理、模型特征归一化等需要统计量的场景。
+
+- 计算公式：
+
+$$
+  \mu = \frac{1}{W \times H} \sum_{i=0}^{H-1} \sum_{j=0}^{W-1} x_{i,j}
+$$
+
+
+
+$$
+  \sigma = \sqrt{\frac{1}{W \times H} \sum_{i=0}^{H-1} \sum_{j=0}^{W-1} (x_{i,j} - \mu)^2}
+$$
+
+  其中：
+
+- $x_{i, j} \in \mathbb{R}$ 是输入张量 $\text{input}$ 中第 $i$ 行第 $j$ 列的有效元素，实际存储位置为 $\text{input}[i \times \text{stride} + j]$
+- $\mu \in \mathbb{R}$ 是输入张量所有有效元素的均值，计算结果写入 $\text{mean}$ 指针指向的 CUDA 设备内存
+- $\sigma \in \mathbb{R}$ 是输入张量所有有效元素的总体标准差，计算结果写入 $\text{std}$ 指针指向的 CUDA 设备内存
+- $W \in \mathbb{N}^+$ 是输入张量的有效宽度（对应算子参数 $\text{width}$ ）
+- $H \in \mathbb{N}^+$ 是输入张量的高度（对应算子参数 $\text{height}$ ）
+- $\text{stride} \in \mathbb{N}^+$ 是输入张量的存储步长（每行实际存储的元素数，需满足 $\text{stride} \geq W$ ）
+- $\mathbb{N}^+$ 表示正整数集合
+	若需计算样本标准差（除以 $W \times H - 1$ ），算子可扩展为：
+
+$$
+  \sigma_{\text{sample}} = \sqrt{\frac{1}{W \times H - 1} \sum_{i=0}^{H-1} \sum_{j=0}^{W-1} (x_{i,j} - \mu)^2}
+$$
+
+  其中 $\sigma_{\text{sample}} \in \mathbb{R}$ 为样本标准差，适用于小批量数据统计场景。
+
+### 参数说明
+
+- **input** (const T* __restrict, 入参): 待计算统计量的设备端输入张量指针
+- **mean** (D* __restrict, 出参): 存储计算结果的设备端均值指针
+- **std** (D* __restrict, 出参): 存储计算结果的设备端标准差指针
+- **width** (int, 入参): 输入张量的有效宽度（每行有效元素数）
+- **height** (int, 入参): 输入张量的高度（行数）
+- **stride** (int, 入参): 输入张量的存储步长（每行实际存储的元素数，含填充）
+- **stream** (cudaStream_t, 入参): 执行计算的 CUDA 流（管理异步任务队列）
+
+### 约束与调用
+
+- 所有张量（input、mean、std）必须位于 CUDA 设备内存中
+- 支持的数据类型：模板参数 T/D 兼容 float 等数值类型（代码包含 float 的特化实现）
+- 需满足`stride ≥ width`（步长需不小于有效宽度，匹配存储布局）
+- **stream**需为有效的 CUDA 流对象（可传`cudaStreamDefault`使用默认流）
+
+### 调用示例
+
+```C++
+#include <iostream>
+#include <vector>
+#include <cuda_runtime.h>
+#include "utils.h"
+#include "meanstdev.h"  
+// 封装CUDA错误检查宏（避免隐藏bug）
+#define CHECK_CUDA_ERR(err) \
+    do { \
+        if (err != cudaSuccess) { \
+            std::cerr << "CUDA Error: " << cudaGetErrorString(err) \
+                      << " at line " << __LINE__ << std::endl; \
+            exit(1); \
+        } \
+    } while (0)
+int main() {
+    // 1. 定义输入参数（2x2矩阵，连续存储无填充）
+    const int width = 2;     // 有效宽度
+    const int height = 2;    // 高度
+    const int stride = width;// 存储步长（无填充，等于有效宽度）
+    const int num_elems = stride * height; // 总存储元素数
+    // 2. 构造Host端输入数据（2x2矩阵：[[1.0, 2.0], [3.0, 4.0]]）
+    // 预期均值：(1+2+3+4)/4 = 2.5；预期总体标准差：sqrt(5/4) ≈ 1.11803
+    std::vector<float> input_h = {1.0f, 2.0f, 3.0f, 4.0f};
+    // Host端存储均值/标准差的变量
+    float mean_h = 0.0f;
+    float std_h = 0.0f;
+    // 3. 分配Device端内存（带错误检查）
+    float* input_d = nullptr;  // 输入张量设备内存
+    float* mean_d = nullptr;   // 均值结果设备内存（单个值）
+    float* std_d = nullptr;    // 标准差结果设备内存（单个值）
+    CHECK_CUDA_ERR(cudaMalloc(&input_d, num_elems * sizeof(float)));
+    CHECK_CUDA_ERR(cudaMalloc(&mean_d, sizeof(float)));
+    CHECK_CUDA_ERR(cudaMalloc(&std_d, sizeof(float)));
+    // 4. Host → Device 拷贝输入数据（带错误检查）
+    CHECK_CUDA_ERR(cudaMemcpy(input_d, input_h.data(), num_elems * sizeof(float), cudaMemcpyHostToDevice));
+    // 5. 调用MeanStdevOp算子（模板参数T=float, D=float；使用默认CUDA流）
+    MeanStdevOp<float, float>(
+        input_d, 
+        mean_d, 
+        std_d, 
+        width, 
+        height, 
+        stride, 
+        cudaStreamDefault  // 显式使用默认流，替代(0)更规范
+    );
+    // 等待CUDA核函数执行完成（必须加，确保结果就绪）
+    CHECK_CUDA_ERR(cudaDeviceSynchronize());
+    // 6. Device → Host 拷贝结果（均值+标准差）
+    CHECK_CUDA_ERR(cudaMemcpy(&mean_h, mean_d, sizeof(float), cudaMemcpyDeviceToHost));
+    CHECK_CUDA_ERR(cudaMemcpy(&std_h, std_d, sizeof(float), cudaMemcpyDeviceToHost));
+    // 7. 验证/打印结果
+    std::cout << "MeanStdevOp<float, float> 运算结果：" << std::endl;
+    std::cout << "输入矩阵：" << std::endl;
+    for (int i = 0; i < height; ++i) {
+        for (int j = 0; j < width; ++j) {
+            std::cout << input_h[i * stride + j] << " ";
+        }
+        std::cout << std::endl;
+    }
+    std::cout << "计算得到的均值：" << mean_h << "（预期：2.5）" << std::endl;
+    std::cout << "计算得到的总体标准差：" << std_h << "（预期≈1.11803）" << std::endl;
+    // 8. 释放Device内存
+    CHECK_CUDA_ERR(cudaFree(input_d));
+    CHECK_CUDA_ERR(cudaFree(mean_d));
+    CHECK_CUDA_ERR(cudaFree(std_d));
+    return 0;
+}
+```
+
+## 4. fused_postprocess_yuv420
+
+### 支持的产品型号
+
+- Metax C500/C550/C588/C600
+
+### 接口原型
+
+```c
+void fused_postprocess_yuv420(
+    const float* __restrict inputData,
+    uint8_t* __restrict yuv420Data,
+    int width,
+    int height,
+    float scale,
+    cudaStream_t stream
+);
+```
+
+### 功能描述
+
+fused_postprocess_yuv420 是融合式后处理算子，负责将输入的 float 类型数据转换为 YUV420 格式的图像数据。过程集成了颜色空间转换、数据缩放等步骤，通过融合操作减少内存访问次数，提升计算效率；基于 CUDA 执行，支持通过 CUDA 流实现异步计算。
+
+- 计算公式：
+	该算子实现 $float$ 类型 RGB 数据到 $uint8_t$ 类型 YUV420 格式的转换，包含数据缩放、颜色空间转换与格式排布：
+
+$$
+  R' = \text{round}(inputData_{(y,x,0)} \times scale),\ G' = \text{round}(inputData_{(y,x,1)} \times scale),\ B' = \text{round}(inputData_{(y,x,2)} \times scale)
+$$
+
+
+
+$$
+  R' = \max(0, \min(255, R')),\ G' = \max(0, \min(255, G')),\ B' = \max(0, \min(255, B'))
+$$
+
+
+
+$$
+  Y(x,y) = 0.299 \times R' + 0.587 \times G' + 0.114 \times B'
+$$
+
+
+
+$$
+  U(x,y) = -0.147 \times R' - 0.289 \times G' + 0.436 \times B' + 128
+$$
+
+
+
+$$
+  V(x,y) = 0.615 \times R' - 0.515 \times G' - 0.100 \times B' + 128
+$$
+
+
+
+$$
+  \text{yuv420Data}[y \times width + x] = \text{round}(Y(x,y))
+$$
+
+
+
+$$
+  \text{yuv420Data}[height \times width + (y//2) \times (width//2) + (x//2)] = \text{round}(\text{avg}_{2×2}U(x,y))
+$$
+
+
+
+$$
+  \text{yuv420Data}[height \times width + \frac{height \times width}{4} + (y//2) \times (width//2) + (x//2)] = \text{round}(\text{avg}_{2×2}V(x,y))
+$$
+
+  其中：
+
+- $inputData \in \mathbb{R}^{height \times width \times 3}$ ： $float$ 类型输入张量，存储每个像素的 $R、G、B$ 通道值（对应索引 $0、1、2$ ）
+- $yuv420Data \in \mathbb{U}^{height \times width + \frac{height \times width}{2}}$ ： $uint8_t$ 类型输出张量，存储 YUV420 格式数据
+- $width, height \in \mathbb{N}^+$ ：目标图像的宽度与高度
+- $scale \in \mathbb{R}^+$ ：输入数据的缩放因子
+- $R', G', B' \in \mathbb{N}$ ：缩放并裁剪后的 RGB 通道值，范围 $[0,255]$
+- $Y (x, y), U (x, y), V (x, y) \in \mathbb{R}$ ：转换后的 YUV 分量值
+- $\text{avg}_{2×2}U (x, y)$ ： $2×2$ 像素块内 $U$ 分量的均值
+- $\text{avg}_{2×2}V (x, y)$ ： $2×2$ 像素块内 $V$ 分量的均值
+
+### 参数说明
+
+- **inputData** (const float* __restrict, 入参): 待处理的 float 类型输入张量，存储原始数据
+- **yuv420Data** (uint8_t* __restrict, 出参): 输出缓冲区，存储转换后的 YUV420 格式图像数据（uint8_t 类型）
+- **width** (int, 入参): 目标图像的宽度
+- **height** (int, 入参): 目标图像的高度
+- **scale** (float, 入参): 数据缩放因子，用于调整输入数据的数值范围
+- **stream** (cudaStream_t, 入参): CUDA 流对象，指定算子异步执行的流
+
+### 约束与调用
+
+- 所有指针对应的内存必须位于 CUDA 设备上
+- inputData 的维度需与 width、height 对应的图像数据量匹配
+- 支持的输入类型：float；输出类型：uint8_t
+
+### 调用示例
+
+```cpp
+#include <iostream>
+#include <vector>
+#include <cuda_runtime.h>
+#include "utils.h"
+#include "process_interface.h"  
+int main() {
+    // 1. 定义输入参数（2x2 RGB图像，简化验证）
+    const int width = 2;                 // 图像宽度
+    const int height = 2;                // 图像高度
+    const float scale = 255.0f;          // 缩放因子（将float[0,1]映射到uint8[0,255]）
+    const int input_elems = height * width * 3;  // RGB输入元素数（2*2*3=12）
+    // YUV420输出大小：Y(2*2) + U(1*1) + V(1*1) = 6字节
+    const int yuv420_elems = height * width + (height/2)*(width/2) + (height/2)*(width/2);
+    // 2. 构造Host端输入数据（RGB全1.0f，缩放后为255）
+    std::vector<float> inputData_h(input_elems, 1.0f);  
+    // 存储YUV420结果的Host数组
+    std::vector<uint8_t> yuv420Data_h(yuv420_elems, 0);  
+    // 3. 分配Device端内存（带错误检查）
+    float* inputData_d = nullptr;
+    uint8_t* yuv420Data_d = nullptr;
+    CHECK_CUDA_ERR(cudaMalloc(&inputData_d, input_elems * sizeof(float)));
+    CHECK_CUDA_ERR(cudaMalloc(&yuv420Data_d, yuv420_elems * sizeof(uint8_t)));
+    // 4. Host → Device 拷贝数据
+    CHECK_CUDA_ERR(cudaMemcpy(inputData_d, inputData_h.data(), input_elems * sizeof(float), cudaMemcpyHostToDevice));
+    // 5. 创建CUDA流并调用算子
+    cudaStream_t stream = nullptr;
+    CHECK_CUDA_ERR(cudaStreamCreate(&stream));
+    fused_postprocess_yuv420(inputData_d, yuv420Data_d, width, height, scale, stream);
+    // 等待CUDA流执行完成
+    CHECK_CUDA_ERR(cudaStreamSynchronize(stream));
+    // 6. Device → Host 拷贝结果
+    CHECK_CUDA_ERR(cudaMemcpy(yuv420Data_h.data(), yuv420Data_d, yuv420_elems * sizeof(uint8_t), cudaMemcpyDeviceToHost));
+    // 7. 验证结果（预期：Y全255，U/V均为128）
+    std::cout << "fused_postprocess_yuv420 运算结果：" << std::endl;
+    std::cout << "Y分量：";
+    for (int i = 0; i < height*width; ++i) {
+        std::cout << (int)yuv420Data_h[i] << " ";
+    }
+    std::cout << "\nU分量：" << (int)yuv420Data_h[height*width] << std::endl;
+    std::cout << "V分量：" << (int)yuv420Data_h[height*width + 1] << std::endl;
+    // 8. 释放资源
+    cudaStreamDestroy(stream);
+    cudaFree(inputData_d);
+    cudaFree(yuv420Data_d);
+    return 0;
+}
+```
+
+## 5. fused_postprocess_nv12
+
+### 支持的产品型号
+
+- Metax C500/C550/C588/C600
+
+### 接口原型
+
+```cpp
+void fused_postprocess_nv12(
+    const float* __restrict inputData,
+    uint8_t* __restrict nv12Data,
+    int width,
+    int height,
+    float scale,
+    cudaStream_t stream
+);
+```
+
+### 功能描述
+
+fused_postprocess_nv12 是融合式后处理算子，负责将输入的 float 类型数据转换为 NV12 格式的图像数据。集成了颜色空间转换、数据缩放等步骤，通过融合操作优化性能；基于 CUDA 执行，支持通过 CUDA 流实现异步计算。
+
+- 计算公式：
+	该算子实现 $float$ 类型 RGB 数据到 $uint8_t$ 类型 NV12 格式的转换，包含数据缩放、颜色空间转换与格式排布：
+
+$$
+  R' = \text{round}(inputData_{(y,x,0)} \times scale),\ G' = \text{round}(inputData_{(y,x,1)} \times scale),\ B' = \text{round}(inputData_{(y,x,2)} \times scale)
+$$
+
+
+
+$$
+  R' = \max(0, \min(255, R')),\ G' = \max(0, \min(255, G')),\ B' = \max(0, \min(255, B'))
+$$
+
+
+
+$$
+  Y(x,y) = 0.299 \times R' + 0.587 \times G' + 0.114 \times B'
+$$
+
+
+
+$$
+  U(x,y) = -0.147 \times R' - 0.289 \times G' + 0.436 \times B' + 128
+$$
+
+
+
+$$
+  V(x,y) = 0.615 \times R' - 0.515 \times G' - 0.100 \times B' + 128
+$$
+
+
+
+$$
+  \text{nv12Data}[y \times width + x] = \text{round}(Y(x,y))
+$$
+
+
+
+$$
+  \text{nv12Data}[height \times width + 2 \times [(y//2) \times (width//2) + (x//2)]] = \text{round}(\text{avg}_{2×2}U(x,y))
+$$
+
+
+
+$$
+  \text{nv12Data}[height \times width + 2 \times [(y//2) \times (width//2) + (x//2)] + 1] = \text{round}(\text{avg}_{2×2}V(x,y))
+$$
+
+  其中：
+
+- $inputData \in \mathbb{R}^{height \times width \times 3}$ ： $float$ 类型输入张量，存储每个像素的 $R、G、B$ 通道值（对应索引 $0、1、2$ ）
+- $nv12Data \in \mathbb{U}^{height \times width + \frac{height \times width}{2}}$ ： $uint8_t$ 类型输出张量，存储 NV12 格式数据
+- $width, height \in \mathbb{N}^+$ ：目标图像的宽度与高度
+- $scale \in \mathbb{R}^+$ ：输入数据的缩放因子
+- $R', G', B' \in \mathbb{N}$ ：缩放并裁剪后的 RGB 通道值，范围 $[0,255]$
+- $Y (x, y), U (x, y), V (x, y) \in \mathbb{R}$ ：转换后的 YUV 分量值
+- $\text{avg}_{2×2}U (x, y)$ ： $2×2$ 像素块内 $U$ 分量的均值
+- $\text{avg}_{2×2}V (x, y)$ ： $2×2$ 像素块内 $V$ 分量的均值
+
+### 参数说明
+
+- **inputData** (const float* __restrict, 入参): 待处理的 float 类型输入张量，存储原始数据
+- **nv12Data** (uint8_t* __restrict, 出参): 输出缓冲区，存储转换后的 NV12 格式图像数据（uint8_t 类型）
+- **width** (int, 入参): 目标图像的宽度
+- **height** (int, 入参): 目标图像的高度
+- **scale** (float, 入参): 数据缩放因子，用于调整输入数据的数值范围
+- **stream** (cudaStream_t, 入参): CUDA 流对象，指定算子异步执行的流
+
+### 约束与调用
+
+- 所有指针对应的内存必须位于 CUDA 设备上
+- inputData 的维度需与 width、height 对应的图像数据量匹配
+- 支持的输入类型：float；输出类型：uint8_t
+
+### 调用示例
+
+```cpp
+#include <iostream>
+#include <vector>
+#include <cuda_runtime.h>
+#include "utils.h"
+#include "process_interface.h"  
+int main() {
+    // 1. 定义输入参数（2x2 RGB图像，简化验证）
+    const int width = 2;                 // 图像宽度
+    const int height = 2;                // 图像高度
+    const float scale = 255.0f;          // 缩放因子（将float[0,1]映射到uint8[0,255]）
+    const int input_elems = height * width * 3;  // RGB输入元素数（2*2*3=12）
+    // NV12输出大小：Y(2*2) + UV(1*1*2) = 6字节
+    const int nv12_elems = height * width + (height/2)*(width/2)*2;
+    // 2. 构造Host端输入数据（RGB全1.0f，缩放后为255）
+    std::vector<float> inputData_h(input_elems, 1.0f);  
+    // 存储NV12结果的Host数组
+    std::vector<uint8_t> nv12Data_h(nv12_elems, 0);  
+    // 3. 分配Device端内存（带错误检查）
+    float* inputData_d = nullptr;
+    uint8_t* nv12Data_d = nullptr;
+    CHECK_CUDA_ERR(cudaMalloc(&inputData_d, input_elems * sizeof(float)));
+    CHECK_CUDA_ERR(cudaMalloc(&nv12Data_d, nv12_elems * sizeof(uint8_t)));
+    // 4. Host → Device 拷贝数据
+    CHECK_CUDA_ERR(cudaMemcpy(inputData_d, inputData_h.data(), input_elems * sizeof(float), cudaMemcpyHostToDevice));
+    // 5. 创建CUDA流并调用算子
+    cudaStream_t stream = nullptr;
+    CHECK_CUDA_ERR(cudaStreamCreate(&stream));
+    fused_postprocess_nv12(inputData_d, nv12Data_d, width, height, scale, stream);
+    // 等待CUDA流执行完成
+    CHECK_CUDA_ERR(cudaStreamSynchronize(stream));
+    // 6. Device → Host 拷贝结果
+    CHECK_CUDA_ERR(cudaMemcpy(nv12Data_h.data(), nv12Data_d, nv12_elems * sizeof(uint8_t), cudaMemcpyDeviceToHost));
+    // 7. 验证结果（预期：Y全255，U=128、V=128）
+    std::cout << "fused_postprocess_nv12 运算结果：" << std::endl;
+    std::cout << "Y分量：";
+    for (int i = 0; i < height*width; ++i) {
+        std::cout << (int)nv12Data_h[i] << " ";
+    }
+    std::cout << "\nU分量：" << (int)nv12Data_h[height*width] << std::endl;
+    std::cout << "V分量：" << (int)nv12Data_h[height*width + 1] << std::endl;
+    // 8. 释放资源
+    cudaStreamDestroy(stream);
+    cudaFree(inputData_d);
+    cudaFree(nv12Data_d);
+    return 0;
+}
+```
+
+## 6. fused_preprocess_yuv420
+
+### 支持的产品型号
+
+- Metax C500/C550/C588/C600
+
+### 接口原型
+
+```cpp
+void fused_preprocess_yuv420(
+    const uint8_t* __restrict yuv420Data,
+    float* __restrict outputData,
+    int width,
+    int height,
+    float scale,
+    cudaStream_t stream
+);
+```
+
+### 功能描述
+
+fused_preprocess_yuv420 算子实现了 YUV420 格式图像数据的融合预处理操作，包含 YUV 颜色空间转换、数值归一化（偏移、范围裁剪）及缩放等步骤。通过融合多步操作降低内存访问开销，提升了图像预处理效率，适用于图像/视频类 AI 模型的输入预处理环节。
+
+- 计算公式：
+
+$$
+  \begin{align*}
+  &\text{Step 1: 提取YUV420格式Y/U/V分量} \\
+  &Y(i,j) = \text{yuv420Data}[i \times \text{width} + j] \\
+  &U(i,j) = \text{yuv420Data}\left[\text{width} \times \text{height} + \left\lfloor \frac{i}{2} \right\rfloor \times \frac{\text{width}}{2} + \left\lfloor \frac{j}{2} \right\rfloor\right] \\
+  &V(i,j) = \text{yuv420Data}\left[\text{width} \times \text{height} \times 5/4 + \left\lfloor \frac{i}{2} \right\rfloor \times \frac{\text{width}}{2} + \left\lfloor \frac{j}{2} \right\rfloor\right] \\
+  &\text{Step 2: YUV420转RGB（BT.601标准）} \\
+  &R(i,j) = 1.164 \times (Y(i,j)-16) + 1.596 \times (V(i,j)-128) \\
+  &G(i,j) = 1.164 \times (Y(i,j)-16) - 0.813 \times (V(i,j)-128) - 0.391 \times (U(i,j)-128) \\
+  &B(i,j) = 1.164 \times (Y(i,j)-16) + 2.018 \times (U(i,j)-128) \\
+  &\text{Step 3: 数值裁剪与缩放} \\
+  &R_{\text{norm}}(i,j) = \text{clip}\left(R(i,j), 0, 255\right) \times \frac{\text{scale}}{255} \\
+  &G_{\text{norm}}(i,j) = \text{clip}\left(G(i,j), 0, 255\right) \times \frac{\text{scale}}{255} \\
+  &B_{\text{norm}}(i,j) = \text{clip}\left(B(i,j), 0, 255\right) \times \frac{\text{scale}}{255} \\
+  &\text{Step 4: 输出赋值} \\
+  &\text{outputData}[i \times \text{width} \times 3 + j \times 3 + c] = 
+  \begin{cases}
+  R_{\text{norm}}(i,j) & c=0 \\
+  G_{\text{norm}}(i,j) & c=1 \\
+  B_{\text{norm}}(i,j) & c=2
+  \end{cases}
+  \end{align*}
+$$
+
+  其中：
+
+- $Y (i, j) \in \mathbb{Z}_{[0,255]}$ 是 YUV420 格式中位置 $(i, j)$ 的亮度分量
+- $U (i, j) \in \mathbb{Z}_{[0,255]}$ 是 YUV420 格式中位置 $(i, j)$ 的蓝色色度分量（色度 U）
+- $V (i, j) \in \mathbb{Z}_{[0,255]}$ 是 YUV420 格式中位置 $(i, j)$ 的红色色度分量（色度 V）
+- $i \in [0, \text{height}-1]$ 是图像行索引， $j \in [0, \text{width}-1]$ 是图像列索引
+- $\text{clip}(x, a, b) = \max\left (\min (x, b), a\right)$ 是数值裁剪函数，限制 $x$ 在 $[a, b]$ 范围内
+- $c \in \{0,1,2\}$ 是输出通道索引（0=R、1=G、2=B）
+- $\text{width} \in \mathbb{Z}_{>0}$ 是输入图像宽度， $\text{height} \in \mathbb{Z}_{>0}$ 是输入图像高度
+- $\text{scale} \in \mathbb{R}$ 是输出数据的缩放系数
+- $\text{yuv420Data} \in \mathbb{U8}^{(\text{width} \times \text{height} \times 3/2)}$ 是 YUV420 格式输入数据（CUDA 设备内存）
+- $\text{outputData} \in \mathbb{R}^{(\text{width} \times \text{height} \times 3)}$ 是预处理后输出数据（CUDA 设备内存）
+
+### 参数说明
+
+- **yuv420Data** (const uint8_t* __restrict, 入参): YUV420 格式的输入图像数据指针，需位于 CUDA 设备内存
+- **outputData** (float* __restrict, 出参): 预处理后的输出数据指针，结果写入该 CUDA 设备内存地址
+- **width** (int, 入参): 输入图像的宽度
+- **height** (int, 入参): 输入图像的高度
+- **scale** (float, 入参): 预处理后数据的缩放系数
+- **stream** (cudaStream_t, 入参): CUDA 流，用于指定算子的异步执行流
+
+### 返回值
+
+无返回值，预处理结果直接写入`outputData`指针指向的内存。
+
+### 约束与调用
+
+- 所有数据指针（`yuv420Data`、`outputData`）必须位于 CUDA 设备内存
+- 输入数据需严格符合 YUV420 格式（Y 分量占`width×height`字节，U、V 分量各占`width×height/4`字节）
+- `width`、`height`需为正偶数（符合 YUV420 分辨率要求）
+- `stream`需为有效的`cudaStream_t`对象
+- 支持输入类型：`uint8_t`；输出类型：`float`
+
+### 调用示例
+
+```cpp
+#include <iostream>
+#include <vector>
+#include <cuda_runtime.h>
+#include "utils.h"
+#include "process_interface.h"  
+int main() {
+    // 1. 定义输入参数（选偶数分辨率，符合YUV420格式要求）
+    const int width = 32;          // 图像宽度（偶数）
+    const int height = 32;         // 图像高度（偶数）
+    const float scale = 1.0f / 255.0f;  // 归一化缩放系数
+    // YUV420数据大小：Y(width*height) + U(width*height/4) + V(width*height/4)
+    const size_t yuv420_data_size = width * height * 3 / 2;
+    // 输出数据大小：RGB三通道，float类型
+    const size_t output_data_size = width * height * 3 * sizeof(float);
+    // 2. 构造Host端输入数据（简单初始化YUV420数据）
+    std::vector<uint8_t> yuv420_data_h(yuv420_data_size, 128);  // 初始化为灰度值128
+    // 输出Host数组（存储RGB结果）
+    std::vector<float> output_data_h(width * height * 3, 0.0f);
+    // 3. 分配Device端内存
+    uint8_t* yuv420_data_d = nullptr;
+    float* output_data_d = nullptr;
+    CHECK_CUDA_ERR(cudaMalloc(&yuv420_data_d, yuv420_data_size));
+    CHECK_CUDA_ERR(cudaMalloc(&output_data_d, output_data_size));
+    // 4. Host → Device 拷贝数据
+    CHECK_CUDA_ERR(cudaMemcpy(yuv420_data_d, yuv420_data_h.data(), yuv420_data_size, 
+                              cudaMemcpyHostToDevice));
+    // 5. 创建CUDA流（可选，也可传0使用默认流）
+    cudaStream_t stream;
+    CHECK_CUDA_ERR(cudaStreamCreate(&stream));
+    // 6. 调用fused_preprocess_yuv420算子
+    fused_preprocess_yuv420(yuv420_data_d, output_data_d, width, height, scale, stream);
+    // 7. 等待CUDA流执行完成
+    CHECK_CUDA_ERR(cudaStreamSynchronize(stream));
+    // 8. Device → Host 拷贝结果
+    CHECK_CUDA_ERR(cudaMemcpy(output_data_h.data(), output_data_d, output_data_size, 
+                              cudaMemcpyDeviceToHost));
+    // 9. 验证结果（打印前10个输出值）
+    std::cout << "fused_preprocess_yuv420 运算结果（前10个RGB值）：" << std::endl;
+    for (int i = 0; i < 10; ++i) {
+        std::cout << output_data_h[i] << " ";
+    }
+    std::cout << std::endl;
+    // 10. 释放资源
+    CHECK_CUDA_ERR(cudaStreamDestroy(stream));
+    cudaFree(yuv420_data_d);
+    cudaFree(output_data_d);
+    return 0;
+}
+```
+
+## 7. fused_preprocess_nv12
+
+### 支持的产品型号
+
+- Metax C500/C550/C588/C600
+
+### 接口原型
+
+```cpp
+void fused_preprocess_nv12(
+    const uint8_t* __restrict nv12Data,
+    float* __restrict outputData,
+    int width,
+    int height,
+    float scale,
+    cudaStream_t stream
+);
+```
+
+### 功能描述
+
+fused_preprocess_nv12 算子实现了 NV12 格式图像数据的融合预处理操作，包含 YUV 颜色空间转换、数值归一化（偏移、范围裁剪）及缩放等步骤。通过融合多步操作减少内存访问次数，提升了图像预处理的计算效率，常用于图像/视频类 AI 模型的输入预处理阶段。
+
+- 计算公式：
+
+$$
+  \begin{align*}
+  &\text{Step 1: 提取NV12格式Y/U/V分量} \\
+  &Y(i,j) = \text{nv12Data}[i \times \text{width} + j] \\
+  &\text{uv\\_idx} = \text{width} \times \text{height} + \left\lfloor \frac{i}{2} \right\rfloor \times \text{width} + \left\lfloor \frac{j}{2} \right\rfloor \times 2 \\
+  &U(i,j) = \text{nv12Data}[\text{uv\\_idx}] \\
+  &V(i,j) = \text{nv12Data}[\text{uv\\_idx}+1] \\
+  &\text{Step 2: YUV420(NV12)转RGB（BT.601标准）} \\
+  &R(i,j) = 1.164 \times (Y(i,j)-16) + 1.596 \times (V(i,j)-128) \\
+  &G(i,j) = 1.164 \times (Y(i,j)-16) - 0.813 \times (V(i,j)-128) - 0.391 \times (U(i,j)-128) \\
+  &B(i,j) = 1.164 \times (Y(i,j)-16) + 2.018 \times (U(i,j)-128) \\
+  &\text{Step 3: 数值裁剪与缩放} \\
+  &R_{\text{norm}}(i,j) = \text{clip}\left(R(i,j), 0, 255\right) \times \frac{\text{scale}}{255} \\
+  &G_{\text{norm}}(i,j) = \text{clip}\left(G(i,j), 0, 255\right) \times \frac{\text{scale}}{255} \\
+  &B_{\text{norm}}(i,j) = \text{clip}\left(B(i,j), 0, 255\right) \times \frac{\text{scale}}{255} \\
+  &\text{Step 4: 输出赋值} \\
+  &\text{outputData}[i \times \text{width} \times 3 + j \times 3 + c] = 
+  \begin{cases}
+  R_{\text{norm}}(i,j) & c=0 \\
+  G_{\text{norm}}(i,j) & c=1 \\
+  B_{\text{norm}}(i,j) & c=2
+  \end{cases}
+  \end{align*}
+$$
+
+  其中：
+
+- $Y (i, j) \in \mathbb{Z}_{[0,255]}$ 是 NV12 格式中位置 $(i, j)$ 的亮度分量
+- $U (i, j) \in \mathbb{Z}_{[0,255]}$ 是 NV12 格式中位置 $(i, j)$ 的蓝色色度分量（色度 U）
+- $V (i, j) \in \mathbb{Z}_{[0,255]}$ 是 NV12 格式中位置 $(i, j)$ 的红色色度分量（色度 V）
+- $i \in [0, \text{height}-1]$ 是图像行索引， $j \in [0, \text{width}-1]$ 是图像列索引
+- $\text{clip}(x, a, b) = \max\left (\min (x, b), a\right)$ 是数值裁剪函数，限制 $x$ 在 $[a, b]$ 范围内
+- $c \in \{0,1,2\}$ 是输出通道索引（0=R、1=G、2=B）
+- $\text{width} \in \mathbb{Z}_{>0}$ 是输入图像宽度， $\text{height} \in \mathbb{Z}_{>0}$ 是输入图像高度
+- $\text{scale} \in \mathbb{R}$ 是输出数据的缩放系数
+- $\text{nv12Data} \in \mathbb{U8}^{(\text{width} \times \text{height} \times 3/2)}$ 是 NV12 格式输入数据（CUDA 设备内存）
+- $\text{outputData} \in \mathbb{R}^{(\text{width} \times \text{height} \times 3)}$ 是预处理后输出数据（CUDA 设备内存）
+
+### 参数说明
+
+- **nv12Data** (const uint8_t* __restrict, 入参): NV12 格式的输入图像数据指针，需位于 CUDA 设备内存
+- **outputData** (float* __restrict, 出参): 预处理后的输出数据指针，结果写入该 CUDA 设备内存地址
+- **width** (int, 入参): 输入图像的宽度
+- **height** (int, 入参): 输入图像的高度
+- **scale** (float, 入参): 预处理后数据的缩放系数
+- **stream** (cudaStream_t, 入参): CUDA 流，用于指定算子的异步执行流
+
+### 返回值
+
+无返回值，预处理结果直接写入`outputData`指针指向的内存。
+
+### 约束与调用
+
+- 所有数据指针（`nv12Data`、`outputData`）必须位于 CUDA 设备内存
+- 输入数据需严格符合 NV12 格式（Y 分量占`width×height`字节，UV 分量交替存储占`width×height/2`字节）
+- `width`、`height`需为正偶数（符合 NV12 分辨率要求）
+- `stream`需为有效的`cudaStream_t`对象
+- 支持输入类型：`uint8_t`；输出类型：`float`
+
+### 调用示例
+
+```cpp
+#include <iostream>
+#include <vector>
+#include <cuda_runtime.h>
+#include "utils.h"
+#include "process_interface.h"  
+int main() {
+    // 1. 定义输入参数（选偶数分辨率，符合NV12格式要求）
+    const int width = 32;          // 图像宽度（偶数）
+    const int height = 32;         // 图像高度（偶数）
+    const float scale = 1.0f / 255.0f;  // 归一化缩放系数
+    // NV12数据大小：Y分量(width*height) + UV分量(width*height/2)
+    const size_t nv12_data_size = width * height * 3 / 2;
+    // 输出数据大小：RGB三通道，float类型
+    const size_t output_data_size = width * height * 3 * sizeof(float);
+    // 2. 构造Host端输入数据（简单初始化NV12数据）
+    std::vector<uint8_t> nv12_data_h(nv12_data_size, 128);  // 初始化为灰度值128
+    // 输出Host数组（存储RGB结果）
+    std::vector<float> output_data_h(width * height * 3, 0.0f);
+    // 3. 分配Device端内存
+    uint8_t* nv12_data_d = nullptr;
+    float* output_data_d = nullptr;
+    CHECK_CUDA_ERR(cudaMalloc(&nv12_data_d, nv12_data_size));
+    CHECK_CUDA_ERR(cudaMalloc(&output_data_d, output_data_size));
+    // 4. Host → Device 拷贝数据
+    CHECK_CUDA_ERR(cudaMemcpy(nv12_data_d, nv12_data_h.data(), nv12_data_size, 
+                              cudaMemcpyHostToDevice));
+    // 5. 创建CUDA流（可选，也可传0使用默认流）
+    cudaStream_t stream;
+    CHECK_CUDA_ERR(cudaStreamCreate(&stream));
+    // 6. 调用fused_preprocess_nv12算子
+    fused_preprocess_nv12(nv12_data_d, output_data_d, width, height, scale, stream);
+    // 7. 等待CUDA流执行完成
+    CHECK_CUDA_ERR(cudaStreamSynchronize(stream));
+    // 8. Device → Host 拷贝结果
+    CHECK_CUDA_ERR(cudaMemcpy(output_data_h.data(), output_data_d, output_data_size, 
+                              cudaMemcpyDeviceToHost));
+    // 9. 验证结果（打印前10个输出值）
+    std::cout << "fused_preprocess_nv12 运算结果（前10个RGB值）：" << std::endl;
+    for (int i = 0; i < 10; ++i) {
+        std::cout << output_data_h[i] << " ";
+    }
+    std::cout << std::endl;
+    // 10. 释放资源
+    CHECK_CUDA_ERR(cudaStreamDestroy(stream));
+    cudaFree(nv12_data_d);
+    cudaFree(output_data_d);
+    return 0;
+}
+```

@@ -74,13 +74,16 @@ __global__ void __launch_bounds__(512, 1)
   }
 }
 
-struct IPC_KEY {
+struct alignas(alignof(cudaIpcMemHandle_t)) IPC_KEY {
   uint8_t data[sizeof(cudaIpcMemHandle_t)];
+
   bool operator<(const IPC_KEY& other) const {
     return std::memcmp(data, other.data, sizeof(data)) < 0;
   }
 };
+
 static_assert(sizeof(IPC_KEY) == sizeof(cudaIpcMemHandle_t));
+static_assert(alignof(IPC_KEY) == alignof(cudaIpcMemHandle_t));
 
 class CustomAllreduce {
  public:
@@ -343,6 +346,12 @@ class CustomAllreduce {
   void mnnvl_lamport_reduce_scatter(cudaStream_t stream, T* input, T* output,
                                     void* local_buffer, uint32_t* epochs,
                                     int size, int stage_size_bytes);
+  template <typename T>
+  void mnnvl_multimem_reduce_scatter(cudaStream_t stream,
+                                     const T* multicast_input, T* output,
+                                     Signal* local_signal,
+                                     Signal* multicast_signal, int size,
+                                     int block_limit);
 
   ~CustomAllreduce() {
     for (auto [_, ptr] : ipc_handles_) {

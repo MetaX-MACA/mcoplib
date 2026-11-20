@@ -47,4 +47,33 @@ __device__ __forceinline__ void rotary_emb(
     }
 }
 
+template<typename scalar_t, int QK_ROPE_HEAD_DIM=64>
+__device__ __forceinline__ void rotary_emb_float4(
+    int lane_in_seg,
+    int pid,
+    const scalar_t* pe_ptr,
+    const float* cos_sin_cache,
+    const int64_t* positions,
+    scalar_t* out_ptr
+) {
+    
+    constexpr int kPairsPerThread = QK_ROPE_HEAD_DIM * sizeof(scalar_t) / 16 / 2;  // 4 rope pair/lane
+    const int pair0 = lane_in_seg * kPairsPerThread;
+    const int64_t pos = positions[pid];
+    const float* cos_sin_cache_ptr = cos_sin_cache + pos * QK_ROPE_HEAD_DIM;
+    float4 raw = __ldg((const float4*)pe_ptr + lane_in_seg);
+    __nv_bfloat16* v = (__nv_bfloat16*)&raw;
+    #pragma unroll
+    for (int p = 0; p < kPairsPerThread; ++p) {
+        const int k = pair0 + p;
+        const float cos_val = __ldg(cos_sin_cache_ptr + k);
+        const float sin_val = __ldg(cos_sin_cache_ptr + QK_ROPE_HEAD_DIM / 2 + k);
+        const float x_f32 = __bfloat162float(v[2 * p]);
+        const float y_f32 = __bfloat162float(v[2 * p + 1]);
+        v[2 * p]     = __float2bfloat16_rn(x_f32 * cos_val - y_f32 * sin_val);
+        v[2 * p + 1] = __float2bfloat16_rn(x_f32 * sin_val + y_f32 * cos_val);
+    }
+    ((float4*)out_ptr)[lane_in_seg] = raw;
+}
+
 }

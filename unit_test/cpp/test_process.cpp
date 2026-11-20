@@ -292,7 +292,7 @@ void test_prepostprocess_nv12(int width, int height){
     // for(int i = 0; i < width*height*3/2; i++) {
     //     yuv[i] = ((i*7) % 128) + 1;
     // }
-    FILE * f = fopen("/home/yiyu/mcOplib/kuaishou/re_1920x1080.nv12", "rb");
+    FILE * f = fopen("/home/yiyu/mcoplib/kuaishou/re_1920x1080.nv12", "rb");
     fread(yuv, 1, width*height*3/2, f);
     fclose(f);
     cudaMemcpy(yuv_device, yuv , width*height*3/2, cudaMemcpyHostToDevice);
@@ -305,7 +305,7 @@ void test_prepostprocess_nv12(int width, int height){
     cudaMemcpy(rgb_check, rgb_device , width*height*3*sizeof(float), cudaMemcpyDeviceToHost);
     checkresult<float>(rgb, rgb_check, width*height*3);
     rgb_to_nv12(rgb, width,height, 255, yuv_check1); 
-    f = fopen("/home/yiyu/mcOplib/kuaishou/dst_1920x1080.nv12", "wb");
+    f = fopen("/home/yiyu/mcoplib/kuaishou/dst_1920x1080.nv12", "wb");
     fwrite(yuv_check1, 1, width*height*3/2, f);
     fclose(f);
     checkresult<uint8_t>(yuv_check1, yuv_check, width*height*3/2);

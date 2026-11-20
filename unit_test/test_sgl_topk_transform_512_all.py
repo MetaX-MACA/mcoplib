@@ -6,7 +6,7 @@ Test data and benchmark methodology aligned with unit_test/test_topk.py
 (same bs/seq_len grid, same bytes_accessed formula, same warmup/iters).
 
 ================================================================================
-Expanded accuracy suite (2481 pytest cases; 2439 new beyond the original 42).
+Expanded accuracy suite (case totals are determined by pytest parametrization).
 ================================================================================
 
 Goal: prove topk_transform_v1 precision in EVERY situation reachable through
@@ -17,32 +17,24 @@ distribution zoo is modeled after unit_test/test_sglang_topk_transformer_prefill
 (clustered / separated / extreme builders) plus the adversarial + NaN suites
 validated during the kernel's optimization.
 
-Kernel contract under test (from op/sglang/jit_kernels/topk_v1.cu):
-  * TopK is fixed at 512; k = 512 always.
-  * Launch-level dispatch by max(seq_lens): <=16384 hist4096; <=2^20 sampled
-    single-pass (512-thread wide launch when B > 64, else 1024 threads);
-    > 2^20 exact two-pass radix. During CUDA-graph capture the allocated row
-    width (scores.size(1)) plays the role of max(seq_lens).
-  * Per row: seq_len <= 512 takes the naive transform (raw[i] = i for
-    i < seq_len else -1; page[i] = page_to_indices(i) else -1).
-  * page_size is any power of two; page_to_indices(i) =
+Kernel contract under test:
+  * The output width is the requested top-k; the main suite exercises K=512.
+  * Allocated input width selects histogram (<=16384) or radix (>16384).
+    Per-row device lengths select the identity/padding path when seq_len <= k.
+  * Rows with seq_len <= k emit identity indices followed by -1 padding.
+  * page_size is a power of two; page_to_indices(i) =
     (page_table[i >> page_bits] << page_bits) | (i & (page_size - 1)).
-  * seq_lens is a per-row device tensor -> ragged batches are in-contract and
-    mixed-length launches (some rows naive, some hist-sized inside a sampled
-    launch, ...) must stay exact.
+  * Per-row device seq_lens support ragged batches, including empty rows.
 
 Comparison contract (strictly stronger than the original tie-tolerant set
 diff, which a duplicated-index bug could slip through):
   1. long rows (seq_len > 512): every raw index in [0, seq_len) and pairwise
      DISTINCT;
-  2. the selected VALUE MULTISET equals torch.topk's exactly: NaN counts match,
-     NaN payload bits match (<=512 NaNs are all selected by both sides, so the
-     multiset is exactly defined; >512-NaN rows are generated with a single
-     payload so any 512 of them are bitwise identical), finite parts compare
-     with IEEE == (so +0.0/-0.0 are interchangeable, matching torch's own
-     comparison semantics);
-  3. whenever the top-512 cut is tie-free (512th largest value > 513rd), the
-     sorted raw index set must equal torch.topk's sorted index set EXACTLY;
+  2. the selected SORTABLE-KEY MULTISET equals the CPU integer top-k exactly.
+     FP32 bits are ordered numerically (including subnormals), all NaN signs
+     and payloads share one greatest key, and signed zeros share one key;
+  3. whenever the top-k cut is tie-free, the sorted raw index set must equal
+     the CPU reference index set EXACTLY; arbitrary boundary ties are valid;
   4. page transform: torch.equal(page_to_indices(raw), page_indices) for every
      row, and the naive (-1) padding for short rows;
   5. rows are allocated wider than seq_len and the padding is filled with a
@@ -66,13 +58,8 @@ TOPK = 512
 MAX_SEQ_LEN = 66551
 TABLE_LEN = 299062
 PAGE_SIZE = 16
-MAX_PERMIT_ERROR = 0
-# torch.topk on this platform SELECTS with NaN-greatest semantics (every NaN
-# makes the top-k, any payload) but its sorted OUTPUT places +NaN first and
-# -NaN last, so a k=513-then-[:512] slice silently drops the trailing -NaN.
-# The selection ground truth therefore comes from a direct k=512 call; the
-# k=513 call below is only the cut-straddle probe for the index-set check.
-K_REF = TOPK + 1
+# Reference selection never uses GPU floating-point sorting/comparison: device
+# implementations may flush subnormals or order negative NaNs inconsistently.
 CANARY = 1e30  # fill for allocated columns >= seq_len (out-of-range read detector)
 
 POS_NAN_BITS = 2143289344  # 0x7FC00000 (positive-payload quiet NaN)
@@ -82,9 +69,24 @@ NEG_NAN_BITS = -4194304    # 0xFFC00000 as int32 (negative-payload quiet NaN)
 SCORE_BUDGET_BYTES = 24 * (1024 ** 3)
 
 
+def _fp32_sortable_keys(values: torch.Tensor) -> torch.Tensor:
+    """Return CPU int64 keys ordered like FP32, with NaNs greatest and zeros equal."""
+    bits = values.detach().to(device="cpu", dtype=torch.float32).contiguous().view(torch.int32).to(torch.int64)
+    sign = bits & 0x80000000
+    magnitude = bits & 0x7FFFFFFF
+    is_nan = magnitude > 0x7F800000
+    is_zero = magnitude == 0
+    # Invert negative encodings; flip the sign bit for nonnegative encodings.
+    keys = torch.where(sign != 0, (~bits) & 0xFFFFFFFF, bits ^ 0x80000000)
+    keys = torch.where(is_zero, torch.full_like(keys, 0x80000000), keys)
+    return torch.where(is_nan, torch.full_like(keys, 0xFFFFFFFF), keys)
+
+
 def _ref_torch_impl(score: torch.Tensor, seq_len: int, topk: int) -> torch.Tensor:
     assert score.dim() == 2
-    return torch.topk(score[:, :seq_len], topk, dim=-1, sorted=False).indices.to(torch.int32)
+    keys = _fp32_sortable_keys(score[:, :seq_len])
+    return torch.topk(keys, topk, dim=-1, sorted=False).indices.to(
+        device=score.device, dtype=torch.int32)
 
 
 def _ref_page_to_indices(topk_indices: torch.Tensor, page_table: torch.Tensor, page_size: int) -> torch.Tensor:
@@ -105,21 +107,18 @@ def assert_equal(
     k: int,
     seq_len: int,
 ):
-    """Tie-tolerant comparison matching unit_test/test_topk.py::assert_equal."""
-    indices_our_cpu = indices_our.cpu().tolist()
-    indices_ref_cpu = indices_ref.cpu().tolist()
-    for i in range(bs):
-        ref_set_i = set(indices_ref_cpu[i])
-        our_set_i = set(indices_our_cpu[i])
-        more = our_set_i - ref_set_i
-        less = ref_set_i - our_set_i
-        if len(more) > MAX_PERMIT_ERROR or len(less) > MAX_PERMIT_ERROR:
-            more_values = sorted(score[i, idx].item() for idx in more)
-            less_values = sorted(score[i, idx].item() for idx in less)
-            assert more_values == less_values, (
-                f"{bs=}, {k=}, {seq_len=}, {i=}, {more=}, {less=} failed, "
-                f"with {more_values=}, {less_values=}"
-            )
+    """Tie-tolerant multiset comparison with range and uniqueness checks."""
+    keys = _fp32_sortable_keys(score[:, :seq_len])
+    ours = indices_our.cpu().long()
+    ref = indices_ref.cpu().long()
+    assert ours.shape == (bs, k), f"unexpected output shape {ours.shape}"
+    assert bool(((ours >= 0) & (ours < seq_len)).all()), "raw index out of range"
+    sorted_ours = ours.sort(dim=-1).values
+    assert not bool((sorted_ours[:, 1:] == sorted_ours[:, :-1]).any()), "duplicate raw indices"
+    assert torch.equal(keys.gather(1, ours).sort(dim=-1).values,
+                       keys.gather(1, ref).sort(dim=-1).values), (
+        f"{bs=}, {k=}, {seq_len=}: selected sortable-key multiset mismatch"
+    )
 
 
 def run_cuda_benchmark(kernel_name, run_func, bytes_accessed, warmup=5, iters=100):
@@ -142,8 +141,8 @@ def run_cuda_benchmark(kernel_name, run_func, bytes_accessed, warmup=5, iters=10
 
 
 # ============================================================================
-# Exact-comparison contract for the expanded accuracy suite (all vectorized;
-# one kernel launch + one torch.topk per case).
+# Exact-comparison contract for the expanded accuracy suite. Reference ranking
+# uses CPU integer keys, never device floating-point comparisons.
 # ============================================================================
 
 def _nan_scalar(bits: int) -> torch.Tensor:
@@ -157,32 +156,18 @@ def _nan_full(bits: int, bs: int, W: int) -> torch.Tensor:
             .view(torch.float32).view(bs, W))
 
 
-def _canon_row(v: torch.Tensor):
-    """Canonical (nan_bits, finite_values) form of one row's selected values.
-
-    NaNs first sorted by payload bits (torch.topk ranks every NaN greatest, so
-    all NaNs of a row with <= TOPK NaNs are selected by BOTH sides and the
-    payload-bit multiset is exactly defined); finites sorted descending and
-    compared with IEEE == (+0.0/-0.0 interchangeable, matching torch).
-    """
-    m = torch.isnan(v)
-    nan_bits = v[m].view(torch.int32)
-    nan_sorted = torch.sort(nan_bits, descending=True).values if nan_bits.numel() else nan_bits
-    fin_sorted = torch.sort(v[~m], descending=True).values
-    return nan_sorted, fin_sorted
-
-
 def _check_topk_exact(tag, score, seq_lens, raw, page, page_table, page_size):
     """Full exactness check of one kernel run. See the module docstring."""
     device = score.device
     B, W = score.shape
+    k = raw.shape[1]
     lens = seq_lens.long()
-    ar = torch.arange(TOPK, device=device)
+    ar = torch.arange(k, device=device)
     pb = page_size.bit_length() - 1
     pmask = page_size - 1
 
-    # ---- rows with seq_len <= TOPK: naive transform (identity + -1 pad) ----
-    naive = lens <= TOPK
+    # ---- rows with seq_len <= k: naive transform (identity + -1 pad) ----
+    naive = lens <= k
     if bool(naive.any()):
         nl = lens[naive].unsqueeze(1)
         arb = ar.unsqueeze(0)
@@ -200,7 +185,7 @@ def _check_topk_exact(tag, score, seq_lens, raw, page, page_table, page_size):
         exp_page = torch.where(arb < nl, xf, torch.full_like(xf, -1))
         assert torch.equal(page[naive].long(), exp_page), f"{tag}: naive page_indices mismatch"
 
-    # ---- rows with seq_len > TOPK: exact top-512 contract ----
+    # ---- rows with seq_len > k: exact top-k contract ----
     longm = ~naive
     if not bool(longm.any()):
         return
@@ -209,7 +194,7 @@ def _check_topk_exact(tag, score, seq_lens, raw, page, page_table, page_size):
     lensL = lens[longm].unsqueeze(1)
     nL = sL.size(0)
 
-    # 1) index range + pairwise distinctness
+    # 1) Index range + pairwise distinctness.
     in_range = (rawL >= 0) & (rawL < lensL)
     if not bool(in_range.all()):
         gmap = longm.nonzero().flatten()
@@ -241,59 +226,26 @@ def _check_topk_exact(tag, score, seq_lens, raw, page, page_table, page_size):
             f"{tag}: duplicate raw indices ({int(dup.sum())}); " + "; ".join(detail)
         )
 
-    # 2) reference over the padded row: canary -> -inf so padding never wins.
-    # ref_k (k=512) is the selection ground truth; ref_x (k=513) exists only
-    # to detect a tie straddling the 512/513 cut (see K_REF note above: the
-    # [:512] slice of a k=513 call is NOT the k=512 answer when -NaNs are
-    # present, because torch sorts -NaNs to the end).
-    col = torch.arange(W, device=device).unsqueeze(0)
-    ref_in = torch.where(col < lensL, sL, torch.full_like(sL, float("-inf")))
-    ref_k = torch.topk(ref_in, TOPK, dim=1, sorted=True)  # long rows: len >= 513
-    ref_x = torch.topk(ref_in, K_REF, dim=1, sorted=True)
-    ref_vals = ref_k.values
-    ref_idx = ref_k.indices
+    # 2) CPU integer sortable-key reference. Keys preserve subnormal ordering,
+    # treat signed zeros equally, and collapse all NaN signs/payloads to greatest.
+    key_rows = _fp32_sortable_keys(sL)
+    valid_cols = torch.arange(W, device="cpu").unsqueeze(0) < lensL.cpu()
+    key_rows = torch.where(valid_cols, key_rows, torch.full_like(key_rows, -1))
+    ref_keys = torch.topk(key_rows, k, dim=1, sorted=True).values
+    ours_keys = key_rows.gather(1, rawL.cpu().long())
+    assert torch.equal(ours_keys.sort(dim=-1, descending=True).values, ref_keys), (
+        f"{tag}: CPU sortable-key multiset mismatch"
+    )
 
-    my_vals = sL.gather(1, rawL.long())
-    a = my_vals.sort(dim=-1, descending=True).values
-    b = ref_vals.sort(dim=-1, descending=True).values
-    na, nb = torch.isnan(a), torch.isnan(b)
-    nan_rows = (na.sum(-1) > 0) | (nb.sum(-1) > 0)
-
-    cnt_bad = (na.sum(-1) != nb.sum(-1)).nonzero().flatten().tolist()
-    assert not cnt_bad, f"{tag}: NaN count mismatch rows={cnt_bad[:8]}"
-
-    plain = ~nan_rows
-    if bool(plain.any()):
-        bad = (~(a[plain] == b[plain])).any(-1).nonzero().flatten().tolist()
-        if bad:
-            r0 = bad[0]
-            row_id = int(longm.nonzero().flatten()[plain.nonzero().flatten()[r0]])
-            aa = a[plain][r0][:5].cpu().tolist()
-            bb = b[plain][r0][:5].cpu().tolist()
-            raise AssertionError(
-                f"{tag}: value multiset mismatch in {len(bad)} rows; row {row_id} "
-                f"top5 ours={aa} ref={bb}"
-            )
-    for r in nan_rows.nonzero().flatten().tolist():
-        cn, cf = _canon_row(my_vals[r])
-        rn, rf = _canon_row(ref_vals[r])
-        assert cn.numel() == rn.numel() and cf.numel() == rf.numel() and \
-            torch.equal(cn, rn) and torch.equal(cf, rf), (
-            f"{tag}: NaN-aware value multiset mismatch row={r} "
-            f"nan={int(cn.numel())}/{int(rn.numel())} "
-            f"fin_top3={cf[:3].cpu().tolist()} vs {rf[:3].cpu().tolist()}"
-        )
-
-    # 3) exact index set whenever the top-512 cut is tie-free
-    v511 = ref_x.values[:, TOPK - 1]
-    v512 = ref_x.values[:, TOPK]
-    uniq = v511 > v512  # NaN comparisons and equal-value ties both yield False
+    # 3) Exact index set when the kth key is strictly greater than k+1th.
+    ref_x = torch.topk(key_rows, k + 1, dim=1, sorted=True)
+    uniq = ref_x.values[:, k - 1] > ref_x.values[:, k]
     if bool(uniq.any()):
         u = uniq.nonzero().flatten()
-        mismatch = ~(sraw[u].long() == ref_idx[u].sort(dim=-1).values).all(-1)
-        assert not bool(mismatch.any()), (
-            f"{tag}: index set != torch.topk on tie-free rows "
-            f"({int(mismatch.sum())} rows)"
+        ours_sorted = sraw.cpu()[u].long()
+        ref_sorted = ref_x.indices[u, :k].sort(dim=-1).values
+        assert torch.equal(ours_sorted, ref_sorted), (
+            f"{tag}: index set != CPU reference on tie-free rows"
         )
 
     # 4) page transform
@@ -501,7 +453,7 @@ def _run_accuracy_case(tag, dist, bs, lens_list, page_size=16, page_kind="identi
 
 
 # ============================================================================
-# Original perf battery + CUDA-graph smoke tests (42 cases, unchanged).
+# Original perf grid + CUDA-graph smoke tests (coverage retained).
 # ============================================================================
 
 @pytest.mark.parametrize("bs", [1, 132, 256, 4096, 1662])
@@ -587,26 +539,87 @@ def test_topk_transform_v1_cuda_graph_replay(seq_len: int) -> None:
         generator = torch.Generator(device="cuda").manual_seed(seed)
         score.copy_(torch.randn(score.shape, generator=generator, device="cuda"))
         graph.replay()
-        # Keep raw indices in their original (unsorted) order for the page
-        # mapping check. Only sort copies for the unordered Top-K comparison.
+        # Validate graph and eager outputs independently against the oracle.
         graph_raw = raw_indices.clone()
-        graph_raw_sorted = torch.sort(graph_raw, dim=-1).values
         graph_page = page_indices.clone()
 
         launch()
         torch.cuda.synchronize()
-        eager_raw = torch.sort(raw_indices, dim=-1).values
-        assert_equal(score, eager_raw, graph_raw_sorted, bs, TOPK, seq_len)
-        expected_page = _ref_page_to_indices(graph_raw, page_table, PAGE_SIZE)
-        assert torch.equal(expected_page, graph_page), (
-            f"graph page transform mismatch for {seq_len=}, {seed=}"
-        )
+        _check_topk_exact(f"graph-smoke-L{seq_len}-{seed}", score, seq_lens,
+                          graph_raw, graph_page, page_table, PAGE_SIZE)
+        _check_topk_exact(f"eager-smoke-L{seq_len}-{seed}", score, seq_lens,
+                          raw_indices, page_indices, page_table, PAGE_SIZE)
+
+@pytest.mark.parametrize("with_raw", [True, False], ids=["raw", "raw-none"])
+@pytest.mark.parametrize("k", [512, 1024], ids=["k512", "k1024"])
+@pytest.mark.parametrize("width", [4096, 20000], ids=["hist-width", "radix-width"])
+@torch.inference_mode()
+def test_topk_cuda_graph_replay_key_edges(k: int, width: int, with_raw: bool) -> None:
+    """Replay graph with changed key classes, lengths, and page mappings."""
+    bs = 2
+    dev = "cuda"
+    lens = torch.full((bs,), width, dtype=torch.int32, device=dev)
+    cols = torch.arange(width, device=dev)
+    score = torch.randn(bs, width, device=dev)
+    table_cols = (width + PAGE_SIZE - 1) // PAGE_SIZE
+    page_table = torch.argsort(torch.rand(bs, table_cols, device=dev), dim=1).to(torch.int32)
+    page_indices = torch.empty((bs, k), dtype=torch.int32, device=dev)
+    raw_indices = torch.empty_like(page_indices) if with_raw else None
+
+    def launch():
+        torch.ops.sgl_kernel.topk_transform_v1.default(
+            score, lens, page_indices, page_table, PAGE_SIZE, raw_indices)
+
+    launch()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launch()
+
+    patterns = ("denormal", "negative_nan", "dense_bins", "normal")
+    for step, pattern in enumerate(patterns):
+        replay_lens = ([width, max(k + 1, width - 137)], [width - 53, width],
+                       [0, width - 137], [width, k - 1])[step]
+        lens.copy_(torch.tensor(replay_lens, dtype=torch.int32, device=dev))
+        if pattern == "denormal":
+            bits = ((cols % 1023) + 1).to(torch.int32)
+            score.copy_(bits.view(torch.float32).unsqueeze(0).expand(bs, -1))
+        elif pattern == "negative_nan":
+            bits = torch.full((bs, width), NEG_NAN_BITS, dtype=torch.int32, device=dev)
+            bits[:, k + 7:] = torch.arange(width - k - 7, device=dev, dtype=torch.int32).view(1, -1) % 31
+            score.copy_(bits.view(torch.float32))
+        elif pattern == "dense_bins":
+            # Thousands of ULP-distinct values packed into one coarse bin,
+            # with exact ties crossing the selection boundary.
+            bits = (0x3F800000 + (cols % 4096)).to(torch.int32)
+            score.copy_(bits.view(torch.float32).unsqueeze(0).expand(bs, -1))
+        else:
+            score.copy_(torch.randn(score.shape, generator=torch.Generator(device=dev).manual_seed(7231 + step), device=dev))
+        # Change physical page mapping as well as per-row lengths across replays.
+        page_table.copy_(torch.argsort(torch.rand(bs, table_cols, device=dev), dim=1).to(torch.int32))
+        graph.replay()
+        torch.cuda.synchronize()
+        graph_page = page_indices.clone()
+        if raw_indices is None:
+            # The permutation table is injective; invert page IDs to recover
+            # selected logical indices independently, including naive padding.
+            page_bits = PAGE_SIZE.bit_length() - 1
+            inverse = torch.argsort(page_table, dim=1)
+            physical = (graph_page >> page_bits).long()
+            assert bool(((graph_page == -1) | ((physical >= 0) & (physical < table_cols))).all()), (
+                f"graph-keys-{k}-{width}-{pattern}: invalid physical page")
+            decoded = (inverse.gather(1, physical.clamp(0, table_cols - 1)) << page_bits) | (graph_page & (PAGE_SIZE - 1))
+            graph_raw = torch.where(graph_page == -1, torch.full_like(decoded, -1), decoded).to(torch.int32)
+        else:
+            graph_raw = raw_indices.clone()
+        _check_topk_exact(f"graph-keys-{k}-{width}-{pattern}-raw{with_raw}", score, lens,
+                          graph_raw, graph_page, page_table, PAGE_SIZE)
 
 
 # ============================================================================
 # (A) Distribution zoo x shape grid: 35 distributions x 28 (bs, seq_len).
-# Covers all three dispatch modes, the narrow/wide launch boundary (B=64/65),
-# odd (non-float4-aligned) widths, and the DSV4 max decode length.
+# Includes small/large batches, B=64/65, odd (non-float4-aligned) widths,
+# and the DSV4 max decode length; dispatch details are implementation-specific.
 # ============================================================================
 
 _MAIN_SHAPES = [
@@ -1103,4 +1116,4 @@ def test_topk_raw_indices_optional(seq_len, dist) -> None:
 
 
 if __name__ == "__main__":
-    pytest.main(["-s", "-v", __file__])
+    raise SystemExit(pytest.main(["-s", "-v", __file__]))

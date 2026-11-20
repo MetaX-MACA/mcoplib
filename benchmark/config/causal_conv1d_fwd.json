@@ -1,8 +1,8 @@
 {
     "device_id": 0,
     "device_name": "MetaX C600U",
-    "tp": [8, 4],
-    "tokens": [2048, 16384],
+    "tp": [1, 2, 4, 8],
+    "tokens": [256, 2048, 16384],
     "model_num_heads": 96,
     "head_dim": 128,
     "kernel_width": 4,

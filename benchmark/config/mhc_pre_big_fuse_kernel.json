@@ -1,10 +1,10 @@
 {
     "device_id": 0,
     "device_name": ["MetaX C500", "MetaX C600-UL", "Metax C600-U"],
-    "num_tokens": 2080,
+    "num_tokens": [1, 96, 512, 1024, 2080, 8192, 16384, 32768, 49152, 65536],
     "hidden_size": 4096,
     "mhc_mult": 4,
     "dtype": "bfloat16",
     "seed": 42,
-    "samples": 1000
+    "samples": 100
 }

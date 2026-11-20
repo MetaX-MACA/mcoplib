@@ -1,8 +1,8 @@
 {
     "device_id": 0,
     "device_name": ["MetaX C500", "MetaX C600-UL", "Metax C600-U"],
-    "num_tokens": [16],
-    "num_heads": [4],
+    "num_tokens": [1, 4, 16, 32],
+    "num_heads": [4, 16, 64],
     "ql_nope_dim": [512],
     "q_pe_dim": [64],
     "kv_lora_rank": [512],
@@ -10,5 +10,5 @@
     "dtype": ["bfloat16"],
     "cache_dtype": ["uint8"],
     "seed": 42,
-    "samples": 1000
+    "samples": 100
 }

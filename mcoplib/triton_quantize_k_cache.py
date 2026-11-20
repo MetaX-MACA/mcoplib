@@ -1,10 +1,39 @@
 """Triton kernels for GLM-4.2 FP8 MLA K-cache quantization."""
 
+from functools import lru_cache
 from typing import Optional, Tuple
 
 import torch
 
 from .triton_utils import HAS_TRITON, tl, triton
+
+try:
+    from .triton_quantize_k_cache_gluon import _quantize_k_cache_gluon_kernel
+except ImportError:
+    _quantize_k_cache_gluon_kernel = None
+
+
+try:
+    from .triton_quantize_k_cache_c600u import _quantize_k_cache_c600u_kernel
+except ImportError:
+    _quantize_k_cache_c600u_kernel = None
+
+try:
+    from .triton_quantize_k_cache_c600u import _quantize_k_cache_group_c600u_kernel
+except ImportError:
+    _quantize_k_cache_group_c600u_kernel = None
+
+
+try:
+    from .triton_quantize_k_cache_c600u import _quantize_k_cache_decode_inline_c600u_kernel
+except ImportError:
+    _quantize_k_cache_decode_inline_c600u_kernel = None
+
+
+try:
+    from .triton_quantize_k_cache_c600u import _quantize_k_cache_decode_four_group_c600u_kernel
+except ImportError:
+    _quantize_k_cache_decode_four_group_c600u_kernel = None
 
 
 DIM_NOPE = 512
@@ -18,6 +47,42 @@ ROPE_PART_BYTES = DIM_ROPE * 2
 def _fp8_dtype() -> torch.dtype:
     """Return the FP8 format used by the MLA cache byte layout."""
     return torch.float8_e4m3fn
+
+
+@lru_cache(maxsize=None)
+def _single_token_num_warps(device: torch.device) -> int:
+    # C500 has 64 lanes per Triton warp. One warp covers this 128-value
+    # reduction without the cross-warp work of the default four-warp launch.
+    name = torch.cuda.get_device_name(device).upper()
+    return 1 if name.startswith("METAX C500") else 4
+
+
+@lru_cache(maxsize=None)
+def _is_c600u(device: torch.device) -> bool:
+    return torch.cuda.get_device_name(device).upper() == "METAX C600-U"
+
+
+@triton.jit
+def _bounded_fp8_e4m3(values):
+    # The caller has already clamped FP32 values to [-448, 448]. Round
+    # normals by the discarded significand bits; subnormals have step 2^-9.
+    bits = values.to(tl.int32, bitcast=True)
+    magnitude = bits & 0x7FFFFFFF
+    sign = (bits >> 24) & 0x80
+    normal = ((magnitude + 0x7FFFF + ((magnitude >> 20) & 1)) >> 20) - 960
+    subnormal = (tl.abs(values) + 16384.0).to(tl.int32, bitcast=True) - 0x46800000
+    encoded = sign | tl.where(magnitude < 0x3C800000, subnormal, normal)
+    return encoded.to(tl.uint8).to(tl.float8e4nv, bitcast=True)
+
+
+@triton.jit
+def _bounded_fp8_e4m3_magic(values):
+    bits = values.to(tl.int32, bitcast=True)
+    sign = (bits >> 24) & 0x80
+    magic_bits = tl.maximum(bits & 0x7F800000, 0x3C800000) + 0x0A000000
+    rounded_bits = (tl.abs(values) + magic_bits.to(tl.float32, bitcast=True)).to(tl.int32, bitcast=True)
+    rounded = (rounded_bits & 0x7FFFFF) + (magic_bits >> 20) - 1128
+    return (sign | rounded).to(tl.uint8).to(tl.float8e4nv, bitcast=True)
 
 
 @triton.jit
@@ -106,6 +171,7 @@ def _quantize_k_cache_fast_kernel_optimized(
     DIM_ROPE: tl.constexpr,
     FP8_MIN: tl.constexpr,
     FP8_MAX: tl.constexpr,
+    BOUNDED_FP8: tl.constexpr = False,
 ):
     token_block_id = tl.program_id(0)
     group_id = tl.program_id(1)
@@ -126,9 +192,14 @@ def _quantize_k_cache_fast_kernel_optimized(
     max_abs = tl.max(tl.abs(values), axis=1)
     scales = max_abs / FP8_MAX
     safe_scales = tl.where(max_abs > 0.0, scales, 1.0)
-    quantized = tl.clamp(
-        values / safe_scales[:, None], FP8_MIN, FP8_MAX
-    ).to(output_nope_q_ptr.dtype.element_ty)
+    inverse_scales = 1.0 / safe_scales
+    scaled = tl.clamp(
+        values * inverse_scales[:, None], FP8_MIN, FP8_MAX
+    )
+    if BOUNDED_FP8:
+        quantized = _bounded_fp8_e4m3(scaled)
+    else:
+        quantized = scaled.to(output_nope_q_ptr.dtype.element_ty)
 
     output_q_offsets = (
         token_offsets[:, None] * output_nope_q_stride_0
@@ -190,6 +261,8 @@ def _quantize_k_cache_all_groups_kernel(
     DIM_ROPE: tl.constexpr,
     FP8_MIN: tl.constexpr,
     FP8_MAX: tl.constexpr,
+    BOUNDED_FP8: tl.constexpr = False,
+    MAGIC_FP8: tl.constexpr = False,
 ):
     token_block_id = tl.program_id(0)
     token_offsets = token_block_id * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -208,9 +281,17 @@ def _quantize_k_cache_all_groups_kernel(
     max_abs = tl.max(tl.abs(values_grouped), axis=2)
     scales = max_abs / FP8_MAX
     safe_scales = tl.where(max_abs > 0.0, scales, 1.0)
-    quantized_grouped = tl.clamp(
-        values_grouped / safe_scales[:, :, None], FP8_MIN, FP8_MAX
-    ).to(output_nope_q_ptr.dtype.element_ty)
+    inverse_scales = 1.0 / safe_scales
+    scaled_grouped = tl.clamp(
+        values_grouped * inverse_scales[:, :, None], FP8_MIN, FP8_MAX
+    )
+    if BOUNDED_FP8:
+        if MAGIC_FP8:
+            quantized_grouped = _bounded_fp8_e4m3_magic(scaled_grouped)
+        else:
+            quantized_grouped = _bounded_fp8_e4m3(scaled_grouped)
+    else:
+        quantized_grouped = scaled_grouped.to(output_nope_q_ptr.dtype.element_ty)
     quantized = tl.reshape(quantized_grouped, (BLOCK_M, DIM_NOPE))
 
     output_q_offsets = (
@@ -257,13 +338,13 @@ def _allocate_outputs(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     num_tokens = k_nope.shape[0]
     nope_part = torch.empty(
-        (num_tokens, NOPE_PART_BYTES), dtype=torch.uint8, device=k_nope.device
+        (num_tokens, 1, NOPE_PART_BYTES), dtype=torch.uint8, device=k_nope.device
     )
     rope_part = torch.empty(
-        (num_tokens, ROPE_PART_BYTES), dtype=torch.uint8, device=k_rope.device
+        (num_tokens, 1, ROPE_PART_BYTES), dtype=torch.uint8, device=k_rope.device
     )
-    nope_q = nope_part[:, :DIM_NOPE].view(_fp8_dtype())
-    nope_s = nope_part[:, DIM_NOPE:].view(torch.float32)
+    nope_q = nope_part.narrow(-1, 0, DIM_NOPE).view(_fp8_dtype())
+    nope_s = nope_part.narrow(-1, DIM_NOPE, NUM_NOPE_GROUPS * 4).view(torch.float32)
     rope = rope_part.view(torch.bfloat16)
     return nope_part, rope_part, nope_q, nope_s, rope
 
@@ -291,8 +372,150 @@ def _launch_single_token(
             DIM_ROPE=DIM_ROPE,
             FP8_MIN=torch.finfo(_fp8_dtype()).min,
             FP8_MAX=torch.finfo(_fp8_dtype()).max,
+            num_warps=_single_token_num_warps(k_nope.device),
         )
-    return nope_part.unsqueeze(1), rope_part.unsqueeze(1)
+    return nope_part, rope_part
+
+
+@triton.jit
+def _quantize_k_cache_single_token_c600u_kernel(
+    output_nope_q_ptr,
+    output_nope_s_ptr,
+    output_rope_ptr,
+    k_nope_ptr,
+    k_rope_ptr,
+    output_nope_q_stride_0: int,
+    output_nope_s_stride_0: int,
+    output_rope_stride_0: int,
+    k_nope_stride_0: int,
+    k_rope_stride_0: int,
+    NUM_NOPE_BLOCKS: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    DIM_NOPE: tl.constexpr,
+    DIM_ROPE: tl.constexpr,
+    FP8_MIN: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+):
+    token_id = tl.program_id(0)
+    block_id = tl.program_id(1)
+    if block_id < NUM_NOPE_BLOCKS:
+        offsets = block_id * GROUP_SIZE + tl.arange(0, GROUP_SIZE)
+        valid = offsets < DIM_NOPE
+        values = tl.load(
+            k_nope_ptr + token_id * k_nope_stride_0 + offsets,
+            mask=valid, other=0.0,
+        ).to(tl.float32)
+        scales = tl.max(tl.abs(values)) / FP8_MAX
+        inverse = 1.0 / scales
+        quantized = tl.clamp(values * inverse, FP8_MIN, FP8_MAX).to(
+            output_nope_q_ptr.dtype.element_ty
+        )
+        # C600-U packs the two multiplies into FMA(+0), which can erase
+        # negative zero. Restore zero signs to match the original 4-warp path.
+        bits = quantized.to(tl.uint8, bitcast=True)
+        sign = ((values.to(tl.uint32, bitcast=True) >> 24) & 0x80).to(tl.uint8)
+        bits = tl.where((bits & 0x7F) == 0, sign, bits)
+        quantized = bits.to(output_nope_q_ptr.dtype.element_ty, bitcast=True)
+        tl.store(output_nope_q_ptr + token_id * output_nope_q_stride_0 + offsets,
+                 quantized, mask=valid)
+        tl.store(output_nope_s_ptr + token_id * output_nope_s_stride_0 + block_id,
+                 scales)
+    else:
+        offsets = (block_id - NUM_NOPE_BLOCKS) * GROUP_SIZE + tl.arange(0, GROUP_SIZE)
+        valid = offsets < DIM_ROPE
+        rope = tl.load(k_rope_ptr + token_id * k_rope_stride_0 + offsets, mask=valid)
+        tl.store(output_rope_ptr + token_id * output_rope_stride_0 + offsets,
+                 rope, mask=valid)
+
+
+@triton.jit
+def _quantize_k_cache_single_token_c600u_raw_kernel(
+    output_nope_ptr,
+    output_rope_ptr,
+    k_nope_ptr,
+    k_rope_ptr,
+    output_nope_q_stride_0: int,
+    output_nope_s_stride_0: int,
+    output_rope_stride_0: int,
+    k_nope_stride_0: int,
+    k_rope_stride_0: int,
+    NUM_NOPE_BLOCKS: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    DIM_NOPE: tl.constexpr,
+    DIM_ROPE: tl.constexpr,
+    FP8_MIN: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+):
+    # Interpret the packed byte buffers on device, keeping the U1b math intact.
+    _quantize_k_cache_single_token_c600u_kernel(
+        output_nope_ptr.to(tl.pointer_type(tl.float8e4nv)),
+        (output_nope_ptr + DIM_NOPE).to(tl.pointer_type(tl.float32)),
+        output_rope_ptr.to(tl.pointer_type(tl.bfloat16)),
+        k_nope_ptr, k_rope_ptr,
+        output_nope_q_stride_0, output_nope_s_stride_0, output_rope_stride_0,
+        k_nope_stride_0, k_rope_stride_0,
+        NUM_NOPE_BLOCKS, GROUP_SIZE, DIM_NOPE, DIM_ROPE, FP8_MIN, FP8_MAX,
+    )
+
+
+def _allocate_outputs_c600u_raw(
+    k_nope: torch.Tensor, k_rope: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    num_tokens = k_nope.shape[0]
+    return (
+        torch.empty((num_tokens, 1, NOPE_PART_BYTES), dtype=torch.uint8, device=k_nope.device),
+        torch.empty((num_tokens, 1, ROPE_PART_BYTES), dtype=torch.uint8, device=k_rope.device),
+    )
+
+
+def _launch_single_token_c600u_raw(
+    k_nope: torch.Tensor, k_rope: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    nope_part, rope_part = _allocate_outputs_c600u_raw(k_nope, k_rope)
+    num_tokens = k_nope.shape[0]
+    if num_tokens:
+        _quantize_k_cache_single_token_c600u_raw_kernel[(num_tokens, NUM_NOPE_GROUPS + 1)](
+            nope_part, rope_part, k_nope, k_rope,
+            nope_part.stride(0), nope_part.stride(0) // 4, rope_part.stride(0) // 2,
+            k_nope.stride(0), k_rope.stride(0),
+            NUM_NOPE_BLOCKS=NUM_NOPE_GROUPS,
+            GROUP_SIZE=GROUP_SIZE,
+            DIM_NOPE=DIM_NOPE,
+            DIM_ROPE=DIM_ROPE,
+            FP8_MIN=torch.finfo(_fp8_dtype()).min,
+            FP8_MAX=torch.finfo(_fp8_dtype()).max,
+            num_warps=1,
+        )
+    return nope_part, rope_part
+
+
+def _launch_single_token_c600u(
+    k_nope: torch.Tensor, k_rope: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    # C600-U experiment: leave the original C500 launcher unchanged.
+    nope_part, rope_part, nope_q, nope_s, rope = _allocate_outputs(k_nope, k_rope)
+    num_tokens = k_nope.shape[0]
+    if num_tokens:
+        _quantize_k_cache_single_token_c600u_kernel[(num_tokens, NUM_NOPE_GROUPS + 1)](
+            nope_q,
+            nope_s,
+            rope,
+            k_nope,
+            k_rope,
+            nope_q.stride(0),
+            nope_s.stride(0),
+            rope.stride(0),
+            k_nope.stride(0),
+            k_rope.stride(0),
+            NUM_NOPE_BLOCKS=NUM_NOPE_GROUPS,
+            GROUP_SIZE=GROUP_SIZE,
+            DIM_NOPE=DIM_NOPE,
+            DIM_ROPE=DIM_ROPE,
+            FP8_MIN=torch.finfo(_fp8_dtype()).min,
+            FP8_MAX=torch.finfo(_fp8_dtype()).max,
+            num_warps=1,
+        )
+    return nope_part, rope_part
 
 
 def _launch_multi_token(
@@ -325,8 +548,10 @@ def _launch_multi_token(
             FP8_MIN=torch.finfo(_fp8_dtype()).min,
             FP8_MAX=torch.finfo(_fp8_dtype()).max,
             num_warps=num_warps,
+            # Larger tiles can spill with the integer rounding epilogue.
+            BOUNDED_FP8=block_m <= 4 and _single_token_num_warps(k_nope.device) == 1,
         )
-    return nope_part.unsqueeze(1), rope_part.unsqueeze(1)
+    return nope_part, rope_part
 
 
 def _launch_all_groups(
@@ -337,8 +562,13 @@ def _launch_all_groups(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     nope_part, rope_part, nope_q, nope_s, rope = _allocate_outputs(k_nope, k_rope)
     num_tokens = k_nope.shape[0]
+    kernel = (_quantize_k_cache_gluon_kernel
+              if num_tokens > 32768 and _quantize_k_cache_gluon_kernel is not None
+              and block_m == 4 and num_warps == 1
+              and _single_token_num_warps(k_nope.device) == 1
+              else _quantize_k_cache_all_groups_kernel)
     if num_tokens:
-        _quantize_k_cache_all_groups_kernel[(triton.cdiv(num_tokens, block_m),)](
+        kernel[(triton.cdiv(num_tokens, block_m),)](
             nope_q,
             nope_s,
             rope,
@@ -358,8 +588,75 @@ def _launch_all_groups(
             FP8_MIN=torch.finfo(_fp8_dtype()).min,
             FP8_MAX=torch.finfo(_fp8_dtype()).max,
             num_warps=num_warps,
+            BOUNDED_FP8=_single_token_num_warps(k_nope.device) == 1,
+            MAGIC_FP8=24576 <= num_tokens <= 32768,
         )
-    return nope_part.unsqueeze(1), rope_part.unsqueeze(1)
+    return nope_part, rope_part
+
+
+def _launch_all_groups_c600u(
+    k_nope: torch.Tensor, k_rope: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    nope_part, rope_part, nope_q, nope_s, rope = _allocate_outputs(k_nope, k_rope)
+    num_tokens = k_nope.shape[0]
+    _quantize_k_cache_c600u_kernel[(triton.cdiv(num_tokens, 4),)](
+        nope_q, nope_s, rope, k_nope, k_rope, num_tokens,
+        nope_q.stride(0), nope_s.stride(0), rope.stride(0),
+        k_nope.stride(0), k_rope.stride(0),
+        BLOCK_M=4, NUM_GROUPS=NUM_NOPE_GROUPS, GROUP_SIZE=GROUP_SIZE,
+        DIM_ROPE=DIM_ROPE,
+        FP8_MIN=torch.finfo(_fp8_dtype()).min,
+        FP8_MAX=torch.finfo(_fp8_dtype()).max, num_warps=1,
+    )
+    return nope_part, rope_part
+
+
+def _launch_decode_inline_c600u(
+    k_nope: torch.Tensor, k_rope: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    nope_part, rope_part = _allocate_outputs_c600u_raw(k_nope, k_rope)
+    num_tokens = k_nope.shape[0]
+    _quantize_k_cache_decode_inline_c600u_kernel[(num_tokens, 3)](
+        nope_part, rope_part, k_nope, k_rope,
+        nope_part.stride(0), nope_part.stride(0) // 4,
+        rope_part.stride(0) // 2, k_nope.stride(0), k_rope.stride(0),
+        GROUP_SIZE=GROUP_SIZE, DIM_NOPE=DIM_NOPE, DIM_ROPE=DIM_ROPE,
+        FP8_MIN=torch.finfo(_fp8_dtype()).min,
+        FP8_MAX=torch.finfo(_fp8_dtype()).max, num_warps=1,
+    )
+    return nope_part, rope_part
+
+
+def _launch_decode_four_group_c600u(
+    k_nope: torch.Tensor, k_rope: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    nope_part, rope_part = _allocate_outputs_c600u_raw(k_nope, k_rope)
+    num_tokens = k_nope.shape[0]
+    _quantize_k_cache_decode_four_group_c600u_kernel[(num_tokens, 2)](
+        nope_part, rope_part, k_nope, k_rope,
+        nope_part.stride(0), nope_part.stride(0) // 4,
+        rope_part.stride(0) // 2, k_nope.stride(0), k_rope.stride(0),
+        GROUP_SIZE=GROUP_SIZE, DIM_NOPE=DIM_NOPE, DIM_ROPE=DIM_ROPE,
+        FP8_MIN=torch.finfo(_fp8_dtype()).min,
+        FP8_MAX=torch.finfo(_fp8_dtype()).max, num_warps=1,
+    )
+    return nope_part, rope_part
+
+
+def _launch_group_c600u(
+    k_nope: torch.Tensor, k_rope: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    nope_part, rope_part = _allocate_outputs_c600u_raw(k_nope, k_rope)
+    num_tokens = k_nope.shape[0]
+    _quantize_k_cache_group_c600u_kernel[(triton.cdiv(num_tokens, 4), NUM_NOPE_GROUPS)](
+        nope_part, nope_part, rope_part, k_nope, k_rope, num_tokens,
+        nope_part.stride(0), nope_part.stride(0) // 4, rope_part.stride(0) // 2,
+        k_nope.stride(0), k_rope.stride(0),
+        BLOCK_M=4, GROUP_SIZE=GROUP_SIZE, DIM_ROPE=DIM_ROPE,
+        FP8_MIN=torch.finfo(_fp8_dtype()).min,
+        FP8_MAX=torch.finfo(_fp8_dtype()).max, RAW_OUTPUT=True, num_warps=1,
+    )
+    return nope_part, rope_part
 
 
 def _normalize_and_validate_inputs(
@@ -368,15 +665,15 @@ def _normalize_and_validate_inputs(
     if not HAS_TRITON:
         raise RuntimeError("Triton is required for quantize_k_cache_separate_optimized")
 
-    k_nope = k_nope.squeeze(1) if k_nope.ndim == 3 else k_nope
-    k_rope = k_rope.squeeze(1) if k_rope.ndim == 3 else k_rope
-
-    if k_nope.ndim != 2 or k_nope.shape[1] != DIM_NOPE:
+    # Kernels use only row strides and pointers; a singleton head needs no view.
+    if not ((k_nope.ndim == 2 and k_nope.shape[1] == DIM_NOPE)
+            or (k_nope.ndim == 3 and k_nope.shape[1:] == (1, DIM_NOPE))):
         raise ValueError(
             f"Expected k_nope shape [N, {DIM_NOPE}] or [N, 1, {DIM_NOPE}], "
             f"got {tuple(k_nope.shape)}"
         )
-    if k_rope.ndim != 2 or k_rope.shape[1] != DIM_ROPE:
+    if not ((k_rope.ndim == 2 and k_rope.shape[1] == DIM_ROPE)
+            or (k_rope.ndim == 3 and k_rope.shape[1:] == (1, DIM_ROPE))):
         raise ValueError(
             f"Expected k_rope shape [N, {DIM_ROPE}] or [N, 1, {DIM_ROPE}], "
             f"got {tuple(k_rope.shape)}"
@@ -421,8 +718,33 @@ def quantize_k_cache_separate_optimized(
     k_nope, k_rope = _normalize_and_validate_inputs(k_nope, k_rope, tile_size)
     num_tokens = k_nope.shape[0]
 
+    if _is_c600u(k_nope.device):
+        if block_m is None and num_warps is None and num_tokens <= 64:
+            if num_tokens >= 57 and _quantize_k_cache_decode_four_group_c600u_kernel is not None:
+                return _launch_decode_four_group_c600u(k_nope, k_rope)
+            if num_tokens >= 32 and _quantize_k_cache_decode_inline_c600u_kernel is not None:
+                return _launch_decode_inline_c600u(k_nope, k_rope)
+            return _launch_single_token_c600u_raw(k_nope, k_rope)
+        if (block_m is None and num_warps is None and 1024 <= num_tokens < 2048
+                and _quantize_k_cache_c600u_kernel is not None):
+            return _launch_all_groups_c600u(k_nope, k_rope)
+        if (block_m is None and num_warps is None and 65 <= num_tokens < 2048
+                and _quantize_k_cache_group_c600u_kernel is not None):
+            return _launch_group_c600u(k_nope, k_rope)
+        if block_m is None and num_warps is None and 2048 <= num_tokens < 8192:
+            if _quantize_k_cache_c600u_kernel is not None:
+                return _launch_all_groups_c600u(k_nope, k_rope)
+            return _launch_all_groups(k_nope, k_rope, block_m=4, num_warps=1)
+        if (block_m is None and num_warps is None and num_tokens >= 8192
+                and _quantize_k_cache_c600u_kernel is not None):
+            return _launch_all_groups_c600u(k_nope, k_rope)
+
+
     if block_m is None and num_warps is None and num_tokens <= 64:
         return _launch_single_token(k_nope, k_rope)
+    if block_m is None and num_warps is None and _single_token_num_warps(k_nope.device) == 1:
+        if 4096 < num_tokens <= 32768:
+            return _launch_all_groups(k_nope, k_rope, block_m=2, num_warps=1)
     if block_m is None and num_warps is None and num_tokens >= 8192:
         return _launch_all_groups(k_nope, k_rope)
     return _launch_multi_token(k_nope, k_rope, block_m, num_warps)

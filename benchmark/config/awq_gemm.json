@@ -8,5 +8,5 @@
     "split_k_iters": [1],
     "pack_factor": [8],
     "dtype": ["float16"],
-    "samples": 1000
+    "samples": 100
 }

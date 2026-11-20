@@ -197,7 +197,6 @@ __global__ void gemm_test(const scalar_t* q, const scalar_t* w_kc, scalar_t* q_i
         >(Q_LEN, q, w_kc, wave_idx, wave_group_idx, wave_group_lane, 0, 0,0, q_input);
 }
 
-
 template<typename scalar_t, int NUM_LOCAL_HEADS=128, int KV_LORA_RANK=512, int QK_NOPE_HEAD_DIM=128, int QK_ROPE_HEAD_DIM=64>
 __global__ void fused_mla_RMS_rotary_emb(
     const int Q_LEN,
@@ -208,29 +207,31 @@ __global__ void fused_mla_RMS_rotary_emb(
     const scalar_t* norm_weight,
     scalar_t* kv_a
 ) {
+    constexpr int kHeadDim = QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM;
+    constexpr int kLanesPerHead = QK_ROPE_HEAD_DIM * sizeof(scalar_t) / 16;
+    constexpr int kHeadsPerWarp = 64 / kLanesPerHead;         // 8 heads per warp
+    constexpr int kHeadsPerBlock = 256 / kLanesPerHead;       // 32 heads per block
+    const int kBlocksPerToken = (NUM_LOCAL_HEADS + kHeadsPerBlock - 1) / kHeadsPerBlock;
+
     uint32_t bidx = blockIdx.x;
     uint32_t tid = threadIdx.x;
 
-    if (bidx < Q_LEN*NUM_LOCAL_HEADS/4) {
-        bidx = bidx * 4;
-        uint32_t m = bidx + tid/QK_ROPE_HEAD_DIM;
-        uint32_t j = m / NUM_LOCAL_HEADS;
-        uint32_t i = m % NUM_LOCAL_HEADS;
+    if (bidx < Q_LEN * kBlocksPerToken) {
+        const int j  = bidx / kBlocksPerToken;  // token
+        const int head_group = bidx % kBlocksPerToken;  // head group
 
-        uint32_t q_pe_offset = j * (NUM_LOCAL_HEADS * (QK_NOPE_HEAD_DIM+QK_ROPE_HEAD_DIM)) + i * (QK_NOPE_HEAD_DIM+QK_ROPE_HEAD_DIM)+ QK_NOPE_HEAD_DIM;
+        const int head = head_group * kHeadsPerBlock + (tid / 64) * kHeadsPerWarp
+                       + (tid % 64) / kLanesPerHead;
+        if (head < NUM_LOCAL_HEADS) {
+            scalar_t* seg = q + (int64_t)j * NUM_LOCAL_HEADS * kHeadDim
+                              + (int64_t)head * kHeadDim + QK_NOPE_HEAD_DIM;
 
-        tid = tid % QK_ROPE_HEAD_DIM;
-
-        rotary_emb(
-            tid,
-            j,
-            q + q_pe_offset,
-            cos_sin_cache,
-            positions,
-            q + q_pe_offset
-        );
-    } else if (bidx < Q_LEN*NUM_LOCAL_HEADS/4 + (Q_LEN+3)/4) {
-        bidx -= Q_LEN*NUM_LOCAL_HEADS/4;
+            const int lane_in_seg = (tid % 64) % kLanesPerHead;
+            rotary_emb_float4<scalar_t, QK_ROPE_HEAD_DIM>(
+                lane_in_seg, j, seg, cos_sin_cache, positions, seg);
+        }
+    } else if (bidx < Q_LEN * kBlocksPerToken + (Q_LEN+3)/4) {
+        bidx -= Q_LEN * kBlocksPerToken;
         bidx *= 4;
 
         uint32_t m = bidx + tid/QK_ROPE_HEAD_DIM;
@@ -238,15 +239,15 @@ __global__ void fused_mla_RMS_rotary_emb(
         if (m < Q_LEN) {
             uint32_t latent_cache_offset = m * (KV_LORA_RANK + QK_ROPE_HEAD_DIM);
             uint32_t kv_a_offset = m * KV_LORA_RANK;
-            tid =  tid % QK_ROPE_HEAD_DIM;
+            tid = tid % QK_ROPE_HEAD_DIM;
             rms_norm(tid, norm_weight, latent_cache+latent_cache_offset, kv_a+kv_a_offset, latent_cache+latent_cache_offset);
             rotary_emb(
                 tid,
                 m,
-                latent_cache+latent_cache_offset+KV_LORA_RANK,
+                latent_cache + latent_cache_offset + KV_LORA_RANK,
                 cos_sin_cache,
                 positions,
-                latent_cache+latent_cache_offset+KV_LORA_RANK
+                latent_cache + latent_cache_offset + KV_LORA_RANK
             );
         }
     }
@@ -286,8 +287,8 @@ __global__ void fused_mla_normal_kv_element_wise(
     if (idx >= k_back_start && idx < (k_back_start + k_back_total)) {
         int local_idx = idx - k_back_start;
         const int k_back_group_size = QK_ROPE_HEAD_DIM / 8;
-        int i = local_idx / (128 * k_back_group_size);      // 3201
-        int j = (local_idx % (128 * k_back_group_size)) / k_back_group_size; // 128
+        int i = local_idx / (NUM_LOCAL_HEADS * k_back_group_size);      // 3201
+        int j = (local_idx % (NUM_LOCAL_HEADS * k_back_group_size)) / k_back_group_size; // 128
         int k_group = (local_idx % k_back_group_size);      // 64/8=8
 
         // latent_cache load
@@ -295,7 +296,7 @@ __global__ void fused_mla_normal_kv_element_wise(
         float4 val = *((float4*)latent_cache + lc_offset);
 
         // k offset
-        int k_offset = i * (128 * (QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM)/8) + j * (QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM)/8 + QK_NOPE_HEAD_DIM/8 + k_group; // 128/8=16
+        int k_offset = i * (NUM_LOCAL_HEADS * (QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM)/8) + j * (QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM)/8 + QK_NOPE_HEAD_DIM/8 + k_group; // 128/8=16
         *((float4*)k + k_offset) = val;
     }
 

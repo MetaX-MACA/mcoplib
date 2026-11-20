@@ -91,13 +91,21 @@ step5_fused_qk_norm_rope(
     const std::optional<torch::Tensor>& q_out,
     const std::optional<torch::Tensor>& k_out,
     const std::optional<torch::Tensor>& v_out);
+
+void fused_deepseek_v4_kv_rope_insert(
+    torch::stable::Tensor const& kv, torch::stable::Tensor& k_cache,
+    torch::stable::Tensor const& slot_mapping,
+    torch::stable::Tensor const& position_ids,
+    torch::stable::Tensor const& cos_sin_cache, int64_t cache_block_size,
+    std::optional<torch::stable::Tensor> fp8_scale, bool kv_mxfp8);
                         
 torch::stable::Tensor fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
     torch::stable::Tensor const& q_in, torch::stable::Tensor const& kv,
     torch::stable::Tensor& k_cache, torch::stable::Tensor const& slot_mapping,
     torch::stable::Tensor const& position_ids,
     torch::stable::Tensor const& cos_sin_cache, int64_t q_head_padded,
-    double eps, int64_t cache_block_size, bool apply_q_norm, bool kv_mxfp8);
+    double eps, int64_t cache_block_size, bool apply_q_norm, bool kv_mxfp8,
+    bool apply_q_rope, bool is_q_interleaved);
 
 void fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_out(
     torch::Tensor const& q_in, torch::Tensor const& kv,
@@ -177,6 +185,15 @@ void persistent_topk(const torch::Tensor& logits, const torch::Tensor& lengths,
 
 torch::Tensor region_topk_ids(const torch::Tensor& logits,
                               const torch::Tensor& lengths, int64_t topk);
+
+void prepare_topk_scores(const torch::Tensor& scores_in,
+                         const torch::Tensor& summary_valid,
+                         const torch::Tensor& row_starts,
+                         const torch::Tensor& row_ends,
+                         torch::Tensor& scores_out,
+                         int64_t num_regions,
+                         int64_t padded_regions,
+                         bool has_summary_valid);
 
 void stable_topk_gathered(torch::Tensor gathered, torch::Tensor out,
                           int64_t topk);
@@ -363,12 +380,10 @@ void dynamic_scaled_int8_quant(torch::Tensor& out, torch::Tensor const& input,
                                torch::Tensor& scales,
                                std::optional<torch::Tensor> const& azp);
 
-torch::Tensor gptq_gemm(torch::Tensor a, torch::Tensor b_q_weight,
-                        torch::Tensor b_gptq_qzeros,
-                        torch::Tensor b_gptq_scales, torch::Tensor b_g_idx,
-                        bool use_exllama, int64_t bit, int64_t group_size,
-                        torch::Tensor perm_space, torch::Tensor temp_space,
-                        bool dtype_bf16);
+torch::stable::Tensor gptq_gemm(
+    torch::stable::Tensor a, torch::stable::Tensor b_q_weight,
+    torch::stable::Tensor b_gptq_qzeros, torch::stable::Tensor b_gptq_scales,
+    bool use_exllama, bool use_v2_format, int64_t bit);
 
 void gptq_shuffle(torch::Tensor q_weight, torch::Tensor q_perm, int64_t bit);
 
@@ -456,7 +471,7 @@ void hisparse_resolve_residency(
     torch::Tensor& device_global_indices,
     torch::Tensor& lru_slots,
     std::optional<torch::Tensor> const& request_state_indices,
-    int64_t region_stride,
+    int64_t region_stride, int64_t max_union_rows,
     std::optional<torch::Tensor> const& miss_mask,
     std::optional<torch::Tensor> const& stats,
     std::optional<torch::Tensor> const& attention_indices,
@@ -513,7 +528,9 @@ void fused_minimax_m3_qknorm_rope_kv_insert(
     std::optional<torch::stable::Tensor> q_out,
     std::optional<torch::stable::Tensor> index_q_out,
     const std::string& kv_cache_dtype, bool skip_index_branch,
-    std::optional<torch::stable::Tensor> q_fp8_out, double q_fp8_scale);
+    std::optional<torch::stable::Tensor> q_fp8_out, double q_fp8_scale,
+    std::optional<torch::stable::Tensor> kv_k_scale,
+    std::optional<torch::stable::Tensor> kv_v_scale);
 
 void fused_kimi_k3_mla_key_concat_kv_cache_insert(
     torch::Tensor& q, torch::Tensor const& k_nope,
@@ -642,6 +659,10 @@ void mnnvl_lamport_reduce_scatter(fptr_t _fa, torch::Tensor& inp,
                                   torch::Tensor& out,
                                   fptr_t local_buffer, fptr_t epoch_buffer,
                                   int64_t stage_sz_bytes);
+void mnnvl_multimem_reduce_scatter(fptr_t _fa, torch::Tensor& inp,
+                                   torch::Tensor& out,
+                                   fptr_t local_buffer, fptr_t multicast_buffer,
+                                   int64_t stage_sz_bytes, int64_t block_limit);
 void dispose(fptr_t _fa);
 int64_t meta_size();
 void register_buffer(fptr_t _fa, const std::vector<int64_t>& fake_ipc_ptrs);

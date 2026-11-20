@@ -1,8 +1,8 @@
 {
     "device_id": 0,
     "device_name": ["MetaX C500", "MetaX C600-UL", "Metax C600-U"],
-    "batch_size": 131072,
-    "num_experts": 320,
+    "batch_size": [1, 512, 8192, 65536, 131072],
+    "num_experts": [160, 320],
     "num_expert_group": 1,
     "topk_group": 1,
     "topk": 8,
@@ -10,5 +10,5 @@
     "num_fused_shared_experts": 0,
     "routed_scaling_factor": 1.0,
     "dtype": "bfloat16",
-    "samples": 1000
+    "samples": 100
 }

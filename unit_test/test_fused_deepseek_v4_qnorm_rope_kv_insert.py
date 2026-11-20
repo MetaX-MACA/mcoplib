@@ -4,7 +4,8 @@
 Standalone unit test for the horizontally-fused DeepseekV4-MLA kernel:
 
   fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert
-    - Q side:  per-head RMSNorm (no weight) + GPT-J RoPE on last 64 dims
+    - Q side: optional per-head RMSNorm (no weight) + optional RoPE on last 64 dims
+      with interleaved-pair or split-half layout
     - KV side: GPT-J RoPE on last 64 + UE8M0 FP8 quant + paged cache insert
 
 We compare against:
@@ -43,6 +44,8 @@ _, FP8_MAX = get_fp8_min_max()
 # e4m3fn-typed outputs must be reinterpreted under it before decoding.
 FP8_STORE_DTYPE = torch.float8_e4m3fnuz if USE_FNUZ else torch.float8_e4m3fn
 HEAD_BYTES = NOPE_DIM + ROPE_DIM * 2 + 8  # 448 + 128 + 8 = 584
+Q_CHUNK = 16
+NUM_Q_CHUNKS = HEAD_DIM // Q_CHUNK  # 32
 
 
 # ── PyTorch reference implementations ────────────────────────────────────────
@@ -95,47 +98,87 @@ def make_cos_sin_cache(max_pos: int, rope_dim: int, dtype, device):
 
 
 def apply_rope_gptj_last_k(
-    x: torch.Tensor, positions: torch.Tensor, cos_sin_cache: torch.Tensor
+    x: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    is_interleaved: bool = True,
 ) -> torch.Tensor:
-    """GPT-J-style (interleaved-pair) RoPE on the LAST rope_dim elements.
+    """Apply RoPE to the last rope_dim elements.
 
-    x: [..., head_dim] float32
-    positions: [num_tokens] int64 (positions[i] corresponds to x[i, ...])
-    cos_sin_cache: [max_pos, rope_dim] float (cos|sin layout)
-
-    Returns rotated x (same shape/dtype).
+    ``is_interleaved=True`` uses GPT-J pairs (x0, x1), (x2, x3), ...
+    ``is_interleaved=False`` uses split-half layout (first half, second half).
     """
     rope_dim = cos_sin_cache.shape[-1]
     half = rope_dim // 2
-    head_dim = x.shape[-1]
-    nope_dim = head_dim - rope_dim
-
+    nope_dim = x.shape[-1] - rope_dim
     cs = cos_sin_cache[positions.long()].to(torch.float32)
     cos = cs[..., :half]
     sin = cs[..., half:]
-
     rope = x[..., nope_dim:].float()
     shape = rope.shape
-    rope = rope.reshape(*shape[:-1], half, 2)
-    even = rope[..., 0]
-    odd = rope[..., 1]
 
-    for _ in range(rope.ndim - 3):
+    # Broadcast [N, half] cos/sin over any head dimensions in x.
+    for _ in range(rope.ndim - 2):
         cos = cos.unsqueeze(1)
         sin = sin.unsqueeze(1)
 
-    # Use addcmul (an FMA) for the 2x2 rotation to mirror the kernel's
-    # `e*c - o*s` fused form. This keeps the reference close to the kernel, but
-    # the fp32 reference and the fp32 GPU kernel can still round to bf16 on
-    # opposite sides of a round-to-nearest tie for a tiny number of elements at
-    # high positions, so callers compare the RoPE region within 1 bf16 ULP.
-    new_even = torch.addcmul(-odd * sin, even, cos)
-    new_odd = torch.addcmul(odd * cos, even, sin)
-    rope_rotated = torch.stack((new_even, new_odd), dim=-1).reshape(shape)
+    if is_interleaved:
+        pairs = rope.reshape(*shape[:-1], half, 2)
+        even = pairs[..., 0]
+        odd = pairs[..., 1]
+        rotated_even = torch.addcmul(-odd * sin, even, cos)
+        rotated_odd = torch.addcmul(odd * cos, even, sin)
+        rotated = torch.stack((rotated_even, rotated_odd), dim=-1).reshape(shape)
+    else:
+        first, second = rope[..., :half], rope[..., half:]
+        rotated_first = torch.addcmul(-second * sin, first, cos)
+        rotated_second = torch.addcmul(second * cos, first, sin)
+        rotated = torch.cat((rotated_first, rotated_second), dim=-1)
 
     out = x.clone().float()
-    out[..., nope_dim:] = rope_rotated
+    out[..., nope_dim:] = rotated
     return out.to(x.dtype)
+
+
+def _permute_q_to_fused(q: torch.Tensor) -> torch.Tensor:
+    """Convert head-major Q to the chunk-interleaved layout expected by the op."""
+    num_tokens, n_heads, head_dim = q.shape
+    assert head_dim == HEAD_DIM
+    return (
+        q.contiguous()
+        .view(num_tokens, n_heads, NUM_Q_CHUNKS, Q_CHUNK)
+        .permute(0, 2, 1, 3)
+        .contiguous()
+        .view(num_tokens, n_heads, HEAD_DIM)
+    )
+
+
+def _assert_q_output_matches_reference(
+    q_out: torch.Tensor,
+    q_ref: torch.Tensor,
+    n_heads: int,
+    padded_heads: int,
+    is_q_interleaved: bool,
+    *,
+    rtol: float = 1e-2,
+    atol: float = 1e-2,
+) -> None:
+    """Compare Q in head-major or official 16-dim chunk-interleaved layout."""
+    if is_q_interleaved:
+        num_tokens = q_out.shape[0]
+        got = q_out.contiguous().view(num_tokens, NUM_Q_CHUNKS, padded_heads, Q_CHUNK)
+        want = q_ref.contiguous().view(num_tokens, NUM_Q_CHUNKS, n_heads, Q_CHUNK)
+        torch.testing.assert_close(got[:, :, :n_heads, :], want, rtol=rtol, atol=atol)
+        if n_heads < padded_heads:
+            assert (got[:, :, n_heads:, :] == 0).all(), (
+                "padded head slots must be exact zero in interleaved layout"
+            )
+    else:
+        torch.testing.assert_close(q_out[:, :n_heads], q_ref, rtol=rtol, atol=atol)
+        if n_heads < padded_heads:
+            assert q_out[:, n_heads:padded_heads].count_nonzero().item() == 0, (
+                "padded head slots must be exact zero"
+            )
 
 
 def rmsnorm_no_weight(x: torch.Tensor, eps: float) -> torch.Tensor:
@@ -176,10 +219,18 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _call_fused(q_in, q_head_padded, kv, k_cache, slot_mapping, positions, cos_sin_cache, eps, bs, apply_q_norm=None, kv_mxfp8=False):
+def _call_fused(
+    q_in, q_head_padded, kv, k_cache, slot_mapping, positions, cos_sin_cache,
+    eps, bs, apply_q_norm=None, kv_mxfp8=False, apply_q_rope=True,
+    is_q_interleaved=True,
+):
     if apply_q_norm is None:
         apply_q_norm = True
-    return torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(q_in, kv, k_cache, slot_mapping, positions, cos_sin_cache, q_head_padded, eps, bs, apply_q_norm, kv_mxfp8)
+    return torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+        q_in, kv, k_cache, slot_mapping, positions, cos_sin_cache,
+        q_head_padded, eps, bs, apply_q_norm, kv_mxfp8, apply_q_rope,
+        is_q_interleaved,
+    )
 
 
 def _as_stored_fp8(t: torch.Tensor) -> torch.Tensor:
@@ -237,6 +288,8 @@ def _assert_kv_cache_parity(
 
 
 @pytest.mark.parametrize("num_tokens", [1, 4, 17, 64, 2048])
+@pytest.mark.parametrize("apply_q_rope", [True, False])
+@pytest.mark.parametrize("is_q_interleaved", [True, False])
 @pytest.mark.parametrize(
     "n_heads,padded_heads",
     [
@@ -253,7 +306,10 @@ def _assert_kv_cache_parity(
         (64, 128),
     ],
 )
-def test_q_path_matches_reference(num_tokens: int, n_heads: int, padded_heads: int):
+def test_q_path_matches_reference(
+    num_tokens: int, n_heads: int, padded_heads: int,
+    apply_q_rope: bool, is_q_interleaved: bool,
+):
     torch.manual_seed(0)
     device = "cuda"
     dtype = torch.bfloat16
@@ -264,13 +320,17 @@ def test_q_path_matches_reference(num_tokens: int, n_heads: int, padded_heads: i
     positions = torch.arange(num_tokens, dtype=torch.int64, device=device)
     cos_sin_cache = make_cos_sin_cache(max_pos, ROPE_DIM, torch.float32, device)
 
-    # Reference: RMSNorm (no weight) per head, then GPT-J RoPE on last 64.
-    # Keep the chain in fp32 (rmsnorm_no_weight returns fp32) and round to
-    # bf16 once at the end, matching the kernel.
+    # is_q_interleaved controls Q memory layout, not the RoPE pairing scheme.
+    # RoPE itself remains GPT-J/interleaved-pair in both Q layouts.
     q_ref = rmsnorm_no_weight(q, eps)
-    q_ref = apply_rope_gptj_last_k(q_ref, positions, cos_sin_cache).to(dtype)
+    if apply_q_rope:
+        q_ref = apply_rope_gptj_last_k(q_ref, positions, cos_sin_cache)
+    q_ref = q_ref.to(dtype)
 
-    # Fused call with dummy KV tensors (KV branch will write slot_mapping=-1 → noop).
+    q_for_op = _permute_q_to_fused(q) if is_q_interleaved else q
+    q_ref_for_compare = _permute_q_to_fused(q_ref) if is_q_interleaved else q_ref
+
+    # Fused call with dummy KV tensors (slot_mapping=-1 disables KV insertion).
     num_blocks = 2
     bs = 16
     kv = torch.zeros(num_tokens, HEAD_DIM, dtype=dtype, device=device)
@@ -279,19 +339,22 @@ def test_q_path_matches_reference(num_tokens: int, n_heads: int, padded_heads: i
     ).view(num_blocks, -1)
     slot_mapping = torch.full((num_tokens,), -1, dtype=torch.int64, device=device)
     q_out = _call_fused(
-        q, padded_heads, kv, k_cache, slot_mapping, positions, cos_sin_cache, eps, bs
+        q_for_op, padded_heads, kv, k_cache, slot_mapping, positions, cos_sin_cache,
+        eps, bs, apply_q_rope=apply_q_rope, is_q_interleaved=is_q_interleaved,
     )
 
-    torch.testing.assert_close(q_out[:, :n_heads], q_ref, rtol=1e-2, atol=1e-2)
-    if n_heads < padded_heads:
-        pad_region = q_out[:, n_heads:padded_heads]
-        assert pad_region.abs().max().item() == 0.0, (
-            "padded head slots must be exact zero"
-        )
+    _assert_q_output_matches_reference(
+        q_out, q_ref_for_compare, n_heads, padded_heads, is_q_interleaved,
+        rtol=1e-2, atol=1e-2,
+    )
 
 
 @pytest.mark.parametrize("num_tokens", [4, 2048])
-def test_q_path_without_qnorm_matches_rope_only_reference(num_tokens: int):
+@pytest.mark.parametrize("apply_q_rope", [True, False])
+@pytest.mark.parametrize("is_q_interleaved", [True, False])
+def test_q_path_without_qnorm_matches_rope_only_reference(
+    num_tokens: int, apply_q_rope: bool, is_q_interleaved: bool
+):
     """Disabling Q norm must apply RoPE directly to the projected query."""
     torch.manual_seed(7)
     device = "cuda"
@@ -304,13 +367,15 @@ def test_q_path_without_qnorm_matches_rope_only_reference(num_tokens: int):
     q = torch.randn(num_tokens, n_heads, HEAD_DIM, dtype=dtype, device=device)
     positions = torch.arange(num_tokens, dtype=torch.int64, device=device)
     cos_sin_cache = make_cos_sin_cache(4096, ROPE_DIM, torch.float32, device)
-    q_ref = apply_rope_gptj_last_k(q, positions, cos_sin_cache)
+    q_ref = apply_rope_gptj_last_k(q, positions, cos_sin_cache) if apply_q_rope else q
+    q_for_op = _permute_q_to_fused(q) if is_q_interleaved else q
+    q_ref_for_compare = _permute_q_to_fused(q_ref) if is_q_interleaved else q_ref
     kv = torch.zeros(num_tokens, HEAD_DIM, dtype=dtype, device=device)
     k_cache = torch.zeros(2, block_size * HEAD_BYTES, dtype=torch.uint8, device=device)
     slot_mapping = torch.full((num_tokens,), -1, dtype=torch.int64, device=device)
 
     q_out = _call_fused(
-        q,
+        q_for_op,
         padded_heads,
         kv,
         k_cache,
@@ -320,10 +385,14 @@ def test_q_path_without_qnorm_matches_rope_only_reference(num_tokens: int):
         eps,
         block_size,
         apply_q_norm=False,
+        apply_q_rope=apply_q_rope,
+        is_q_interleaved=is_q_interleaved,
     )
 
-    torch.testing.assert_close(q_out[:, :n_heads], q_ref, rtol=0, atol=0)
-    assert q_out[:, n_heads:].count_nonzero().item() == 0
+    _assert_q_output_matches_reference(
+        q_out, q_ref_for_compare, n_heads, padded_heads, is_q_interleaved,
+        rtol=0, atol=0,
+    )
 
 
 # ── Test 2: KV path round-trip byte/value parity ─────────────────────────────
@@ -490,6 +559,8 @@ def test_kv_path_mxfp8_record_matches_reference(num_tokens: int, block_size: int
         block_size,
         True,
         True,  # kv_mxfp8
+        True,  # apply_q_rope
+        True,  # is_q_interleaved
     )
 
     # A pre-quantization bf16 tie can land the two encoders on adjacent e4m3
@@ -585,6 +656,8 @@ def test_kv_path_with_dp_padding(num_tokens: int, pad: int, block_size: int):
 
 
 @pytest.mark.parametrize("num_tokens", [1, 4, 17, 2048])
+@pytest.mark.parametrize("apply_q_rope", [True, False])
+@pytest.mark.parametrize("is_q_interleaved", [True, False])
 @pytest.mark.parametrize(
     "n_heads,padded_heads",
     [
@@ -603,7 +676,8 @@ def test_kv_path_with_dp_padding(num_tokens: int, pad: int, block_size: int):
 )
 @pytest.mark.parametrize("block_size", [16, 64])
 def test_combined_q_and_kv(
-    num_tokens: int, n_heads: int, padded_heads: int, block_size: int
+    num_tokens: int, n_heads: int, padded_heads: int, block_size: int,
+    apply_q_rope: bool, is_q_interleaved: bool,
 ):
     torch.manual_seed(2)
     device = "cuda"
@@ -621,7 +695,11 @@ def test_combined_q_and_kv(
 
     # Reference.
     q_ref = rmsnorm_no_weight(q, eps)
-    q_ref = apply_rope_gptj_last_k(q_ref, positions, cos_sin_cache).to(dtype)
+    if apply_q_rope:
+        q_ref = apply_rope_gptj_last_k(q_ref, positions, cos_sin_cache)
+    q_ref = q_ref.to(dtype)
+    q_for_op = _permute_q_to_fused(q) if is_q_interleaved else q
+    q_ref_for_compare = _permute_q_to_fused(q_ref) if is_q_interleaved else q_ref
     kv_ref = apply_rope_gptj_last_k(kv, positions, cos_sin_cache)
     k_cache_ref = torch.zeros(
         num_blocks, block_size * HEAD_BYTES, dtype=torch.uint8, device=device
@@ -633,7 +711,7 @@ def test_combined_q_and_kv(
     # Fused single call.
     k_cache_fused = torch.zeros_like(k_cache_ref)
     q_out = _call_fused(
-        q,
+        q_for_op,
         padded_heads,
         kv,
         k_cache_fused,
@@ -642,14 +720,14 @@ def test_combined_q_and_kv(
         cos_sin_cache,
         eps,
         block_size,
+        apply_q_rope=apply_q_rope,
+        is_q_interleaved=is_q_interleaved,
     )
 
-    torch.testing.assert_close(q_out[:, :n_heads], q_ref, rtol=1e-2, atol=1e-2)
-    if n_heads < padded_heads:
-        pad_region = q_out[:, n_heads:padded_heads]
-        assert pad_region.abs().max().item() == 0.0, (
-            "padded head slots must be exact zero"
-        )
+    _assert_q_output_matches_reference(
+        q_out, q_ref_for_compare, n_heads, padded_heads, is_q_interleaved,
+        rtol=1e-2, atol=1e-2,
+    )
     _assert_kv_cache_parity(
         k_cache_fused, k_cache_ref, num_tokens, num_blocks, block_size
     )

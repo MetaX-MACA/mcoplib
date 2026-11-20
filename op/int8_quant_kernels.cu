@@ -1,4 +1,6 @@
 // 2025 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
+#include <type_traits>
+#include <cstdint>
 #include <ATen/cuda/CUDAContext.h>
 #include <torch/all.h>
 #include <cmath>
@@ -1969,6 +1971,204 @@ __global__ void silu_and_mul_sm_quant(T* input, int8_t* output, float* scale, in
     }
 }
 
+#define SILU_SMOOTH_LUT_SIZE 65536
+__device__ float g_silu_smooth_lut_bf16[SILU_SMOOTH_LUT_SIZE];
+__device__ float g_silu_smooth_lut_f16[SILU_SMOOTH_LUT_SIZE];
+__device__ int g_silu_smooth_lut_ready;
+
+// One-time on-device silu table builder. Launched as a single block so
+// __syncthreads orders every table write before the ready flag is published;
+// any kernel launched later on the same stream (incl. inside a cuda graph)
+// therefore observes a complete table. Later launches early-out on the flag.
+__global__ void init_silu_smooth_lut_kernel() {
+    if (g_silu_smooth_lut_ready != 0) return;
+    for (int i = threadIdx.x; i < SILU_SMOOTH_LUT_SIZE; i += blockDim.x) {
+        // bf16 bit pattern i -> fp32 -> silu (same fp32 formula as the
+        // sizeof(T)==4 path in silu_and_mul_smooth_quant below)
+        float const xb = __int_as_float((unsigned)i << 16);
+        g_silu_smooth_lut_bf16[i] = xb * __builtin_mxc_rcpf(1.0f + __builtin_expf(-xb));
+        // fp16 bit pattern i -> fp32 -> silu
+        at::Half h;
+        h.x = (unsigned short)i;
+        float const xh = static_cast<float>(h);
+        g_silu_smooth_lut_f16[i] = xh * __builtin_mxc_rcpf(1.0f + __builtin_expf(-xh));
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) g_silu_smooth_lut_ready = 1;
+}
+
+template<typename T, typename VT, typename VT1, int NUM_VT, int type, int BLOCK>
+__global__ void silu_and_mul_smooth_quant(const T* __restrict__ input, int8_t* __restrict__ output,
+                                          float* __restrict__ per_token_scale,
+                                          const float* __restrict__ smooth_scale,
+                                          int64_t inner_hidden_size,
+                                          int64_t num_tokens, int m_rows)
+{
+    static_assert(sizeof(T) == 4 || std::is_same<T, at::BFloat16>::value ||
+                      std::is_same<T, at::Half>::value,
+                  "silu_and_mul_smooth_quant: LUT path needs a known 16-bit dtype");
+    constexpr int N = sizeof(VT) / sizeof(T);
+    int const tid = threadIdx.x;
+    constexpr int stride = BLOCK * N;
+    int64_t const token_base = (int64_t)blockIdx.x * m_rows;
+
+    // Per-thread smooth_scale slice (columns tid*N + j*stride .. +N), loaded
+    // once and reused by every token row this block owns.
+    float sm[NUM_VT][N];
+    #pragma unroll
+    for (int j = 0; j < NUM_VT; ++j) {
+        int const col = tid * N + j * stride;
+        if (col < inner_hidden_size) {
+            // inner_hidden_size % N == 0 and col % N == 0 -> 16B aligned float4s
+            float4 const* p = reinterpret_cast<float4 const*>(smooth_scale + col);
+            #pragma unroll
+            for (int s = 0; s < N; s += 4) {
+                float4 v = p[s >> 2];
+                sm[j][s + 0] = v.x;  sm[j][s + 1] = v.y;
+                sm[j][s + 2] = v.z;  sm[j][s + 3] = v.w;
+            }
+        }
+    }
+
+    // absmax staging: one partial per 16-lane shuffle group. sm_size = BLOCK/16
+    // is a compile-time constant so the thread-0 fold below fully unrolls - a
+    // runtime-bounded fold here was measured to cost 26 registers
+    constexpr int sm_size = BLOCK >> 4;
+    __shared__ __align__(16) float sm_max[sm_size];
+    __shared__ float sm_max2;
+    for (int m = 0; m < m_rows; ++m) {
+        int64_t const token_idx = token_base + m;
+        if (token_idx >= num_tokens) break; // uniform per block -> barrier safe
+        const T* ptr_input0 = input + token_idx * (inner_hidden_size << 1);
+        const T* ptr_input1 = ptr_input0 + inner_hidden_size;
+
+        // pass 1: swiglu * smooth -> registers, per-thread absmax. x1/x2 are
+        // single-pass streams -> non-temporal loads (keep the LUT L2-resident)
+        float absmax_val = 0.0f;
+        float reg_i[NUM_VT][N];
+        #pragma unroll
+        for (int j = 0; j < NUM_VT; ++j) {
+            int const col = tid * N + j * stride;
+            if (col < inner_hidden_size) {
+                VT vsrc0 = dq_nt_load<VT>(ptr_input0 + col);
+                VT vsrc1 = dq_nt_load<VT>(ptr_input1 + col);
+                if constexpr (sizeof(T) == 4) {
+                    // fp32: silu via hardware exp + fast reciprocal (a 65536-entry
+                    // LUT cannot cover 2^32 fp32 bit patterns)
+                    T const* ptr_local0 = reinterpret_cast<T const*>(&vsrc0);
+                    T const* ptr_local1 = reinterpret_cast<T const*>(&vsrc1);
+                    #pragma unroll
+                    for (int k = 0; k < N; ++k) {
+                        float val0 = static_cast<float>(ptr_local0[k]);
+                        float val1 = static_cast<float>(ptr_local1[k]);
+                        float sigmoid = val0 * __builtin_mxc_rcpf(1.0f + __builtin_expf(-val0));
+                        float gate_up = val1 * sigmoid * sm[j][k];
+                        reg_i[j][k] = gate_up;
+                        absmax_val = fmaxf(absmax_val, fabsf(gate_up));
+                    }
+                } else if constexpr (std::is_same<T, at::BFloat16>::value) {
+                    // bf16: silu through the LUT (bit-identical to the fp32 path
+                    // above; bf16->fp32 is a 16-bit shift). One u32 word carries
+                    // two elements, so the four bit-ops below serve both.
+                    uint32_t const* w0 = reinterpret_cast<uint32_t const*>(&vsrc0);
+                    uint32_t const* w1 = reinterpret_cast<uint32_t const*>(&vsrc1);
+                    #pragma unroll
+                    for (int w = 0; w < N / 2; ++w) {
+                        uint32_t const gw = w0[w];
+                        uint32_t const uw = w1[w];
+                        float const s_lo = g_silu_smooth_lut_bf16[gw & 0xffffu];
+                        float const s_hi = g_silu_smooth_lut_bf16[gw >> 16];
+                        float const up_lo = __int_as_float(uw << 16);
+                        float const up_hi = __int_as_float(uw & 0xffff0000u);
+                        float const g0 = s_lo * up_lo * sm[j][2 * w];
+                        float const g1 = s_hi * up_hi * sm[j][2 * w + 1];
+                        reg_i[j][2 * w] = g0;
+                        reg_i[j][2 * w + 1] = g1;
+                        absmax_val = fmaxf(absmax_val, fmaxf(fabsf(g0), fabsf(g1)));
+                    }
+                } else {
+                    // fp16: LUT indexed by the raw 16-bit pattern (bit-identical
+                    // to the fp32 path); the up-conversion is a real cvt, not a
+                    // shift, so this path stays scalar
+                    uint16_t const* b0 = reinterpret_cast<uint16_t const*>(&vsrc0);
+                    T const* ptr_local1 = reinterpret_cast<T const*>(&vsrc1);
+                    #pragma unroll
+                    for (int k = 0; k < N; ++k) {
+                        float sigmoid = g_silu_smooth_lut_f16[b0[k]];
+                        float val1 = static_cast<float>(ptr_local1[k]);
+                        float gate_up = val1 * sigmoid * sm[j][k];
+                        reg_i[j][k] = gate_up;
+                        absmax_val = fmaxf(absmax_val, fabsf(gate_up));
+                    }
+                }
+            }
+        }
+
+        // block absmax, 2-stage: every 16-lane shuffle subgroup reduces to its
+        // leader, the sm_size leaders store one partial each, then thread 0
+        // folds the partials in a fully unrolled scalar chain (constexpr
+        // sm_size keeps the fold's registers out of the main loop's live
+        // set). Two barriers per row order the single buffers: row m+1's
+        // partial writes happen only after every thread passed the second
+        // barrier of row m, i.e. after all row-m reads are complete.
+        #pragma unroll
+        for (int i = 8; i > 0; i >>= 1)
+            absmax_val = fmaxf(absmax_val, __shfl_down_sync_16(0xffffffffffffffff, absmax_val, i));
+        if ((tid & 15) == 0)
+            sm_max[tid >> 4] = absmax_val;
+        __syncthreads();
+        if (tid == 0) {
+            float v = sm_max[0];
+            #pragma unroll
+            for (int g = 1; g < sm_size; ++g)
+                v = fmaxf(v, sm_max[g]);
+            sm_max2 = v;
+        }
+        __syncthreads();
+        float const block_absmax_val = sm_max2;
+
+        // per-token scale output = absmax / QMAX (reciprocal of the internal
+        // quant factor, matching smooth_per_token_dynamic_quant)
+        if (tid == 0) {
+            if constexpr (type == 0)  // fp8 e4m3
+                per_token_scale[token_idx] = block_absmax_val * 0.002232142857f;
+            else                      // int8
+                per_token_scale[token_idx] = block_absmax_val * 0.0078740157f;
+        }
+        float const tmp_scale = (type == 0 ? 448.0f : 127.0f) * __builtin_mxc_rcpf(block_absmax_val);
+
+        // pass 2: quantize straight from registers (SREG, no second global
+        // read); q is write-once -> non-temporal store
+        int8_t* ptr_output = output + token_idx * inner_hidden_size;
+        #pragma unroll
+        for (int j = 0; j < NUM_VT; ++j) {
+            int const col = tid * N + j * stride;
+            if (col < inner_hidden_size) {
+                VT1 vdst;
+                if constexpr (type == 0) {  // fp8: clamp +-448 then HW 4-wide pack
+                    uint32_t* ptr_reg_dst = reinterpret_cast<uint32_t*>(&vdst);
+                    #pragma unroll
+                    for (int s = 0; s < N; s += 4) {
+                        v4f32 reg_tmp;
+                        #pragma unroll
+                        for (int t = 0; t < 4; ++t) {
+                            float q = reg_i[j][s + t] * tmp_scale;
+                            reg_tmp[t] = fminf(fmaxf(q, -448.0f), 448.0f);
+                        }
+                        *ptr_reg_dst++ = __builtin_mxc_cvt_pk4_f32tof8(reg_tmp);
+                    }
+                } else {                   // int8: round-half-even + clamp +-127
+                    int8_t* ptr_dst = reinterpret_cast<int8_t*>(&vdst);
+                    #pragma unroll
+                    for (int k = 0; k < N; ++k)
+                        ptr_dst[k] = float_to_int8_rn(reg_i[j][k] * tmp_scale);
+                }
+                dq_nt_store<VT1>(ptr_output + col, vdst);
+            }
+        }
+    }
+}
+
 template<typename T, typename T1, int type>
 void launch_silu_mul_quant_pack(T* input, T* output, T1* mask, int64_t num_tokens, int64_t hidden_size, int64_t out_stride, int64_t mask_size,cudaStream_t stream, SwigluConfig swiglu_config, T* weight = nullptr) {
     int dev = 0;
@@ -2478,6 +2678,64 @@ void launch_silu_mul_quan_no_mask(T* input, int8_t* output, float* scale, int64_
     }
 }
 
+template<typename T, int type>
+void launch_silu_mul_smooth_quan_no_mask(const T* input, int8_t* output, float* per_token_scale,
+                                         const float* smooth_scale, int64_t num_tokens,
+                                         int64_t hidden_size, cudaStream_t stream) {
+    int64_t inner_hidden_size = hidden_size / 2;
+    // silu LUT init: single block, early-outs through the device-side ready
+    // flag after its first run. Same stream as the consumer kernel below ->
+    // stream ordered, and recorded by cuda graph capture like any launch.
+    init_silu_smooth_lut_kernel<<<1, 512, 0, stream>>>();
+    constexpr int blocksize = 448;
+    int m_rows = 1;
+    if (num_tokens >= 1024) m_rows = 2;
+    if (num_tokens >= 1536) m_rows = 4;
+    int64_t gridsize = (num_tokens + m_rows - 1) / m_rows;
+    if (gridsize < 1) gridsize = 1;
+    int N = sizeof(float4) / sizeof(T);
+    if (N == 8 && (inner_hidden_size & (N - 1)) == 0) {
+        int base = blocksize * N;
+        if (inner_hidden_size <= base) {
+            silu_and_mul_smooth_quant<T, float4, float2, 1, type, blocksize><<<gridsize, blocksize,0,stream>>>(input, output, per_token_scale, smooth_scale, inner_hidden_size, num_tokens, m_rows);
+        } else if (inner_hidden_size <= base * 2) {
+            silu_and_mul_smooth_quant<T, float4, float2, 2, type, blocksize><<<gridsize, blocksize,0,stream>>>(input, output, per_token_scale, smooth_scale, inner_hidden_size, num_tokens, m_rows);
+        } else if (inner_hidden_size <= base * 3) {
+            silu_and_mul_smooth_quant<T, float4, float2, 3, type, blocksize><<<gridsize, blocksize,0,stream>>>(input, output, per_token_scale, smooth_scale, inner_hidden_size, num_tokens, m_rows);
+        } else if (inner_hidden_size <= 576 * N * 3) {
+            // wide-block tier: 576*8*3 = 13824 columns at the NUM_VT=3
+            // register footprint (70 regs -> 3 resident blocks/AP)
+            silu_and_mul_smooth_quant<T, float4, float2, 3, type, 576><<<gridsize, 576,0,stream>>>(input, output, per_token_scale, smooth_scale, inner_hidden_size, num_tokens, m_rows);
+        } else if (inner_hidden_size <= 896 * N * 2) {
+            // 896*8*2 = 14336 columns at the NUM_VT=2 footprint (54 regs ->
+            // 2 resident blocks/AP)
+            silu_and_mul_smooth_quant<T, float4, float2, 2, type, 896><<<gridsize, 896,0,stream>>>(input, output, per_token_scale, smooth_scale, inner_hidden_size, num_tokens, m_rows);
+        } else {
+            TORCH_CHECK(false, "launch_silu_mul_smooth_quan_no_mask (N=8): inner_hidden_size ", inner_hidden_size,
+                        " exceeds max supported (", 896 * N * 2, ", type=", type, ")");
+        }
+    } else if (N == 4 && (inner_hidden_size & (N - 1)) == 0) {
+        int base = blocksize * N;
+        if (inner_hidden_size <= base) {
+            silu_and_mul_smooth_quant<T, float4, float, 1, type, blocksize><<<gridsize, blocksize,0,stream>>>(input, output, per_token_scale, smooth_scale, inner_hidden_size, num_tokens, m_rows);
+        } else if (inner_hidden_size <= base * 2) {
+            silu_and_mul_smooth_quant<T, float4, float, 2, type, blocksize><<<gridsize, blocksize,0,stream>>>(input, output, per_token_scale, smooth_scale, inner_hidden_size, num_tokens, m_rows);
+        } else if (inner_hidden_size <= base * 3) {
+            silu_and_mul_smooth_quant<T, float4, float, 3, type, blocksize><<<gridsize, blocksize,0,stream>>>(input, output, per_token_scale, smooth_scale, inner_hidden_size, num_tokens, m_rows);
+        } else if (inner_hidden_size <= base * 4) {
+            silu_and_mul_smooth_quant<T, float4, float, 4, type, blocksize><<<gridsize, blocksize,0,stream>>>(input, output, per_token_scale, smooth_scale, inner_hidden_size, num_tokens, m_rows);
+        } else if (inner_hidden_size <= base * 8) {
+            silu_and_mul_smooth_quant<T, float4, float, 8, type, blocksize><<<gridsize, blocksize,0,stream>>>(input, output, per_token_scale, smooth_scale, inner_hidden_size, num_tokens, m_rows);
+        } else {
+            TORCH_CHECK(false, "launch_silu_mul_smooth_quan_no_mask (N=4): inner_hidden_size ", inner_hidden_size,
+                        " exceeds max supported (base*8=", base * 8, ", type=", type, ")");
+        }
+    } else {
+        TORCH_CHECK(false, "launch_silu_mul_smooth_quan_no_mask: unsupported configuration: inner_hidden_size=",
+                    inner_hidden_size, ", N=", N, ", type=", type,
+                    " (requires N==4 or N==8 with inner_hidden_size%N==0)");
+    }
+}
 template<typename T, typename T_IDS, typename VT, typename VT1, int NUM_VT, bool HAS_SCALE, typename OUT_T = int8_t, int NUM_THREADS=512> 
 __global__ void silu_and_mul_reorder_quant(const T* input, const float* input_scale, OUT_T* output, float* scale, const T_IDS* reorder_topk_ids, int start_expert_id, int end_expert_id, int64_t hidden_size)
 {
@@ -3261,6 +3519,20 @@ void fused_silu_mul_dq_quant_interface(
   TORCH_CHECK(input.is_contiguous());
   TORCH_CHECK(scale.is_contiguous());
   TORCH_CHECK(out.is_contiguous());
+
+  TORCH_CHECK(
+      input.dim() >= 1 && out.dim() >= 1 && scale.dim() >= 1,
+      "input, out and scale must have at least 1 dimension");
+
+  TORCH_CHECK(
+      input.size(0) == out.size(0),
+      "input and out must have the same first dimension, but got input.size(0)=",
+      input.size(0), ", out.size(0)=", out.size(0));
+
+  TORCH_CHECK(
+      input.size(0) == scale.size(0),
+      "input and scale must have the same first dimension, but got input.size(0)=",
+      input.size(0), ", scale.size(0)=", scale.size(0));
   int64_t const hidden_size = input.size(-1);
   int64_t const num_tokens = input.numel() / hidden_size;
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -3273,6 +3545,65 @@ void fused_silu_mul_dq_quant_interface(
       launch_silu_mul_quan_no_mask<scalar_t, 1>(input.data_ptr<scalar_t>(), out.data_ptr<int8_t>(), scale.data_ptr<float>(), num_tokens, hidden_size, stream);
     });
   }
+}
+
+void fused_silu_mul_dq_quant_smooth_interface(
+    torch::Tensor& out,
+    torch::Tensor& scale,
+    torch::Tensor const& input,
+    torch::Tensor& per_token_scale)
+{
+    DEBUG_TRACE_PARAMS(out, scale, input, per_token_scale);
+    DEBUG_DUMP_PARAMS(out, scale, input, per_token_scale);
+
+    TORCH_CHECK(input.is_contiguous());
+    TORCH_CHECK(scale.is_contiguous());
+    TORCH_CHECK(out.is_contiguous());
+    TORCH_CHECK(per_token_scale.is_contiguous());
+    TORCH_CHECK(
+        input.dim() >= 1 && out.dim() >= 1,
+        "input and out must have at least 1 dimension");
+
+    int64_t const hidden_size = input.size(-1);
+    int64_t const num_tokens = input.numel() / hidden_size;
+    int64_t const inner_hidden_size = hidden_size / 2;
+    TORCH_CHECK(hidden_size % 2 == 0,
+                "fused_silu_mul_dq_quant: input.size(-1) must be even, got ", hidden_size);
+
+    if (scale.numel() == num_tokens) {
+        // per_token mode: reuse the existing 3-arg entry, byte-for-byte.
+        fused_silu_mul_dq_quant_interface(out, scale, input);
+        return;
+    }
+
+    // ---- smooth_scale mode (NEW path, isolated kernel) ----
+    TORCH_CHECK(scale.numel() == inner_hidden_size,
+                "fused_silu_mul_dq_quant: cannot infer quant mode from scale shape: scale.numel()=",
+                scale.numel(), " but num_tokens=", num_tokens, " (per_token) and inner=",
+                inner_hidden_size, " (smooth_scale)");
+    TORCH_CHECK(scale.scalar_type() == torch::kFloat32,
+                "smooth_scale must be float32, got ", scale.scalar_type());
+    TORCH_CHECK(out.numel() == num_tokens * inner_hidden_size,
+                "smooth mode: out must have num_tokens*inner=", num_tokens * inner_hidden_size,
+                " elements, got ", out.numel());
+    TORCH_CHECK(per_token_scale.numel() == num_tokens &&
+                per_token_scale.scalar_type() == torch::kFloat32,
+                "per_token_scale must be float32 with numel == num_tokens == ", num_tokens,
+                ", got numel ", per_token_scale.numel(), ", dtype ", per_token_scale.scalar_type());
+    TORCH_CHECK(out.scalar_type() == torch::kInt8 || out.scalar_type() == torch::kFloat8_e4m3fn,
+                "smooth_scale mode supports int8 / float8_e4m3fn outputs only, got ",
+                out.scalar_type());
+
+    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    if (out.scalar_type() == torch::kFloat8_e4m3fn) {
+        MOE_DISPATCH_FLOATING_TYPES(input.scalar_type(), "launch_silu_mul_smooth_quan_no_mask", [&] {
+            launch_silu_mul_smooth_quan_no_mask<scalar_t, 0>(input.data_ptr<scalar_t>(), reinterpret_cast<int8_t*>(out.data_ptr()), per_token_scale.data_ptr<float>(), scale.data_ptr<float>(), num_tokens, hidden_size, stream);
+        });
+    } else {
+        MOE_DISPATCH_FLOATING_TYPES(input.scalar_type(), "launch_silu_mul_smooth_quan_no_mask", [&] {
+            launch_silu_mul_smooth_quan_no_mask<scalar_t, 1>(input.data_ptr<scalar_t>(), out.data_ptr<int8_t>(), per_token_scale.data_ptr<float>(), scale.data_ptr<float>(), num_tokens, hidden_size, stream);
+        });
+    }
 }
 
 void fused_silu_mul_dq_quant_reordered_topk_interface(

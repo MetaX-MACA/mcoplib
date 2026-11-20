@@ -28,6 +28,11 @@ void fused_silu_mul_dq_quant_interface(
     torch::Tensor& scale,   
     torch::Tensor const& input);
 
+void fused_silu_mul_dq_quant_smooth_interface(
+    torch::Tensor& out,
+    torch::Tensor& scale,
+    torch::Tensor const& input,
+    torch::Tensor& per_token_scale);
 void silu_mul_mask_interface(
     at::Tensor& out,
     at::Tensor const& input,

@@ -2,19 +2,19 @@
     "device_id": 0,
     "device_name": ["MetaX C500", "MetaX C600-UL", "Metax C600-U"],
     "batch_size": 17,
-    "num_heads": 17,
+    "num_heads": [8, 64],
     "num_kv_heads": 1,
     "head_dim": 512,
     "rotary_dim": 64,
     "max_position": 4096,
     "block_size": 64,
-    "eps": 1e-6,
+    "eps": 1e-06,
     "dtype": "bfloat16",
     "kv_cache_dtype": "bfloat16",
-    "num_tokens": 2048,
+    "num_tokens": [1, 64, 512, 2048, 4096],
     "positions_dtype": "int64",
     "fp8_scale": 1.0,
     "q_fp8_scale_inv": 1.0,
     "seed": 42,
-    "samples": 1000
+    "samples": 100
 }

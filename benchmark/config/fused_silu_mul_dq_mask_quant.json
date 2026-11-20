@@ -12,6 +12,15 @@
             "with_weight": false
         },
         {
+            "name": "mask1_bf16_h7168",
+            "num_experts": 1,
+            "hidden_size": 7168,
+            "mask_values": [7],
+            "input_dtype": "bfloat16",
+            "mask_dtype": "int32",
+            "with_weight": false
+        },
+        {
             "name": "mask2_bf16_h1024",
             "num_experts": 2,
             "hidden_size": 1024,
@@ -30,10 +39,55 @@
             "with_weight": true
         },
         {
+            "name": "mask2_fp16_h4096_weight",
+            "num_experts": 2,
+            "hidden_size": 4096,
+            "mask_values": [5, 9],
+            "input_dtype": "float16",
+            "mask_dtype": "int32",
+            "with_weight": true
+        },
+        {
+            "name": "mask2_bf16_h7168_weight",
+            "num_experts": 2,
+            "hidden_size": 7168,
+            "mask_values": [5, 9],
+            "input_dtype": "bfloat16",
+            "mask_dtype": "int32",
+            "with_weight": true
+        },
+        {
             "name": "mask3_bf16_h4096_weight",
             "num_experts": 3,
             "hidden_size": 4096,
             "mask_values": [9, 6, 3],
+            "input_dtype": "bfloat16",
+            "mask_dtype": "int32",
+            "with_weight": true
+        },
+        {
+            "name": "mask3_fp16_h2048",
+            "num_experts": 3,
+            "hidden_size": 2048,
+            "mask_values": [7, 5, 9],
+            "input_dtype": "float16",
+            "mask_dtype": "int32",
+            "with_weight": false
+        },
+        {
+            "name": "mask4_bf16_h2048",
+            "num_experts": 4,
+            "hidden_size": 2048,
+            "mask_values": [4, 8, 6, 10],
+            "input_dtype": "bfloat16",
+            "mask_dtype": "int32",
+            "with_weight": false
+        },
+        {
+            "name": "mask4_bf16_h4096_weight",
+            "num_experts": 4,
+            "hidden_size": 4096,
+            "mask_values": [9, 6, 3, 7],
             "input_dtype": "bfloat16",
             "mask_dtype": "int32",
             "with_weight": true
@@ -44,5 +98,5 @@
     "gemm1_alpha": 1.702,
     "gemm1_limit": 7.0,
     "seed": 42,
-    "samples": 10000
+    "samples": 100
 }

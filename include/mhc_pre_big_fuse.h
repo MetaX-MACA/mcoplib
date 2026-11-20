@@ -22,6 +22,15 @@
 //   residual_out -> select the first-layer broadcast contract: residual is
 //                   [N, H], residual_out is filled with four identical streams,
 //                   and rms_numel defaults to H instead of 4 * H
+//   quant_scales -> enables per-token INT8 output when layer_input is INT8
+//                   [N, H], or packed INT8 when layer_input is BF16
+//                   [N, 2816]. Both modes require norm_weight. The packed
+//                   buffer stores H INT8 bytes, one FP32 scale, then padding.
+//                   BF16 [N, H] without quant_scales keeps the original path.
+//   output_rms -> required for both INT8 modes; additionally expose the BF16
+//                 RMSNorm result with shape [N, H].
+//   output_quant_int8 -> required only for packed INT8 output; additionally
+//                        expose the unpacked INT8 values with shape [N, H].
 void mhc_pre_big_fuse_out(
     torch::Tensor gemm_out_mul, torch::Tensor gemm_out_sqrsum,
     torch::Tensor hc_scale, torch::Tensor hc_base, torch::Tensor residual,
@@ -33,4 +42,7 @@ void mhc_pre_big_fuse_out(
     c10::optional<torch::Tensor> pre_mix_out = c10::nullopt,
     c10::optional<torch::Tensor> aux_out = c10::nullopt,
     double norm_eps = 1e-6, int64_t rms_numel = -1,
-    c10::optional<torch::Tensor> residual_out = c10::nullopt);
+    c10::optional<torch::Tensor> residual_out = c10::nullopt,
+    c10::optional<torch::Tensor> quant_scales = c10::nullopt,
+    c10::optional<torch::Tensor> output_rms = c10::nullopt,
+    c10::optional<torch::Tensor> output_quant_int8 = c10::nullopt);

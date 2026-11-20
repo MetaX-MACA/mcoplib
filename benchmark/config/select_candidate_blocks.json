@@ -1,11 +1,11 @@
 {
     "device_id": 0,
     "device_name": ["MetaX C500", "MetaX C600-UL", "Metax C600-U"],
-    "num_rows": [1, 16],
-    "width": [524288, 1048576],
+    "num_rows": [1, 4, 16],
+    "width": [32768, 262144, 1048576, 2097152],
     "topk_blocks": 2048,
     "block_size": 8,
     "row_repeat": 1,
     "dtype": "float32",
-    "samples": 1000
+    "samples": 100
 }

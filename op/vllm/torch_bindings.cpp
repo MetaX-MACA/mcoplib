@@ -260,6 +260,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "                 Tensor! lru_slots,"
       "                 Tensor? request_state_indices,"
       "                 int region_stride,"
+      "                 int max_union_rows,"
       "                 Tensor(a!)? miss_mask=None,"
       "                 Tensor(b!)? stats=None,"
       "                 Tensor(c!)? attention_indices=None,"
@@ -397,6 +398,14 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("region_topk_ids", torch::kCUDA, &region_topk_ids);
   
   ops.def(
+      "prepare_topk_scores("
+      "Tensor scores_in, Tensor summary_valid, Tensor row_starts, "
+      "Tensor row_ends, Tensor(a!) scores_out, int num_regions, "
+      "int padded_regions, bool has_summary_valid) -> ()");
+  ops.impl("prepare_topk_scores", torch::kCUDA,
+           &prepare_topk_scores);
+
+  ops.def(
       "stable_topk_gathered(Tensor gathered, Tensor! out, int topk) -> ()");
   ops.impl("stable_topk_gathered", torch::kCUDA, &stable_topk_gathered);
 
@@ -489,15 +498,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def("awq_to_gptq_4bit(Tensor qweight) -> Tensor");
   ops.impl("awq_to_gptq_4bit", torch::kCUDA, &awq_to_gptq_4bit);
 
-  // Quantized GEMM for GPTQ.
-  // Note: even though the C++ inferred schema is correct for this op, it seems
-  // to prevent the meta function registry.
-  ops.def(
-      "gptq_gemm(Tensor a, Tensor b_q_weight, Tensor b_gptq_qzeros, "
-      "Tensor b_gptq_scales, Tensor b_g_idx, bool use_exllama, int bit, int "
-      "group_size, Tensor perm_space, "
-      "Tensor temp_space, bool dtype_bf16)-> Tensor");
-  ops.impl("gptq_gemm", torch::kCUDA, &gptq_gemm);
+  // Quantized GEMM for GPTQ is registered through the stable facade below.
 
   // Post processing for GPTQ.
   ops.def("gptq_shuffle(Tensor! q_weight, Tensor q_perm, int bit) -> ()");
@@ -905,6 +906,11 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cuda_utils), cuda_utils) {
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)
 
 STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
+    ops.def(
+        "gptq_gemm(Tensor a, Tensor b_q_weight, Tensor b_gptq_qzeros, "
+        "Tensor b_gptq_scales, bool use_exllama, bool use_v2_format, "
+        "int bit) -> Tensor");
+
     //在 PyTorch 的 Schema 定义语言中（这与 Python 和 C++ 的函数传参规则完全一致）：一旦某个参数被赋予了默认值，那么它后面的所有参数都必须拥有默认值。不能出现“带默认值的参数”后面紧跟着“不带默认值的参数”
     ops.def(
       "per_token_group_fp8_quant(Tensor input, Tensor! output_q, Tensor! "
@@ -924,12 +930,25 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "output_s, int group_size, float eps, float int8_min, float int8_max) -> "
       "()");
     
+    // q_head_padded is the padded Q head count of the returned tensor, or 0 to
+    // do the KV insert alone and return an empty tensor.  The Q knobs are
+    // independent: apply_q_norm and apply_q_rope each drop that step for Q
+    // alone (KV is always rotated), and is_q_interleaved reads and writes Q in
+    // FlashMLA's mega-attention chunk-interleaved layout, which moves the
+    // padding heads to the tail of every head-dim chunk.
     ops.def(
-      "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert("
-      "Tensor q_in, Tensor kv, Tensor! k_cache, "
-      "Tensor slot_mapping, Tensor position_ids, Tensor cos_sin_cache, "
-      "int q_head_padded, float eps, int cache_block_size, "
-      "bool apply_q_norm=True, bool kv_mxfp8=False) -> Tensor");
+        "fused_deepseek_v4_kv_rope_insert("
+        "Tensor kv, Tensor! k_cache, Tensor slot_mapping, Tensor position_ids, "
+        "Tensor cos_sin_cache, int cache_block_size, Tensor? fp8_scale=None, "
+        "bool kv_mxfp8=False) -> "
+        "()");
+    ops.def(
+        "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert("
+        "Tensor q_in, Tensor kv, Tensor! k_cache, "
+        "Tensor slot_mapping, Tensor position_ids, Tensor cos_sin_cache, "
+        "int q_head_padded, float eps, int cache_block_size, "
+        "bool apply_q_norm=True, bool kv_mxfp8=False, bool apply_q_rope=True, "
+        "bool is_q_interleaved=False) -> Tensor");
 
     // FP8 tensor, and KV into a contiguous 512-wide token-strided cache.
     ops.def(
@@ -955,16 +974,20 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "Tensor!? kv_cache, Tensor!? index_cache, "
       "int block_size, Tensor!? q_out, Tensor!? index_q_out, "
       "str kv_cache_dtype, bool skip_index_branch=False, "
-      "Tensor!? q_fp8_out=None, float q_fp8_scale=1.0) -> ()");                                                
+      "Tensor!? q_fp8_out=None, float q_fp8_scale=1.0, "
+      "Tensor? kv_k_scale=None, Tensor? kv_v_scale=None) -> ()");                                               
 }
 
 STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
+    ops.impl("gptq_gemm", TORCH_BOX(&gptq_gemm));
       // Per-token group quantization
     ops.impl("per_token_group_fp8_quant", TORCH_BOX(&per_token_group_quant_fp8));
     ops.impl("per_token_group_fp8_quant_packed",
             TORCH_BOX(&per_token_group_quant_8bit_packed));
     ops.impl("per_token_group_quant_int8",
            TORCH_BOX(&per_token_group_quant_int8));
+    ops.impl("fused_deepseek_v4_kv_rope_insert",
+           TORCH_BOX(&fused_deepseek_v4_kv_rope_insert));
     ops.impl("fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert",
            TORCH_BOX(&fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert));
     ops.impl(

@@ -1,10 +1,25 @@
 import argparse
+import pytest
 import torch
 import triton
 import triton.language as tl
 import mcoplib
 import mcoplib._C
 import mcoplib.sgl_kernel
+
+
+DSV41_FLASH_INT8_TP8DP2_TOKENS = (
+    1, 2, 3, 4, 16, 30, 61, 62, 94, 99, 123, 126, 132, 256, 512, 2048
+)
+
+# Range edges 4/5/6 and 2047/2048/2049, interior values, and C500's
+# 104-AP / two-wave neighborhoods. Keep the original model shape set intact.
+H5120_RANGE_PROBE_TOKENS = (
+    5, 6, 8, 32, 64, 103, 104, 105, 208, 209, 255, 257, 1024, 2047, 2049
+)
+H5120_DISPATCH_VALIDATION_TOKENS = tuple(sorted(set(
+    DSV41_FLASH_INT8_TP8DP2_TOKENS + H5120_RANGE_PROBE_TOKENS
+)))
 
 
 # ============================ Triton 标杆 ============================
@@ -51,11 +66,13 @@ def _hc_head_kernel(
         tl.store(y_row + d_offs, y_block.to(y_ptr.dtype.element_ty), mask=d_mask)
 
 
-def triton_hc_head(x, hc_fn, hc_scale, hc_base, norm_eps: float, hc_eps: float):
+def triton_hc_head(x, hc_fn, hc_scale, hc_base, norm_eps: float, hc_eps: float,
+                   out: torch.Tensor = None):
     """Triton 标杆实现。注意：hc_mult 非 2 的幂时会越界，调用方需跳过。"""
     assert x.is_contiguous() and hc_fn.is_contiguous() and x.dim() == 3
     T, hc_mult, hidden_size = x.shape
-    y = torch.empty((T, hidden_size), dtype=x.dtype, device=x.device)
+    y = out if out is not None else torch.empty(
+        (T, hidden_size), dtype=x.dtype, device=x.device)
     if T == 0:
         return y
     _hc_head_kernel[(T,)](
@@ -121,6 +138,141 @@ def triton_supported(M):
     return M == triton.next_power_of_2(M)
 
 
+@pytest.fixture
+def full_precision_matmul():
+    previous = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    try:
+        yield
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = previous
+
+
+def assert_head_matches_torch(inputs, norm_eps=1e-6, hc_eps=1e-6):
+    x, fn, scale, base = inputs
+    out = torch.empty((x.shape[0], x.shape[2]), dtype=x.dtype, device=x.device)
+    actual = fused_hc_head(x, fn, scale, base, norm_eps, hc_eps, out=out)
+    expected = torch_golden_hc_head(x, fn, scale, base, norm_eps, hc_eps)
+    atol, rtol = TOL[x.dtype]
+    torch.testing.assert_close(actual.float(), expected, atol=atol, rtol=rtol)
+    assert actual is out
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="需要 CUDA/MACA GPU")
+@pytest.mark.parametrize("tokens", DSV41_FLASH_INT8_TP8DP2_TOKENS)
+@pytest.mark.parametrize("seed", (0, 1, 2))
+def test_dsv41_flash_int8_tp8dp2(tokens, seed, full_precision_matmul):
+    assert_head_matches_torch(make_inputs(tokens, 4, 5120, torch.bfloat16, seed=seed))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="需要 CUDA/MACA GPU")
+@pytest.mark.parametrize("tokens", H5120_RANGE_PROBE_TOKENS)
+@pytest.mark.parametrize("seed", (0, 1, 2))
+def test_h5120_range_dispatch(tokens, seed, full_precision_matmul):
+    assert_head_matches_torch(make_inputs(tokens, 4, 5120, torch.bfloat16, seed=seed))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="需要 CUDA/MACA GPU")
+@pytest.mark.parametrize("tokens", (1, 3, 132, 2048))
+@pytest.mark.parametrize("mode", ("zero", "constant", "onehot", "unscaled_fn"))
+def test_h5120_structured(tokens, mode, full_precision_matmul):
+    x, fn, scale, base = make_inputs(tokens, 4, 5120, torch.bfloat16, seed=4)
+    if mode == "zero":
+        x.zero_()
+    elif mode == "constant":
+        x.fill_(0.25)
+        fn.zero_()
+        base.copy_(torch.tensor([-80., -1., 1., 80.], device=x.device))
+    elif mode == "onehot":
+        fn.zero_()
+        for m in range(4):
+            fn[m, m * 5120] = 0.5 if m % 2 == 0 else -0.5
+    else:
+        fn.mul_(20480 ** 0.5)
+    assert_head_matches_torch((x, fn, scale, base))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="需要 CUDA/MACA GPU")
+@pytest.mark.parametrize("tokens", (1, 4))
+@pytest.mark.parametrize("position", (0, 511, 512, 1023, 1024, 2559, 2560, 5119, 5120, 20479))
+def test_h5120_splitk_boundaries(tokens, position, full_precision_matmul):
+    x, fn, scale, base = make_inputs(tokens, 4, 5120, torch.bfloat16, seed=8)
+    x.zero_()
+    flat = x.view(tokens, 20480)
+    neighbor = (position + 1) % 20480
+    flat[:, position] = 1.0
+    flat[:, neighbor] = -0.5
+    x[1::2].neg_()
+    fn.zero_()
+    fn[:, position] = torch.tensor([0.01, -0.02, 0.03, -0.04], device=x.device)
+    fn[:, neighbor] = torch.tensor([-0.02, 0.03, -0.04, 0.05], device=x.device)
+    scale.fill_(0.75)
+    assert_head_matches_torch((x, fn, scale, base))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="需要 CUDA/MACA GPU")
+@pytest.mark.parametrize("tokens", (1, 4))
+def test_h5120_splitk_repeated_inputs(tokens, full_precision_matmul):
+    x, fn, scale, base = make_inputs(tokens, 4, 5120, torch.bfloat16, seed=9)
+    stream = torch.cuda.Stream(device=x.device)
+    stream.wait_stream(torch.cuda.current_stream(x.device))
+    actual, expected = [], []
+    with torch.cuda.stream(stream):
+        original = x.clone()
+        for mode in ("original", "zero", "negated"):
+            x.copy_(original)
+            if mode == "zero":
+                x.zero_()
+            elif mode == "negated":
+                x.neg_()
+            actual.append(fused_hc_head(x, fn, scale, base, 1e-6, 1e-6))
+            expected.append(torch_golden_hc_head(x, fn, scale, base, 1e-6, 1e-6))
+    torch.cuda.current_stream(x.device).wait_stream(stream)
+    atol, rtol = TOL[x.dtype]
+    for result, golden in zip(actual, expected):
+        torch.testing.assert_close(result.float(), golden, atol=atol, rtol=rtol)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="需要 CUDA/MACA GPU")
+def test_h5120_empty():
+    inputs = make_inputs(0, 4, 5120, torch.bfloat16)
+    actual = fused_hc_head(*inputs, 1e-6, 1e-6)
+    assert actual.shape == (0, 5120)
+    assert actual.dtype == torch.bfloat16
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="需要 CUDA/MACA GPU")
+@pytest.mark.parametrize("case", ("row_stride", "norm_eps", "hc_eps"))
+def test_h5120_aot_contract(case):
+    x, fn, scale, base = make_inputs(3, 4, 5120, torch.bfloat16)
+    ne, he = 1e-6, 1e-6
+    if case == "row_stride":
+        padded = torch.empty((3, 20480 + 8), device=x.device, dtype=x.dtype)
+        view = padded[:, :20480].view(3, 4, 5120)
+        view.copy_(x)
+        x = view
+    elif case == "norm_eps":
+        ne = 1e-4
+    else:
+        he = 1e-3
+    with pytest.raises(RuntimeError, match="AOT baseline requires contiguous x"):
+        fused_hc_head(x, fn, scale, base, ne, he)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="需要 CUDA/MACA GPU")
+@pytest.mark.parametrize("tokens", (1, 17, 132, 2048))
+@pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float16, torch.float32))
+@pytest.mark.parametrize("padded", (False, True))
+def test_h4096_regression(tokens, dtype, padded, full_precision_matmul):
+    x, fn, scale, base = make_inputs(tokens, 4, 4096, dtype)
+    if padded:
+        storage = torch.empty((tokens, 16384 + 8), device=x.device, dtype=dtype)
+        view = storage[:, :16384].view(tokens, 4, 4096)
+        view.copy_(x)
+        x = view
+    assert_head_matches_torch((x, fn, scale, base), norm_eps=1e-4, hc_eps=1e-3)
+
+
 # ============================ 精度 ============================
 def check_accuracy(T, M, H, dtype, norm_eps, hc_eps):
     x, fn, s, b = make_inputs(T, M, H, dtype)
@@ -140,12 +292,15 @@ def check_accuracy(T, M, H, dtype, norm_eps, hc_eps):
 def bench(T, M, H, dtype, norm_eps, hc_eps, peak_gbs):
     x, fn, s, b = make_inputs(T, M, H, dtype)
     out = torch.empty((T, H), dtype=dtype, device=x.device)
+    triton_out = torch.empty_like(out)
     esz = x.element_size()
 
     t_cu = triton.testing.do_bench(
-        lambda: fused_hc_head(x, fn, s, b, norm_eps, hc_eps, out=out), warmup=25, rep=100)  # ms
+        lambda: fused_hc_head(x, fn, s, b, norm_eps, hc_eps, out=out),
+        warmup=25, rep=100, return_mode="mean")  # ms, both outputs preallocated
     t_tr = (triton.testing.do_bench(
-        lambda: triton_hc_head(x, fn, s, b, norm_eps, hc_eps), warmup=25, rep=100)
+        lambda: triton_hc_head(x, fn, s, b, norm_eps, hc_eps, out=triton_out),
+        warmup=25, rep=100, return_mode="mean")
         if triton_supported(M) else float("nan"))
 
     # 最小必要访存：x 读 1 次 + y 写 1 次 + hc_fn/base/scale 各 1 次
@@ -193,7 +348,12 @@ def main():
     p.add_argument("--peak-bw", type=float, default=1500.0, help="峰值带宽 GB/s")
     p.add_argument("--skip-acc", action="store_true")
     p.add_argument("--skip-perf", action="store_true")
+    p.add_argument("--tp8dp2", action="store_true",
+                   help="使用 HC4/H5120 BF16 的全部16个生产N")
     a = p.parse_args()
+    if a.tp8dp2:
+        a.hidden, a.hc_mult, a.dtype = 5120, 4, "bf16"
+        a.tokens = list(DSV41_FLASH_INT8_TP8DP2_TOKENS)
 
     dtype = DTYPES[a.dtype]
     M, H = a.hc_mult, a.hidden
@@ -215,9 +375,11 @@ def main():
                     all_ok &= ok
                 print(f"{T:>6} | {name:>11} | {str(ok):>5} | {ma:>10.3e} | {rel:>10.3e} | {cos:>10.7f}")
         print(f"\nCUDA accuracy: {'PASS' if all_ok else 'FAIL'}")
+        if not all_ok:
+            raise SystemExit(1)
 
     if not a.skip_perf:
-        print("\n== Performance (BW = bytes_min / time) ==")
+        print("\n== Performance (both preallocated; local Triton reference, not vLLM) ==")
         hdr = (f"{'T':>6} | {'cuda(us)':>9} | {'triton(us)':>10} | {'ideal(us)':>9} | {'speedup':>8} | "
                f"{'cuda GB/s':>9} | {'cuda %pk':>8} | {'tri GB/s':>9} | {'tri %pk':>8}")
         print(hdr)

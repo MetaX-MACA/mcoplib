@@ -2,6 +2,8 @@
 #include <cuda_runtime.h>
 #include <torch/all.h>
 
+#include <algorithm>
+
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -60,10 +62,87 @@ int64_t moe_permute_sort_workspace_size(int64_t num_expanded_rows,
                                         int64_t n_expert) {
   // key: expert id
   // value: token id
-  // 额外预留 radix sort 临时空间
+  // 4 个 int buffer（keys/values 各两份）+ cub radix sort 需要的临时空间。
+  // cub 的需求随 shape 变化，取两者较大值，保证调用方传入的 workspace 充足。
   constexpr int64_t kNumBuffers = 4;
 
-  return num_expanded_rows * sizeof(int) * kNumBuffers;
+  MacaKeyValueSorter sorter(static_cast<int>(n_expert));
+  const int64_t cub_workspace_size = static_cast<int64_t>(
+      sorter.getWorkspaceSize(static_cast<size_t>(num_expanded_rows),
+                              static_cast<int>(n_expert)));
+
+  return std::max(num_expanded_rows * static_cast<int64_t>(sizeof(int)) *
+                      kNumBuffers,
+                  cub_workspace_size);
+}
+
+torch::Tensor moe_sort_routing(
+    const torch::Tensor& topk_ids,                   // [n_token, topk]
+    const torch::Tensor& token_expert_indices,       // [n_token, topk]
+    const std::optional<torch::Tensor>& expert_map,  // [n_expert]
+    int64_t n_expert, int64_t n_local_expert, int64_t topk,
+    torch::Tensor& expert_first_token_offset,  // [n_local_expert + 1]
+    torch::Tensor& inv_permuted_idx,           // [n_token, topk]
+    const std::optional<torch::Tensor>& maybe_sort_workspace,
+    const std::optional<torch::Tensor>& maybe_permuted_experts_id,
+    const std::optional<torch::Tensor>& maybe_sorted_row_idx,
+    const std::optional<torch::Tensor>& maybe_topk_ids_for_sort,
+    bool build_inverse) {
+  TORCH_CHECK(expert_first_token_offset.scalar_type() ==
+                      torch::headeronly::ScalarType::Long,
+                  "expert_first_token_offset must be int64");
+  TORCH_CHECK(topk_ids.scalar_type() == torch::headeronly::ScalarType::Int,
+                  "topk_ids must be int32");
+  TORCH_CHECK(
+      token_expert_indices.scalar_type() == torch::headeronly::ScalarType::Int,
+      "token_expert_indices must be int32");
+  TORCH_CHECK(
+      inv_permuted_idx.scalar_type() == torch::headeronly::ScalarType::Int,
+      "inv_permuted_idx must be int32");
+  TORCH_CHECK(expert_first_token_offset.size(0) == n_local_expert + 1,
+                  "expert_first_token_offset shape != n_local_expert+1");
+  TORCH_CHECK(
+      inv_permuted_idx.sizes().equals(token_expert_indices.sizes()),
+      "token_expert_indices shape must be same as inv_permuted_idx");
+
+  at::cuda::OptionalCUDAGuard const device_guard(topk_ids.device());
+  auto device = topk_ids.device();
+  auto n_token = topk_ids.sizes()[0];
+  auto expanded_rows = n_token * topk;
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  auto sorter_size = moe_permute_sort_workspace_size(expanded_rows, n_expert);
+  auto sort_workspace = maybe_allocate_tensor(
+      maybe_sort_workspace, {sorter_size}, torch::headeronly::ScalarType::Char,
+      device, "sort_workspace");
+  auto permuted_experts_id = maybe_allocate_tensor(
+      maybe_permuted_experts_id, topk_ids.sizes(),
+      torch::headeronly::ScalarType::Int, device, "permuted_experts_id");
+  auto sorted_row_idx = maybe_allocate_tensor(
+      maybe_sorted_row_idx, inv_permuted_idx.sizes(),
+      torch::headeronly::ScalarType::Int, device, "sorted_row_idx");
+
+  MacaKeyValueSorter sorter{};
+  torch::Tensor topk_ids_for_sort = topk_ids;
+
+  if (expert_map.has_value() || build_inverse) {
+    const int* expert_map_ptr =
+        expert_map.has_value() ? get_ptr<int>(expert_map.value()) : nullptr;
+    topk_ids_for_sort = maybe_allocate_tensor(
+        maybe_topk_ids_for_sort, topk_ids.sizes(),
+        torch::headeronly::ScalarType::Int, device, "topk_ids_for_sort");
+    topk_ids.copy_(topk_ids_for_sort);
+    preprocessTopkIdLauncher(get_ptr<int>(topk_ids_for_sort), n_token * topk,
+                             expert_map_ptr, n_expert, stream);
+  }
+
+  sortAndScanExpert(
+      get_ptr<const int>(topk_ids_for_sort), get_ptr<int>(token_expert_indices),
+      get_ptr<int>(permuted_experts_id), get_ptr<int>(sorted_row_idx),
+      get_ptr<int64_t>(expert_first_token_offset), n_token, n_expert,
+      n_local_expert, topk, sorter, get_ptr<int>(sort_workspace), stream,
+      build_inverse ? get_ptr<int>(inv_permuted_idx) : nullptr);
+  return sorted_row_idx;
 }
 
 void moe_permute_impl(
@@ -80,65 +159,19 @@ void moe_permute_impl(
     const std::optional<torch::Tensor>& maybe_permuted_experts_id,
     const std::optional<torch::Tensor>& maybe_sorted_row_idx,
     const std::optional<torch::Tensor>& maybe_topk_ids_for_sort) {
-  TORCH_CHECK(expert_first_token_offset.scalar_type() == at::ScalarType::Long,
-                  "expert_first_token_offset must be int64");
-  TORCH_CHECK(topk_ids.scalar_type() == at::ScalarType::Int,
-                  "topk_ids must be int32");
-  TORCH_CHECK(
-      token_expert_indices.scalar_type() == at::ScalarType::Int,
-      "token_expert_indices must be int32");
-  TORCH_CHECK(
-      inv_permuted_idx.scalar_type() == at::ScalarType::Int,
-      "inv_permuted_idx must be int32");
-  TORCH_CHECK(expert_first_token_offset.size(0) == n_local_expert + 1,
-                  "expert_first_token_offset shape != n_local_expert+1");
-  TORCH_CHECK(
-      inv_permuted_idx.sizes().equals(token_expert_indices.sizes()),
-      "token_expert_indices shape must be same as inv_permuted_idx");
-
-  const at::DeviceGuard device_guard(input.device());
-  auto device = input.device();
-  auto n_token = input.sizes()[0];
-  auto n_hidden = input.sizes()[1];
-  auto expanded_rows = n_token * topk;
-  auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
-
-  auto sorter_size = moe_permute_sort_workspace_size(expanded_rows, n_expert);
-  auto sort_workspace = maybe_allocate_tensor(
-      maybe_sort_workspace, {sorter_size}, at::ScalarType::Char,
-      device, "sort_workspace");
-  auto permuted_experts_id = maybe_allocate_tensor(
-      maybe_permuted_experts_id, topk_ids.sizes(),
-      at::ScalarType::Int, device, "permuted_experts_id");
-  auto sorted_row_idx = maybe_allocate_tensor(
-      maybe_sorted_row_idx, inv_permuted_idx.sizes(),
-      at::ScalarType::Int, device, "sorted_row_idx");
-
-  #if defined(USE_CUDA)
-  CubKeyValueSorter sorter;
-  #else
-  MacaKeyValueSorter sorter;
-  #endif
-  int64_t* valid_num_ptr = nullptr;
-  torch::Tensor topk_ids_for_sort = topk_ids;
-
-  if (expert_map.has_value()) {
-    const int* expert_map_ptr = get_ptr<int>(expert_map.value());
-    valid_num_ptr =
-        get_ptr<int64_t>(expert_first_token_offset) + n_local_expert;
-    topk_ids_for_sort = maybe_allocate_tensor(
-        maybe_topk_ids_for_sort, topk_ids.sizes(),
-        at::ScalarType::Int, device, "topk_ids_for_sort");
-    torch::copy(topk_ids_for_sort, topk_ids);
-    preprocessTopkIdLauncher(get_ptr<int>(topk_ids_for_sort), n_token * topk,
-                             expert_map_ptr, n_expert, stream);
-  }
-
-  sortAndScanExpert(
-      get_ptr<const int>(topk_ids_for_sort), get_ptr<int>(token_expert_indices),
-      get_ptr<int>(permuted_experts_id), get_ptr<int>(sorted_row_idx),
-      get_ptr<int64_t>(expert_first_token_offset), n_token, n_expert,
-      n_local_expert, topk, sorter, get_ptr<int>(sort_workspace), stream);
+  at::cuda::OptionalCUDAGuard const device_guard(input.device());
+  auto sorted_row_idx = moe_sort_routing(
+      topk_ids, token_expert_indices, expert_map, n_expert, n_local_expert,
+      topk, expert_first_token_offset, inv_permuted_idx, maybe_sort_workspace,
+      maybe_permuted_experts_id, maybe_sorted_row_idx, maybe_topk_ids_for_sort,
+      false);
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  auto n_token = input.size(0);
+  auto n_hidden = input.size(1);
+  auto valid_num_ptr =
+      expert_map.has_value()
+          ? get_ptr<int64_t>(expert_first_token_offset) + n_local_expert
+          : nullptr;
 
   MOE_DISPATCH(input.scalar_type(), [&] {
     expandInputRowsKernelLauncher<scalar_t>(
@@ -215,6 +248,22 @@ void moe_unpermute(
         get_ptr<int>(inv_permuted_idx), n_token, n_hidden, topk, valid_ptr,
         stream);
   });
+}
+
+void moe_prepare_scatter(const torch::Tensor& topk_ids,
+                         const torch::Tensor& token_expert_indices,
+                         const std::optional<torch::Tensor>& expert_map,
+                         int64_t n_expert, int64_t n_local_expert,
+                         torch::Tensor& expert_first_token_offset,
+                         torch::Tensor& scatter_idx,
+                         torch::Tensor& sort_workspace,
+                         torch::Tensor& sorted_experts,
+                         torch::Tensor& sorted_rows,
+                         torch::Tensor& topk_ids_for_sort) {
+  moe_sort_routing(topk_ids, token_expert_indices, expert_map, n_expert,
+                   n_local_expert, topk_ids.size(1), expert_first_token_offset,
+                   scatter_idx, sort_workspace, sorted_experts, sorted_rows,
+                   topk_ids_for_sort, true);
 }
 
 template <typename T>
@@ -342,4 +391,5 @@ TORCH_LIBRARY_IMPL_EXPAND(TORCH_EXTENSION_NAME, CUDA, m) {
     m.impl("moe_permute", &moe_permute);
     m.impl("moe_permute_with_scratch", &moe_permute_with_scratch);
     m.impl("moe_unpermute", &moe_unpermute);
+    m.impl("moe_prepare_scatter", &moe_prepare_scatter);
 }

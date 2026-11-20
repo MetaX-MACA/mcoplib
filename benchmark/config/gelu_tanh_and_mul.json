@@ -1,9 +1,9 @@
 {
     "device_id": 0,
     "device_name": ["MetaX C500", "MetaX C600-UL", "Metax C600-U"],
-    "batch_size": 8,
+    "batch_size": [1, 8, 64, 512],
     "seq_len": 128,
-    "hidden_size": 4096,
+    "hidden_size": [2048, 4096, 7168],
     "dtype": "bfloat16",
-    "samples": 1000
+    "samples": 100
 }

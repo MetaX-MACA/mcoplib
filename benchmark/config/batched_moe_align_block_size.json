@@ -3,8 +3,8 @@
     "device_name": ["MetaX C500", "MetaX C600-UL", "Metax C600-U"],
     "max_tokens_per_batch": 131072,
     "block_size": 128,
-    "num_experts": 128,
-    "num_tokens": 65536,
+    "num_experts": [32, 128, 256],
+    "num_tokens": [4096, 16384],
     "dtype": "int64",
-    "samples": 1000
+    "samples": 100
 }

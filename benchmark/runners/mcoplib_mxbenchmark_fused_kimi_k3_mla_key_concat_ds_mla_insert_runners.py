@@ -22,12 +22,21 @@ class Fused_kimi_k3_mla_key_concat_ds_mla_insert_runner(OpBenchmarkBase):
         state.add_summary("Shape",f"tokens={self.num_tokens} heads={self.num_heads}")
         elements=self.num_tokens*self.num_heads*192
         state.add_element_count(elements)
-        state.add_global_memory_reads(self.num_tokens*(self.num_heads*128+64+512)*2)
-        state.add_global_memory_writes(self.num_tokens*(self.num_heads*192))
+        # 4-head light warps (kernel's KIMI_K3_HEADS_PER_WARP=4): k_pe is read
+        # once per light warp (shared by its 4 head slots) plus once by the
+        # cache order.
+        light_orders=(self.num_heads+3)//4
+        # reads (bf16, x2 bytes): q rope seg per head (H*64) + k_nope per head
+        # (H*128) + k_pe per light order (light_orders*64) + k_pe for the cache
+        # row (64) + kv_c (512); plus cos/sin row (64 floats = 256B) per token
+        state.add_global_memory_reads(self.num_tokens*(self.num_heads*(64+128)+light_orders*64+64+512)*2 + self.num_tokens*256)
+        # writes: q rope seg per head (H*64, bf16 x2) + k_out per head (H*192,
+        # bf16 x2) + 656B fp8_ds_mla cache row per token
+        state.add_global_memory_writes(self.num_tokens*(self.num_heads*(64+192))*2 + self.num_tokens*656)
 
-    def make_rope_cache(self,dev):
+    def make_rope_cache(self,dev,max_position=2048):
         inv_freq=1.0/(50000**(torch.arange(0,64,2,device=dev,dtype=torch.float32)/64))
-        pos=torch.arange(2048,device=dev,dtype=torch.float32)
+        pos=torch.arange(max_position,device=dev,dtype=torch.float32)
         freq=torch.outer(pos,inv_freq)
         return torch.cat([freq.cos(),freq.sin()],dim=-1)
 
@@ -42,13 +51,15 @@ class Fused_kimi_k3_mla_key_concat_ds_mla_insert_runner(OpBenchmarkBase):
 
             k_out=torch.empty(self.num_tokens,self.num_heads,192,dtype=self.dtype,device=dev)
 
-            num_blocks=4
+            num_blocks=(self.num_tokens + self.block_size - 1) // self.block_size
             k_cache=torch.zeros(num_blocks,self.block_size,656,dtype=torch.uint8,device=dev)
 
             slots=torch.arange(self.num_tokens,dtype=torch.int64,device=dev)
             positions=torch.arange(self.num_tokens,dtype=torch.int64,device=dev)
 
-            rope_cache=self.make_rope_cache(dev)
+            # positions 最大到 num_tokens-1，rope_cache 必须覆盖同样多的位置，
+            # 否则 kernel 越界读 cos_sin_cache 触发 ATU 错误
+            rope_cache=self.make_rope_cache(dev,max_position=max(self.num_tokens,2048))
 
         return self.make_launcher(dev_id,torch.ops._C.fused_kimi_k3_mla_key_concat_ds_mla_insert,q,k_nope,k_pe,kv_c,k_out,k_cache,slots,self.block_size,positions,rope_cache)
 

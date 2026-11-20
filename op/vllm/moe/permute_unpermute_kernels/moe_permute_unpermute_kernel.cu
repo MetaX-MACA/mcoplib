@@ -3,8 +3,7 @@
 #include <torch/all.h>
 #include <ATen/ATen.h>
 #include <c10/util/Exception.h>
-#include <thrust/device_ptr.h>
-#include <thrust/sort.h>
+#include <cub/cub.cuh>
 #include <cmath>
 
 #include "moe/permute_unpermute_kernels/moe_permute_unpermute_kernel.h"
@@ -89,8 +88,20 @@ void MacaKeyValueSorter::updateNumExperts(
 size_t MacaKeyValueSorter::getWorkspaceSize(
     size_t num_key_value_pairs,
     int num_experts) {
+  size_t temp_storage_bytes = 0;
+  int* null_int = nullptr;
+  const int num_bits = expertsToBits(num_experts);
 
-  return 0;
+  // Query only (no kernel is launched, nothing is synchronized).
+  mcError_t status = cub::DeviceRadixSort::SortPairs(
+      nullptr, temp_storage_bytes, null_int, null_int, null_int, null_int,
+      num_key_value_pairs, 0, num_bits);
+  TORCH_CHECK(
+      status == mcSuccess,
+      "[MacaKeyValueSorter::getWorkspaceSize] SortPairs size query failed, "
+      "status=", static_cast<int>(status));
+
+  return temp_storage_bytes;
 }
 
 void MacaKeyValueSorter::run(
@@ -102,43 +113,26 @@ void MacaKeyValueSorter::run(
     int* values_out,
     size_t num_key_value_pairs,
     cudaStream_t stream) {
-
+  const int num_bits = expertsToBits(num_experts_);
+  const size_t required_workspace_size =
+      getWorkspaceSize(num_key_value_pairs, num_experts_);
 
   TORCH_CHECK(
-      workspace_size >= getWorkspaceSize(
-          num_key_value_pairs,
-          num_experts_),
-      "[MacaKeyValueSorter::run] workspace too small");
+      workspace_size >= required_workspace_size,
+      "[MacaKeyValueSorter::run] workspace too small: need ",
+      required_workspace_size, " bytes, got ", workspace_size);
 
-
-  cudaMemcpyAsync(
-      keys_out,
-      keys_in,
-      num_key_value_pairs * sizeof(int),
-      cudaMemcpyDeviceToDevice,
-      stream);
-
-
-  cudaMemcpyAsync(
-      values_out,
-      values_in,
-      num_key_value_pairs * sizeof(int),
-      cudaMemcpyDeviceToDevice,
-      stream);
-
-
-
-  auto keys =
-      thrust::device_pointer_cast(keys_out);
-
-  auto values =
-      thrust::device_pointer_cast(values_out);
-
-
-  thrust::sort_by_key(
-      keys,
-      keys + num_key_value_pairs,
-      values);
+  // Fully asynchronous on `stream`: cub sorts straight from the input arrays
+  // into the output arrays using the caller-provided workspace. There is no
+  // host synchronization and no allocation, so this is safe to call from a
+  // benchmark that only synchronizes the stream from the host side.
+  mcError_t status = cub::DeviceRadixSort::SortPairs(
+      workspace, workspace_size, keys_in, keys_out, values_in, values_out,
+      num_key_value_pairs, 0, num_bits, stream);
+  TORCH_CHECK(
+      status == mcSuccess,
+      "[MacaKeyValueSorter::run] SortPairs failed, status=",
+      static_cast<int>(status));
 }
 // MacaKeyValueSorter definition end
 
@@ -164,34 +158,40 @@ __device__ inline int64_t findTotalEltsLessThanTarget(T const* sorted_indices,
   return target_location + 1;
 }
 
-// Calculates the start offset of the tokens for a given expert. The last
-// element is the total number of valid tokens
-__global__ void computeExpertFirstTokenOffsetKernel(
+// Computes expert offsets (ending with the valid row count) and optional
+// inverse indices.
+__global__ void computeExpertOffsetsAndInverseKernel(
     int const* sorted_experts, int64_t const sorted_experts_len,
-    int const num_experts, int64_t* expert_first_token_offset) {
-  // First, compute the global tid. We only need 1 thread per expert.
-  int const expert = blockIdx.x * blockDim.x + threadIdx.x;
+    int const num_experts, int64_t* expert_first_token_offset,
+    int const* sorted_rows, int* inverse) {
+  int const index = blockIdx.x * blockDim.x + threadIdx.x;
 
   // Note that expert goes [0, num_experts] (inclusive) because we want a count
   // for the total number of active tokens at the end of the scan.
-  if (expert >= num_experts + 1) {
-    return;
+  if (index < num_experts + 1) {
+    expert_first_token_offset[index] =
+        findTotalEltsLessThanTarget(sorted_experts, sorted_experts_len, index);
   }
-  expert_first_token_offset[expert] =
-      findTotalEltsLessThanTarget(sorted_experts, sorted_experts_len, expert);
+  if (inverse != nullptr && index < sorted_experts_len) {
+    inverse[sorted_rows[index]] = index;
+  }
 }
 
-void computeExpertFirstTokenOffset(int const* sorted_indices,
-                                   int const total_indices,
-                                   int const num_experts,
-                                   int64_t* expert_first_token_offset,
-                                   cudaStream_t stream) {
-  int const num_entries = num_experts + 1;
-  int const threads = std::min(1024, num_entries);
+void computeExpertOffsetsAndInverse(int const* sorted_indices,
+                                    int const total_indices,
+                                    int const num_experts,
+                                    int64_t* expert_first_token_offset,
+                                    int const* sorted_rows, int* inverse,
+                                    cudaStream_t stream) {
+  int const num_entries = inverse != nullptr
+                              ? std::max(num_experts + 1, total_indices)
+                              : num_experts + 1;
+  int const threads = inverse != nullptr ? 256 : std::min(1024, num_entries);
   int const blocks = (num_entries + threads - 1) / threads;
 
-  computeExpertFirstTokenOffsetKernel<<<blocks, threads, 0, stream>>>(
-      sorted_indices, total_indices, num_experts, expert_first_token_offset);
+  computeExpertOffsetsAndInverseKernel<<<blocks, threads, 0, stream>>>(
+      sorted_indices, total_indices, num_experts, expert_first_token_offset,
+      sorted_rows, inverse);
 }
 
 template <typename Sorter>
@@ -200,7 +200,7 @@ void sortAndScanExpert(const int* expert_for_source_row, const int* source_rows,
                        int64_t* expert_first_token_offset, int num_rows,
                        int num_experts, int num_experts_per_node, int k,
                        Sorter& sorter, void* sorter_ws,
-                       cudaStream_t stream) {
+                       cudaStream_t stream, int* inverse) {
   int64_t const expanded_num_rows = static_cast<int64_t>(k) * num_rows;
   // We need to use the full num_experts because that is the sentinel value used
   // by topk for disabled experts
@@ -210,9 +210,9 @@ void sortAndScanExpert(const int* expert_for_source_row, const int* source_rows,
   sorter.run((void*)sorter_ws, sorter_ws_size_bytes, expert_for_source_row,
              permuted_experts, source_rows, permuted_rows, expanded_num_rows,
              stream);
-  computeExpertFirstTokenOffset(permuted_experts, expanded_num_rows,
-                                num_experts_per_node, expert_first_token_offset,
-                                stream);
+  computeExpertOffsetsAndInverse(
+      permuted_experts, expanded_num_rows, num_experts_per_node,
+      expert_first_token_offset, permuted_rows, inverse, stream);
 }
 
 __global__ void preprocessTopkIdKernel(int* topk_id_ptr, int size,
@@ -225,7 +225,7 @@ __global__ void preprocessTopkIdKernel(int* topk_id_ptr, int size,
   extern __shared__ int smem_expert_map[];
   // store expert_map in smem
   for (int i = tidx; i < num_experts; i += blockDim.x) {
-    smem_expert_map[i] = expert_map_ptr[i];
+    smem_expert_map[i] = expert_map_ptr ? expert_map_ptr[i] : i;
   }
   __syncthreads();
 
@@ -269,4 +269,5 @@ template void sortAndScanExpert<MacaKeyValueSorter>(
     int,
     MacaKeyValueSorter&,
     void*,
-    cudaStream_t);
+    cudaStream_t,
+    int*);

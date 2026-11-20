@@ -1,11 +1,11 @@
 {
     "device_id": 0,
     "device_name": ["MetaX C500", "MetaX C600-UL", "Metax C600-U"],
-    "batch_size": 1024,
+    "batch_size": [1, 8, 64, 256, 1024],
     "topk": 4,
     "depth": 5,
-    "draft_token_num": 64,
+    "draft_token_num": [8, 16, 64],
     "tree_mask_mode": 1,
     "dtype": "int64",
-    "samples": 1000
+    "samples": 100
 }

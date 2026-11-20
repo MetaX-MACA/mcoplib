@@ -8,6 +8,18 @@ import triton.language as tl
 PAD_SLOT_ID = -1
 
 
+# MetaX capability 80 corresponds to xcore1000/xcore1008 (C500). Keep the
+# shape-specific launch policy below isolated from newer MetaX generations and
+# all other Triton backends.
+try:
+    _current_target = triton.runtime.driver.active.get_current_target()
+    is_xcore1000_or_1008 = (
+        _current_target.backend == "maca" and _current_target.arch == 80
+    )
+except BaseException:
+    is_xcore1000_or_1008 = False
+
+
 @triton.jit()
 def _causal_conv1d_fwd_kernel(  # continuous batching
     # Pointers to matrices
@@ -402,7 +414,7 @@ def _causal_conv1d_fwd_kernel_optimized(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
-    """Width-4 streaming kernel tuned for MetaX C600U."""
+    """Width-4 streaming causal convolution kernel."""
     state_len: tl.constexpr = 3
     idx_seq = tl.program_id(0)
     idx_chunk = tl.program_id(1)
@@ -834,14 +846,39 @@ def causal_conv1d_fwd(
         if has_initial_state is not None:
             assert has_initial_state.shape == (padded_batch,)
 
-    
-    default_num_warps = 2
+    max_seq_len = max(seq_lens_cpu)
+    if is_xcore1000_or_1008:
+        if max_seq_len <= 32:
+            # Short tails need more feature-parallel programs and enough
+            # threads per CTA to minimize single-wave latency.
+            default_block_m = 8
+            default_block_n = 256
+            default_num_warps = 4
+        elif dim == 24576 and max_seq_len <= 64:
+            # GLM5.3-flash decode: balance token work per CTA against the 96
+            # feature tiles needed to fill C500.
+            default_block_m = 16
+            default_block_n = 256
+            default_num_warps = 2
+        else:
+            # Long prefill has enough chunk parallelism; wider feature tiles
+            # and four warps provide the best C500 memory throughput.
+            default_block_m = 32
+            default_block_n = 512
+            default_num_warps = 4
+    else:
+        default_block_m = 32
+        default_block_n = 512
+        default_num_warps = 2
 
+    block_m = kwargs.pop("_block_m", default_block_m)
+    block_n = kwargs.pop("_block_n", default_block_n)
     num_warps = kwargs.pop("_num_warps", default_num_warps)
+
     def grid(meta):
         return (
             len(seq_lens_cpu),
-            triton.cdiv(max(seq_lens_cpu), meta["BLOCK_M"]),
+            triton.cdiv(max_seq_len, meta["BLOCK_M"]),
             triton.cdiv(dim, meta["BLOCK_N"]),
         )
 
@@ -871,8 +908,8 @@ def causal_conv1d_fwd(
         HAS_INITIAL_STATES=has_initial_state is not None,
         IS_CONTINUOUS_BATCHING=cache_indices is not None,
         USE_PAD_SLOT=pad_slot_id is not None,
-        BLOCK_M=32,
-        BLOCK_N=512,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
         num_warps=num_warps,
         num_stages=2,
     )

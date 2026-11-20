@@ -1,6 +1,7 @@
 import pytest
 import torch
 import mcoplib._C
+import re
 
 
 OP = torch.ops._C.hisparse_resolve_residency
@@ -24,6 +25,7 @@ def _base_inputs(rows=2, top_k=2, hot_size=4, block_size=BLOCK_SIZE):
         "lru_slots": torch.zeros((max(rows, 1), hot_size), dtype=torch.int16, device=DEVICE)[:rows],
         "request_state_indices": None,
         "region_stride": hot_size,
+        "max_union_rows": min(top_k, hot_size),
         "miss_mask": None,
         "stats": None,
         "attention_indices": None,
@@ -53,6 +55,7 @@ def _invoke(args):
         args["lru_slots"],
         args["request_state_indices"],
         args["region_stride"],
+        args["max_union_rows"],
         args["miss_mask"],
         args["stats"],
         args["attention_indices"],
@@ -72,7 +75,7 @@ def _invoke(args):
 
 
 def _assert_raises(args, message):
-    with pytest.raises(RuntimeError, match=message):
+    with pytest.raises(RuntimeError, match=re.escape(message)):
         _invoke(args)
 
 
@@ -89,10 +92,88 @@ def test_hisparse_resolve_residency_basic():
 def test_hisparse_resolve_residency_empty_rows():
     args = _base_inputs(rows=0, top_k=2, hot_size=4)
     _invoke(args)
+    torch.cuda.synchronize()
 
 
 def test_hisparse_resolve_residency_empty_top_k():
     args = _base_inputs(rows=2, top_k=0, hot_size=4)
+    _invoke(args)
+    torch.cuda.synchronize()
+
+
+def test_hisparse_resolve_residency_multiple_rows_and_top_k():
+    args = _base_inputs(rows=4, top_k=3, hot_size=8, block_size=4)
+    args["max_union_rows"] = 5
+    args["hot_block_table"] = torch.zeros((4, 2), dtype=torch.int32, device=DEVICE)
+    _invoke(args)
+    torch.cuda.synchronize()
+
+
+# ---------------------------------------------------------------------------
+# max_union_rows validation
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("max_union_rows", [1, 2, 3, 4])
+def test_hisparse_resolve_residency_accepts_valid_max_union_rows(max_union_rows):
+    args = _base_inputs(rows=2, top_k=2, hot_size=4)
+    args["max_union_rows"] = max_union_rows
+    _invoke(args)
+    torch.cuda.synchronize()
+
+
+@pytest.mark.parametrize("max_union_rows", [0, -1, -4])
+def test_hisparse_resolve_residency_rejects_non_positive_max_union_rows(max_union_rows):
+    args = _base_inputs(rows=2, top_k=2, hot_size=4)
+    args["max_union_rows"] = max_union_rows
+    _assert_raises(args, r"max_union_rows must be in")
+
+
+@pytest.mark.parametrize("max_union_rows", [5, 8, 32769])
+def test_hisparse_resolve_residency_rejects_max_union_rows_above_hot_size(max_union_rows):
+    args = _base_inputs(rows=2, top_k=2, hot_size=4)
+    args["max_union_rows"] = max_union_rows
+    _assert_raises(args, r"max_union_rows must be in")
+
+
+def test_hisparse_resolve_residency_max_union_rows_one():
+    args = _base_inputs(rows=1, top_k=1, hot_size=4)
+    args["max_union_rows"] = 1
+    _invoke(args)
+    torch.cuda.synchronize()
+
+
+def test_hisparse_resolve_residency_max_union_rows_equals_hot_size():
+    args = _base_inputs(rows=2, top_k=2, hot_size=4)
+    args["max_union_rows"] = 4
+    _invoke(args)
+    torch.cuda.synchronize()
+
+
+def test_hisparse_resolve_residency_max_union_rows_greater_than_top_k():
+    args = _base_inputs(rows=2, top_k=2, hot_size=8, block_size=4)
+    args["max_union_rows"] = 6
+    args["hot_block_table"] = torch.zeros((2, 2), dtype=torch.int32, device=DEVICE)
+    assert args["max_union_rows"] > args["global_indices"].size(1)
+    assert args["max_union_rows"] <= args["lru_slots"].size(1)
+    _invoke(args)
+    torch.cuda.synchronize()
+
+
+def test_hisparse_resolve_residency_rejects_max_union_rows_above_hot_size_with_small_top_k():
+    args = _base_inputs(rows=1, top_k=1, hot_size=4)
+    args["max_union_rows"] = 5
+    _assert_raises(args, r"max_union_rows must be in")
+
+
+def test_hisparse_resolve_residency_empty_rows_skips_max_union_rows_validation():
+    args = _base_inputs(rows=0, top_k=2, hot_size=4)
+    args["max_union_rows"] = 0
+    _invoke(args)
+
+
+def test_hisparse_resolve_residency_empty_top_k_skips_max_union_rows_validation():
+    args = _base_inputs(rows=2, top_k=0, hot_size=4)
+    args["max_union_rows"] = 0
     _invoke(args)
 
 
@@ -112,10 +193,7 @@ def test_hisparse_resolve_residency_rejects_hot_cache_on_cpu():
     _assert_raises(args, "hot_cache must be on CUDA")
 
 
-@pytest.mark.parametrize(
-    "field",
-    ["global_indices", "hot_indices", "device_global_indices"],
-)
+@pytest.mark.parametrize("field", ["global_indices", "hot_indices", "device_global_indices"])
 def test_hisparse_resolve_residency_rejects_wrong_int32_dtype(field):
     args = _base_inputs()
     args[field] = args[field].to(torch.int64)
@@ -425,6 +503,20 @@ def test_hisparse_resolve_residency_rejects_request_state_wrong_dim():
     _assert_raises(args, "request_state_indices must be contiguous 1D int32 on CUDA")
 
 
+def test_hisparse_resolve_residency_with_request_state_indices():
+    args = _base_inputs(rows=2, top_k=2, hot_size=4)
+    args["request_state_indices"] = torch.tensor([0, 1], dtype=torch.int32, device=DEVICE)
+    _invoke(args)
+    torch.cuda.synchronize()
+
+
+def test_hisparse_resolve_residency_with_non_identity_request_state_indices():
+    args = _base_inputs(rows=2, top_k=2, hot_size=4)
+    args["request_state_indices"] = torch.tensor([1, 0], dtype=torch.int32, device=DEVICE)
+    _invoke(args)
+    torch.cuda.synchronize()
+
+
 # ---------------------------------------------------------------------------
 # miss_mask, stats, attention_indices validation
 # ---------------------------------------------------------------------------
@@ -503,4 +595,170 @@ def test_hisparse_resolve_residency_with_request_source_and_resident_tables():
     args["resident_null_block"] = 0
 
     _invoke(args)
+    torch.cuda.synchronize()
+
+
+def test_hisparse_resolve_residency_with_request_source_table_without_resident_table():
+    args = _base_inputs(rows=2, top_k=2, hot_size=4)
+    args["request_ids"] = torch.tensor([0, 1], dtype=torch.int32, device=DEVICE)
+    args["source_block_table"] = torch.zeros((2, 4), dtype=torch.int32, device=DEVICE)
+
+    _invoke(args)
+    torch.cuda.synchronize()
+
+
+def test_hisparse_resolve_residency_with_all_optional_outputs_and_tables():
+    args = _base_inputs(rows=2, top_k=2, hot_size=4)
+    args["request_ids"] = torch.tensor([0, 1], dtype=torch.int32, device=DEVICE)
+    args["source_block_table"] = torch.zeros((2, 4), dtype=torch.int32, device=DEVICE)
+    args["resident_block_table"] = torch.zeros((2, 4), dtype=torch.int32, device=DEVICE)
+    args["miss_mask"] = torch.zeros((2, 2), dtype=torch.int32, device=DEVICE)
+    args["stats"] = torch.zeros((2,), dtype=torch.uint64, device=DEVICE)
+    args["attention_indices"] = torch.zeros((2, 2), dtype=torch.int32, device=DEVICE)
+    args["attention_block_stride"] = BLOCK_SIZE
+    args["resolved_global_indices"] = torch.zeros((2, 2), dtype=torch.int32, device=DEVICE)
+    args["valid_counts"] = torch.zeros((2,), dtype=torch.int32, device=DEVICE)
+    args["swap_host_physical_rows"] = torch.zeros((2, 2), dtype=torch.int32, device=DEVICE)
+    args["swap_device_physical_rows"] = torch.zeros((2, 2), dtype=torch.int32, device=DEVICE)
+    args["swap_counts"] = torch.zeros((2,), dtype=torch.int32, device=DEVICE)
+
+    _invoke(args)
+    torch.cuda.synchronize()
+
+
+# ---------------------------------------------------------------------------
+# Non-contiguous optional inputs
+# ---------------------------------------------------------------------------
+
+def test_hisparse_resolve_residency_rejects_noncontiguous_request_ids():
+    args = _base_inputs()
+    args["request_ids"] = torch.zeros((4,), dtype=torch.int32, device=DEVICE)[::2]
+    args["source_block_table"] = torch.zeros((2, 4), dtype=torch.int32, device=DEVICE)
+    _assert_raises(args, "request_ids must be contiguous int32 on CUDA with one entry per row")
+
+
+def test_hisparse_resolve_residency_rejects_non_row_major_source_table():
+    args = _base_inputs()
+    args["request_ids"] = torch.zeros((2,), dtype=torch.int32, device=DEVICE)
+    args["source_block_table"] = torch.zeros((4, 2), dtype=torch.int32, device=DEVICE).transpose(0, 1)
+    _assert_raises(args, "source_block_table must be a row-major 2D int32 CUDA tensor")
+
+
+def test_hisparse_resolve_residency_rejects_non_row_major_resident_table():
+    args = _base_inputs()
+    args["request_ids"] = torch.zeros((2,), dtype=torch.int32, device=DEVICE)
+    args["source_block_table"] = torch.zeros((2, 4), dtype=torch.int32, device=DEVICE)
+    args["resident_block_table"] = torch.zeros((4, 2), dtype=torch.int32, device=DEVICE).transpose(0, 1)
+    _assert_raises(args, "resident_block_table must be a row-major 2D int32 CUDA tensor")
+
+
+def test_hisparse_resolve_residency_rejects_noncontiguous_resolved_indices():
+    args = _base_inputs()
+    args["resolved_global_indices"] = torch.zeros((2, 4), dtype=torch.int32, device=DEVICE)[:, ::2]
+    _assert_raises(args, "resolved_global_indices must be contiguous int32 matching indices")
+
+
+def test_hisparse_resolve_residency_rejects_noncontiguous_miss_mask():
+    args = _base_inputs()
+    args["miss_mask"] = torch.zeros((2, 4), dtype=torch.int32, device=DEVICE)[:, ::2]
+    _assert_raises(args, "miss_mask must be a contiguous int32 CUDA tensor matching")
+
+
+def test_hisparse_resolve_residency_rejects_noncontiguous_stats():
+    args = _base_inputs()
+    args["stats"] = torch.zeros((4,), dtype=torch.uint64, device=DEVICE)[::2]
+    _assert_raises(args, "stats must be a contiguous two-element uint64 CUDA tensor")
+
+
+def test_hisparse_resolve_residency_rejects_noncontiguous_compact_swaps():
+    args = _base_inputs()
+    args["swap_host_physical_rows"] = torch.zeros((2, 4), dtype=torch.int32, device=DEVICE)[:, ::2]
+    args["swap_device_physical_rows"] = torch.zeros((2, 2), dtype=torch.int32, device=DEVICE)
+    args["swap_counts"] = torch.zeros((2,), dtype=torch.int32, device=DEVICE)
+    _assert_raises(args, "compact swaps must be contiguous int32 matching indices")
+
+
+# ---------------------------------------------------------------------------
+# Additional shape and validation boundaries
+# ---------------------------------------------------------------------------
+
+def test_hisparse_resolve_residency_supports_hot_block_table_noncontiguous_columns():
+    args = _base_inputs(rows=2, top_k=2, hot_size=8, block_size=BLOCK_SIZE)
+    required_cols = (args["region_stride"] + BLOCK_SIZE - 1) // BLOCK_SIZE
+    base = torch.zeros((2, required_cols * 2), dtype=torch.int32, device=DEVICE)
+    args["hot_block_table"] = base[:, ::2]
+    assert args["hot_block_table"].shape[1] >= required_cols
+    assert args["hot_block_table"].stride(1) != 1
+    _invoke(args)
+
+
+def test_hisparse_resolve_residency_rejects_global_indices_wrong_dtype():
+    args = _base_inputs()
+    args["global_indices"] = args["global_indices"].to(torch.int64)
+    _assert_raises(args, "global_indices/hot_indices must be int32")
+
+
+def test_hisparse_resolve_residency_rejects_hot_indices_wrong_dtype():
+    args = _base_inputs()
+    args["hot_indices"] = args["hot_indices"].to(torch.int64)
+    _assert_raises(args, "global_indices/hot_indices must be int32")
+
+
+def test_hisparse_resolve_residency_rejects_lru_slots_wrong_dim():
+    args = _base_inputs()
+    args["lru_slots"] = torch.zeros((8,), dtype=torch.int16, device=DEVICE)
+    _assert_raises(args, "lru_slots must be contiguous with one row per request state")
+
+
+def test_hisparse_resolve_residency_rejects_hot_cache_wrong_dim():
+    args = _base_inputs()
+    args["hot_cache"] = torch.zeros((2, BLOCK_SIZE * ROW_BYTES), dtype=torch.uint8, device=DEVICE)
+    _assert_raises(args, "hot_cache must be [num_blocks, block_size, row_width]")
+
+
+def test_hisparse_resolve_residency_rejects_attention_indices_non_row_major():
+    args = _base_inputs()
+    args["attention_indices"] = torch.zeros((2, 2), dtype=torch.int32, device=DEVICE).transpose(0, 1)
+    args["attention_block_stride"] = BLOCK_SIZE
+    _assert_raises(args, "attention_indices must be row-major int32 matching global_indices")
+
+
+def test_hisparse_resolve_residency_accepts_attention_block_stride_equal_to_block_size():
+    args = _base_inputs()
+    args["attention_indices"] = torch.zeros((2, 2), dtype=torch.int32, device=DEVICE)
+    args["attention_block_stride"] = BLOCK_SIZE
+    _invoke(args)
+    torch.cuda.synchronize()
+
+
+# ---------------------------------------------------------------------------
+# Output initialization and repeated invocation
+# ---------------------------------------------------------------------------
+
+def test_hisparse_resolve_residency_optional_outputs_have_expected_shapes():
+    args = _base_inputs(rows=2, top_k=2, hot_size=4)
+    args["miss_mask"] = torch.full((2, 2), -1, dtype=torch.int32, device=DEVICE)
+    args["stats"] = torch.zeros((2,), dtype=torch.uint64, device=DEVICE)
+    args["resolved_global_indices"] = torch.full((2, 2), -1, dtype=torch.int32, device=DEVICE)
+    args["valid_counts"] = torch.full((2,), -1, dtype=torch.int32, device=DEVICE)
+    args["swap_host_physical_rows"] = torch.full((2, 2), -1, dtype=torch.int32, device=DEVICE)
+    args["swap_device_physical_rows"] = torch.full((2, 2), -1, dtype=torch.int32, device=DEVICE)
+    args["swap_counts"] = torch.full((2,), -1, dtype=torch.int32, device=DEVICE)
+
+    _invoke(args)
+    torch.cuda.synchronize()
+
+    assert args["miss_mask"].shape == (2, 2)
+    assert args["stats"].shape == (2,)
+    assert args["resolved_global_indices"].shape == (2, 2)
+    assert args["valid_counts"].shape == (2,)
+    assert args["swap_host_physical_rows"].shape == (2, 2)
+    assert args["swap_device_physical_rows"].shape == (2, 2)
+    assert args["swap_counts"].shape == (2,)
+
+
+def test_hisparse_resolve_residency_repeated_invocation():
+    args = _base_inputs(rows=2, top_k=2, hot_size=4)
+    for _ in range(3):
+        _invoke(args)
     torch.cuda.synchronize()

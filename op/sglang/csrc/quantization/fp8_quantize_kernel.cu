@@ -142,14 +142,45 @@ void per_token_cast_to_f8_kernel(const T* __restrict__ input,
     for (int s = LANES >> 1; s >= 1; s >>= 1)
         abs_max = fmaxf(abs_max, __shfl_xor_sync(0xffffffffffffffffULL, abs_max, s));
 
+    // vllm per_token_group_quant_8bit parity: the scale must be the true
+    // IEEE quotient absmax / 448 (vllm divides by the runtime max_8bit), and
+    // the reciprocal is taken of that scale, not 448*rcpf(absmax).
+    // __builtin_mxc_rcpf flushes to 0 once its result is subnormal, which for
+    // 448*rcpf(absmax) happens at absmax > ~8.5e37 (bf16 reaches 3.4e38) and
+    // silently zeroes the whole group; the scale argument sits 448x further
+    // from that flush point.
+    //
+    // This TU compiles with -use-fast-math, which lowers every division
+    // (literal, __fdiv_rn, runtime divisor, even fp64) to a multiply by
+    // fl(1/448), 1 ulp off the true quotient on ~54% of scales and breaking
+    // bit parity with the vllm reference ops.  Compute the correctly rounded
+    // quotient with the Markstein iteration instead (2 FMAs around the
+    // correctly rounded reciprocal):  q0 = RN(a*r), e = a - 448*q0 (exact
+    // via FMA), q = RN(q0 + e*r) == RN(a/448) for every finite a
+    // (probe-verified on 2.1e6 values including near-FLT_MAX).  +-inf takes
+    // the plain product, which yields +-inf like the true division.
+    float y_s;
+    if (__builtin_isinf(abs_max)) {
+        y_s = abs_max * (1.0f / 448.0f);
+    } else {
+        const float r = 1.0f / 448.0f;
+        const float q0 = abs_max * r;
+        const float e = fmaf(-q0, 448.0f, abs_max);
+        y_s = fmaf(e, r, q0);
+    }
     if ((tid & (LANES - 1)) == 0) {
         const int g = off >> 7;
-        scale[TRANS_SCATTER ? (g % G) * m + g / G : g] = abs_max * (1.0f / 448.0f);
+        scale[TRANS_SCATTER ? (g % G) * m + g / G : g] = y_s;
     }
 
-    const float div = 448.0f * __builtin_mxc_rcpf(abs_max);
+    const float div = __builtin_mxc_rcpf(y_s);
+    // Clamp to +-448 before the cast, as both vllm references do:
+    // __builtin_mxc_cvt_pk4_f32tof8 is non-saturating above 464 and emits
+    // 0x7f/0xff (NaN) for overflow, +-inf and NaN inputs.  The fmaxf-first
+    // order folds NaN to -448, matching the vllm group-quant regs path.
     #pragma unroll
-    for (int i = 0; i < VEC; ++i) f[i] *= div;
+    for (int i = 0; i < VEC; ++i)
+        f[i] = fminf(fmaxf(f[i] * div, -448.0f), 448.0f);
 
     __maca_fp8_e4m3 d[VEC];
     #pragma unroll

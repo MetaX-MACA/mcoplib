@@ -948,7 +948,6 @@ void rms_norm(torch::Tensor &out, torch::Tensor &input,
     }
   }
 
-
   const int num_dims = input.dim();
   const int64_t input_stride_d2 = input.stride(-2);
   const int64_t input_stride_d3 = num_dims >= 3 ? input.stride(-3) : 0;

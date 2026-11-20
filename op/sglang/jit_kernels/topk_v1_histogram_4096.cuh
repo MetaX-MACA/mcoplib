@@ -43,7 +43,74 @@ struct alignas(8) Tie {
 
 __device__ __forceinline__ uint32_t convert_to_uint32_v2(float x) {
   uint32_t bits = __float_as_uint(x);
+  const uint32_t magnitude = bits & 0x7FFFFFFFu;
+  if (magnitude > 0x7F800000u) return 0xFFFFFFFFu;  // All NaNs rank first.
+  if (magnitude == 0) bits = 0;  // Signed zeros are equal.
   return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
+}
+
+// Exact bounded-memory fallback for a dense coarse bin. Scan all candidates
+// instead of truncating them; integer keys preserve FP32 subnormals under FTZ.
+template <uint32_t TopK>
+__device__ void exact_radix_topk(const float* scores, int32_t* output,
+                                uint32_t length, void* scratch) {
+  struct Scratch {
+    uint32_t histogram[2][RADIX + 1];
+    uint32_t threshold, above, greater_count, equal_count;
+  };
+  auto* s = static_cast<Scratch*>(scratch);
+  const uint32_t tx = threadIdx.x;
+  uint32_t prefix = 0, mask = 0, remain = TopK;
+
+#pragma unroll
+  for (int round = 0; round < 4; ++round) {
+    const uint32_t shift = 24 - round * 8;
+    if (tx <= RADIX) s->histogram[0][tx] = 0;
+    __syncthreads();
+    for (uint32_t idx = tx; idx < length; idx += kBlockSize) {
+      const uint32_t key = convert_to_uint32_v2(scores[idx]);
+      if ((key & mask) == prefix) {
+        atomicAdd(&s->histogram[0][(key >> shift) & 255u], 1u);
+      }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int step = 0; step < 8; ++step) {
+      const uint32_t offset = 1u << step;
+      if (tx < RADIX) {
+        const uint32_t next = tx + offset;
+        s->histogram[(step + 1) & 1][tx] =
+            s->histogram[step & 1][tx] +
+            (next < RADIX ? s->histogram[step & 1][next] : 0u);
+      }
+      __syncthreads();
+    }
+    if (tx < RADIX && s->histogram[0][tx] >= remain &&
+        s->histogram[0][tx + 1] < remain) {
+      s->threshold = tx;
+      s->above = s->histogram[0][tx + 1];
+    }
+    __syncthreads();
+    prefix |= s->threshold << shift;
+    mask |= 255u << shift;
+    remain -= s->above;
+    // Every thread must read the shared threshold before the next iteration.
+    __syncthreads();
+  }
+
+  if (tx == 0) s->greater_count = s->equal_count = 0;
+  __syncthreads();
+  const uint32_t num_above = TopK - remain;
+  for (uint32_t idx = tx; idx < length; idx += kBlockSize) {
+    const uint32_t key = convert_to_uint32_v2(scores[idx]);
+    if (key > prefix) {
+      output[atomicAdd(&s->greater_count, 1u)] = static_cast<int32_t>(idx);
+    } else if (key == prefix) {
+      const uint32_t pos = atomicAdd(&s->equal_count, 1u);
+      if (pos < remain) output[num_above + pos] = static_cast<int32_t>(idx);
+    }
+  }
+  __syncthreads();
 }
 
 // 12-bit bin from FP16 sign-magnitude key (ascending: high values -> high bins).
@@ -52,6 +119,9 @@ __device__ __forceinline__ uint32_t convert_to_uint32_v2(float x) {
 // candidates land in the threshold bin, so tie-breaking is cheaper.
 template <uint32_t kBits>
 __device__ __forceinline__ uint32_t extract_coarse_bin_N(float x) {
+  const uint32_t raw = __float_as_uint(x);
+  if ((raw & 0x7FFFFFFFu) > 0x7F800000u) return (1u << kBits) - 1;
+  if ((raw & 0x7FFFFFFFu) == 0) x = 0.0f;
   __half h = __float2half_rn(x);
   uint16_t bits = __half_as_ushort(h);
   uint16_t key = (bits & 0x8000) ? static_cast<uint16_t>(~bits)
@@ -298,6 +368,11 @@ __device__ void histogram_4096_topk(const float* __restrict__ scores,
   // Phase 3: Scatter from registers.
   const auto [thr_bin, num_above, num_equal] = smem->match;
   const bool need_tie = (num_equal + num_above > TopK);
+  if (need_tie && num_equal > TopK) {
+    __syncthreads();
+    exact_radix_topk<TopK>(scores, output, length, _smem);
+    return;
+  }
 
   done = false;
 #pragma unroll
@@ -350,8 +425,10 @@ __device__ void histogram_4096_topk(const float* __restrict__ scores,
                               : ((1ULL << num_ties) - 1ULL);
     const auto tie = smem->tie_buffer[lane_id];
     const auto target = smem->tie_buffer[warp_id];
-    const bool pred = (tie.score > target.score) ||
-                      (tie.score == target.score && tie.idx < target.idx);
+    const uint32_t key = convert_to_uint32_v2(tie.score);
+    const uint32_t target_key = convert_to_uint32_v2(target.score);
+    const bool pred = (key > target_key) ||
+                      (key == target_key && tie.idx < target.idx);
     const auto rank = static_cast<uint32_t>(__popcll(__ballot_sync(mask, pred)));
     if (lane_id == 0 && rank < topk_remain) {
       output[num_above + rank] = static_cast<int32_t>(target.idx);

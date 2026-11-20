@@ -11,6 +11,7 @@
 
 #ifndef USE_ROCM
   #include "persistent_topk.cuh"
+  #include "sampled_topk.cuh"
 #endif
 
 namespace {
@@ -38,7 +39,22 @@ void launch_persistent_topk(const torch::Tensor& logits,
   }
 
   constexpr size_t kFilteredTopKMinSmem = sizeof(int) * 2 * (7 * 1024) + 2048;
-  if (num_rows > 32 && max_smem_per_block >= kFilteredTopKMinSmem) {
+  // Allow static fallback storage in addition to the 128 KiB dynamic buffer.
+  if (num_rows > 64 &&
+      max_seq_len >= vllm::sampled_topk::kMinSampledLength<TopK> &&
+      max_smem_per_block >= 144 * 1024) {
+    auto kernel = vllm::sampled_topk::sampled_topk_kernel<TopK>;
+    constexpr size_t smem_size =
+        vllm::filtered_topk::FILTERED_TOPK_SMEM_DYNAMIC;
+    cudaError_t status = cudaFuncSetAttribute(
+        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+    STD_TORCH_CHECK(status == cudaSuccess,
+                    "sampled_topk smem failed: ", cudaGetErrorString(status));
+    kernel<<<num_rows, vllm::sampled_topk::kThreads, smem_size, stream>>>(
+        logits.const_data_ptr<float>(), lengths.const_data_ptr<int32_t>(),
+        output.mutable_data_ptr<int32_t>(), stride,
+        static_cast<int>(std::min(max_seq_len, logits.size(1))));
+  } else if (num_rows > 32 && max_smem_per_block >= kFilteredTopKMinSmem) {
     // 确保即使以后移植到更小显存的卡也能准确报错
     TORCH_CHECK(max_smem_per_block >= kFilteredTopKMinSmem,
                 "persistent_topk would oversubscribe and the FilteredTopK "

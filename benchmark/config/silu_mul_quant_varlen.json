@@ -2,8 +2,8 @@
     "device_id": 0,
     "device_name": ["MetaX C500", "MetaX C600-UL", "Metax C600-U"],
     "num_experts": 16,
-    "num_tokens": 2048,
-    "hidden_size": 2048,
+    "num_tokens": [256, 2048, 16384],
+    "hidden_size": [1024, 2048, 4096, 7168],
     "topk": 6,
     "active_routes": 768,
     "group_size": 128,
@@ -18,5 +18,5 @@
     "output_threshold": 0.9999,
     "scale_threshold": 0.999999,
     "seed": 7,
-    "samples": 1000
+    "samples": 100
 }

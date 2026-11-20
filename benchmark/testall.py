@@ -14,7 +14,7 @@ Default (no mode flag): pure benchmark mode. Every op in scope is benchmarked
 for real (equivalent to `python mcoplib_mxbenchmark_ops.py --op <name>` per
 op) with NO generate/update/compare actions — the CSV is neither read for
 baselines nor written. Per-result stats tables are printed and, with
---report, aggregated into the 6-column Excel report.
+--report, aggregated into the 7-column Excel report.
   python testall.py --infer_framework FW # only run ops of one framework: op | vllm | sglang
                                          #   vllm   -> op/vllm kernels (mcoplib._C / mcoplib._moe_C,
                                          #              torch.ops._C / torch.ops._moe_C)
@@ -24,9 +24,10 @@ baselines nor written. Per-result stats tables are printed and, with
                                          #              the package's triton_/tilelang_ python kernels)
                                          # unset  -> run all ops
   python testall.py --report PATH        # aggregate per-result performance stats into one Excel
-                                         # table (op_name, dtype, shape, acc_pass, GlobalMem BW,
-                                         # BWUtil; one row per benchmark result). Works in every
-                                         # mode. Default: benchmark dir, mirroring the CSV name.
+                                         # table (op_name, dtype, shape, acc_pass, Gpu Time,
+                                         # GlobalMem BW, BWUtil; one row per benchmark result).
+                                         # Works in every mode. Default: benchmark dir,
+                                         # mirroring the CSV name.
   python testall.py --dry-run            # list ops without running
 
 The script:
@@ -36,7 +37,7 @@ The script:
   3. Parses stdout to extract accuracy status and performance status.
   4. Prints a per-op summary table and a final roll-up (success/failure counts + failing op names).
   5. In --compare mode, generates an Excel report (.xlsx) with summary and per-operator sheets.
-  6. Always aggregates every benchmark result into a 6-column Excel table (see --report).
+  6. Always aggregates every benchmark result into a 7-column Excel table (see --report).
   7. Writes the overall summary (total/success/failed/skipped counts, elapsed,
      failed/skipped op lists, overall result) to testall_output.json (replaces
      the old testall_output.txt per-op log).
@@ -85,6 +86,7 @@ DEFAULT_CSV = os.path.join(STATISTICS_DIR, CSV_FILENAME)
 # Overall summary JSON written at the end of every run (replaces the old
 # testall_output.txt per-op log).
 SUMMARY_JSON_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "testall_output.json")
+SUMMARY_HTML_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "testall_output.html")
 
 LIST_OP_PREFIX = "  * "
 VERIFY_RE = re.compile(r"\[VERIFY\]\s+(\S+)\s*->\s*(PASS|FAIL)", re.IGNORECASE)
@@ -97,6 +99,7 @@ IGNORED_RE = re.compile(r"\[IGNORED\]\s+(\S+)", re.IGNORECASE)
 SUMMARY_RE = re.compile(
     r"\[SUMMARY\]\s+(Appended|Skipped|Updated|Kept):\s*(\d+)", re.IGNORECASE
 )
+AVG_PERF_RE = re.compile(r"Average Performance Ratio:\s*([^\s,]+)", re.IGNORECASE)
 
 # Threshold for performance regression in --compare mode (must match the
 # single-op script's own 5%% rule).
@@ -222,6 +225,10 @@ def parse_run_output(stdout):
         if m:
             info["perf_verify"] = m.group(1).strip()
             continue
+        m = AVG_PERF_RE.search(line)
+        if m:
+            info["perf_verify"] = m.group(1).strip()
+            continue
         m = APPEND_RE.search(line)
         if m:
             info["csv_action"] = "APPEND"
@@ -303,13 +310,13 @@ def _rejoin_done_split(head_line, cont_line):
 def parse_benchmark_tables(stdout, op_name):
     """Parse the per-result pipe tables from a single-op run's stdout.
 
-    Returns report-row dicts (op_name/dtype/shape/acc_pass/GlobalMem BW/
-    BWUtil), one per benchmark result row. Column positions are taken from
-    each table's own header line, so extra axis columns (Bits, NE_N, ...)
-    don't break the parse. Some ops define neither a dtype axis nor a
-    bandwidth metric, so their tables have no dtype / GlobalMem BW / BWUtil
-    columns at all — those fields default to "" (matching how such ops
-    appear in the results CSV).
+    Returns report-row dicts (op_name/dtype/shape/acc_pass/Gpu Time/
+    GlobalMem BW/BWUtil), one per benchmark result row. Column positions
+    are taken from each table's own header line, so extra axis columns
+    (Bits, NE_N, ...) don't break the parse. Some ops define neither a
+    dtype axis nor a bandwidth metric, so their tables have no dtype /
+    GlobalMem BW / BWUtil columns at all — those fields default to ""
+    (matching how such ops appear in the results CSV).
 
     Lines split by the "Done." flush (see _rejoin_done_split) are recovered:
     a split header or data row is rejoined with its continuation half and
@@ -389,6 +396,9 @@ def parse_benchmark_tables(stdout, op_name):
                     "dtype": d.get("dtype", ""),
                     "shape": d.get("Shape", ""),
                     "acc_pass": d.get("Acc_Pass", ""),
+                    # The printed column is "GPU Time" (e.g. '29.339 us');
+                    # the report column is spelled "Gpu Time" (REPORT_COLUMNS).
+                    "Gpu Time": d.get("GPU Time", ""),
                     "GlobalMem BW": d.get("GlobalMem BW", ""),
                     "BWUtil": d.get("BWUtil", ""),
                 })
@@ -825,7 +835,7 @@ def _get_op_data_from_csv(op_name, csv_path, output_csv=None):
 #
 # One Excel row per benchmark result (an op with multiple shape/dtype
 # combinations gets multiple rows), with exactly these columns:
-#   op_name | dtype | shape | acc_pass | GlobalMem BW | BWUtil
+#   op_name | dtype | shape | acc_pass | Gpu Time | GlobalMem BW | BWUtil
 # Data source depends on the mode:
 #   - generate/update: the results CSV (freshly appended rows plus previously
 #     recorded ones for the ops in scope)
@@ -833,7 +843,8 @@ def _get_op_data_from_csv(op_name, csv_path, output_csv=None):
 #     (in compare mode the current run's rows are otherwise discarded by the
 #     single-op script; in bench mode no CSV is written at all)
 # ---------------------------------------------------------------------------
-REPORT_COLUMNS = ["op_name", "dtype", "shape", "acc_pass", "GlobalMem BW", "BWUtil"]
+REPORT_COLUMNS = ["op_name", "dtype", "shape", "acc_pass", "Gpu Time",
+                  "GlobalMem BW", "BWUtil"]
 DEFAULT_REPORT = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     CSV_FILENAME.replace(".csv", ".xlsx"),
@@ -862,6 +873,19 @@ def _fmt_bwutil(val):
     return f"{v * 100:.2f}%"
 
 
+def _fmt_time_sec(val):
+    """Format a seconds number string like the benchmark tables' GPU Time
+    cells do (e.g. 2.9339e-05 -> '29.339 us'). Empty/invalid stays as-is."""
+    try:
+        v = float(val)
+    except (TypeError, ValueError):
+        return str(val or "")
+    for unit, factor in (("s", 1.0), ("ms", 1e-3)):
+        if v >= factor:
+            return f"{v / factor:.3f} {unit}"
+    return f"{v * 1e6:.3f} us"
+
+
 def collect_report_rows_from_csv(op_scope, csv_path):
     """Collect report rows for ops in op_scope from a benchmark results CSV."""
     rows = []
@@ -877,6 +901,9 @@ def collect_report_rows_from_csv(op_scope, csv_path):
                     "dtype": r.get("dtype", ""),
                     "shape": r.get("Shape", ""),
                     "acc_pass": r.get("Acc_Pass", ""),
+                    "Gpu Time": _fmt_time_sec(
+                        r.get("GPU Time (sec)") or r.get("GPU Time", "")
+                    ),
                     "GlobalMem BW": _fmt_bw_bytes(r.get("GlobalMem BW (bytes/sec)", "")),
                     "BWUtil": _fmt_bwutil(r.get("BWUtil", "")),
                 })
@@ -886,7 +913,7 @@ def collect_report_rows_from_csv(op_scope, csv_path):
 
 
 def generate_report_excel(report_rows, output_path, mode, infer_framework):
-    """Write the aggregated 6-column performance table to an Excel file."""
+    """Write the aggregated 7-column performance table to an Excel file."""
     if not EXCEL_AVAILABLE:
         print("[WARN] openpyxl not available, skipping --report Excel generation")
         return
@@ -951,6 +978,293 @@ def write_summary_json(path, total, success, failed, skipped,
         json.dump(summary, f, indent=2, ensure_ascii=False)
         f.write("\n")
 
+def write_summary_html(path, mode, total, success, failed, skipped,
+                       total_elapsed, failing_ops, skipped_ops, rows):
+    """Generate a standalone HTML report for testall."""
+
+    from html import escape
+
+    result = "SUCCESS" if (failed == 0 and skipped == 0) else "FAILED"
+    generated_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    status_rows = []
+
+    for row in rows:
+        status = str(row.get("status") or "-")
+        status_class = status.lower()
+
+        status_rows.append(
+            "<tr>"
+            f"<td>{escape(str(row.get('op') or ''))}</td>"
+            f"<td>{escape(str(row.get('acc') or '-'))}</td>"
+            f"<td>{escape(str(row.get('perf') or '-'))}</td>"
+            f'<td><span class="status {escape(status_class)}">'
+            f"{escape(status)}</span></td>"
+            f"<td>{escape(str(row.get('detail') or ''))}</td>"
+            f"<td>{float(row.get('elapsed') or 0):.1f}s</td>"
+            "</tr>"
+        )
+
+    if not status_rows:
+        status_rows.append(
+            '<tr><td colspan="6" class="empty">No operator results</td></tr>'
+        )
+
+    failed_html = "".join(
+        f"<li>{escape(str(op))}</li>" for op in failing_ops
+    ) or "<li>None</li>"
+
+    skipped_html = "".join(
+        f"<li>{escape(str(op))}</li>" for op in skipped_ops
+    ) or "<li>None</li>"
+
+    result_class = "success" if result == "SUCCESS" else "failed"
+
+    html_content = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Testall Benchmark Report</title>
+
+<style>
+* {{
+    box-sizing: border-box;
+}}
+
+body {{
+    margin: 0;
+    padding: 30px;
+    background: #f4f6fa;
+    color: #263238;
+    font-family: Arial, Helvetica, sans-serif;
+}}
+
+.container {{
+    max-width: 1400px;
+    margin: 0 auto;
+}}
+
+h1 {{
+    margin-bottom: 8px;
+    color: #1f2937;
+}}
+
+.subtitle {{
+    color: #6b7280;
+    margin-bottom: 25px;
+}}
+
+.summary {{
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 16px;
+    margin-bottom: 25px;
+}}
+
+.card {{
+    background: white;
+    padding: 20px;
+    border-radius: 10px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+}}
+
+.card .label {{
+    color: #6b7280;
+    font-size: 13px;
+}}
+
+.card .value {{
+    margin-top: 10px;
+    font-size: 27px;
+    font-weight: bold;
+}}
+
+.success {{
+    color: #16803c;
+}}
+
+.failed {{
+    color: #dc2626;
+}}
+
+.skipped {{
+    color: #d97706;
+}}
+
+.result {{
+    font-size: 22px;
+    font-weight: bold;
+    margin-bottom: 20px;
+}}
+
+.section {{
+    background: white;
+    padding: 22px;
+    margin-bottom: 22px;
+    border-radius: 10px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+}}
+
+.section h2 {{
+    margin-top: 0;
+    font-size: 19px;
+}}
+
+.table-wrapper {{
+    overflow-x: auto;
+}}
+
+table {{
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+}}
+
+th {{
+    background: #e9eef6;
+    color: #374151;
+    text-align: left;
+    padding: 12px;
+    white-space: nowrap;
+}}
+
+td {{
+    padding: 11px 12px;
+    border-bottom: 1px solid #e5e7eb;
+}}
+
+tr:hover {{
+    background: #f9fafb;
+}}
+
+.status {{
+    font-weight: bold;
+}}
+
+.empty {{
+    text-align: center;
+    color: #9ca3af;
+    padding: 25px;
+}}
+
+ul {{
+    line-height: 1.9;
+    overflow-wrap: anywhere;
+}}
+
+.footer {{
+    text-align: center;
+    color: #9ca3af;
+    font-size: 12px;
+    margin-top: 25px;
+}}
+
+@media (max-width: 600px) {{
+    body {{
+        padding: 12px;
+    }}
+}}
+</style>
+</head>
+
+<body>
+<div class="container">
+
+<h1>Testall Benchmark Report</h1>
+
+<div class="subtitle">
+    Mode: {escape(mode.upper())}
+    &nbsp;|&nbsp; Generated: {generated_time}
+    &nbsp;|&nbsp; Total Time: {total_elapsed:.2f}s
+</div>
+
+<div class="result {result_class}">
+    Overall Result: {result}
+</div>
+
+<div class="summary">
+
+    <div class="card">
+        <div class="label">Total Operators</div>
+        <div class="value">{total}</div>
+    </div>
+
+    <div class="card">
+        <div class="label">Success</div>
+        <div class="value success">{success}</div>
+    </div>
+
+    <div class="card">
+        <div class="label">Failed</div>
+        <div class="value failed">{failed}</div>
+    </div>
+
+    <div class="card">
+        <div class="label">Skipped</div>
+        <div class="value skipped">{skipped}</div>
+    </div>
+
+    <div class="card">
+        <div class="label">Elapsed Time</div>
+        <div class="value">{total_elapsed:.2f}s</div>
+    </div>
+
+</div>
+
+<div class="section">
+    <h2>Operator Results</h2>
+
+    <div class="table-wrapper">
+    <table>
+        <thead>
+            <tr>
+                <th>Operator</th>
+                <th>Acc</th>
+                <th>Perf</th>
+                <th>Status</th>
+                <th>Detail</th>
+                <th>Time</th>
+            </tr>
+        </thead>
+        <tbody>
+            {''.join(status_rows)}
+        </tbody>
+    </table>
+    </div>
+</div>
+
+<div class="section">
+    <h2>Failed Operators ({failed})</h2>
+    <ul>{failed_html}</ul>
+</div>
+
+<div class="section">
+    <h2>Skipped Operators ({skipped})</h2>
+    <ul>{skipped_html}</ul>
+</div>
+
+<div class="footer">
+    Generated by testall.py
+</div>
+
+</div>
+</body>
+</html>
+"""
+
+    try:
+        output_dir = os.path.dirname(os.path.abspath(path))
+        os.makedirs(output_dir, exist_ok=True)
+
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(html_content)
+
+        print(f"[INFO] HTML report generated: {os.path.abspath(path)}")
+
+    except Exception as e:
+        print(f"[WARN] Failed to generate HTML report: {e}")
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -984,10 +1298,10 @@ def main():
     )
     parser.add_argument(
         "--report", default=None,
-        help="Aggregate every benchmark result into one Excel table with columns "
-             "op_name, dtype, shape, acc_pass, GlobalMem BW, BWUtil (one row per "
-             "result; ops with multiple results get multiple rows). Works in every "
-             f"mode. Default: {DEFAULT_REPORT}"
+        help=("Aggregate every benchmark result into one Excel table with columns "
+              "op_name, dtype, shape, acc_pass, Gpu Time, GlobalMem BW, BWUtil "
+              "(one row per result; ops with multiple results get multiple rows). "
+              f"Works in every mode. Default: {DEFAULT_REPORT}")
     )
     parser.add_argument("--ops", default=None, help="Comma-separated op subset")
     parser.add_argument("--dry-run", action="store_true", help="List ops without running")
@@ -1199,6 +1513,21 @@ def main():
         SUMMARY_JSON_FILE, len(ops), success, failed, skipped,
         total_elapsed, failing_ops, skipped_ops,
     )
+
+    # Generate HTML report in compare mode.
+    if mode == "compare":
+        write_summary_html(
+            SUMMARY_HTML_FILE,
+            mode,
+            len(ops),
+            success,
+            failed,
+            skipped,
+            total_elapsed,
+            failing_ops,
+            skipped_ops,
+            rows,
+        )
 
     # --- Aggregated performance report (--report) ---
     # One row per benchmark result; ops in scope with several shape/dtype

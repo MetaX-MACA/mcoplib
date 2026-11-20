@@ -1,0 +1,9 @@
+{
+    "device_id": 0,
+    "device_name": ["MetaX C500", "MetaX C600-UL", "Metax C600-U"],
+    "n_tokens": [2048, 4096],
+    "topk": [2, 4],
+    "n_expert": [16, 32],
+    "expert_map_mode": ["none", "half"],
+    "samples": 100
+}

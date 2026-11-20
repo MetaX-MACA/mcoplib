@@ -2,8 +2,8 @@
     "device_id": 0,
     "device_name": ["MetaX C500", "MetaX C600-UL", "Metax C600-U"],
     "dtype": "bfloat16",
-    "nnz": 81920,
-    "num_q_heads": 32,
+    "nnz": [1, 1024, 8192, 81920, 262144],
+    "num_q_heads": [8, 32],
     "num_kv_heads": 32,
     "head_dim": 128,
     "rotary_dim": 128,
@@ -11,5 +11,5 @@
     "interleave": false,
     "enable_pdl": false,
     "seed": 42,
-    "samples": 1000
+    "samples": 100
 }
