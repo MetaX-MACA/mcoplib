@@ -36,7 +36,7 @@
 
 namespace {
 
-// constexpr int TopK = 512;
+constexpr int TopK = 512;
 constexpr int kThreadsPerBlock = 1024;  // matches histogram_4096 + persistent_topk
 constexpr int kWarpSize = 64;           // MACA warp size
 constexpr int kNumWarpsBlock = kThreadsPerBlock / kWarpSize;  // 16
@@ -95,7 +95,6 @@ __device__ __forceinline__ int32_t page_to_indices(
   return (page_table[i >> page_bits] << page_bits) | (i & mask);
 }
 
-template<int TopK>
 __device__ void naive_transform(
     const float* __restrict__ score,
     const int32_t* __restrict__ page_table,
@@ -127,7 +126,7 @@ __device__ void naive_transform(
 // candidates when the bin is dense (a real correctness risk for long rows
 // with many equal FP16 keys), and lets pass 2 re-read fewer elements from
 // HBM (better L2 behavior).
-template <uint32_t TopK, uint32_t kStagingSize>
+template <uint32_t kStagingSize>
 __device__ void radix_topk(
     const float* __restrict__ input, int32_t* __restrict__ output, const uint32_t length) {
   constexpr uint32_t RADIX = 256;
@@ -359,7 +358,7 @@ __device__ void radix_topk(
   }
 }
 
-template <uint32_t TopK, bool kUseHist4096, uint32_t kRadixStagingSize = kSmemInputSize>
+template <bool kUseHist4096, uint32_t kRadixStagingSize = kSmemInputSize>
 __global__ __launch_bounds__(kThreadsPerBlock)
     void topk_transform_kernel(const TopKTransformParams params) {
   const auto& [input, seq_lens, page_table, page_indices, raw_indices,
@@ -373,7 +372,7 @@ __global__ __launch_bounds__(kThreadsPerBlock)
   const auto raw_indices_ptr = raw_indices != nullptr ? raw_indices + work_id * TopK : nullptr;
 
   if (seq_len <= TopK) {
-    naive_transform<TopK>(score_ptr, page_ptr, indices_ptr, raw_indices_ptr, seq_len, page_bits);
+    naive_transform(score_ptr, page_ptr, indices_ptr, raw_indices_ptr, seq_len, page_bits);
     return;
   }
 
@@ -390,7 +389,7 @@ __global__ __launch_bounds__(kThreadsPerBlock)
     topk_v1_hist4096::histogram_4096_topk<TopK, 12>(
         score_ptr, s_topk_indices, seq_len, hist_smem);
   } else {
-    radix_topk<TopK, kRadixStagingSize>(score_ptr, s_topk_indices, seq_len);
+    radix_topk<kRadixStagingSize>(score_ptr, s_topk_indices, seq_len);
   }
   __syncthreads();
 
@@ -411,25 +410,6 @@ void setup_kernel_smem_once() {
     return ::cudaFuncSetAttribute(f, ::cudaFuncAttributeMaxDynamicSharedMemorySize, max_dynamic_smem);
   }();
   TORCH_CHECK(result == cudaSuccess, "set_up_kernel_once failed:", ::cudaGetErrorString(result));
-}
-
-template <uint32_t kTopK>
-void launch_topk_transform(const TopKTransformParams& params, uint32_t B,
-                           bool use_hist4096, bool use_large_smem,
-                           cudaStream_t stream) {
-  const auto grid  = dim3{B};
-  const auto block = dim3{kThreadsPerBlock};
-  if (use_hist4096) {
-    constexpr size_t kHist4096Smem = 24 * 1024;  // 见下方"必须核对"
-    setup_kernel_smem_once<topk_transform_kernel<kTopK, true>, kHist4096Smem>();
-    topk_transform_kernel<kTopK, true><<<grid, block, kHist4096Smem, stream>>>(params);
-  } else if (use_large_smem) {
-    setup_kernel_smem_once<topk_transform_kernel<kTopK, false, kLargeSmemInputSize>, kLargeSmem>();
-    topk_transform_kernel<kTopK, false, kLargeSmemInputSize><<<grid, block, kLargeSmem, stream>>>(params);
-  } else {
-    setup_kernel_smem_once<topk_transform_kernel<kTopK, false, kSmemInputSize>, kSmem>();
-    topk_transform_kernel<kTopK, false, kSmemInputSize><<<grid, block, kSmem, stream>>>(params);
-  }
 }
 
 }  // namespace
@@ -459,13 +439,13 @@ void topk_transform_v1_interface(
   TORCH_CHECK(page_table.size(0) == B, "page_table batch mismatch");
   TORCH_CHECK(page_indices.dim() == 2 && page_indices.is_contiguous(), "page_indices must be 2D contiguous");
   TORCH_CHECK(page_indices.size(0) == B, "page_indices batch mismatch");
-  TORCH_CHECK(page_indices.size(1) == 512 || page_indices.size(1) == 1024, "page_indices.size(1) must equal TopK (512)");
-  const auto topk = page_indices.size(1);
+  TORCH_CHECK(page_indices.size(1) == TopK, "page_indices.size(1) must equal TopK (512)");
+
   int32_t* raw_indices_ptr = nullptr;
   if (raw_indices_opt.has_value()) {
     const auto& raw = raw_indices_opt.value();
     TORCH_CHECK(raw.dim() == 2 && raw.is_contiguous(), "raw_indices must be 2D contiguous");
-    TORCH_CHECK(raw.size(0) == B && (raw.size(1) == 512 || raw.size(1) == 1024 ), "raw_indices shape mismatch");
+    TORCH_CHECK(raw.size(0) == B && raw.size(1) == TopK, "raw_indices shape mismatch");
     raw_indices_ptr = raw.data_ptr<int32_t>();
   }
 
@@ -528,28 +508,23 @@ void topk_transform_v1_interface(
   // 64K-smem chips (C500/C280 optin cap is 64KB).
   constexpr int kLargeSmemThreshold = 96 * 1024;
   const bool use_large_smem = (max_smem_per_block >= kLargeSmemThreshold);
-  switch (topk) {
-    case 512:  launch_topk_transform<512>(params, B, use_hist4096, use_large_smem, stream); break;
-    case 1024: launch_topk_transform<1024>(params, B, use_hist4096, use_large_smem, stream); break;
-    default:
-    TORCH_CHECK(false , "topk_transform_v1_interface not support this topk");
+
+  if (use_hist4096) {
+    // histogram_4096 Smem: 16KB histogram (union 8KB tie_buffer) + 4KB scan_buf
+    // + scalars (counter_gt/eq, match, warp_sum[16]) under alignas(128) padding.
+    // 24KB dynamic smem covers the struct with headroom.
+    constexpr size_t kHist4096Smem = 24 * 1024;
+    setup_kernel_smem_once<topk_transform_kernel<true>, kHist4096Smem>();
+    topk_transform_kernel<true><<<grid, block, kHist4096Smem, stream>>>(params);
+  } else if (use_large_smem) {
+    // 128K-smem chip: 56KB dynamic staging (7168 entries per buffer).
+    setup_kernel_smem_once<topk_transform_kernel<false, kLargeSmemInputSize>, kLargeSmem>();
+    topk_transform_kernel<false, kLargeSmemInputSize><<<grid, block, kLargeSmem, stream>>>(params);
+  } else {
+    // 64K-smem chip (C500/C280): 32KB dynamic staging (4096 entries per buffer).
+    setup_kernel_smem_once<topk_transform_kernel<false, kSmemInputSize>, kSmem>();
+    topk_transform_kernel<false, kSmemInputSize><<<grid, block, kSmem, stream>>>(params);
   }
-  // if (use_hist4096) {
-  //   // histogram_4096 Smem: 16KB histogram (union 8KB tie_buffer) + 4KB scan_buf
-  //   // + scalars (counter_gt/eq, match, warp_sum[16]) under alignas(128) padding.
-  //   // 24KB dynamic smem covers the struct with headroom.
-  //   constexpr size_t kHist4096Smem = 24 * 1024;
-  //   setup_kernel_smem_once<topk_transform_kernel<true>, kHist4096Smem>();
-  //   topk_transform_kernel<true><<<grid, block, kHist4096Smem, stream>>>(params);
-  // } else if (use_large_smem) {
-  //   // 128K-smem chip: 56KB dynamic staging (7168 entries per buffer).
-  //   setup_kernel_smem_once<topk_transform_kernel<false, kLargeSmemInputSize>, kLargeSmem>();
-  //   topk_transform_kernel<false, kLargeSmemInputSize><<<grid, block, kLargeSmem, stream>>>(params);
-  // } else {
-  //   // 64K-smem chip (C500/C280): 32KB dynamic staging (4096 entries per buffer).
-  //   setup_kernel_smem_once<topk_transform_kernel<false, kSmemInputSize>, kSmem>();
-  //   topk_transform_kernel<false, kSmemInputSize><<<grid, block, kSmem, stream>>>(params);
-  // }
   const auto result = cudaGetLastError();
   TORCH_CHECK(result == cudaSuccess, "topk_transform_v1 kernel failed:", ::cudaGetErrorString(result));
 }

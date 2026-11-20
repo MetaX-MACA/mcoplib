@@ -32,31 +32,17 @@ constexpr std::size_t kLongDynamicSmem =
 // bucket can contain more than 1024 candidates.  A dedicated instance avoids
 // reserving the long-row 4096-entry double buffer for these short rows.
 constexpr int kShortStagingSize = 1024;
-
-// Packed staged entries hold a 16-bit row-relative index plus the top two
-// bytes of the ordered FP32 key.  Packing is only valid while every row
-// index fits 16 bits, i.e. score_width <= 65536.
-constexpr int64_t kPackMaxScoreWidth = 65536;
 constexpr std::size_t kShortDynamicSmem =
     2 * kShortStagingSize * sizeof(int32_t);  // 8 KiB
 constexpr int kRadix = 256;
-// With the warp-shuffle suffix scan, per-pass barrier cost no longer
-// dominates short rows, so the 512-thread medium path is retired: widths in
-// (1024, 2048] join the default 1024-thread scalar dispatch (measured -5.4%
-// on the S=2048 chunk-1 shape against the same-day control legs).
-constexpr int64_t kMediumMaxScoreWidth = 1024;
-// The GLM-5 prefill mid-band splits at the measured load-pattern crossover.
-// Long rows are scalar-load bandwidth bound -- chunk7 (S=14336, scalar) scans
-// the same ~54 MB as chunk8 (S=16128, vec8) yet runs ~30% slower -- so vec8
-// wins from S=8192 up (chunks 4-7 measured -3.3..-20.2%).  Below that the
-// vec8 body under-parallelizes the short rows (S=4096 +20.6%, S=6144 +4.6%:
-// only length/8 of 1024 threads stay active and each concentrates 8
-// histogram atomics), so 2048 < width < 8192 keeps the scalar dispatch.
-constexpr int64_t kVec8MinScoreWidth = 8192;
-// Widths at or above this keep the iteration-tuned 8-KiB staging footprint on
-// constrained parts; the mid-band vec8 rows keep the 32-KiB buffer their
-// scalar dispatch used, isolating the load-width change.
-constexpr int64_t kVec8ShortStagingMinScoreWidth = 16126;
+constexpr int kCoarseBinCacheMinBatch = 32;
+constexpr int64_t kCoarseBinCacheMaxScoreWidth =
+    kLongStagingSize * static_cast<int64_t>(sizeof(int32_t));
+constexpr int64_t kMediumMaxScoreWidth = 2048;
+// The two GLM-5 63-Ki workloads have score widths 16126 and 16383.  Keep the
+// Vec8 experiment scoped to those production shapes; the 3-Ki and generic 8-Ki
+// cases retain their existing scalar dispatch.
+constexpr int64_t kVec8MinScoreWidth = 16126;
 constexpr int32_t kVec8Stride = 2;  // Two float4 loads per thread and iteration.
 
 struct KpoolTopKParams {
@@ -147,7 +133,7 @@ __device__ __forceinline__ int32_t transform_token(
   return raw_token;
 }
 
-template <int K, int Threads, bool UseVec8, int StagingSize, bool PackStaged>
+template <int K, int Threads, bool UseVec8, int StagingSize, bool CacheCoarseBins = false>
 __device__ void radix_topk_exact_with_staged_fast_path(
     const float* __restrict__ input,
     int32_t* __restrict__ selected_indices,
@@ -156,12 +142,6 @@ __device__ void radix_topk_exact_with_staged_fast_path(
   static_assert(Threads >= kRadix + 1, "radix histogram requires at least 257 threads");
   static_assert(!UseVec8 || Threads == kDefaultThreads, "vec8 is tuned for 1024 threads");
   static_assert(StagingSize >= K, "staging buffer must hold at least K candidates");
-
-  // Packed staged entry layout (PackStaged only): row-relative index in
-  // bits 0-15, ordered-FP32-key byte 0 in bits 16-23, byte 1 in bits
-  // 24-31.  Refinement rounds 0/1 then read their threshold bytes from
-  // shared memory instead of reloading the score from global memory.
-  constexpr uint32_t kPackIndexMask = 0xFFFFu;
 
   // Two staged buffers preserve the fast JIT path for normal score
   // distributions. If a threshold bucket exceeds this kernel instance's
@@ -185,49 +165,38 @@ __device__ void radix_topk_exact_with_staged_fast_path(
   const int32_t tid = threadIdx.x;
   const float* row_input = input + row_start;
   auto& histogram = histogram_buffer[0];
-  // PackStaged only: histogram_buffer[1] collects the byte-1 histogram
-  // during staging.  When the whole staged pool shares one byte-0 bin, it is
-  // exactly the histogram round 0's restage pass would have built, which
-  // lets the refine loop skip that pass (see below).
-  auto& histogram_byte1 = histogram_buffer[1];
-  int32_t remain = K;
-
-  // Single-warp suffix sum: 256 bins / 32 lanes = 8 registers per lane, an
-  // in-lane sequential pass, and a five-step shuffle scan replace the
-  // eight-round all-thread Hillis-Steele sweep and its per-round barriers.
-  // The result layout matches the original: hist[i] holds the count of
-  // bins >= i.  The trailing barrier publishes the scan to all threads,
-  // exactly like the last round of the sweep did.
-  const auto run_suffix_sum_on = [&](uint32_t* hist) {
-    if (tid < 32) {
-      uint32_t values[8];
-#pragma unroll
-      for (int j = 0; j < 8; ++j) {
-        values[j] = hist[tid * 8 + j];
-      }
-#pragma unroll
-      for (int j = 6; j >= 0; --j) {
-        values[j] += values[j + 1];
-      }
-      const uint32_t lane_total = values[0];
-      uint32_t lane_suffix = lane_total;
-#pragma unroll
-      for (int distance = 1; distance < 32; distance <<= 1) {
-        const uint32_t neighbor =
-            __shfl_down_sync(0xffffffffu, lane_suffix, distance);
-        if (tid + distance < 32) {
-          lane_suffix += neighbor;
-        }
-      }
-      const uint32_t higher_lanes = lane_suffix - lane_total;
-#pragma unroll
-      for (int j = 0; j < 8; ++j) {
-        hist[tid * 8 + j] = values[j] + higher_lanes;
-      }
+  auto* coarse_bin_cache = reinterpret_cast<uint8_t*>(staged_indices);
+  const auto staged_buffer = [&](int32_t buffer_index) {
+    if constexpr (CacheCoarseBins) {
+      // While the coarse bytes are live, the first candidate buffer occupies
+      // the upper half.  Once the cache is dead, its lower half becomes the
+      // second refinement buffer, preserving the original two-buffer layout.
+      return staged_indices + (buffer_index == 0 ? StagingSize : 0);
+    } else {
+      return staged_indices + buffer_index * StagingSize;
     }
-    __syncthreads();
   };
-  const auto run_suffix_sum = [&] { run_suffix_sum_on(&histogram_buffer[0][0]); };
+  int32_t remain = K;
+  static_assert(!CacheCoarseBins || UseVec8, "coarse-bin caching requires vec8");
+  static_assert(
+      !CacheCoarseBins || StagingSize * sizeof(int32_t) >= kCoarseBinCacheMaxScoreWidth,
+      "coarse-bin cache must fit in half of dynamic shared memory");
+
+  const auto run_suffix_sum = [&] {
+#pragma unroll 8
+    for (int round = 0; round < 8; ++round) {
+      const int distance = 1 << round;
+      const int source = round & 1;
+      if (tid < kRadix) {
+        uint32_t value = histogram_buffer[source][tid];
+        if (tid + distance < kRadix) {
+          value += histogram_buffer[source][tid + distance];
+        }
+        histogram_buffer[source ^ 1][tid] = value;
+      }
+      __syncthreads();
+    }
+  };
 
   // Stage 1: coarse 8-bit histogram over the valid score region.
   if (tid < kRadix + 1) {
@@ -238,7 +207,11 @@ __device__ void radix_topk_exact_with_staged_fast_path(
   if constexpr (UseVec8) {
     const Vec8Layout layout = make_vec8_layout(row_input, length);
     for (int32_t index = tid; index < layout.prefix; index += Threads) {
-      ::atomicAdd(&histogram[ordered_fp16_high_byte(row_input[index])], 1u);
+      const uint8_t coarse_bin = ordered_fp16_high_byte(row_input[index]);
+      if constexpr (CacheCoarseBins) {
+        coarse_bin_cache[index] = coarse_bin;
+      }
+      ::atomicAdd(&histogram[coarse_bin], 1u);
     }
     for (int32_t vec_index = tid; vec_index < layout.vec8_length;
          vec_index += Threads) {
@@ -250,6 +223,17 @@ __device__ void radix_topk_exact_with_staged_fast_path(
       ordered_fp16_high_bytes(first.z, first.w, key2, key3);
       ordered_fp16_high_bytes(second.x, second.y, key4, key5);
       ordered_fp16_high_bytes(second.z, second.w, key6, key7);
+      if constexpr (CacheCoarseBins) {
+        const int32_t index = layout.prefix + base * 4;
+        coarse_bin_cache[index] = key0;
+        coarse_bin_cache[index + 1] = key1;
+        coarse_bin_cache[index + 2] = key2;
+        coarse_bin_cache[index + 3] = key3;
+        coarse_bin_cache[index + 4] = key4;
+        coarse_bin_cache[index + 5] = key5;
+        coarse_bin_cache[index + 6] = key6;
+        coarse_bin_cache[index + 7] = key7;
+      }
       ::atomicAdd(&histogram[key0], 1u);
       ::atomicAdd(&histogram[key1], 1u);
       ::atomicAdd(&histogram[key2], 1u);
@@ -266,13 +250,24 @@ __device__ void radix_topk_exact_with_staged_fast_path(
       uint8_t key0, key1, key2, key3;
       ordered_fp16_high_bytes(values.x, values.y, key0, key1);
       ordered_fp16_high_bytes(values.z, values.w, key2, key3);
+      if constexpr (CacheCoarseBins) {
+        const int32_t index = layout.prefix + vec_index * 4;
+        coarse_bin_cache[index] = key0;
+        coarse_bin_cache[index + 1] = key1;
+        coarse_bin_cache[index + 2] = key2;
+        coarse_bin_cache[index + 3] = key3;
+      }
       ::atomicAdd(&histogram[key0], 1u);
       ::atomicAdd(&histogram[key1], 1u);
       ::atomicAdd(&histogram[key2], 1u);
       ::atomicAdd(&histogram[key3], 1u);
     }
     for (int32_t index = layout.tail + tid; index < length; index += Threads) {
-      ::atomicAdd(&histogram[ordered_fp16_high_byte(row_input[index])], 1u);
+      const uint8_t coarse_bin = ordered_fp16_high_byte(row_input[index]);
+      if constexpr (CacheCoarseBins) {
+        coarse_bin_cache[index] = coarse_bin;
+      }
+      ::atomicAdd(&histogram[coarse_bin], 1u);
     }
   } else {
     for (int32_t index = tid; index < length; index += Threads) {
@@ -301,7 +296,11 @@ __device__ void radix_topk_exact_with_staged_fast_path(
       }
     };
 
-    if constexpr (UseVec8) {
+    if constexpr (CacheCoarseBins) {
+      for (int32_t index = tid; index < length; index += Threads) {
+        append_if_above_threshold(index, coarse_bin_cache[index]);
+      }
+    } else if constexpr (UseVec8) {
       const Vec8Layout layout = make_vec8_layout(row_input, length);
       for (int32_t index = tid; index < layout.prefix; index += Threads) {
         append_if_above_threshold(index, ordered_fp16_high_byte(row_input[index]));
@@ -359,9 +358,6 @@ __device__ void radix_topk_exact_with_staged_fast_path(
   // Collect the threshold bucket and build the first FP32-byte histogram.
   if (tid < kRadix + 1) {
     histogram[tid] = 0;
-    if constexpr (PackStaged) {
-      histogram_byte1[tid] = 0;
-    }
   }
   __syncthreads();
 
@@ -372,22 +368,31 @@ __device__ void radix_topk_exact_with_staged_fast_path(
     } else if (coarse_bin == coarse_threshold) {
       const int32_t position = ::atomicAdd(&num_input[0], 1);
       if (C10_LIKELY(position < StagingSize)) {
-        const uint32_t key = ordered_fp32_key(value);
-        staged_indices[position] = PackStaged
-            ? static_cast<int32_t>((static_cast<uint32_t>(index) & kPackIndexMask)
-                                   | (((key >> 24) & 0xFFu) << 16)
-                                   | (((key >> 16) & 0xFFu) << 24))
-            : index;
-        const int32_t sub_bin = static_cast<int32_t>((key >> 24) & 0xFFu);
+        staged_buffer(0)[position] = index;
+        const int32_t sub_bin = static_cast<int32_t>((ordered_fp32_key(value) >> 24) & 0xFFu);
         ::atomicAdd(&histogram[sub_bin], 1u);
-        if constexpr (PackStaged) {
-          ::atomicAdd(&histogram_byte1[(key >> 16) & 0xFFu], 1u);
-        }
       }
     }
   };
 
-  if constexpr (UseVec8) {
+  if constexpr (CacheCoarseBins) {
+    for (int32_t index = tid; index < length; index += Threads) {
+      const uint8_t coarse_bin = coarse_bin_cache[index];
+      if (coarse_bin > coarse_threshold) {
+        const int32_t position = ::atomicAdd(&output_counter, 1);
+        selected_indices[position] = index;
+      } else if (coarse_bin == coarse_threshold) {
+        const float value = row_input[index];
+        const int32_t position = ::atomicAdd(&num_input[0], 1);
+        if (C10_LIKELY(position < StagingSize)) {
+          staged_buffer(0)[position] = index;
+          const int32_t sub_bin =
+              static_cast<int32_t>((ordered_fp32_key(value) >> 24) & 0xFFu);
+          ::atomicAdd(&histogram[sub_bin], 1u);
+        }
+      }
+    }
+  } else if constexpr (UseVec8) {
     const Vec8Layout layout = make_vec8_layout(row_input, length);
     for (int32_t index = tid; index < layout.prefix; index += Threads) {
       const float value = row_input[index];
@@ -540,58 +545,38 @@ __device__ void radix_topk_exact_with_staged_fast_path(
 
   // Normal staged path: refine only the threshold candidates in shared
   // memory, matching the low-overhead behavior of the supplied JIT kernel.
-  // Round 0 is usually redundant: when the whole staged pool shares one
-  // byte-0 bin it emits nothing, drops nothing, and restages the identical
-  // pool, and the staging-time byte-1 histogram already holds what its
-  // element pass would have built.
-  bool skipped_round0 = false;
 #pragma unroll 4
   for (int round = 0; round < 4; ++round) {
-    const int buffer_index = (round & 1) ^ (skipped_round0 ? 1 : 0);
+    const int buffer_index = round & 1;
     const int32_t current_count = num_input[buffer_index];
 
     if (current_count == remain) {
       const int32_t output_base = output_counter;
       for (int32_t index = tid; index < current_count; index += Threads) {
-        const uint32_t entry =
-            static_cast<uint32_t>(staged_indices[buffer_index * StagingSize + index]);
-        selected_indices[output_base + index] =
-            PackStaged ? static_cast<int32_t>(entry & kPackIndexMask)
-                       : static_cast<int32_t>(entry);
+        selected_indices[output_base + index] = staged_buffer(buffer_index)[index];
       }
       __syncthreads();
       return;
     }
 
-    uint32_t* const scan_src =
-        (PackStaged && round == 1 && skipped_round0) ? &histogram_byte1[0]
-                                                     : &histogram[0];
-    run_suffix_sum_on(scan_src);
-    if (tid < kRadix && scan_src[tid] > static_cast<uint32_t>(remain) &&
-        scan_src[tid + 1] <= static_cast<uint32_t>(remain)) {
+    run_suffix_sum();
+    if (tid < kRadix && histogram[tid] > static_cast<uint32_t>(remain) &&
+        histogram[tid + 1] <= static_cast<uint32_t>(remain)) {
       threshold_bin_id = tid;
       num_input[buffer_index ^ 1] = 0;
-      last_remain = remain - static_cast<int32_t>(scan_src[tid + 1]);
+      last_remain = remain - static_cast<int32_t>(histogram[tid + 1]);
     }
     __syncthreads();
 
     const int32_t refine_threshold = threshold_bin_id;
-    const int32_t emitted = static_cast<int32_t>(scan_src[refine_threshold + 1]);
-    remain -= emitted;
+    remain -= static_cast<int32_t>(histogram[refine_threshold + 1]);
     const int shift = 24 - round * 8;
 
     if (remain == 0) {
       for (int32_t index = tid; index < current_count; index += Threads) {
-        const uint32_t entry =
-            static_cast<uint32_t>(staged_indices[buffer_index * StagingSize + index]);
-        const int32_t score_index =
-            PackStaged ? static_cast<int32_t>(entry & kPackIndexMask)
-                       : static_cast<int32_t>(entry);
+        const int32_t score_index = staged_buffer(buffer_index)[index];
         const int32_t bin =
-            (PackStaged && round <= 1)
-                ? static_cast<int32_t>((entry >> (16 + 8 * round)) & 0xFFu)
-                : static_cast<int32_t>(
-                      (ordered_fp32_key(input[row_start + score_index]) >> shift) & 0xFFu);
+            static_cast<int32_t>((ordered_fp32_key(input[row_start + score_index]) >> shift) & 0xFFu);
         if (bin > refine_threshold) {
           const int32_t position = ::atomicAdd(&output_counter, 1);
           selected_indices[position] = score_index;
@@ -599,18 +584,6 @@ __device__ void radix_topk_exact_with_staged_fast_path(
       }
       __syncthreads();
       return;
-    }
-
-    if constexpr (PackStaged) {
-      if (round == 0 && emitted == 0 &&
-          scan_src[refine_threshold] == static_cast<uint32_t>(current_count)) {
-        // The entire pool sits in the threshold bin and nothing is above it,
-        // so the restage pass is a no-op on the pool and the staging-time
-        // byte-1 histogram already matches it exactly.  Keep the pool in the
-        // current buffer and let round 1 scan histogram_byte1 instead.
-        skipped_round0 = true;
-        continue;
-      }
     }
 
     // Do not clear the suffix sums until all threads have consumed
@@ -624,16 +597,10 @@ __device__ void radix_topk_exact_with_staged_fast_path(
     }
     __syncthreads();
     for (int32_t index = tid; index < current_count; index += Threads) {
-      const uint32_t entry =
-          static_cast<uint32_t>(staged_indices[buffer_index * StagingSize + index]);
-      const int32_t score_index =
-          PackStaged ? static_cast<int32_t>(entry & kPackIndexMask)
-                     : static_cast<int32_t>(entry);
-      const int32_t bin =
-          (PackStaged && round <= 1)
-              ? static_cast<int32_t>((entry >> (16 + 8 * round)) & 0xFFu)
-              : static_cast<int32_t>(
-                    (ordered_fp32_key(input[row_start + score_index]) >> shift) & 0xFFu);
+      const int32_t score_index = staged_buffer(buffer_index)[index];
+      const float value = input[row_start + score_index];
+      const uint32_t key = ordered_fp32_key(value);
+      const int32_t bin = static_cast<int32_t>((key >> shift) & 0xFFu);
       if (bin > refine_threshold) {
         const int32_t position = ::atomicAdd(&output_counter, 1);
         selected_indices[position] = score_index;
@@ -647,13 +614,8 @@ __device__ void radix_topk_exact_with_staged_fast_path(
         } else {
           const int32_t position = ::atomicAdd(&num_input[buffer_index ^ 1], 1);
           if (C10_LIKELY(position < StagingSize)) {
-            staged_indices[(buffer_index ^ 1) * StagingSize + position] =
-                static_cast<int32_t>(entry);
-            const int32_t sub_bin =
-                (PackStaged && round == 0)
-                    ? static_cast<int32_t>((entry >> 24) & 0xFFu)
-                    : static_cast<int32_t>(
-                          (ordered_fp32_key(input[row_start + score_index]) >> (shift - 8)) & 0xFFu);
+            staged_buffer(buffer_index ^ 1)[position] = score_index;
+            const int32_t sub_bin = static_cast<int32_t>((key >> (shift - 8)) & 0xFFu);
             ::atomicAdd(&histogram[sub_bin], 1u);
           }
         }
@@ -663,7 +625,7 @@ __device__ void radix_topk_exact_with_staged_fast_path(
   }
 }
 
-template <int K, int Threads, bool UseVec8, int StagingSize, bool PackStaged>
+template <int K, int Threads, bool UseVec8, int StagingSize, bool CacheCoarseBins = false>
 __global__ __launch_bounds__(Threads) void kpool_topk_transform_kernel(
     KpoolTopKParams params) {
   const int64_t row = static_cast<int64_t>(blockIdx.x);
@@ -743,7 +705,7 @@ __global__ __launch_bounds__(Threads) void kpool_topk_transform_kernel(
   }
 
   __shared__ int32_t selected_groups[K];
-  radix_topk_exact_with_staged_fast_path<K, Threads, UseVec8, StagingSize, PackStaged>(
+  radix_topk_exact_with_staged_fast_path<K, Threads, UseVec8, StagingSize, CacheCoarseBins>(
       score_row, selected_groups, row_start, length);
 
   // GLM-5 fixes pool_size at four.  Specialize the output expansion so the
@@ -817,20 +779,20 @@ template <
     int Threads,
     bool UseVec8,
     int StagingSize,
-    bool PackStaged,
+    bool CacheCoarseBins,
     std::size_t DynamicSmem>
 void launch_kpool_topk_transform_impl(
     const KpoolTopKParams& params, int64_t batch_size, cudaStream_t stream) {
   set_kernel_smem_once<
-      kpool_topk_transform_kernel<K, Threads, UseVec8, StagingSize, PackStaged>,
+      kpool_topk_transform_kernel<K, Threads, UseVec8, StagingSize, CacheCoarseBins>,
       DynamicSmem>();
   const dim3 grid{static_cast<uint32_t>(batch_size)};
   const dim3 block{Threads};
-  kpool_topk_transform_kernel<K, Threads, UseVec8, StagingSize, PackStaged>
+  kpool_topk_transform_kernel<K, Threads, UseVec8, StagingSize, CacheCoarseBins>
       <<<grid, block, DynamicSmem, stream>>>(params);
 }
 
-template <int K, bool PackStaged>
+template <int K>
 void launch_kpool_topk_transform(
     const KpoolTopKParams& params,
     int64_t batch_size,
@@ -838,36 +800,45 @@ void launch_kpool_topk_transform(
     bool use_medium_threads,
     bool use_vec8,
     bool constrained_shared_memory,
-    int64_t score_width,
     cudaStream_t stream) {
+  const int64_t score_width = params.score_stride;
   if (use_vec8) {
-    if (constrained_shared_memory && batch_size >= 32 &&
-        score_width >= kVec8ShortStagingMinScoreWidth) {
+    if (constrained_shared_memory && batch_size >= 32) {
       launch_kpool_topk_transform_impl<
-          K, kDefaultThreads, true, kShortStagingSize, PackStaged, kShortDynamicSmem>(
+          K, kDefaultThreads, true, kShortStagingSize, false, kShortDynamicSmem>(
           params, batch_size, stream);
     } else {
-      launch_kpool_topk_transform_impl<
-          K, kDefaultThreads, true, kLongStagingSize, PackStaged, kLongDynamicSmem>(
-          params, batch_size, stream);
+      const bool use_coarse_bin_cache =
+          !constrained_shared_memory &&
+          score_width <= kCoarseBinCacheMaxScoreWidth &&
+          batch_size >= kCoarseBinCacheMinBatch;
+      if (use_coarse_bin_cache) {
+        launch_kpool_topk_transform_impl<
+            K, kDefaultThreads, true, kLongStagingSize, true, kLongDynamicSmem>(
+            params, batch_size, stream);
+      } else {
+        launch_kpool_topk_transform_impl<
+            K, kDefaultThreads, true, kLongStagingSize, false, kLongDynamicSmem>(
+            params, batch_size, stream);
+      }
     }
   } else if (use_short_staging) {
     if (constrained_shared_memory && batch_size < 32) {
       launch_kpool_topk_transform_impl<
-          K, kDefaultThreads, false, kShortStagingSize, PackStaged, kShortDynamicSmem>(
+          K, kDefaultThreads, false, kShortStagingSize, false, kShortDynamicSmem>(
           params, batch_size, stream);
     } else {
       launch_kpool_topk_transform_impl<
-          K, kMediumThreads, false, kShortStagingSize, PackStaged, kShortDynamicSmem>(
+          K, kMediumThreads, false, kShortStagingSize, false, kShortDynamicSmem>(
           params, batch_size, stream);
     }
   } else if (use_medium_threads) {
     launch_kpool_topk_transform_impl<
-        K, kMediumThreads, false, kLongStagingSize, PackStaged, kLongDynamicSmem>(
+        K, kMediumThreads, false, kLongStagingSize, false, kLongDynamicSmem>(
         params, batch_size, stream);
   } else {
     launch_kpool_topk_transform_impl<
-        K, kDefaultThreads, false, kLongStagingSize, PackStaged, kLongDynamicSmem>(
+        K, kDefaultThreads, false, kLongStagingSize, false, kLongDynamicSmem>(
         params, batch_size, stream);
   }
 }
@@ -993,8 +964,7 @@ void kpool_topk_transform_interface(
   // while longer rows retain the 4096-candidate buffer and exact overflow
   // fallback. Keep the implementations separate so the short kernel does not
   // reserve long-row shared memory.
-  const int64_t score_width = score.size(1);
-  const bool use_short_staging = score_width <= kShortStagingSize;
+  const bool use_short_staging = score.size(1) <= kShortStagingSize;
   const bool use_medium_threads =
       score.size(1) > group_topk + 1 && score.size(1) <= kMediumMaxScoreWidth;
   const bool use_vec8 = score.size(1) >= kVec8MinScoreWidth;
@@ -1018,36 +988,36 @@ void kpool_topk_transform_interface(
     return properties.sharedMemPerMultiprocessor <= 64 * 1024;
   }();
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
-  const auto launch_kpool = [&](auto group_topk_constant) {
-    constexpr int K = decltype(group_topk_constant)::value;
-    if (score_width <= kPackMaxScoreWidth) {
-      launch_kpool_topk_transform<K, true>(
-          params, batch_size, use_short_staging, use_medium_threads,
-          use_vec8, constrained_shared_memory, score_width, stream);
-    } else {
-      launch_kpool_topk_transform<K, false>(
-          params, batch_size, use_short_staging, use_medium_threads,
-          use_vec8, constrained_shared_memory, score_width, stream);
-    }
-  };
   switch (group_topk) {
     case 128:
-      launch_kpool(std::integral_constant<int, 128>{});
+      launch_kpool_topk_transform<128>(
+          params, batch_size, use_short_staging, use_medium_threads, use_vec8,
+          constrained_shared_memory, stream);
       break;
     case 160:
-      launch_kpool(std::integral_constant<int, 160>{});
+      launch_kpool_topk_transform<160>(
+          params, batch_size, use_short_staging, use_medium_threads, use_vec8,
+          constrained_shared_memory, stream);
       break;
     case 192:
-      launch_kpool(std::integral_constant<int, 192>{});
+      launch_kpool_topk_transform<192>(
+          params, batch_size, use_short_staging, use_medium_threads, use_vec8,
+          constrained_shared_memory, stream);
       break;
     case 224:
-      launch_kpool(std::integral_constant<int, 224>{});
+      launch_kpool_topk_transform<224>(
+          params, batch_size, use_short_staging, use_medium_threads, use_vec8,
+          constrained_shared_memory, stream);
       break;
     case 256:
-      launch_kpool(std::integral_constant<int, 256>{});
+      launch_kpool_topk_transform<256>(
+          params, batch_size, use_short_staging, use_medium_threads, use_vec8,
+          constrained_shared_memory, stream);
       break;
     case 512:
-      launch_kpool(std::integral_constant<int, 512>{});
+      launch_kpool_topk_transform<512>(
+          params, batch_size, use_short_staging, use_medium_threads, use_vec8,
+          constrained_shared_memory, stream);
       break;
     default:
       TORCH_CHECK(false, "unsupported group_topk: ", group_topk);

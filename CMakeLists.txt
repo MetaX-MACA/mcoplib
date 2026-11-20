@@ -227,7 +227,6 @@ if (BUILD_VLLM_SUBMODULE)
     "${VLLM_SRC_DIR}/fused_kimi_k3_mla_key_concat_kv_cache_kernel.cu"
     "${VLLM_SRC_DIR}/sampler.cu"
     "${VLLM_SRC_DIR}/topk.cu"
-    "${VLLM_SRC_DIR}/candidate_blocks.cu"
     "${VLLM_SRC_DIR}/region_topk_ids.cu"
     "${VLLM_SRC_DIR}/dsv3_fused_a_gemm.cu"
     "${VLLM_SRC_DIR}/cuda_view.cu"
@@ -257,8 +256,6 @@ if (BUILD_VLLM_SUBMODULE)
     "${VLLM_SRC_DIR}/attention/dcp_utils/dcp_direct_kv_gather.cu"
     "${VLLM_SRC_DIR}/attention/dcp_utils/dcp_direct_q_gather.cu"
     "${VLLM_SRC_DIR}/vocab_parallel_embedding_kernels.cu"
-    "${VLLM_SRC_DIR}/hisparse_kernels.cu"
-    "${VLLM_SRC_DIR}/nvfp4_ds_mla_cache_kernels.cu"
     "${VLLM_SRC_DIR}/torch_bindings.cpp")
     
 

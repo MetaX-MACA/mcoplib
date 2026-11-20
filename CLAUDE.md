@@ -155,7 +155,7 @@ Extension ordering in `setup.py` matters: extensions needing `EXT_SUFFIX` (lmdep
 ### Python package (`mcoplib/`)
 
 - `__init__.py` — version parsing + MACA compatibility checks (runs at import)
-- `version` — generated at build time by `setup.py:write_git_info_file` with `Mcoplib_Version`, `Build_Maca_Version`, `Min_Compatibility_Maca_Version`, `GIT_BRANCH`, `GIT_COMMIT`, framework op versions
+- `version` — generated at build time by `setup.py:write_git_info_file` with `mcoplib_Version`, `Build_Maca_Version`, `Min_Compatibility_Maca_Version`, `GIT_BRANCH`, `GIT_COMMIT`, framework op versions
 - `custom_ops.py` — high-level Python wrappers over `mcoplib.op` kernels
 - `triton_fused_moe.py`, `triton_dsv4.py`, `triton_utils/` — Triton fallback/alternative kernels
 - `quant_utils.py`, `marlin_*.py`, `fused_*.py` — quantization and fusion helpers

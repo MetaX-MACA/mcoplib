@@ -81,8 +81,7 @@ __device__ __forceinline__ cache_t quant_one(float f) {
     return static_cast<cache_t>(q);
   } else {
     f = fminf(fmaxf(f, -448.f), 448.f);
-    uint8_t const bits = c10::Float8_e4m3fn(f).x;
-    return *reinterpret_cast<const cache_t*>(&bits);
+    return static_cast<cache_t>(c10::Float8_e4m3fn(f).x);
   }
 }
 

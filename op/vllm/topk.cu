@@ -6,8 +6,6 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_runtime.h>
 #include <algorithm>
-#include "ops.h"
-#include "torch_utils.h"
 
 #ifndef USE_ROCM
   #include "persistent_topk.cuh"
@@ -139,15 +137,16 @@ void launch_persistent_topk(const torch::Tensor& logits,
     if (num_groups == 0) num_groups = 1;
     uint32_t total_ctas = num_groups * ctas_per_group;
 
-    // If the cooperative launch wouldn't fit, use the generic decode kernel on
-    // low-smem devices or FilteredTopK where its 128 KiB requirement is met.
+    // If the cooperative launch wouldn't fit, fall back to FilteredTopK
+    // instead of deadlocking. Only relevant when needs_cooperative.
     if (needs_cooperative && total_ctas > hw_resident_cap) {
-      if (max_smem_per_block < 128 * 1024) {
-        const int64_t next_n = lengths.dim() == 2 ? lengths.size(1) : 1;
-        top_k_per_row_decode(logits, next_n, lengths, output, num_rows,
-                             logits.stride(0), logits.stride(1), TopK);
-        return;
-      }
+      TORCH_CHECK(max_smem_per_block >= kFilteredTopKMinSmem,
+                  "persistent_topk would oversubscribe and the FilteredTopK "
+                  "fallback requires >= ", kFilteredTopKMinSmem,
+                  " bytes smem per block (have ", max_smem_per_block, "). total_ctas=", total_ctas,
+                  " > num_sms*occupancy=", hw_resident_cap, " (TopK=", TopK,
+                  ", vec_size=", vec_size, ", ctas_per_group=", ctas_per_group,
+                  ", smem=", smem_size, ").");
       cudaError_t status =
           vllm::FilteredTopKRaggedTransform<float, int32_t, TopK>(
               logits.data_ptr<float>(), output.data_ptr<int32_t>(),

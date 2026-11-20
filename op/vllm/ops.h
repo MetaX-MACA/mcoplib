@@ -160,16 +160,6 @@ void top_k_per_row_decode(const torch::Tensor& logits, int64_t next_n,
                           int64_t numRows, int64_t stride0, int64_t stride1,
                           int64_t topK);
 
-void select_candidate_blocks(torch::Tensor logits,
-                             c10::optional<torch::Tensor> starts,
-                             torch::Tensor ends, int64_t topk_blocks,
-                             int64_t block_size, torch::Tensor out,
-                             int64_t row_repeat);
-
-void apply_candidate_mask(torch::Tensor logits,
-                          c10::optional<torch::Tensor> starts,
-                          torch::Tensor ends, torch::Tensor candidates,
-                          int64_t block_size, int64_t row_repeat);
 
 void persistent_topk(const torch::Tensor& logits, const torch::Tensor& lengths,
                      torch::Tensor& output, torch::Tensor& workspace, int64_t k,
@@ -280,24 +270,18 @@ void swigluoai_and_mul(torch::Tensor& out, torch::Tensor& input,
                        double alpha = 1.702, double limit = 7.0);
 
 void situ_and_mul(torch::Tensor& out, torch::Tensor& input, double beta = 1.0,
-    double linear_beta = -1.0);
-void situ_and_mul_quant(
-    torch::Tensor& out, torch::Tensor& scale,
-    torch::Tensor& input, double beta = 1.0, double linear_beta = -1.0,
-    int64_t group_size = 0,
-    std::optional<torch::Tensor> num_valid_tokens = std::nullopt,
-    int64_t topk = 1);
+    double linear_beta = -1.0,
+    std::optional<torch::Tensor> valid_rows = std::nullopt);
+// void situ_and_mul_quant(
+//     torch::Tensor& out, torch::Tensor& scale,
+//     torch::Tensor& input, double beta = 1.0, double linear_beta = -1.0,
+//     int64_t group_size = 0,
+//     std::optional<torch::Tensor> valid_rows = std::nullopt,
+//     int64_t topk = 1);
 void masked_situ_and_mul(torch::Tensor& out,
                          torch::Tensor& input,
                          const torch::Tensor& expert_num_tokens,
                          double beta = 1.0, double linear_beta = -1.0);
-void masked_moe_activation(torch::Tensor& out,
-                           torch::Tensor& input,
-                           const torch::Tensor& valid_token_counts,
-                           const std::string& activation,
-                           double clamp_limit = 0.0, double alpha = 1.0,
-                           double beta = 0.0, double situ_beta = 1.0,
-                           double situ_linear_beta = -1.0);
 
 void gelu_new(torch::Tensor& out, torch::Tensor& input);
 
@@ -439,61 +423,12 @@ std::tuple<torch::Tensor, torch::Tensor> minimax_allreduce_rms_qk(
     int64_t const q_size, int64_t const kv_size, int64_t const rank,
     int64_t const nranks, double const eps);
 
-void concat_and_cache_mla_grouped(
-    torch::Tensor& kv_c, torch::Tensor& k_pe,
-    torch::Tensor& kv_cache_ptrs, torch::Tensor& slot_mapping,
-    int64_t block_size, int64_t block_stride, int64_t entry_stride,
-    std::optional<torch::Tensor> kv_scales,
-    const std::string& kv_cache_dtype);
-
-#ifndef USE_ROCM
-// HiSparse kernels use raw PTX in the row copy; CUDA-only.
-void hisparse_resolve_residency(
-    torch::Tensor const& host_cache, torch::Tensor& hot_cache,
-    torch::Tensor const& hot_block_table,
-    torch::Tensor const& global_indices,
-    torch::Tensor& hot_indices,
-    torch::Tensor& device_global_indices,
-    torch::Tensor& lru_slots,
-    std::optional<torch::Tensor> const& request_state_indices,
-    int64_t region_stride,
-    std::optional<torch::Tensor> const& miss_mask,
-    std::optional<torch::Tensor> const& stats,
-    std::optional<torch::Tensor> const& attention_indices,
-    int64_t attention_block_stride,
-    std::optional<torch::Tensor> const& request_ids,
-    std::optional<torch::Tensor> const& source_block_table,
-    int64_t source_block_size,
-    std::optional<torch::Tensor> const& resolved_global_indices,
-    std::optional<torch::Tensor> const& valid_counts,
-    std::optional<torch::Tensor> const& swap_host_physical_rows,
-    std::optional<torch::Tensor> const& swap_device_physical_rows,
-    std::optional<torch::Tensor> const& swap_counts,
-    std::optional<torch::Tensor> const& resident_block_table,
-    int64_t resident_block_size, int64_t resident_null_block);
-
-void hisparse_invalidate_written_slots(
-    torch::Tensor& device_global_indices,
-    torch::Tensor const& request_state_indices,
-    torch::Tensor const& req_id_per_token,
-    torch::Tensor const& written_slots);
-
-void hisparse_gather_plan(
-    torch::Tensor const& host_cache, torch::Tensor& hot_cache,
-    torch::Tensor const& global_indices,
-    torch::Tensor const& hot_indices,
-    torch::Tensor const& miss_mask,
-    std::optional<torch::Tensor> const& request_state_indices,
-    std::optional<torch::Tensor> const& attention_indices,
-    int64_t attention_block_stride);
-
-void hisparse_gather_compact(torch::Tensor const& host_cache,
-                             torch::Tensor& hot_cache,
-                             torch::Tensor const& miss_global_indices,
-                             torch::Tensor const& miss_hot_indices,
-                             torch::Tensor const& miss_counts);
-
-#endif  // !USE_ROCM
+void concat_and_cache_mla_grouped(torch::Tensor& kv_c,
+                                  torch::Tensor& k_pe,
+                                  torch::Tensor& kv_cache_ptrs,
+                                  torch::Tensor& slot_mapping,
+                                  int64_t block_size, int64_t block_stride,
+                                  int64_t entry_stride);
 
 // Horizontally-fused MiniMax-M3 QK-norm + partial NeoX RoPE (+ optional KV /
 // index-cache insert). Dense layer: norm+RoPE only; sparse layer: also packs
@@ -610,14 +545,13 @@ void fused_gdn_decode_post_conv_mtp(
 
 #ifdef VLLM_ENABLE_KIMI_K3_ATTN_RES
 void kimi_k3_attn_res(torch::Tensor& prefix,
-                      std::optional<torch::Tensor> delta,
-                      torch::Tensor& blocks,
+                      torch::Tensor const& delta,
+                      torch::Tensor const& blocks,
                       torch::Tensor const& norm_weight,
                       torch::Tensor const& qk_weight,
-                      std::optional<torch::Tensor> output_norm_weight,
+                      torch::Tensor const& output_norm_weight,
                       torch::Tensor& output, int64_t num_blocks,
-                      int64_t block_write_idx, double eps,
-                      double output_norm_eps);
+                      double eps, double output_norm_eps);
 #endif
 
 using fptr_t = int64_t;

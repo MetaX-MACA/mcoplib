@@ -10,12 +10,12 @@
 
 // Output dispatch for swiglu_step_and_mul_per_block_quant: fp8, int8, and the
 // normalized bf16 path (scale = amax, out in [-1, 1]).
-#define SWIGLU_MCOP_CASE_OUT(...)                     \
+#define SWIGLU_MCOPLIB_CASE_OUT(...)                     \
   AT_DISPATCH_CASE(at::ScalarType::BFloat16, __VA_ARGS__) \
   VLLM_DISPATCH_CASE_QUANT_TYPES(__VA_ARGS__)
 
-#define SWIGLU_MCOP_DISPATCH_OUT(TYPE, NAME, ...) \
-  AT_DISPATCH_SWITCH(TYPE, NAME, SWIGLU_MCOP_CASE_OUT(__VA_ARGS__))
+#define SWIGLU_MCOPLIB_DISPATCH_OUT(TYPE, NAME, ...) \
+  AT_DISPATCH_SWITCH(TYPE, NAME, SWIGLU_MCOPLIB_CASE_OUT(__VA_ARGS__))
 
 namespace vllm {
 
@@ -475,7 +475,7 @@ void swiglu_step_and_mul_per_block_quant(
       input.scalar_type(), "swiglu_step_and_mul_per_block_quant", [&] {
         using scalar_in_t = scalar_t;
 
-        SWIGLU_MCOP_DISPATCH_OUT(
+        SWIGLU_MCOPLIB_DISPATCH_OUT(
             out.scalar_type(), "swiglu_step_and_mul_per_block_quant", [&] {
               using scalar_out_t = scalar_t;
               float const l = (float)limit;

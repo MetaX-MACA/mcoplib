@@ -2,44 +2,21 @@
 testall.py — Batch driver for mcoplib operator benchmarks.
 
 Usage:
-  python testall.py                      # default: pure benchmark mode (see below)
+  python testall.py                      # default: --generate
   python testall.py --generate           # only fill missing CSV rows (skip existing)
   python testall.py --compare            # compare each op vs CSV baseline; fail if >5%% slower
   python testall.py --update             # overwrite CSV rows for all ops
   python testall.py --csv PATH           # override CSV path (default: statistics/mcoplib_ops_performance_C500.csv)
   python testall.py --output PATH        # specify output Excel file path (.xlsx) for compare report (supports absolute and relative paths)
   python testall.py --ops a,b,c          # only run named ops
-
-Default (no mode flag): pure benchmark mode. Every op in scope is benchmarked
-for real (equivalent to `python mcoplib_mxbenchmark_ops.py --op <name>` per
-op) with NO generate/update/compare actions — the CSV is neither read for
-baselines nor written. Per-result stats tables are printed and, with
---report, aggregated into the 6-column Excel report.
-  python testall.py --infer_framework FW # only run ops of one framework: op | vllm | sglang
-                                         #   vllm   -> op/vllm kernels (mcoplib._C / mcoplib._moe_C,
-                                         #              torch.ops._C / torch.ops._moe_C)
-                                         #   sglang -> op/sglang kernels (mcoplib.sgl_kernel,
-                                         #              torch.ops.sgl_kernel)
-                                         #   op     -> mcoplib's own ops (mcoplib.op module plus
-                                         #              the package's triton_/tilelang_ python kernels)
-                                         # unset  -> run all ops
-  python testall.py --report PATH        # aggregate per-result performance stats into one Excel
-                                         # table (op_name, dtype, shape, acc_pass, GlobalMem BW,
-                                         # BWUtil; one row per benchmark result). Works in every
-                                         # mode. Default: benchmark dir, mirroring the CSV name.
   python testall.py --dry-run            # list ops without running
 
 The script:
   1. Calls `python mcoplib_mxbenchmark_ops.py --list` to enumerate supported ops.
-  2. For each op, runs `python mcoplib_mxbenchmark_ops.py --op <name> [--<mode>] --csv <csv>`
-     (no mode flag in the default pure benchmark mode).
+  2. For each op, runs `python mcoplib_mxbenchmark_ops.py --op <name> --<mode> --csv <csv>`.
   3. Parses stdout to extract accuracy status and performance status.
   4. Prints a per-op summary table and a final roll-up (success/failure counts + failing op names).
   5. In --compare mode, generates an Excel report (.xlsx) with summary and per-operator sheets.
-  6. Always aggregates every benchmark result into a 6-column Excel table (see --report).
-  7. Writes the overall summary (total/success/failed/skipped counts, elapsed,
-     failed/skipped op lists, overall result) to testall_output.json (replaces
-     the old testall_output.txt per-op log).
 """
 
 import os
@@ -48,7 +25,6 @@ import sys
 import csv
 import ast
 import time
-import json
 import argparse
 import subprocess
 from datetime import datetime
@@ -82,9 +58,7 @@ def _resolve_default_csv_filename():
 
 CSV_FILENAME = _resolve_default_csv_filename()
 DEFAULT_CSV = os.path.join(STATISTICS_DIR, CSV_FILENAME)
-# Overall summary JSON written at the end of every run (replaces the old
-# testall_output.txt per-op log).
-SUMMARY_JSON_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "testall_output.json")
+OUTPUT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "testall_output.txt")
 
 LIST_OP_PREFIX = "  * "
 VERIFY_RE = re.compile(r"\[VERIFY\]\s+(\S+)\s*->\s*(PASS|FAIL)", re.IGNORECASE)
@@ -101,49 +75,6 @@ SUMMARY_RE = re.compile(
 # Threshold for performance regression in --compare mode (must match the
 # single-op script's own 5%% rule).
 PERF_REGRESSION_THRESHOLD_PCT = 5.0
-
-# ---------------------------------------------------------------------------
-# Framework classification (--infer_framework)
-#
-# mcoplib exposes its kernels through several extension modules:
-#   - mcoplib._C / mcoplib._moe_C, built from op/vllm/ (the _C extension also
-#     registers the torch.ops._C_cache_ops namespace)   -> "vllm" framework ops
-#   - mcoplib.sgl_kernel, built from op/sglang/         -> "sglang" framework ops
-#   - everything else: the mcoplib.op module (built from op/ direct sources)
-#     plus the package's own triton_/tilelang_ python kernels -> "op"
-# An op is classified by the invocation pattern found in its runner file.
-# ---------------------------------------------------------------------------
-FRAMEWORK_CHOICES = ("op", "vllm", "sglang")
-FRAMEWORK_PATTERNS = {
-    "vllm": re.compile(
-        r"torch\.ops\._C\.|torch\.ops\._C_cache_ops\.|torch\.ops\._moe_C\."
-        r"|mcoplib\._C\b|mcoplib\._moe_C\b"
-    ),
-    "sglang": re.compile(r"torch\.ops\.sgl_kernel\.|mcoplib\.sgl_kernel\b"),
-}
-RUNNERS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "runners")
-
-
-def detect_op_framework(op_name):
-    """Classify an op as 'vllm', 'sglang' or 'op' from its runner file.
-
-    Scans runners/mcoplib_mxbenchmark_<op>_runners.py for the invocation
-    pattern of the kernel under test. Returns None when the runner file
-    cannot be read (such an op matches no framework filter).
-    """
-    runner_path = os.path.join(
-        RUNNERS_DIR, f"mcoplib_mxbenchmark_{op_name}_runners.py"
-    )
-    try:
-        with open(runner_path, "r", encoding="utf-8") as f:
-            src = f.read()
-    except OSError:
-        return None
-    if FRAMEWORK_PATTERNS["vllm"].search(src):
-        return "vllm"
-    if FRAMEWORK_PATTERNS["sglang"].search(src):
-        return "sglang"
-    return "op"
 
 
 def _load_ignored_operators():
@@ -246,156 +177,6 @@ def parse_run_output(stdout):
     return info
 
 
-# ---------------------------------------------------------------------------
-# Parsing of the per-result pipe tables the single-op script prints at the end
-# of every run ("# Benchmark Results" markdown section). Used both to echo the
-# per-op stats into this run's output and to feed the --report table in
-# --compare mode (where the current run's full rows are not persisted anywhere
-# else: the subprocess writes them to a temp CSV it deletes afterwards).
-# ---------------------------------------------------------------------------
-BENCH_SECTION_TITLE = "# Benchmark Results"
-
-
-def extract_benchmark_section(stdout):
-    """Return the '# Benchmark Results' markdown section of a single-op run's
-    stdout (the per-result pipe tables), or '' when absent."""
-    lines = stdout.splitlines()
-    for i, line in enumerate(lines):
-        if line.strip() == BENCH_SECTION_TITLE:
-            section = "\n".join(lines[i:]).rstrip()
-            # Drop a trailing markdown code fence, if present.
-            if section.endswith("```"):
-                section = section[: section.rfind("```")].rstrip()
-            return section
-    return ""
-
-
-def _is_separator(line):
-    """True if line is a pipe-table separator (|-----|-----|...)."""
-    s = line.strip()
-    return s.startswith("|") and "-" in s and all(c in "|-: " for c in s)
-
-
-def _cells(line):
-    """Split a pipe-table line into stripped cells."""
-    return [c.strip() for c in line.strip().strip("|").split("|")]
-
-
-def _rejoin_done_split(head_line, cont_line):
-    """Rejoin a table line split by the child's unflushed "Done." print.
-
-    When the single-op script's stdout is a pipe, its exit flush of the
-    unflushed warmup progress print ("Done.") can land mid-line, splitting a
-    table line into "<line prefix> Done." + "<line suffix>". Strip the marker
-    and glue the halves back together. Returns None when cont_line is not a
-    plausible continuation (no pipe-table fragment, or it carries its own
-    marker), leaving the caller's original line untouched.
-    """
-    cont = cont_line.strip()
-    if "|" not in cont:
-        return None
-    joined = head_line.strip()[: -len("Done.")].rstrip() + cont
-    if "Done." in joined:  # continuation itself carries the marker
-        return None
-    return joined
-
-
-def parse_benchmark_tables(stdout, op_name):
-    """Parse the per-result pipe tables from a single-op run's stdout.
-
-    Returns report-row dicts (op_name/dtype/shape/acc_pass/GlobalMem BW/
-    BWUtil), one per benchmark result row. Column positions are taken from
-    each table's own header line, so extra axis columns (Bits, NE_N, ...)
-    don't break the parse. Some ops define neither a dtype axis nor a
-    bandwidth metric, so their tables have no dtype / GlobalMem BW / BWUtil
-    columns at all — those fields default to "" (matching how such ops
-    appear in the results CSV).
-
-    Lines split by the "Done." flush (see _rejoin_done_split) are recovered:
-    a split header or data row is rejoined with its continuation half and
-    accepted only when the rejoined column count matches the table's own
-    structure (the separator line for headers, the header for rows), so a
-    well-formed line is never altered.
-    """
-    rows = []
-    lines = stdout.splitlines()
-    i = 0
-    while i < len(lines):
-        stripped = lines[i].strip()
-        # A results-table header: pipe table carrying the per-result columns.
-        # (Acc_Pass + Shape is the stable signature across table variants.)
-        if (stripped.startswith("|") and "Acc_Pass" in stripped
-                and "Shape" not in stripped and stripped.endswith("Done.")
-                and i + 2 < len(lines) and _is_separator(lines[i + 2])):
-            # Header split before its Shape column: the signature test fails
-            # even though this is a header; rejoin and re-test before moving on.
-            cand = _rejoin_done_split(stripped, lines[i + 1])
-            if cand and "Shape" in cand \
-                    and len(_cells(cand)) == len(_cells(lines[i + 2])):
-                stripped = cand
-                i += 1  # consume the continuation half of the split header
-        if not (stripped.startswith("|") and "Acc_Pass" in stripped
-                and "Shape" in stripped):
-            i += 1
-            continue
-        header = _cells(stripped)
-        # Header split after its Shape column still passes the signature test
-        # but keeps a wrong column count; the separator line below the
-        # continuation validates the rejoined count.
-        if (stripped.endswith("Done.") and i + 2 < len(lines)
-                and _is_separator(lines[i + 2])
-                and len(header) != len(_cells(lines[i + 2]))):
-            joined = _rejoin_done_split(stripped, lines[i + 1])
-            if joined is not None \
-                    and len(_cells(joined)) == len(_cells(lines[i + 2])):
-                header = _cells(joined)
-                i += 1  # consume the continuation half of the split header
-        i += 1
-        # Skip the header separator line (|-----|-----|...).
-        if i < len(lines) and _is_separator(lines[i]):
-            i += 1
-        while i < len(lines):
-            s = lines[i].strip()
-            if not s.startswith("|"):
-                # A standalone "Done." line (injection landed exactly at a
-                # line boundary): skip it and keep reading this table's rows.
-                if s == "Done." and i + 1 < len(lines):
-                    nxt = lines[i + 1].strip()
-                    if (nxt.startswith("|") and "Acc_Pass" not in nxt
-                            and not _is_separator(nxt)):
-                        i += 1
-                        continue
-                break
-            raw = s
-            cells = [c.strip() for c in raw.strip("|").split("|")]
-            # Data row split by the "Done." flush ("<row prefix> Done." +
-            # "<row suffix>"): rejoin and accept only on an exact column
-            # count match, so a well-formed row is never altered. ("Done."
-            # can never occur in a real row cell here.) If the rejoin is not
-            # possible, the following line is the orphaned suffix fragment:
-            # consume it so the rest of this table's rows are still read.
-            if raw.endswith("Done.") and i + 1 < len(lines):
-                joined = _rejoin_done_split(raw, lines[i + 1])
-                if joined is not None and len(_cells(joined)) == len(header):
-                    cells = _cells(joined)
-                    i += 1  # consume the continuation half of the split row
-                elif ("|" in lines[i + 1]
-                        and not lines[i + 1].strip().startswith("|")):
-                    i += 1  # skip the orphaned continuation fragment
-            if len(cells) == len(header):
-                d = dict(zip(header, cells))
-                rows.append({
-                    "op_name": d.get("Op") or op_name,
-                    "dtype": d.get("dtype", ""),
-                    "shape": d.get("Shape", ""),
-                    "acc_pass": d.get("Acc_Pass", ""),
-                    "GlobalMem BW": d.get("GlobalMem BW", ""),
-                    "BWUtil": d.get("BWUtil", ""),
-                })
-            i += 1
-    return rows
-
-
 def _op_in_csv(op_name, csv_path):
     """Return True if op_name appears as op_name column in the CSV."""
     if not os.path.exists(csv_path):
@@ -452,21 +233,6 @@ def classify_result(op_name, mode, info, returncode, csv_path, csv_before):
             return "FAILED", f"perf={perf} (slow {slowdown_pct:.2f}%)"
         return "SUCCESS", f"acc=Pass perf={perf}"
 
-    # bench mode (no-flag default): pure benchmark run, no CSV actions.
-    # Success = result tables were printed and no result row failed its
-    # accuracy check. (Acc_Pass lives in the per-result tables; empty cells
-    # carry no verdict and don't fail the op.)
-    if mode == "bench":
-        stdout = info.get("stdout") or ""
-        bench_rows = parse_benchmark_tables(stdout, op_name)
-        if not bench_rows:
-            return "SKIPPED", "no benchmark results"
-        n_fail = sum(1 for r in bench_rows
-                     if r["acc_pass"].strip().lower() not in ("yes", "pass", ""))
-        if n_fail:
-            return "FAILED", f"acc fail ({n_fail}/{len(bench_rows)} results)"
-        return "SUCCESS", f"acc=Pass ({len(bench_rows)} results)"
-
     # generate mode: APPEND = success, SKIP = skipped (already exists).
     if mode == "generate":
         if info["csv_action"] == "APPEND":
@@ -506,15 +272,9 @@ def run_one_op(op_name, mode, csv_path, output_csv=None):
     cmd = [
         sys.executable, script_path,
         "--op", op_name,
+        f"--{mode}",
         "--csv", csv_path,
     ]
-    # Pure benchmark mode ("bench", the no-flag default): invoke the single-op
-    # script WITHOUT any mode flag so it only benchmarks the op and prints the
-    # per-result tables — no generate/update/compare CSV actions. (--csv is
-    # inert without a mode flag; it only silences the script's default-path
-    # warning.)
-    if mode != "bench":
-        cmd.append(f"--{mode}")
     if output_csv and mode == "compare":
         # Ensure output_csv is absolute
         output_csv = os.path.abspath(output_csv)
@@ -530,11 +290,7 @@ def run_one_op(op_name, mode, csv_path, output_csv=None):
     except subprocess.TimeoutExpired:
         return None, 124, time.time() - start
     elapsed = time.time() - start
-    info = parse_run_output(stdout)
-    # Keep the raw stdout so the caller can echo the per-result benchmark
-    # tables and (in --compare/--bench modes) feed the --report aggregation.
-    info["stdout"] = stdout
-    return info, rc, elapsed
+    return parse_run_output(stdout), rc, elapsed
 
 
 def print_summary_table(rows):
@@ -820,138 +576,6 @@ def _get_op_data_from_csv(op_name, csv_path, output_csv=None):
         return []
 
 
-# ---------------------------------------------------------------------------
-# Aggregated performance report (--report)
-#
-# One Excel row per benchmark result (an op with multiple shape/dtype
-# combinations gets multiple rows), with exactly these columns:
-#   op_name | dtype | shape | acc_pass | GlobalMem BW | BWUtil
-# Data source depends on the mode:
-#   - generate/update: the results CSV (freshly appended rows plus previously
-#     recorded ones for the ops in scope)
-#   - compare/bench: the per-result tables parsed from each op's run stdout
-#     (in compare mode the current run's rows are otherwise discarded by the
-#     single-op script; in bench mode no CSV is written at all)
-# ---------------------------------------------------------------------------
-REPORT_COLUMNS = ["op_name", "dtype", "shape", "acc_pass", "GlobalMem BW", "BWUtil"]
-DEFAULT_REPORT = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    CSV_FILENAME.replace(".csv", ".xlsx"),
-)
-
-
-def _fmt_bw_bytes(val):
-    """Format a bytes/sec number string like the benchmark tables do
-    (e.g. 1446396330269.95 -> '1.446 TB/s')."""
-    try:
-        v = float(val)
-    except (TypeError, ValueError):
-        return str(val or "")
-    for unit, factor in (("TB/s", 1e12), ("GB/s", 1e9), ("MB/s", 1e6), ("KB/s", 1e3)):
-        if v >= factor:
-            return f"{v / factor:.3f} {unit}"
-    return f"{v:.1f} B/s"
-
-
-def _fmt_bwutil(val):
-    """Format a BWUtil ratio like the benchmark tables do (0.7847 -> '78.47%')."""
-    try:
-        v = float(val)
-    except (TypeError, ValueError):
-        return str(val or "")
-    return f"{v * 100:.2f}%"
-
-
-def collect_report_rows_from_csv(op_scope, csv_path):
-    """Collect report rows for ops in op_scope from a benchmark results CSV."""
-    rows = []
-    if not os.path.exists(csv_path):
-        return rows
-    try:
-        with open(csv_path, newline="", encoding="utf-8") as f:
-            for r in csv.DictReader(f):
-                if r.get("op_name") not in op_scope:
-                    continue
-                rows.append({
-                    "op_name": r.get("op_name", ""),
-                    "dtype": r.get("dtype", ""),
-                    "shape": r.get("Shape", ""),
-                    "acc_pass": r.get("Acc_Pass", ""),
-                    "GlobalMem BW": _fmt_bw_bytes(r.get("GlobalMem BW (bytes/sec)", "")),
-                    "BWUtil": _fmt_bwutil(r.get("BWUtil", "")),
-                })
-    except Exception as e:
-        print(f"[WARN] Failed to read '{csv_path}' for --report: {e}")
-    return rows
-
-
-def generate_report_excel(report_rows, output_path, mode, infer_framework):
-    """Write the aggregated 6-column performance table to an Excel file."""
-    if not EXCEL_AVAILABLE:
-        print("[WARN] openpyxl not available, skipping --report Excel generation")
-        return
-    filepath = os.path.abspath(output_path)
-    out_dir = os.path.dirname(filepath)
-    if out_dir and not os.path.exists(out_dir):
-        os.makedirs(out_dir, exist_ok=True)
-
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "Performance"
-
-    header_font = Font(name='Arial', size=12, bold=True)
-    header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
-    header_alignment = Alignment(horizontal='center', vertical='center')
-
-    for col_idx, name in enumerate(REPORT_COLUMNS, start=1):
-        cell = ws.cell(row=1, column=col_idx, value=name)
-        cell.font = header_font
-        cell.fill = header_fill
-        cell.alignment = header_alignment
-
-    for row_idx, r in enumerate(report_rows, start=2):
-        for col_idx, name in enumerate(REPORT_COLUMNS, start=1):
-            ws.cell(row=row_idx, column=col_idx, value=r.get(name, ""))
-
-    for col_idx, name in enumerate(REPORT_COLUMNS, start=1):
-        width = len(name)
-        for r in report_rows:
-            width = max(width, len(str(r.get(name, ""))))
-        ws.column_dimensions[get_column_letter(col_idx)].width = min(width + 2, 60)
-
-    try:
-        wb.save(filepath)
-        print(f"[INFO] Performance report ({len(report_rows)} result rows) "
-              f"saved to: {filepath}")
-    except Exception as e:
-        print(f"[WARN] Failed to save performance report: {e}")
-
-
-def write_summary_json(path, total, success, failed, skipped,
-                       total_elapsed, failing_ops, skipped_ops):
-    """Write the run's overall summary as a JSON file.
-
-    Content is the whole-run roll-up only (no per-op details): total/success/
-    failed/skipped counts, elapsed time (string with unit, e.g. "21.32s"),
-    the failed and skipped op lists, and
-    the top-level "result" verdict. "result" is "success" only when every op
-    in scope succeeded; any FAILED or SKIPPED op makes the whole run "failed".
-    """
-    summary = {
-        "result": "success" if (failed == 0 and skipped == 0) else "failed",
-        "total": total,
-        "success": success,
-        "failed": failed,
-        "skipped": skipped,
-        "elapsed_time": f"{total_elapsed:.2f}s",
-        "failed_ops": list(failing_ops),
-        "skipped_ops": list(skipped_ops),
-    }
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(summary, f, indent=2, ensure_ascii=False)
-        f.write("\n")
-
-
 def main():
     parser = argparse.ArgumentParser(
         description="Batch driver for mcoplib operator benchmarks"
@@ -959,7 +583,7 @@ def main():
     mode_group = parser.add_mutually_exclusive_group()
     mode_group.add_argument(
         "--generate", action="store_true",
-        help="Only fill missing CSV rows (skip existing)"
+        help="Only fill missing CSV rows (skip existing) [default]"
     )
     mode_group.add_argument(
         "--compare", action="store_true",
@@ -969,26 +593,8 @@ def main():
         "--update", action="store_true",
         help="Overwrite CSV rows for all ops"
     )
-    # No mode flag = pure benchmark mode ("bench"): every op in scope is
-    # benchmarked for real with no CSV generate/update/compare actions.
     parser.add_argument("--csv", default=DEFAULT_CSV, help="CSV path")
     parser.add_argument("--output", default=None, help="Output Excel file path (.xlsx) for the final report (only in --compare mode). Supports absolute and relative paths.")
-    parser.add_argument(
-        "--infer_framework", choices=list(FRAMEWORK_CHOICES), default=None,
-        help="Only run ops whose kernels belong to the given framework: "
-             "'vllm' (op/vllm kernels, invoked via mcoplib._C / mcoplib._moe_C "
-             "and torch.ops._C / torch.ops._moe_C), 'sglang' (op/sglang kernels, "
-             "invoked via mcoplib.sgl_kernel and torch.ops.sgl_kernel), 'op' "
-             "(mcoplib's own ops: the mcoplib.op module plus the package's "
-             "triton_/tilelang_ python kernels). Unset: run all ops."
-    )
-    parser.add_argument(
-        "--report", default=None,
-        help="Aggregate every benchmark result into one Excel table with columns "
-             "op_name, dtype, shape, acc_pass, GlobalMem BW, BWUtil (one row per "
-             "result; ops with multiple results get multiple rows). Works in every "
-             f"mode. Default: {DEFAULT_REPORT}"
-    )
     parser.add_argument("--ops", default=None, help="Comma-separated op subset")
     parser.add_argument("--dry-run", action="store_true", help="List ops without running")
     args = parser.parse_args()
@@ -997,13 +603,8 @@ def main():
         mode = "compare"
     elif args.update:
         mode = "update"
-    elif args.generate:
-        mode = "generate"
     else:
-        # No mode flag: pure benchmark mode. Every op in scope is benchmarked
-        # for real with no generate/update/compare CSV actions; per-result
-        # stats are printed and aggregated into the --report table.
-        mode = "bench"
+        mode = "generate"
 
     # Requirement: the --output report path must end in '.xlsx'. Validate up
     # front (before running any op) so a bad path fails fast rather than after
@@ -1016,19 +617,8 @@ def main():
             print("[ERROR] --output is only valid in --compare mode.")
             return 1
 
-    # --report works in every mode; validate up front like --output so a bad
-    # path fails fast rather than after a long benchmark run.
-    if args.report is not None:
-        if not args.report.lower().endswith(".xlsx"):
-            print(f"[ERROR] --report must end with '.xlsx' (got: {args.report})")
-            return 1
-        if args.output and os.path.abspath(args.report) == os.path.abspath(args.output):
-            print("[ERROR] --report and --output must not be the same file.")
-            return 1
-
     print("=" * 80)
-    print(f"testall.py | mode={mode} | csv={args.csv}"
-          f" | infer_framework={args.infer_framework or 'all'}")
+    print(f"testall.py | mode={mode} | csv={args.csv}")
     if mode == "generate":
         print("[INFO] --generate: only fills missing CSV rows; ops already in CSV are SKIPPED.")
         print("       Use --update to overwrite existing rows, or --compare to regression-test.")
@@ -1036,32 +626,12 @@ def main():
         print("[INFO] --update: overwrites CSV rows for all ops (verification must pass first).")
     elif mode == "compare":
         print("[INFO] --compare: compares each op vs CSV baseline; fails if >5% slower. No CSV writes.")
-    elif mode == "bench":
-        print("[INFO] Pure benchmark mode (no mode flag): every op is benchmarked for real")
-        print("       (equivalent to `mcoplib_mxbenchmark_ops.py --op <name>` per op) with no")
-        print("       generate/update/compare CSV actions. Use --generate/--update/--compare")
-        print("       for CSV-managing modes.")
     print("=" * 80)
 
     ops = get_supported_operators()
     if args.ops:
         wanted = {s.strip() for s in args.ops.split(",") if s.strip()}
         ops = [o for o in ops if o in wanted]
-    if args.infer_framework:
-        total_before = len(ops)
-        selected, unknown = [], []
-        for o in ops:
-            fw = detect_op_framework(o)
-            if fw is None:
-                unknown.append(o)
-            elif fw == args.infer_framework:
-                selected.append(o)
-        if unknown:
-            print(f"[WARN] Could not classify the framework of {len(unknown)} op(s) "
-                  f"(runner file missing or unreadable); excluded: {', '.join(unknown)}")
-        ops = selected
-        print(f"[INFO] --infer_framework {args.infer_framework}: "
-              f"{len(ops)} of {total_before} operator(s) selected.")
     if not ops:
         print("[ERROR] No operators to run.")
         return 1
@@ -1108,68 +678,72 @@ def main():
     success = failed = skipped = 0
     failing_ops = []
     skipped_ops = []
-    report_rows_from_stdout = []  # --compare mode: per-result rows parsed from stdout
     total_start = time.time()
 
-    for idx, op in enumerate(ops, 1):
-        print(f"[{idx}/{len(ops)}] {op} ... ", end="", flush=True)
-        csv_before = _op_in_csv(op, args.csv)
+    with open(OUTPUT_FILE, "w", encoding="utf-8") as logf:
+        logf.write(f"=== testall.py | mode={mode} | csv={args.csv} ===\n")
+        logf.write(f"=== {len(ops)} operators ===\n\n")
+        logf.flush()
 
-        # --generate fast path: if the op is already in the CSV, skip the
-        # expensive subprocess + nvbench run entirely. The single-op script
-        # would also SKIP, but only after running the full benchmark.
-        if mode == "generate" and csv_before:
-            status, detail, info, rc, elapsed = (
-                "SKIPPED", "exists (use --update to refresh)", None, 0, 0.0
-            )
-        else:
-            # Always use temp_output_csv for collecting comparison data
-            output_csv = temp_output_csv if mode == "compare" else None
-            info, rc, elapsed = run_one_op(op, mode, args.csv, output_csv)
-            if info is None:
-                info = {"verify_pass": None, "acc_verify": None,
-                        "perf_verify": None, "csv_action": None,
-                        "fatal": False, "error_msg": "timeout"}
-                rc = 124
-            status, detail = classify_result(
-                op, mode, info, rc, args.csv, csv_before
-            )
-        if status == "SUCCESS":
-            success += 1
-        elif status == "FAILED":
-            failed += 1
-            failing_ops.append(op)
-        elif status == "SKIPPED":
-            skipped += 1
-            skipped_ops.append(op)
-        print(f"{status} ({detail}) [{elapsed:.1f}s]")
+        for idx, op in enumerate(ops, 1):
+            print(f"[{idx}/{len(ops)}] {op} ... ", end="", flush=True)
+            csv_before = _op_in_csv(op, args.csv)
 
-        # Echo the per-result benchmark tables (Acc_Pass | Cos_Dist | Op |
-        # dtype | Shape | ... | GlobalMem BW | BWUtil | ...) printed by the
-        # single-op run so every op's performance stats are visible in this
-        # run's output.
-        op_stdout = (info or {}).get("stdout") or ""
-        if op_stdout:
-            bench_section = extract_benchmark_section(op_stdout)
-            if bench_section:
-                print(bench_section)
-        if mode in ("compare", "bench"):
-            # The single-op script discards the current run's full result
-            # rows (temp CSV deleted after comparison; in bench mode no
-            # CSV is written at all), so collect them from the stdout
-            # tables for the --report aggregation.
-            report_rows_from_stdout.extend(parse_benchmark_tables(op_stdout, op))
+            # --generate fast path: if the op is already in the CSV, skip the
+            # expensive subprocess + nvbench run entirely. The single-op script
+            # would also SKIP, but only after running the full benchmark.
+            if mode == "generate" and csv_before:
+                status, detail, info, rc, elapsed = (
+                    "SKIPPED", "exists (use --update to refresh)", None, 0, 0.0
+                )
+            else:
+                # Always use temp_output_csv for collecting comparison data
+                output_csv = temp_output_csv if mode == "compare" else None
+                info, rc, elapsed = run_one_op(op, mode, args.csv, output_csv)
+                if info is None:
+                    info = {"verify_pass": None, "acc_verify": None,
+                            "perf_verify": None, "csv_action": None,
+                            "fatal": False, "error_msg": "timeout"}
+                    rc = 124
+                status, detail = classify_result(
+                    op, mode, info, rc, args.csv, csv_before
+                )
+            if status == "SUCCESS":
+                success += 1
+            elif status == "FAILED":
+                failed += 1
+                failing_ops.append(op)
+            elif status == "SKIPPED":
+                skipped += 1
+                skipped_ops.append(op)
+            print(f"{status} ({detail}) [{elapsed:.1f}s]")
 
-        rows.append({
-            "op": op,
-            "acc": info.get("acc_verify") if info else None,
-            "perf": info.get("perf_verify") if info else None,
-            "status": status,
-            "detail": detail,
-            "elapsed": elapsed,
-        })
+            logf.write(f"[{op}] -> {status} | {detail} | rc={rc} | {elapsed:.2f}s\n")
+            if info:
+                logf.write(
+                    f"  verify_pass={info['verify_pass']} "
+                    f"acc={info['acc_verify']} perf={info['perf_verify']} "
+                    f"action={info['csv_action']} fatal={info['fatal']}\n"
+                )
+            logf.flush()
 
-    total_elapsed = time.time() - total_start
+            rows.append({
+                "op": op,
+                "acc": info.get("acc_verify") if info else None,
+                "perf": info.get("perf_verify") if info else None,
+                "status": status,
+                "detail": detail,
+                "elapsed": elapsed,
+            })
+
+        total_elapsed = time.time() - total_start
+        logf.write(
+            f"\n=== SUMMARY | mode={mode} | "
+            f"success={success} failed={failed} skipped={skipped} | "
+            f"total={len(ops)} | {total_elapsed:.1f}s ===\n"
+        )
+        if failing_ops:
+            logf.write(f"FAILED OPS: {', '.join(failing_ops)}\n")
 
     print("\n" + "=" * 80)
     print(f"Per-op results (mode={mode}):")
@@ -1188,33 +762,12 @@ def main():
             print(f"  - {o}")
     else:
         print("No failures.")
-    print(f"\nSummary JSON: {SUMMARY_JSON_FILE}")
+    print(f"\nDetailed log: {OUTPUT_FILE}")
     print("=" * 80)
-
-    # Overall summary JSON (replaces the old testall_output.txt log). Written
-    # once the op run and its roll-up are complete — before the auxiliary
-    # --report/--output Excel generation, so a failure there cannot lose the
-    # test summary.
-    write_summary_json(
-        SUMMARY_JSON_FILE, len(ops), success, failed, skipped,
-        total_elapsed, failing_ops, skipped_ops,
-    )
-
-    # --- Aggregated performance report (--report) ---
-    # One row per benchmark result; ops in scope with several shape/dtype
-    # combinations contribute several rows.
-    report_path = args.report or DEFAULT_REPORT
-    if mode in ("compare", "bench"):
-        report_rows = report_rows_from_stdout
-    else:
-        report_rows = collect_report_rows_from_csv(set(ops), args.csv)
-    if not report_rows:
-        print("[WARN] No benchmark result rows collected for the --report table.")
-    generate_report_excel(report_rows, report_path, mode, args.infer_framework)
-
+    
     # Generate Excel report for compare mode
     if mode == "compare":
-        print("\n[INFO] Generating Excel report (.xlsx file)...")
+        print("\\n[INFO] Generating Excel report (.xlsx file)...")
         generate_excel_report(
             mode=mode,
             csv_path=args.csv,

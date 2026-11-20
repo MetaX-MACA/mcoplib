@@ -41,14 +41,13 @@ def cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> float:
     return (dot / (norm_a * norm_b)).item()
 
 
-def ref_fused_add_rms_norm(hidden_states, residual, weight, epsilon, zero_centered=False):
+def ref_fused_add_rms_norm(hidden_states, residual, weight, epsilon):
     """
     Reference implementation of fused_add_rms_norm in float32 for ground truth.
     Matches the kernel logic:
       1. residual = input + residual (in-place update residual)
       2. variance = sum(residual^2) / hidden_size
       3. input = residual * rsqrt(variance + epsilon) * weight (in-place update input)
-         if zero_centered: weight -> weight + 1 (weight must not be None)
     """
     hidden_states_f = hidden_states.float()
     residual_f = residual.float()
@@ -63,8 +62,6 @@ def ref_fused_add_rms_norm(hidden_states, residual, weight, epsilon, zero_center
     # Step 3: input = residual * inv_rms * weight
     if weight is not None:
         weight_f = weight.float()
-        if zero_centered:
-            weight_f = weight_f + 1.0
         hidden_states_f = residual_f * inv_rms * weight_f
     else:
         hidden_states_f = residual_f * inv_rms
@@ -187,10 +184,6 @@ class OpsBenchmark:
                     result = self.test_add_rms_norm(shape)
                     results.append(result)
 
-                    # zero_centered=True (要求必须有 weight)
-                    result = self.test_add_rms_norm(shape, zero_centered=True)
-                    results.append(result)
-
                     result = self.test_add_rms_norm_without_weight(shape)
                     results.append(result)
 
@@ -207,9 +200,6 @@ class OpsBenchmark:
                     "shapes_info": str(shape),
                     "error": str(e)
                 })
-
-        if op_name == "add_rms_norm":
-            results.append(self.test_zero_centered_requires_weight())
 
         return results
 
@@ -241,7 +231,7 @@ class OpsBenchmark:
 
         return sim_input, sim_residual
 
-    def test_add_rms_norm(self, shape: Tuple[int, ...], zero_centered: bool = False) -> Dict[str, Any]:
+    def test_add_rms_norm(self, shape: Tuple[int, ...]) -> Dict[str, Any]:
         """Test add_rms_norm with weight, including cosine similarity precision verification.
 
         Note: fused_add_rms_norm is an in-place operation that modifies both
@@ -259,15 +249,15 @@ class OpsBenchmark:
 
         # Compute reference in float32
         ref_input, ref_residual = ref_fused_add_rms_norm(
-            hidden_states_orig, residual_orig, weight, epsilon, zero_centered)
+            hidden_states_orig, residual_orig, weight, epsilon)
 
         # --- Precision verification: run kernel once on fresh copies ---
         gpu_input = hidden_states.clone()
         gpu_residual = residual.clone()
-        torch.ops._C.fused_add_rms_norm(gpu_input, gpu_residual, weight, epsilon, zero_centered)
+        torch.ops._C.fused_add_rms_norm(gpu_input, gpu_residual, weight, epsilon)
         torch.cuda.synchronize()
 
-        self._verify_precision("add_rms_norm", f"{shape} zero_centered={zero_centered}",
+        self._verify_precision("add_rms_norm", str(shape),
                                gpu_input, ref_input,
                                gpu_residual, ref_residual)
 
@@ -275,20 +265,17 @@ class OpsBenchmark:
         def test_mcoplib(**kwargs):
             hs = kwargs["hidden_states"].clone()
             res = kwargs["residual"].clone()
-            torch.ops._C.fused_add_rms_norm(hs, res, kwargs["weight"], kwargs["epsilon"],
-                                            kwargs["zero_centered"])
+            torch.ops._C.fused_add_rms_norm(hs, res, kwargs["weight"], kwargs["epsilon"])
             return hs
 
         input_data = {
             "hidden_states": hidden_states,
             "residual": residual,
             "weight": weight,
-            "epsilon": epsilon,
-            "zero_centered": zero_centered,
+            "epsilon": epsilon
         }
 
-        perf_result = self.compare_ops("add_rms_norm", test_mcoplib, input_data,
-                                       f"{shape} zero_centered={zero_centered}")
+        perf_result = self.compare_ops("add_rms_norm", test_mcoplib, input_data, str(shape))
         return perf_result
 
     def test_add_rms_norm_without_weight(self, shape: Tuple[int, ...]) -> Dict[str, Any]:
@@ -297,7 +284,6 @@ class OpsBenchmark:
         Note: fused_add_rms_norm is an in-place operation that modifies both
         input and residual tensors. For precision verification, we must run
         the kernel exactly once on fresh copies of the original data.
-        zero_centered requires weight, so only zero_centered=False is tested here.
         """
         hidden_states = self.generate_test_data(shape)
         residual = self.generate_test_data(shape)
@@ -314,7 +300,7 @@ class OpsBenchmark:
         # --- Precision verification: run kernel once on fresh copies ---
         gpu_input = hidden_states.clone()
         gpu_residual = residual.clone()
-        torch.ops._C.fused_add_rms_norm(gpu_input, gpu_residual, None, epsilon, False)
+        torch.ops._C.fused_add_rms_norm(gpu_input, gpu_residual, None, epsilon)
         torch.cuda.synchronize()
 
         self._verify_precision("add_rms_norm_without_weight", str(shape),
@@ -325,7 +311,7 @@ class OpsBenchmark:
         def test_mcoplib(**kwargs):
             hs = kwargs["hidden_states"].clone()
             res = kwargs["residual"].clone()
-            torch.ops._C.fused_add_rms_norm(hs, res, None, kwargs["epsilon"], False)
+            torch.ops._C.fused_add_rms_norm(hs, res, None, kwargs["epsilon"])
             return hs
 
         input_data = {
@@ -337,20 +323,6 @@ class OpsBenchmark:
         perf_result = self.compare_ops(
             "add_rms_norm_without_weight", test_mcoplib, input_data, str(shape))
         return perf_result
-
-    def test_zero_centered_requires_weight(self) -> Dict[str, Any]:
-        """Negative test: zero_centered=True with weight=None should raise an error."""
-        op_name = "add_rms_norm_zero_centered_without_weight"
-        hidden_states = self.generate_test_data((16, 128))
-        residual = self.generate_test_data((16, 128))
-        try:
-            torch.ops._C.fused_add_rms_norm(hidden_states, residual, None, 1e-6, True)
-            torch.cuda.synchronize()
-        except RuntimeError as e:
-            print(f"\n  PASS: {op_name} raised as expected: {str(e).splitlines()[0]}")
-            return {"op_name": op_name, "shapes_info": "(16, 128)"}
-        print(f"\n  FAIL: {op_name} expected an error but none was raised")
-        sys.exit(1)
 
     def test_silu_and_mul(self, shape: Tuple[int, ...]) -> Dict[str, Any]:
         """Test silu_and_mul op."""

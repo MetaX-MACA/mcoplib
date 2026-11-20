@@ -19,7 +19,7 @@
 #include <cstdio>      // for snprintf
 #include <sys/stat.h>  // for mkdir
 #include <unistd.h>    // for getpid
-namespace mcop {
+namespace mcoplib {
 namespace debug {
 
 // 运行期环境变量检查 - 完全通过环境变量控制，无需编译期宏
@@ -749,7 +749,7 @@ inline void dump_params_simple(const char* function_name, const Args&... args) {
 }
 
 } // namespace debug
-} // namespace mcop
+} // namespace mcoplib
 
 // ============================================================================
 // 统一的宏接口 - DEBUG_DUMP_PARAMS
@@ -782,182 +782,579 @@ inline void dump_params_simple(const char* function_name, const Args&... args) {
 // 1-20 个参数的实现 - 使用字符串化操作符捕获实际变量名
 #define DEBUG_DUMP_PARAMS_IMPL_1(x1) \
     do { \
-        if (::mcop::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
+        if (::mcoplib::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
             constexpr const char* _names[] = {#x1}; \
             std::vector<const char*> _names_vec(_names, _names + 1); \
-            ::mcop::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1); \
+            ::mcoplib::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1); \
         } \
     } while(0)
 
 #define DEBUG_DUMP_PARAMS_IMPL_2(x1, x2) \
     do { \
-        if (::mcop::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
+        if (::mcoplib::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
             constexpr const char* _names[] = {#x1, #x2}; \
             std::vector<const char*> _names_vec(_names, _names + 2); \
-            ::mcop::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2); \
+            ::mcoplib::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2); \
         } \
     } while(0)
 
 #define DEBUG_DUMP_PARAMS_IMPL_3(x1, x2, x3) \
     do { \
-        if (::mcop::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
+        if (::mcoplib::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
             constexpr const char* _names[] = {#x1, #x2, #x3}; \
             std::vector<const char*> _names_vec(_names, _names + 3); \
-            ::mcop::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3); \
+            ::mcoplib::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3); \
         } \
     } while(0)
 
 #define DEBUG_DUMP_PARAMS_IMPL_4(x1, x2, x3, x4) \
     do { \
-        if (::mcop::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
+        if (::mcoplib::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
             constexpr const char* _names[] = {#x1, #x2, #x3, #x4}; \
             std::vector<const char*> _names_vec(_names, _names + 4); \
-            ::mcop::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4); \
+            ::mcoplib::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4); \
         } \
     } while(0)
 
 #define DEBUG_DUMP_PARAMS_IMPL_5(x1, x2, x3, x4, x5) \
     do { \
-        if (::mcop::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
+        if (::mcoplib::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
             constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5}; \
             std::vector<const char*> _names_vec(_names, _names + 5); \
-            ::mcop::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5); \
+            ::mcoplib::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5); \
         } \
     } while(0)
 
 #define DEBUG_DUMP_PARAMS_IMPL_6(x1, x2, x3, x4, x5, x6) \
     do { \
-        if (::mcop::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
+        if (::mcoplib::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
             constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6}; \
             std::vector<const char*> _names_vec(_names, _names + 6); \
-            ::mcop::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6); \
+            ::mcoplib::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6); \
         } \
     } while(0)
 
 #define DEBUG_DUMP_PARAMS_IMPL_7(x1, x2, x3, x4, x5, x6, x7) \
     do { \
-        if (::mcop::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
+        if (::mcoplib::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
             constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7}; \
             std::vector<const char*> _names_vec(_names, _names + 7); \
-            ::mcop::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7); \
+            ::mcoplib::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7); \
         } \
     } while(0)
 
 #define DEBUG_DUMP_PARAMS_IMPL_8(x1, x2, x3, x4, x5, x6, x7, x8) \
     do { \
-        if (::mcop::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
+        if (::mcoplib::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
             constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8}; \
             std::vector<const char*> _names_vec(_names, _names + 8); \
-            ::mcop::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8); \
+            ::mcoplib::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8); \
         } \
     } while(0)
 
 #define DEBUG_DUMP_PARAMS_IMPL_9(x1, x2, x3, x4, x5, x6, x7, x8, x9) \
     do { \
-        if (::mcop::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
+        if (::mcoplib::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
             constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9}; \
             std::vector<const char*> _names_vec(_names, _names + 9); \
-            ::mcop::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9); \
+            ::mcoplib::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9); \
         } \
     } while(0)
 
 #define DEBUG_DUMP_PARAMS_IMPL_10(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10) \
     do { \
-        if (::mcop::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
+        if (::mcoplib::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
             constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10}; \
             std::vector<const char*> _names_vec(_names, _names + 10); \
-            ::mcop::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10); \
+            ::mcoplib::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10); \
         } \
     } while(0)
 
 // 为了节省空间，11-20 个参数的实现 - 使用字符串化操作符捕获实际变量名
 #define DEBUG_DUMP_PARAMS_IMPL_11(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11) \
     do { \
-        if (::mcop::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
+        if (::mcoplib::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
             constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10, #x11}; \
             std::vector<const char*> _names_vec(_names, _names + 11); \
-            ::mcop::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11); \
+            ::mcoplib::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11); \
         } \
     } while(0)
 
 #define DEBUG_DUMP_PARAMS_IMPL_12(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12) \
     do { \
-        if (::mcop::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
+        if (::mcoplib::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
             constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10, #x11, #x12}; \
             std::vector<const char*> _names_vec(_names, _names + 12); \
-            ::mcop::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12); \
+            ::mcoplib::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12); \
         } \
     } while(0)
 
 #define DEBUG_DUMP_PARAMS_IMPL_13(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13) \
     do { \
-        if (::mcop::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
+        if (::mcoplib::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
             constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10, #x11, #x12, #x13}; \
             std::vector<const char*> _names_vec(_names, _names + 13); \
-            ::mcop::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13); \
+            ::mcoplib::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13); \
         } \
     } while(0)
 
 #define DEBUG_DUMP_PARAMS_IMPL_14(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14) \
     do { \
-        if (::mcop::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
+        if (::mcoplib::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
             constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10, #x11, #x12, #x13, #x14}; \
             std::vector<const char*> _names_vec(_names, _names + 14); \
-            ::mcop::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14); \
+            ::mcoplib::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14); \
         } \
     } while(0)
 
 #define DEBUG_DUMP_PARAMS_IMPL_15(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15) \
     do { \
-        if (::mcop::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
+        if (::mcoplib::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
             constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10, #x11, #x12, #x13, #x14, #x15}; \
             std::vector<const char*> _names_vec(_names, _names + 15); \
-            ::mcop::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15); \
+            ::mcoplib::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15); \
         } \
     } while(0)
 
 #define DEBUG_DUMP_PARAMS_IMPL_16(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16) \
     do { \
-        if (::mcop::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
+        if (::mcoplib::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
             constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10, #x11, #x12, #x13, #x14, #x15, #x16}; \
             std::vector<const char*> _names_vec(_names, _names + 16); \
-            ::mcop::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16); \
+            ::mcoplib::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16); \
         } \
     } while(0)
 
 #define DEBUG_DUMP_PARAMS_IMPL_17(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17) \
     do { \
-        if (::mcop::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
+        if (::mcoplib::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
             constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10, #x11, #x12, #x13, #x14, #x15, #x16, #x17}; \
             std::vector<const char*> _names_vec(_names, _names + 17); \
-            ::mcop::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17); \
+            ::mcoplib::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17); \
         } \
     } while(0)
 
 #define DEBUG_DUMP_PARAMS_IMPL_18(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18) \
     do { \
-        if (::mcop::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
+        if (::mcoplib::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
             constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10, #x11, #x12, #x13, #x14, #x15, #x16, #x17, #x18}; \
             std::vector<const char*> _names_vec(_names, _names + 18); \
-            ::mcop::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18); \
+            ::mcoplib::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18); \
         } \
     } while(0)
 
 #define DEBUG_DUMP_PARAMS_IMPL_19(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19) \
     do { \
-        if (::mcop::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
+        if (::mcoplib::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
             constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10, #x11, #x12, #x13, #x14, #x15, #x16, #x17, #x18, #x19}; \
             std::vector<const char*> _names_vec(_names, _names + 19); \
-            ::mcop::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19); \
+            ::mcoplib::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19); \
         } \
     } while(0)
 
 #define DEBUG_DUMP_PARAMS_IMPL_20(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20) \
     do { \
-        if (::mcop::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
+        if (::mcoplib::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
             constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10, #x11, #x12, #x13, #x14, #x15, #x16, #x17, #x18, #x19, #x20}; \
             std::vector<const char*> _names_vec(_names, _names + 20); \
-            ::mcop::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20); \
+            ::mcoplib::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20); \
+        } \
+    } while(0)
+
+
+#define DEBUG_DUMP_PARAMS_IMPL_21(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21) \
+    do { \
+        if (::mcoplib::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
+            constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10, #x11, #x12, #x13, #x14, #x15, #x16, #x17, #x18, #x19, #x20, #x21}; \
+            std::vector<const char*> _names_vec(_names, _names + 21); \
+            ::mcoplib::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21); \
+        } \
+    } while(0)
+
+#define DEBUG_DUMP_PARAMS_IMPL_22(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22) \
+    do { \
+        if (::mcoplib::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
+            constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10, #x11, #x12, #x13, #x14, #x15, #x16, #x17, #x18, #x19, #x20, #x21, #x22}; \
+            std::vector<const char*> _names_vec(_names, _names + 22); \
+            ::mcoplib::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22); \
+        } \
+    } while(0)
+
+#define DEBUG_DUMP_PARAMS_IMPL_23(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23) \
+    do { \
+        if (::mcoplib::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
+            constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10, #x11, #x12, #x13, #x14, #x15, #x16, #x17, #x18, #x19, #x20, #x21, #x22, #x23}; \
+            std::vector<const char*> _names_vec(_names, _names + 23); \
+            ::mcoplib::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23); \
+        } \
+    } while(0)
+
+#define DEBUG_DUMP_PARAMS_IMPL_24(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24) \
+    do { \
+        if (::mcoplib::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
+            constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10, #x11, #x12, #x13, #x14, #x15, #x16, #x17, #x18, #x19, #x20, #x21, #x22, #x23, #x24}; \
+            std::vector<const char*> _names_vec(_names, _names + 24); \
+            ::mcoplib::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24); \
+        } \
+    } while(0)
+
+#define DEBUG_DUMP_PARAMS_IMPL_25(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25) \
+    do { \
+        if (::mcoplib::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
+            constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10, #x11, #x12, #x13, #x14, #x15, #x16, #x17, #x18, #x19, #x20, #x21, #x22, #x23, #x24, #x25}; \
+            std::vector<const char*> _names_vec(_names, _names + 25); \
+            ::mcoplib::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25); \
+        } \
+    } while(0)
+
+#define DEBUG_DUMP_PARAMS_IMPL_26(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26) \
+    do { \
+        if (::mcoplib::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
+            constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10, #x11, #x12, #x13, #x14, #x15, #x16, #x17, #x18, #x19, #x20, #x21, #x22, #x23, #x24, #x25, #x26}; \
+            std::vector<const char*> _names_vec(_names, _names + 26); \
+            ::mcoplib::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26); \
+        } \
+    } while(0)
+
+#define DEBUG_DUMP_PARAMS_IMPL_27(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27) \
+    do { \
+        if (::mcoplib::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
+            constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10, #x11, #x12, #x13, #x14, #x15, #x16, #x17, #x18, #x19, #x20, #x21, #x22, #x23, #x24, #x25, #x26, #x27}; \
+            std::vector<const char*> _names_vec(_names, _names + 27); \
+            ::mcoplib::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27); \
+        } \
+    } while(0)
+
+#define DEBUG_DUMP_PARAMS_IMPL_28(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28) \
+    do { \
+        if (::mcoplib::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
+            constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10, #x11, #x12, #x13, #x14, #x15, #x16, #x17, #x18, #x19, #x20, #x21, #x22, #x23, #x24, #x25, #x26, #x27, #x28}; \
+            std::vector<const char*> _names_vec(_names, _names + 28); \
+            ::mcoplib::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28); \
+        } \
+    } while(0)
+
+#define DEBUG_DUMP_PARAMS_IMPL_29(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29) \
+    do { \
+        if (::mcoplib::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
+            constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10, #x11, #x12, #x13, #x14, #x15, #x16, #x17, #x18, #x19, #x20, #x21, #x22, #x23, #x24, #x25, #x26, #x27, #x28, #x29}; \
+            std::vector<const char*> _names_vec(_names, _names + 29); \
+            ::mcoplib::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29); \
+        } \
+    } while(0)
+
+#define DEBUG_DUMP_PARAMS_IMPL_30(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29, x30) \
+    do { \
+        if (::mcoplib::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
+            constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10, #x11, #x12, #x13, #x14, #x15, #x16, #x17, #x18, #x19, #x20, #x21, #x22, #x23, #x24, #x25, #x26, #x27, #x28, #x29, #x30}; \
+            std::vector<const char*> _names_vec(_names, _names + 30); \
+            ::mcoplib::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29, x30); \
+        } \
+    } while(0)
+
+#define DEBUG_DUMP_PARAMS_IMPL_31(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29, x30, x31) \
+    do { \
+        if (::mcoplib::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
+            constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10, #x11, #x12, #x13, #x14, #x15, #x16, #x17, #x18, #x19, #x20, #x21, #x22, #x23, #x24, #x25, #x26, #x27, #x28, #x29, #x30, #x31}; \
+            std::vector<const char*> _names_vec(_names, _names + 31); \
+            ::mcoplib::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29, x30, x31); \
+        } \
+    } while(0)
+
+#define DEBUG_DUMP_PARAMS_IMPL_32(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29, x30, x31, x32) \
+    do { \
+        if (::mcoplib::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
+            constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10, #x11, #x12, #x13, #x14, #x15, #x16, #x17, #x18, #x19, #x20, #x21, #x22, #x23, #x24, #x25, #x26, #x27, #x28, #x29, #x30, #x31, #x32}; \
+            std::vector<const char*> _names_vec(_names, _names + 32); \
+            ::mcoplib::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29, x30, x31, x32); \
+        } \
+    } while(0)
+
+#define DEBUG_DUMP_PARAMS_IMPL_33(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29, x30, x31, x32, x33) \
+    do { \
+        if (::mcoplib::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
+            constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10, #x11, #x12, #x13, #x14, #x15, #x16, #x17, #x18, #x19, #x20, #x21, #x22, #x23, #x24, #x25, #x26, #x27, #x28, #x29, #x30, #x31, #x32, #x33}; \
+            std::vector<const char*> _names_vec(_names, _names + 33); \
+            ::mcoplib::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29, x30, x31, x32, x33); \
+        } \
+    } while(0)
+
+#define DEBUG_DUMP_PARAMS_IMPL_34(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29, x30, x31, x32, x33, x34) \
+    do { \
+        if (::mcoplib::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
+            constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10, #x11, #x12, #x13, #x14, #x15, #x16, #x17, #x18, #x19, #x20, #x21, #x22, #x23, #x24, #x25, #x26, #x27, #x28, #x29, #x30, #x31, #x32, #x33, #x34}; \
+            std::vector<const char*> _names_vec(_names, _names + 34); \
+            ::mcoplib::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29, x30, x31, x32, x33, x34); \
+        } \
+    } while(0)
+
+#define DEBUG_DUMP_PARAMS_IMPL_35(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29, x30, x31, x32, x33, x34, x35) \
+    do { \
+        if (::mcoplib::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
+            constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10, #x11, #x12, #x13, #x14, #x15, #x16, #x17, #x18, #x19, #x20, #x21, #x22, #x23, #x24, #x25, #x26, #x27, #x28, #x29, #x30, #x31, #x32, #x33, #x34, #x35}; \
+            std::vector<const char*> _names_vec(_names, _names + 35); \
+            ::mcoplib::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29, x30, x31, x32, x33, x34, x35); \
+        } \
+    } while(0)
+
+#define DEBUG_DUMP_PARAMS_IMPL_36(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29, x30, x31, x32, x33, x34, x35, x36) \
+    do { \
+        if (::mcoplib::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
+            constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10, #x11, #x12, #x13, #x14, #x15, #x16, #x17, #x18, #x19, #x20, #x21, #x22, #x23, #x24, #x25, #x26, #x27, #x28, #x29, #x30, #x31, #x32, #x33, #x34, #x35, #x36}; \
+            std::vector<const char*> _names_vec(_names, _names + 36); \
+            ::mcoplib::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29, x30, x31, x32, x33, x34, x35, x36); \
+        } \
+    } while(0)
+
+#define DEBUG_DUMP_PARAMS_IMPL_37(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29, x30, x31, x32, x33, x34, x35, x36, x37) \
+    do { \
+        if (::mcoplib::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
+            constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10, #x11, #x12, #x13, #x14, #x15, #x16, #x17, #x18, #x19, #x20, #x21, #x22, #x23, #x24, #x25, #x26, #x27, #x28, #x29, #x30, #x31, #x32, #x33, #x34, #x35, #x36, #x37}; \
+            std::vector<const char*> _names_vec(_names, _names + 37); \
+            ::mcoplib::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29, x30, x31, x32, x33, x34, x35, x36, x37); \
+        } \
+    } while(0)
+
+#define DEBUG_DUMP_PARAMS_IMPL_38(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29, x30, x31, x32, x33, x34, x35, x36, x37, x38) \
+    do { \
+        if (::mcoplib::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
+            constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10, #x11, #x12, #x13, #x14, #x15, #x16, #x17, #x18, #x19, #x20, #x21, #x22, #x23, #x24, #x25, #x26, #x27, #x28, #x29, #x30, #x31, #x32, #x33, #x34, #x35, #x36, #x37, #x38}; \
+            std::vector<const char*> _names_vec(_names, _names + 38); \
+            ::mcoplib::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29, x30, x31, x32, x33, x34, x35, x36, x37, x38); \
+        } \
+    } while(0)
+
+#define DEBUG_DUMP_PARAMS_IMPL_39(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29, x30, x31, x32, x33, x34, x35, x36, x37, x38, x39) \
+    do { \
+        if (::mcoplib::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
+            constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10, #x11, #x12, #x13, #x14, #x15, #x16, #x17, #x18, #x19, #x20, #x21, #x22, #x23, #x24, #x25, #x26, #x27, #x28, #x29, #x30, #x31, #x32, #x33, #x34, #x35, #x36, #x37, #x38, #x39}; \
+            std::vector<const char*> _names_vec(_names, _names + 39); \
+            ::mcoplib::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29, x30, x31, x32, x33, x34, x35, x36, x37, x38, x39); \
+        } \
+    } while(0)
+
+#define DEBUG_DUMP_PARAMS_IMPL_40(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29, x30, x31, x32, x33, x34, x35, x36, x37, x38, x39, x40) \
+    do { \
+        if (::mcoplib::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
+            constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10, #x11, #x12, #x13, #x14, #x15, #x16, #x17, #x18, #x19, #x20, #x21, #x22, #x23, #x24, #x25, #x26, #x27, #x28, #x29, #x30, #x31, #x32, #x33, #x34, #x35, #x36, #x37, #x38, #x39, #x40}; \
+            std::vector<const char*> _names_vec(_names, _names + 40); \
+            ::mcoplib::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29, x30, x31, x32, x33, x34, x35, x36, x37, x38, x39, x40); \
+        } \
+    } while(0)
+
+#define DEBUG_DUMP_PARAMS_IMPL_41(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29, x30, x31, x32, x33, x34, x35, x36, x37, x38, x39, x40, x41) \
+    do { \
+        if (::mcoplib::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
+            constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10, #x11, #x12, #x13, #x14, #x15, #x16, #x17, #x18, #x19, #x20, #x21, #x22, #x23, #x24, #x25, #x26, #x27, #x28, #x29, #x30, #x31, #x32, #x33, #x34, #x35, #x36, #x37, #x38, #x39, #x40, #x41}; \
+            std::vector<const char*> _names_vec(_names, _names + 41); \
+            ::mcoplib::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29, x30, x31, x32, x33, x34, x35, x36, x37, x38, x39, x40, x41); \
+        } \
+    } while(0)
+
+#define DEBUG_DUMP_PARAMS_IMPL_42(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29, x30, x31, x32, x33, x34, x35, x36, x37, x38, x39, x40, x41, x42) \
+    do { \
+        if (::mcoplib::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
+            constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10, #x11, #x12, #x13, #x14, #x15, #x16, #x17, #x18, #x19, #x20, #x21, #x22, #x23, #x24, #x25, #x26, #x27, #x28, #x29, #x30, #x31, #x32, #x33, #x34, #x35, #x36, #x37, #x38, #x39, #x40, #x41, #x42}; \
+            std::vector<const char*> _names_vec(_names, _names + 42); \
+            ::mcoplib::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29, x30, x31, x32, x33, x34, x35, x36, x37, x38, x39, x40, x41, x42); \
+        } \
+    } while(0)
+
+#define DEBUG_DUMP_PARAMS_IMPL_43(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29, x30, x31, x32, x33, x34, x35, x36, x37, x38, x39, x40, x41, x42, x43) \
+    do { \
+        if (::mcoplib::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
+            constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10, #x11, #x12, #x13, #x14, #x15, #x16, #x17, #x18, #x19, #x20, #x21, #x22, #x23, #x24, #x25, #x26, #x27, #x28, #x29, #x30, #x31, #x32, #x33, #x34, #x35, #x36, #x37, #x38, #x39, #x40, #x41, #x42, #x43}; \
+            std::vector<const char*> _names_vec(_names, _names + 43); \
+            ::mcoplib::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29, x30, x31, x32, x33, x34, x35, x36, x37, x38, x39, x40, x41, x42, x43); \
+        } \
+    } while(0)
+
+#define DEBUG_DUMP_PARAMS_IMPL_44(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29, x30, x31, x32, x33, x34, x35, x36, x37, x38, x39, x40, x41, x42, x43, x44) \
+    do { \
+        if (::mcoplib::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
+            constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10, #x11, #x12, #x13, #x14, #x15, #x16, #x17, #x18, #x19, #x20, #x21, #x22, #x23, #x24, #x25, #x26, #x27, #x28, #x29, #x30, #x31, #x32, #x33, #x34, #x35, #x36, #x37, #x38, #x39, #x40, #x41, #x42, #x43, #x44}; \
+            std::vector<const char*> _names_vec(_names, _names + 44); \
+            ::mcoplib::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29, x30, x31, x32, x33, x34, x35, x36, x37, x38, x39, x40, x41, x42, x43, x44); \
+        } \
+    } while(0)
+
+#define DEBUG_DUMP_PARAMS_IMPL_45(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29, x30, x31, x32, x33, x34, x35, x36, x37, x38, x39, x40, x41, x42, x43, x44, x45) \
+    do { \
+        if (::mcoplib::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
+            constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10, #x11, #x12, #x13, #x14, #x15, #x16, #x17, #x18, #x19, #x20, #x21, #x22, #x23, #x24, #x25, #x26, #x27, #x28, #x29, #x30, #x31, #x32, #x33, #x34, #x35, #x36, #x37, #x38, #x39, #x40, #x41, #x42, #x43, #x44, #x45}; \
+            std::vector<const char*> _names_vec(_names, _names + 45); \
+            ::mcoplib::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29, x30, x31, x32, x33, x34, x35, x36, x37, x38, x39, x40, x41, x42, x43, x44, x45); \
+        } \
+    } while(0)
+
+#define DEBUG_DUMP_PARAMS_IMPL_46(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29, x30, x31, x32, x33, x34, x35, x36, x37, x38, x39, x40, x41, x42, x43, x44, x45, x46) \
+    do { \
+        if (::mcoplib::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
+            constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10, #x11, #x12, #x13, #x14, #x15, #x16, #x17, #x18, #x19, #x20, #x21, #x22, #x23, #x24, #x25, #x26, #x27, #x28, #x29, #x30, #x31, #x32, #x33, #x34, #x35, #x36, #x37, #x38, #x39, #x40, #x41, #x42, #x43, #x44, #x45, #x46}; \
+            std::vector<const char*> _names_vec(_names, _names + 46); \
+            ::mcoplib::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29, x30, x31, x32, x33, x34, x35, x36, x37, x38, x39, x40, x41, x42, x43, x44, x45, x46); \
+        } \
+    } while(0)
+
+#define DEBUG_DUMP_PARAMS_IMPL_47(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29, x30, x31, x32, x33, x34, x35, x36, x37, x38, x39, x40, x41, x42, x43, x44, x45, x46, x47) \
+    do { \
+        if (::mcoplib::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
+            constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10, #x11, #x12, #x13, #x14, #x15, #x16, #x17, #x18, #x19, #x20, #x21, #x22, #x23, #x24, #x25, #x26, #x27, #x28, #x29, #x30, #x31, #x32, #x33, #x34, #x35, #x36, #x37, #x38, #x39, #x40, #x41, #x42, #x43, #x44, #x45, #x46, #x47}; \
+            std::vector<const char*> _names_vec(_names, _names + 47); \
+            ::mcoplib::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29, x30, x31, x32, x33, x34, x35, x36, x37, x38, x39, x40, x41, x42, x43, x44, x45, x46, x47); \
+        } \
+    } while(0)
+
+#define DEBUG_DUMP_PARAMS_IMPL_48(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29, x30, x31, x32, x33, x34, x35, x36, x37, x38, x39, x40, x41, x42, x43, x44, x45, x46, x47, x48) \
+    do { \
+        if (::mcoplib::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
+            constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10, #x11, #x12, #x13, #x14, #x15, #x16, #x17, #x18, #x19, #x20, #x21, #x22, #x23, #x24, #x25, #x26, #x27, #x28, #x29, #x30, #x31, #x32, #x33, #x34, #x35, #x36, #x37, #x38, #x39, #x40, #x41, #x42, #x43, #x44, #x45, #x46, #x47, #x48}; \
+            std::vector<const char*> _names_vec(_names, _names + 48); \
+            ::mcoplib::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29, x30, x31, x32, x33, x34, x35, x36, x37, x38, x39, x40, x41, x42, x43, x44, x45, x46, x47, x48); \
+        } \
+    } while(0)
+
+#define DEBUG_DUMP_PARAMS_IMPL_49(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29, x30, x31, x32, x33, x34, x35, x36, x37, x38, x39, x40, x41, x42, x43, x44, x45, x46, x47, x48, x49) \
+    do { \
+        if (::mcoplib::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
+            constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10, #x11, #x12, #x13, #x14, #x15, #x16, #x17, #x18, #x19, #x20, #x21, #x22, #x23, #x24, #x25, #x26, #x27, #x28, #x29, #x30, #x31, #x32, #x33, #x34, #x35, #x36, #x37, #x38, #x39, #x40, #x41, #x42, #x43, #x44, #x45, #x46, #x47, #x48, #x49}; \
+            std::vector<const char*> _names_vec(_names, _names + 49); \
+            ::mcoplib::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29, x30, x31, x32, x33, x34, x35, x36, x37, x38, x39, x40, x41, x42, x43, x44, x45, x46, x47, x48, x49); \
+        } \
+    } while(0)
+
+#define DEBUG_DUMP_PARAMS_IMPL_50(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29, x30, x31, x32, x33, x34, x35, x36, x37, x38, x39, x40, x41, x42, x43, x44, x45, x46, x47, x48, x49, x50) \
+    do { \
+        if (::mcoplib::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
+            constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10, #x11, #x12, #x13, #x14, #x15, #x16, #x17, #x18, #x19, #x20, #x21, #x22, #x23, #x24, #x25, #x26, #x27, #x28, #x29, #x30, #x31, #x32, #x33, #x34, #x35, #x36, #x37, #x38, #x39, #x40, #x41, #x42, #x43, #x44, #x45, #x46, #x47, #x48, #x49, #x50}; \
+            std::vector<const char*> _names_vec(_names, _names + 50); \
+            ::mcoplib::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29, x30, x31, x32, x33, x34, x35, x36, x37, x38, x39, x40, x41, x42, x43, x44, x45, x46, x47, x48, x49, x50); \
+        } \
+    } while(0)
+
+#define DEBUG_DUMP_PARAMS_IMPL_51(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29, x30, x31, x32, x33, x34, x35, x36, x37, x38, x39, x40, x41, x42, x43, x44, x45, x46, x47, x48, x49, x50, x51) \
+    do { \
+        if (::mcoplib::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
+            constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10, #x11, #x12, #x13, #x14, #x15, #x16, #x17, #x18, #x19, #x20, #x21, #x22, #x23, #x24, #x25, #x26, #x27, #x28, #x29, #x30, #x31, #x32, #x33, #x34, #x35, #x36, #x37, #x38, #x39, #x40, #x41, #x42, #x43, #x44, #x45, #x46, #x47, #x48, #x49, #x50, #x51}; \
+            std::vector<const char*> _names_vec(_names, _names + 51); \
+            ::mcoplib::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29, x30, x31, x32, x33, x34, x35, x36, x37, x38, x39, x40, x41, x42, x43, x44, x45, x46, x47, x48, x49, x50, x51); \
+        } \
+    } while(0)
+
+#define DEBUG_DUMP_PARAMS_IMPL_52(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29, x30, x31, x32, x33, x34, x35, x36, x37, x38, x39, x40, x41, x42, x43, x44, x45, x46, x47, x48, x49, x50, x51, x52) \
+    do { \
+        if (::mcoplib::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
+            constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10, #x11, #x12, #x13, #x14, #x15, #x16, #x17, #x18, #x19, #x20, #x21, #x22, #x23, #x24, #x25, #x26, #x27, #x28, #x29, #x30, #x31, #x32, #x33, #x34, #x35, #x36, #x37, #x38, #x39, #x40, #x41, #x42, #x43, #x44, #x45, #x46, #x47, #x48, #x49, #x50, #x51, #x52}; \
+            std::vector<const char*> _names_vec(_names, _names + 52); \
+            ::mcoplib::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29, x30, x31, x32, x33, x34, x35, x36, x37, x38, x39, x40, x41, x42, x43, x44, x45, x46, x47, x48, x49, x50, x51, x52); \
+        } \
+    } while(0)
+
+#define DEBUG_DUMP_PARAMS_IMPL_53(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29, x30, x31, x32, x33, x34, x35, x36, x37, x38, x39, x40, x41, x42, x43, x44, x45, x46, x47, x48, x49, x50, x51, x52, x53) \
+    do { \
+        if (::mcoplib::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
+            constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10, #x11, #x12, #x13, #x14, #x15, #x16, #x17, #x18, #x19, #x20, #x21, #x22, #x23, #x24, #x25, #x26, #x27, #x28, #x29, #x30, #x31, #x32, #x33, #x34, #x35, #x36, #x37, #x38, #x39, #x40, #x41, #x42, #x43, #x44, #x45, #x46, #x47, #x48, #x49, #x50, #x51, #x52, #x53}; \
+            std::vector<const char*> _names_vec(_names, _names + 53); \
+            ::mcoplib::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29, x30, x31, x32, x33, x34, x35, x36, x37, x38, x39, x40, x41, x42, x43, x44, x45, x46, x47, x48, x49, x50, x51, x52, x53); \
+        } \
+    } while(0)
+
+#define DEBUG_DUMP_PARAMS_IMPL_54(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29, x30, x31, x32, x33, x34, x35, x36, x37, x38, x39, x40, x41, x42, x43, x44, x45, x46, x47, x48, x49, x50, x51, x52, x53, x54) \
+    do { \
+        if (::mcoplib::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
+            constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10, #x11, #x12, #x13, #x14, #x15, #x16, #x17, #x18, #x19, #x20, #x21, #x22, #x23, #x24, #x25, #x26, #x27, #x28, #x29, #x30, #x31, #x32, #x33, #x34, #x35, #x36, #x37, #x38, #x39, #x40, #x41, #x42, #x43, #x44, #x45, #x46, #x47, #x48, #x49, #x50, #x51, #x52, #x53, #x54}; \
+            std::vector<const char*> _names_vec(_names, _names + 54); \
+            ::mcoplib::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29, x30, x31, x32, x33, x34, x35, x36, x37, x38, x39, x40, x41, x42, x43, x44, x45, x46, x47, x48, x49, x50, x51, x52, x53, x54); \
+        } \
+    } while(0)
+
+#define DEBUG_DUMP_PARAMS_IMPL_55(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29, x30, x31, x32, x33, x34, x35, x36, x37, x38, x39, x40, x41, x42, x43, x44, x45, x46, x47, x48, x49, x50, x51, x52, x53, x54, x55) \
+    do { \
+        if (::mcoplib::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
+            constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10, #x11, #x12, #x13, #x14, #x15, #x16, #x17, #x18, #x19, #x20, #x21, #x22, #x23, #x24, #x25, #x26, #x27, #x28, #x29, #x30, #x31, #x32, #x33, #x34, #x35, #x36, #x37, #x38, #x39, #x40, #x41, #x42, #x43, #x44, #x45, #x46, #x47, #x48, #x49, #x50, #x51, #x52, #x53, #x54, #x55}; \
+            std::vector<const char*> _names_vec(_names, _names + 55); \
+            ::mcoplib::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29, x30, x31, x32, x33, x34, x35, x36, x37, x38, x39, x40, x41, x42, x43, x44, x45, x46, x47, x48, x49, x50, x51, x52, x53, x54, x55); \
+        } \
+    } while(0)
+
+#define DEBUG_DUMP_PARAMS_IMPL_56(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29, x30, x31, x32, x33, x34, x35, x36, x37, x38, x39, x40, x41, x42, x43, x44, x45, x46, x47, x48, x49, x50, x51, x52, x53, x54, x55, x56) \
+    do { \
+        if (::mcoplib::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
+            constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10, #x11, #x12, #x13, #x14, #x15, #x16, #x17, #x18, #x19, #x20, #x21, #x22, #x23, #x24, #x25, #x26, #x27, #x28, #x29, #x30, #x31, #x32, #x33, #x34, #x35, #x36, #x37, #x38, #x39, #x40, #x41, #x42, #x43, #x44, #x45, #x46, #x47, #x48, #x49, #x50, #x51, #x52, #x53, #x54, #x55, #x56}; \
+            std::vector<const char*> _names_vec(_names, _names + 56); \
+            ::mcoplib::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29, x30, x31, x32, x33, x34, x35, x36, x37, x38, x39, x40, x41, x42, x43, x44, x45, x46, x47, x48, x49, x50, x51, x52, x53, x54, x55, x56); \
+        } \
+    } while(0)
+
+#define DEBUG_DUMP_PARAMS_IMPL_57(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29, x30, x31, x32, x33, x34, x35, x36, x37, x38, x39, x40, x41, x42, x43, x44, x45, x46, x47, x48, x49, x50, x51, x52, x53, x54, x55, x56, x57) \
+    do { \
+        if (::mcoplib::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
+            constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10, #x11, #x12, #x13, #x14, #x15, #x16, #x17, #x18, #x19, #x20, #x21, #x22, #x23, #x24, #x25, #x26, #x27, #x28, #x29, #x30, #x31, #x32, #x33, #x34, #x35, #x36, #x37, #x38, #x39, #x40, #x41, #x42, #x43, #x44, #x45, #x46, #x47, #x48, #x49, #x50, #x51, #x52, #x53, #x54, #x55, #x56, #x57}; \
+            std::vector<const char*> _names_vec(_names, _names + 57); \
+            ::mcoplib::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29, x30, x31, x32, x33, x34, x35, x36, x37, x38, x39, x40, x41, x42, x43, x44, x45, x46, x47, x48, x49, x50, x51, x52, x53, x54, x55, x56, x57); \
+        } \
+    } while(0)
+
+#define DEBUG_DUMP_PARAMS_IMPL_58(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29, x30, x31, x32, x33, x34, x35, x36, x37, x38, x39, x40, x41, x42, x43, x44, x45, x46, x47, x48, x49, x50, x51, x52, x53, x54, x55, x56, x57, x58) \
+    do { \
+        if (::mcoplib::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
+            constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10, #x11, #x12, #x13, #x14, #x15, #x16, #x17, #x18, #x19, #x20, #x21, #x22, #x23, #x24, #x25, #x26, #x27, #x28, #x29, #x30, #x31, #x32, #x33, #x34, #x35, #x36, #x37, #x38, #x39, #x40, #x41, #x42, #x43, #x44, #x45, #x46, #x47, #x48, #x49, #x50, #x51, #x52, #x53, #x54, #x55, #x56, #x57, #x58}; \
+            std::vector<const char*> _names_vec(_names, _names + 58); \
+            ::mcoplib::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29, x30, x31, x32, x33, x34, x35, x36, x37, x38, x39, x40, x41, x42, x43, x44, x45, x46, x47, x48, x49, x50, x51, x52, x53, x54, x55, x56, x57, x58); \
+        } \
+    } while(0)
+
+#define DEBUG_DUMP_PARAMS_IMPL_59(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29, x30, x31, x32, x33, x34, x35, x36, x37, x38, x39, x40, x41, x42, x43, x44, x45, x46, x47, x48, x49, x50, x51, x52, x53, x54, x55, x56, x57, x58, x59) \
+    do { \
+        if (::mcoplib::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
+            constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10, #x11, #x12, #x13, #x14, #x15, #x16, #x17, #x18, #x19, #x20, #x21, #x22, #x23, #x24, #x25, #x26, #x27, #x28, #x29, #x30, #x31, #x32, #x33, #x34, #x35, #x36, #x37, #x38, #x39, #x40, #x41, #x42, #x43, #x44, #x45, #x46, #x47, #x48, #x49, #x50, #x51, #x52, #x53, #x54, #x55, #x56, #x57, #x58, #x59}; \
+            std::vector<const char*> _names_vec(_names, _names + 59); \
+            ::mcoplib::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29, x30, x31, x32, x33, x34, x35, x36, x37, x38, x39, x40, x41, x42, x43, x44, x45, x46, x47, x48, x49, x50, x51, x52, x53, x54, x55, x56, x57, x58, x59); \
+        } \
+    } while(0)
+
+#define DEBUG_DUMP_PARAMS_IMPL_60(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29, x30, x31, x32, x33, x34, x35, x36, x37, x38, x39, x40, x41, x42, x43, x44, x45, x46, x47, x48, x49, x50, x51, x52, x53, x54, x55, x56, x57, x58, x59, x60) \
+    do { \
+        if (::mcoplib::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
+            constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10, #x11, #x12, #x13, #x14, #x15, #x16, #x17, #x18, #x19, #x20, #x21, #x22, #x23, #x24, #x25, #x26, #x27, #x28, #x29, #x30, #x31, #x32, #x33, #x34, #x35, #x36, #x37, #x38, #x39, #x40, #x41, #x42, #x43, #x44, #x45, #x46, #x47, #x48, #x49, #x50, #x51, #x52, #x53, #x54, #x55, #x56, #x57, #x58, #x59, #x60}; \
+            std::vector<const char*> _names_vec(_names, _names + 60); \
+            ::mcoplib::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29, x30, x31, x32, x33, x34, x35, x36, x37, x38, x39, x40, x41, x42, x43, x44, x45, x46, x47, x48, x49, x50, x51, x52, x53, x54, x55, x56, x57, x58, x59, x60); \
+        } \
+    } while(0)
+
+#define DEBUG_DUMP_PARAMS_IMPL_61(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29, x30, x31, x32, x33, x34, x35, x36, x37, x38, x39, x40, x41, x42, x43, x44, x45, x46, x47, x48, x49, x50, x51, x52, x53, x54, x55, x56, x57, x58, x59, x60, x61) \
+    do { \
+        if (::mcoplib::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
+            constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10, #x11, #x12, #x13, #x14, #x15, #x16, #x17, #x18, #x19, #x20, #x21, #x22, #x23, #x24, #x25, #x26, #x27, #x28, #x29, #x30, #x31, #x32, #x33, #x34, #x35, #x36, #x37, #x38, #x39, #x40, #x41, #x42, #x43, #x44, #x45, #x46, #x47, #x48, #x49, #x50, #x51, #x52, #x53, #x54, #x55, #x56, #x57, #x58, #x59, #x60, #x61}; \
+            std::vector<const char*> _names_vec(_names, _names + 61); \
+            ::mcoplib::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29, x30, x31, x32, x33, x34, x35, x36, x37, x38, x39, x40, x41, x42, x43, x44, x45, x46, x47, x48, x49, x50, x51, x52, x53, x54, x55, x56, x57, x58, x59, x60, x61); \
+        } \
+    } while(0)
+
+#define DEBUG_DUMP_PARAMS_IMPL_62(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29, x30, x31, x32, x33, x34, x35, x36, x37, x38, x39, x40, x41, x42, x43, x44, x45, x46, x47, x48, x49, x50, x51, x52, x53, x54, x55, x56, x57, x58, x59, x60, x61, x62) \
+    do { \
+        if (::mcoplib::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
+            constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10, #x11, #x12, #x13, #x14, #x15, #x16, #x17, #x18, #x19, #x20, #x21, #x22, #x23, #x24, #x25, #x26, #x27, #x28, #x29, #x30, #x31, #x32, #x33, #x34, #x35, #x36, #x37, #x38, #x39, #x40, #x41, #x42, #x43, #x44, #x45, #x46, #x47, #x48, #x49, #x50, #x51, #x52, #x53, #x54, #x55, #x56, #x57, #x58, #x59, #x60, #x61, #x62}; \
+            std::vector<const char*> _names_vec(_names, _names + 62); \
+            ::mcoplib::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29, x30, x31, x32, x33, x34, x35, x36, x37, x38, x39, x40, x41, x42, x43, x44, x45, x46, x47, x48, x49, x50, x51, x52, x53, x54, x55, x56, x57, x58, x59, x60, x61, x62); \
+        } \
+    } while(0)
+
+#define DEBUG_DUMP_PARAMS_IMPL_63(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29, x30, x31, x32, x33, x34, x35, x36, x37, x38, x39, x40, x41, x42, x43, x44, x45, x46, x47, x48, x49, x50, x51, x52, x53, x54, x55, x56, x57, x58, x59, x60, x61, x62, x63) \
+    do { \
+        if (::mcoplib::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
+            constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10, #x11, #x12, #x13, #x14, #x15, #x16, #x17, #x18, #x19, #x20, #x21, #x22, #x23, #x24, #x25, #x26, #x27, #x28, #x29, #x30, #x31, #x32, #x33, #x34, #x35, #x36, #x37, #x38, #x39, #x40, #x41, #x42, #x43, #x44, #x45, #x46, #x47, #x48, #x49, #x50, #x51, #x52, #x53, #x54, #x55, #x56, #x57, #x58, #x59, #x60, #x61, #x62, #x63}; \
+            std::vector<const char*> _names_vec(_names, _names + 63); \
+            ::mcoplib::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29, x30, x31, x32, x33, x34, x35, x36, x37, x38, x39, x40, x41, x42, x43, x44, x45, x46, x47, x48, x49, x50, x51, x52, x53, x54, x55, x56, x57, x58, x59, x60, x61, x62, x63); \
+        } \
+    } while(0)
+
+#define DEBUG_DUMP_PARAMS_IMPL_64(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29, x30, x31, x32, x33, x34, x35, x36, x37, x38, x39, x40, x41, x42, x43, x44, x45, x46, x47, x48, x49, x50, x51, x52, x53, x54, x55, x56, x57, x58, x59, x60, x61, x62, x63, x64) \
+    do { \
+        if (::mcoplib::debug::should_dump(MCOP_GET_FUNC_NAME())) { \
+            constexpr const char* _names[] = {#x1, #x2, #x3, #x4, #x5, #x6, #x7, #x8, #x9, #x10, #x11, #x12, #x13, #x14, #x15, #x16, #x17, #x18, #x19, #x20, #x21, #x22, #x23, #x24, #x25, #x26, #x27, #x28, #x29, #x30, #x31, #x32, #x33, #x34, #x35, #x36, #x37, #x38, #x39, #x40, #x41, #x42, #x43, #x44, #x45, #x46, #x47, #x48, #x49, #x50, #x51, #x52, #x53, #x54, #x55, #x56, #x57, #x58, #x59, #x60, #x61, #x62, #x63, #x64}; \
+            std::vector<const char*> _names_vec(_names, _names + 64); \
+            ::mcoplib::debug::dump_params(MCOP_GET_FUNC_NAME(), _names_vec, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29, x30, x31, x32, x33, x34, x35, x36, x37, x38, x39, x40, x41, x42, x43, x44, x45, x46, x47, x48, x49, x50, x51, x52, x53, x54, x55, x56, x57, x58, x59, x60, x61, x62, x63, x64); \
         } \
     } while(0)
 

@@ -188,27 +188,21 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   // SituGLU implementation used in Kimi models.
   ops.def(
       "situ_and_mul(Tensor! out, Tensor input, float beta=1.0, float "
-      "linear_beta=-1.0) -> ()");
+      "linear_beta=-1.0, Tensor? valid_rows=None) -> ()");
   ops.impl("situ_and_mul", torch::kCUDA, &situ_and_mul);
   // Fused SituGLU activation + dynamic FP8 quantization for the Humming w2 path
   // (writes the fp8 down input and its float32 scale). group_size=0 ->
   // per-token scale [.., 1]; group_size=128 -> k-major block-FP8 scale [..,
   // d/128].
-  ops.def(
-      "situ_and_mul_quant(Tensor! out, Tensor! scale, Tensor input, "
-      "float beta=1.0, float linear_beta=-1.0, int group_size=0, "
-      "Tensor? num_valid_tokens=None, int topk=1) -> ()");
-  ops.impl("situ_and_mul_quant", torch::kCUDA, &situ_and_mul_quant);
+//   ops.def(
+//       "situ_and_mul_quant(Tensor! out, Tensor! scale, Tensor input, "
+//       "float beta=1.0, float linear_beta=-1.0, int group_size=0, "
+//       "Tensor? valid_rows=None, int topk=1) -> ()");
+//   ops.impl("situ_and_mul_quant", torch::kCUDA, &situ_and_mul_quant);
   ops.def(
       "masked_situ_and_mul(Tensor! out, Tensor input, Tensor "
       "expert_num_tokens, float beta=1.0, float linear_beta=-1.0) -> ()");
   ops.impl("masked_situ_and_mul", torch::kCUDA, &masked_situ_and_mul);
-  ops.def(
-      "masked_moe_activation(Tensor! out, Tensor input, Tensor "
-      "valid_token_counts, str activation, float clamp_limit=0.0, float "
-      "alpha=1.0, float beta=0.0, float situ_beta=1.0, float "
-      "situ_linear_beta=-1.0) -> ()");
-  ops.impl("masked_moe_activation", torch::kCUDA, &masked_moe_activation);
 
   // GELU implementation used in GPT-2.
   ops.def("gelu_new(Tensor! out, Tensor input) -> ()");
@@ -244,66 +238,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "                             Tensor kv_cache_ptrs,"
       "                             Tensor slot_mapping,"
       "                             int block_size, int block_stride,"
-      "                             int entry_stride,"
-      "                             Tensor? kv_scales=None,"
-      "                             str kv_cache_dtype='auto') -> ()");
+      "                             int entry_stride) -> ()");
   ops.impl("concat_and_cache_mla_grouped", torch::kCUDA, &concat_and_cache_mla_grouped);
-
-#ifndef USE_ROCM
-  ops.def(
-      "hisparse_resolve_residency(Tensor host_cache,"
-      "                 Tensor! hot_cache,"
-      "                 Tensor hot_block_table,"
-      "                 Tensor global_indices,"
-      "                 Tensor! hot_indices,"
-      "                 Tensor! device_global_indices,"
-      "                 Tensor! lru_slots,"
-      "                 Tensor? request_state_indices,"
-      "                 int region_stride,"
-      "                 Tensor(a!)? miss_mask=None,"
-      "                 Tensor(b!)? stats=None,"
-      "                 Tensor(c!)? attention_indices=None,"
-      "                 int attention_block_stride=0,"
-      "                 Tensor? request_ids=None,"
-      "                 Tensor? source_block_table=None,"
-      "                 int source_block_size=0,"
-      "                 Tensor(d!)? resolved_global_indices=None,"
-      "                 Tensor(e!)? valid_counts=None,"
-      "                 Tensor(f!)? swap_host_physical_rows=None,"
-      "                 Tensor(g!)? swap_device_physical_rows=None,"
-      "                 Tensor(h!)? swap_counts=None,"
-      "                 Tensor? resident_block_table=None,"
-      "                 int resident_block_size=0,"
-      "                 int resident_null_block=0) -> ()");
-  ops.impl("hisparse_resolve_residency", torch::kCUDA, &hisparse_resolve_residency);
-
-  ops.def(
-      "hisparse_invalidate_written_slots(Tensor! device_global_indices,"
-      "                                   Tensor request_state_indices,"
-      "                                   Tensor req_id_per_token,"
-      "                                   Tensor written_slots) -> ()");
-  ops.impl("hisparse_invalidate_written_slots", torch::kCUDA, &hisparse_invalidate_written_slots);
-
-  ops.def(
-      "hisparse_gather_plan(Tensor host_cache,"
-      "                     Tensor! hot_cache,"
-      "                     Tensor global_indices,"
-      "                     Tensor hot_indices,"
-      "                     Tensor miss_mask,"
-      "                     Tensor? request_state_indices,"
-      "                     Tensor(a!)? attention_indices=None,"
-      "                     int attention_block_stride=0) -> ()");
-  ops.impl("hisparse_gather_plan", torch::kCUDA, &hisparse_gather_plan);
-
-  ops.def(
-      "hisparse_gather_compact(Tensor host_cache,"
-      "                        Tensor! hot_cache,"
-      "                        Tensor miss_global_indices,"
-      "                        Tensor miss_hot_indices,"
-      "                        Tensor miss_counts) -> ()");
-  ops.impl("hisparse_gather_compact", torch::kCUDA, &hisparse_gather_compact);
-
-#endif  // !USE_ROCM
 
 //   // Function for fused QK Norm and RoPE
 //   ops.def(
@@ -375,17 +311,6 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor seq_lens, Tensor! indices, "
       "int numRows, int stride0, int stride1, int topK) -> ()");
   ops.impl("top_k_per_row_decode", torch::kCUDA, &top_k_per_row_decode);
-
-  ops.def(
-      "select_candidate_blocks(Tensor logits, Tensor? starts, Tensor ends, "
-      "int topk_blocks, int block_size, Tensor(a!) out, "
-      "int row_repeat=1) -> ()");
-  ops.impl("select_candidate_blocks", torch::kCUDA, &select_candidate_blocks);
-
-  ops.def(
-      "apply_candidate_mask(Tensor(a!) logits, Tensor? starts, Tensor ends, "
-      "Tensor candidates, int block_size, int row_repeat=1) -> ()");
-  ops.impl("apply_candidate_mask", torch::kCUDA, &apply_candidate_mask);
    
   ops.def(
       "persistent_topk(Tensor logits, Tensor lengths, Tensor! output, "
@@ -715,11 +640,9 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
 #ifdef VLLM_ENABLE_KIMI_K3_ATTN_RES
   ops.def(
       "kimi_k3_attn_res("
-      "Tensor! prefix, Tensor? delta, Tensor! blocks, Tensor norm_weight, "
-      "Tensor qk_weight, Tensor? output_norm_weight, Tensor! output, "
-      "int num_blocks, "
-      "int block_write_idx, float eps, "
-      "float output_norm_eps) -> ()");
+      "Tensor! prefix, Tensor delta, Tensor blocks, Tensor norm_weight, "
+      "Tensor qk_weight, Tensor output_norm_weight, Tensor! output, "
+      "int num_blocks, float eps, float output_norm_eps) -> ()");
   ops.impl("kimi_k3_attn_res", torch::kCUDA, &kimi_k3_attn_res);
 #endif
 }
@@ -848,16 +771,9 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cache_ops), cache_ops) {
   cache_ops.def(
       "cp_gather_and_upconvert_fp8_kv_cache(Tensor src_cache, Tensor! dst, "
       "Tensor block_table, Tensor workspace_starts, int batch_size, Tensor? "
-      "seq_starts, Tensor? host_cache=None, Tensor? host_row_ids=None, Tensor? "
-      "device_row_ids=None) -> ()");
+      "seq_starts) -> ()");
   cache_ops.impl("cp_gather_and_upconvert_fp8_kv_cache", torch::kCUDA,
                  &cp_gather_and_upconvert_fp8_kv_cache);
-  
-  cache_ops.def(
-      "cp_gather_and_upconvert_nvfp4_kv_cache(Tensor src_cache, Tensor! dst, "
-      "Tensor block_table, Tensor workspace_starts, int batch_size) -> ()");
-  cache_ops.impl("cp_gather_and_upconvert_nvfp4_kv_cache", torch::kCUDA,
-                 &cp_gather_and_upconvert_nvfp4_kv_cache);
 
   cache_ops.def(
       "indexer_k_quant_and_cache(Tensor k, Tensor! kv_cache, Tensor "

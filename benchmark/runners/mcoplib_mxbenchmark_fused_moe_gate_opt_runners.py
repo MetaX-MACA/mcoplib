@@ -82,20 +82,23 @@ class Fused_moe_gate_opt_runner(OpBenchmarkBase):
         )
 
         gate_f32 = gating_outputs.float()
-        gate_sigmoid_f32 = torch.sigmoid(gate_f32)
-        bias_f32 = correction_bias.float()
-        score_f32 = gate_sigmoid_f32 + bias_f32
+        gate_sigmoid_bf16 = torch.sigmoid(gate_f32).to(self.dtype)
+        bias_bf16 = correction_bias.to(self.dtype)
+        score_bf16 = gate_sigmoid_bf16 + bias_bf16
 
+        score_f32 = score_bf16.float()
         indices_penalty = torch.arange(self.num_experts, device=dev, dtype=torch.float32) * 1e-7
         score_f32_tied = score_f32 - indices_penalty
         #选出top_k个
         _, expected_idx = torch.topk(score_f32_tied, self.topk, dim=-1)
         
-        expected_w_f32 = torch.gather(gate_sigmoid_f32, -1, expected_idx).float()
+        expected_w_f32 = torch.gather(gate_sigmoid_bf16, -1, expected_idx).float()
         #归一化，k个专家权重之和为1
+        weight_sum = expected_w_f32.sum(dim=-1, keepdim=True)
+        expected_w_f32 = expected_w_f32 / weight_sum
+        #缩放
         if self.renormalize:
-            weight_sum = expected_w_f32.sum(dim=-1, keepdim=True)
-            expected_w_f32 = expected_w_f32 / weight_sum
+            expected_w_f32 = expected_w_f32 * self.routed_scaling_factor
 
         pass_w, diff_w = self.check_diff(out_routing_weights, expected_w_f32, threshold=0.999)
         

@@ -11,7 +11,6 @@ import torch
 
 import mcoplib.sgl_kernel  # noqa: F401  (registers torch.ops.sgl_kernel)
 
-TOPK_LIST = [512,1024]
 TOPK = 512
 MAX_SEQ_LEN = 66551
 TABLE_LEN = 299062
@@ -94,39 +93,37 @@ def test_topk_transform_v1(bs: int, seq_len: int) -> None:
 
     page_table = torch.arange(0, TABLE_LEN, dtype=torch.int32, device="cuda")
     page_table = page_table.unsqueeze(0).expand(bs, -1).contiguous()
-    
-    for topk in TOPK_LIST:
-        print(f"============topk={topk}==========")
-        # reference
-        ref_topk = _ref_torch_impl(score, seq_len, topk)
-        ref_page = _ref_page_to_indices(ref_topk, page_table, PAGE_SIZE)
 
-        page_indices = score.new_empty((bs, topk), dtype=torch.int32)
-        raw_indices = score.new_empty((bs, topk), dtype=torch.int32)
+    # reference
+    ref_topk = _ref_torch_impl(score, seq_len, TOPK)
+    ref_page = _ref_page_to_indices(ref_topk, page_table, PAGE_SIZE)
 
-        def launch():
-            torch.ops.sgl_kernel.topk_transform_v1.default(
-                score, seq_lens, page_indices, page_table, PAGE_SIZE, raw_indices
-            )
+    page_indices = score.new_empty((bs, TOPK), dtype=torch.int32)
+    raw_indices = score.new_empty((bs, TOPK), dtype=torch.int32)
 
-        # correctness: compare raw topk indices (tie-tolerant) and page transform
-        launch()
-        raw_ref_sorted = torch.sort(ref_topk, dim=-1).values
-        raw_our_sorted = torch.sort(raw_indices, dim=-1).values
-        assert_equal(score, raw_ref_sorted, raw_our_sorted, bs, topk, seq_len)
-        # page transform must equal page_to_indices(raw_indices)
-        recomputed_page = _ref_page_to_indices(raw_indices, page_table, PAGE_SIZE)
-        assert torch.equal(recomputed_page, page_indices), f"page transform mismatch bs={bs} seq={seq_len}"
+    def launch():
+        torch.ops.sgl_kernel.topk_transform_v1.default(
+            score, seq_lens, page_indices, page_table, PAGE_SIZE, raw_indices
+        )
 
-        # bytes_accessed aligned with unit_test/test_topk.py::test_topk_transform_kernel:
-        # Read Score + Read SrcPageTable + Write DstPageTable = bs * (2 * seq_len + k) * 4
-        bytes_accessed = bs * (2 * seq_len + topk) * 4
-        print(f"\n[Case: BS={bs}, SeqLen={seq_len}, PageSize={PAGE_SIZE}, K={topk}]")
-        bw = run_cuda_benchmark("topk_transform_v1", launch, bytes_accessed)
+    # correctness: compare raw topk indices (tie-tolerant) and page transform
+    launch()
+    raw_ref_sorted = torch.sort(ref_topk, dim=-1).values
+    raw_our_sorted = torch.sort(raw_indices, dim=-1).values
+    assert_equal(score, raw_ref_sorted, raw_our_sorted, bs, TOPK, seq_len)
+    # page transform must equal page_to_indices(raw_indices)
+    recomputed_page = _ref_page_to_indices(raw_indices, page_table, PAGE_SIZE)
+    assert torch.equal(recomputed_page, page_indices), f"page transform mismatch bs={bs} seq={seq_len}"
 
-        # Target: average bandwidth >= 800 GB/s for seq_len >= 4096
-        # if seq_len >= 4096:
-        #     assert bw >= 800.0, f"bandwidth {bw:.1f} GB/s below target 800 GB/s (bs={bs}, seq={seq_len})"
+    # bytes_accessed aligned with unit_test/test_topk.py::test_topk_transform_kernel:
+    # Read Score + Read SrcPageTable + Write DstPageTable = bs * (2 * seq_len + k) * 4
+    bytes_accessed = bs * (2 * seq_len + TOPK) * 4
+    print(f"\n[Case: BS={bs}, SeqLen={seq_len}, PageSize={PAGE_SIZE}, K={TOPK}]")
+    bw = run_cuda_benchmark("topk_transform_v1", launch, bytes_accessed)
+
+    # Target: average bandwidth >= 800 GB/s for seq_len >= 4096
+    # if seq_len >= 4096:
+    #     assert bw >= 800.0, f"bandwidth {bw:.1f} GB/s below target 800 GB/s (bs={bs}, seq={seq_len})"
 
 
 @pytest.mark.parametrize("seq_len", [4096, 20000], ids=["histogram", "radix"])

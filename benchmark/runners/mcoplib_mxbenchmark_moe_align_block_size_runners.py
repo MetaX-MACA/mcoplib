@@ -14,7 +14,8 @@ class Moe_align_block_size_runner(OpBenchmarkBase):
         self.top_k = config.get("top_k", 2)
         self.num_experts = config.get("num_experts", 8)
         self.block_size = config.get("block_size", 64)
-        self.dtype = torch.int32 
+        self.dtype = torch.int32
+        self.invalid_id_ratio = config.get("invalid_id_ratio", 0.0)
 
     def define_metrics(self, state):
         state.add_summary("Op", self.name)
@@ -34,6 +35,10 @@ class Moe_align_block_size_runner(OpBenchmarkBase):
             dev = f'cuda:{dev_id}'
             topk_ids = torch.randint(0, self.num_experts, (self.num_tokens, self.top_k), 
                                      dtype=self.dtype, device=dev)
+            if self.invalid_id_ratio and self.invalid_id_ratio > 0:
+                flat = topk_ids.view(-1)
+                period = max(1, int(round(1.0 / self.invalid_id_ratio)))
+                flat[torch.arange(flat.numel(), device=flat.device) % period == 0] = -1
             total_elements = topk_ids.numel()
             max_num_tokens_padded = total_elements + self.num_experts * self.block_size
             sorted_token_ids = torch.full((max_num_tokens_padded,), total_elements, dtype=torch.int32, device=dev)
@@ -48,6 +53,10 @@ class Moe_align_block_size_runner(OpBenchmarkBase):
         dev = f'cuda:{dev_id}'
         topk_ids = torch.randint(0, self.num_experts, (self.num_tokens, self.top_k), 
                                  dtype=self.dtype, device=dev)
+        if self.invalid_id_ratio and self.invalid_id_ratio > 0:
+            flat = topk_ids.view(-1)
+            period = max(1, int(round(1.0 / self.invalid_id_ratio)))
+            flat[torch.arange(flat.numel(), device=flat.device) % period == 0] = -1
         total_elements = topk_ids.numel()
         max_num_tokens_padded = total_elements + self.num_experts * self.block_size
         sorted_token_ids = torch.full((max_num_tokens_padded,), total_elements, dtype=torch.int32, device=dev)
@@ -58,7 +67,8 @@ class Moe_align_block_size_runner(OpBenchmarkBase):
                                 None)
         topk_cpu = topk_ids.cpu().flatten()
         num_el = topk_cpu.numel()
-        expert_counts = torch.bincount(topk_cpu, minlength=self.num_experts)
+        valid_mask = (topk_cpu >= 0) & (topk_cpu < self.num_experts)
+        expert_counts = torch.bincount(topk_cpu[valid_mask], minlength=self.num_experts)
         padded_counts = ((expert_counts + self.block_size - 1) // self.block_size) * self.block_size
         total_padded = padded_counts.sum().item()
         ref_sorted_token_ids = torch.full((max_num_tokens_padded,), num_el, dtype=torch.int32)

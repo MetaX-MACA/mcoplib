@@ -591,3 +591,163 @@ def test_batched_moe_align_block_size(
     torch.testing.assert_close(
         ref_num_tokens_post_pad, num_tokens_post_pad, atol=0, rtol=0
     )
+
+
+# ---------------------------------------------------------------------------
+# MC3-16154 regression tests: invalid expert ids must be skipped by every
+# alignment kernel. With VLLM_MOE_SKIP_PADDING the routing kernels can emit
+# padding rows whose expert id equals num_experts, and other routing paths
+# mark dropped tokens with -1. moe_align_block_size must treat both families
+# as invalid and never let them reach the per-expert counting/sorting state.
+# ---------------------------------------------------------------------------
+
+
+def _inject_invalid_expert_ids(
+    topk_ids: torch.Tensor, num_experts: int, invalid_kind: str
+) -> tuple[int, int]:
+    """Deterministically overwrite part of topk_ids with invalid ids.
+
+    Returns the number of negative ids and the number of ids >= num_experts
+    that were injected, so tests can assert exact valid-token accounting.
+    """
+    flat = topk_ids.view(-1)
+    idx = torch.nonzero(
+        torch.arange(flat.numel(), device=flat.device) % 8 == 0
+    ).flatten()
+    if invalid_kind == "negative":
+        flat[idx] = -1
+    elif invalid_kind == "overflow":
+        flat[idx] = num_experts
+    else:  # mixed
+        flat[idx[0::3]] = -1
+        flat[idx[1::3]] = num_experts
+        flat[idx[2::3]] = num_experts + 1
+    n_neg = int((flat < 0).sum().item())
+    n_ovf = int((flat >= num_experts).sum().item())
+    return n_neg, n_ovf
+
+
+@pytest.mark.parametrize("m", [16, 256, 2256])
+@pytest.mark.parametrize("topk", [2, 8])
+@pytest.mark.parametrize("block_size", [32, 128])
+@pytest.mark.parametrize("num_experts", [128, 256])
+@pytest.mark.parametrize("invalid_kind", ["negative", "overflow", "mixed"])
+def test_moe_align_block_size_with_invalid_expert_ids(
+    m: int, topk: int, block_size: int, num_experts: int, invalid_kind: str
+):
+    """Invalid expert ids must be skipped, including the 128-expert fast path.
+
+    num_experts=128 dispatches to moe_align_block_size_opt_128_expert_kernel,
+    whose counting and sorting loops historically only rejected
+    expert_id >= num_experts; a negative id therefore indexed
+    shared_counts[0][-1] / cumsum[-1] out of bounds and leaked the invalid
+    token into sorted_token_ids (MC3-16154). num_experts=256 exercises the
+    generic path, which already rejects negative ids via get_local_expert_id,
+    and serves as the in-suite control group.
+    """
+    torch.manual_seed(0)
+    topk_ids = torch.randint(
+        0, num_experts, (m, topk), device="cuda", dtype=torch.int32
+    )
+    n_neg, n_ovf = _inject_invalid_expert_ids(topk_ids, num_experts, invalid_kind)
+    assert n_neg + n_ovf > 0
+    num_valid = m * topk - n_neg - n_ovf
+
+    actual_sorted_ids, actual_expert_ids, actual_num_tokens = moe_align_block_size(
+        topk_ids=topk_ids, block_size=block_size, num_experts=num_experts
+    )
+    golden_sorted_ids, golden_expert_ids, golden_num_tokens = torch_moe_align_block_size(
+        topk_ids=topk_ids, block_size=block_size, num_experts=num_experts
+    )
+
+    # Invalid ids must not participate in counting: the padded totals and the
+    # used prefix of expert_ids have to match the golden reference exactly.
+    torch.testing.assert_close(actual_num_tokens, golden_num_tokens, atol=0, rtol=0)
+    actual_num_blocks = cdiv(int(actual_num_tokens.item()), block_size)
+    torch.testing.assert_close(
+        actual_expert_ids[:actual_num_blocks],
+        golden_expert_ids[:actual_num_blocks],
+        atol=0,
+        rtol=0,
+    )
+    _verify_expert_level_sorting(
+        actual_sorted_ids,
+        golden_sorted_ids,
+        actual_expert_ids,
+        block_size,
+        actual_num_tokens.item(),
+        m * topk,
+    )
+
+    # Exactly the tokens whose expert id is valid may appear in sorted_ids:
+    # an invalid id that leaks into the sorted region either evicts a valid
+    # token or injects an extra one, and both cases are caught here.
+    valid_mask = (topk_ids.view(-1) >= 0) & (topk_ids.view(-1) < num_experts)
+    expected_tokens = torch.nonzero(valid_mask).flatten().to(torch.int32)
+    placed_tokens = actual_sorted_ids[actual_sorted_ids < m * topk]
+    got_tokens = torch.unique(placed_tokens)
+    assert got_tokens.numel() == len(placed_tokens), (
+        "duplicate token indices in sorted_ids"
+    )
+    assert torch.equal(got_tokens, expected_tokens), (
+        f"sorted_ids must contain exactly the {num_valid} tokens with valid "
+        f"expert ids (kind={invalid_kind}, m={m}, topk={topk}, "
+        f"num_experts={num_experts}, block_size={block_size})"
+    )
+
+
+@pytest.mark.parametrize("m", [16, 2048])
+@pytest.mark.parametrize("invalid_kind", ["negative", "mixed"])
+def test_moe_align_block_size_with_expert_map_and_invalid_ids(
+    m: int, invalid_kind: str
+):
+    """Negative raw ids must be dropped before the expert_map lookup.
+
+    With ignore_invalid_experts=True the raw expert id is mapped through
+    expert_map after the range check; a negative raw id used to read
+    expert_map[-1] out of bounds before the post-map -1 test (MC3-16154).
+    """
+    torch.manual_seed(0)
+    num_experts = 128
+    topk = 4
+    block_size = 64
+    topk_ids = torch.randint(
+        0, num_experts, (m, topk), device="cuda", dtype=torch.int32
+    )
+    n_neg, n_ovf = _inject_invalid_expert_ids(topk_ids, num_experts, invalid_kind)
+    assert n_neg + n_ovf > 0
+
+    expert_map = torch.full((num_experts,), -1, device="cuda", dtype=torch.int32)
+    for i, expert_id in enumerate(range(0, num_experts, 2)):
+        expert_map[expert_id] = i
+
+    actual_sorted_ids, actual_expert_ids, actual_num_tokens = moe_align_block_size(
+        topk_ids=topk_ids,
+        block_size=block_size,
+        num_experts=num_experts,
+        expert_map=expert_map,
+        ignore_invalid_experts=True,
+    )
+    golden_sorted_ids, golden_expert_ids, golden_num_tokens = torch_moe_align_block_size(
+        topk_ids=topk_ids,
+        block_size=block_size,
+        num_experts=num_experts,
+        expert_map=expert_map,
+    )
+
+    torch.testing.assert_close(actual_num_tokens, golden_num_tokens, atol=0, rtol=0)
+    actual_num_blocks = cdiv(int(actual_num_tokens.item()), block_size)
+    torch.testing.assert_close(
+        actual_expert_ids[:actual_num_blocks],
+        golden_expert_ids[:actual_num_blocks],
+        atol=0,
+        rtol=0,
+    )
+    _verify_expert_level_sorting(
+        actual_sorted_ids,
+        golden_sorted_ids,
+        actual_expert_ids,
+        block_size,
+        actual_num_tokens.item(),
+        m * topk,
+    )

@@ -23,7 +23,6 @@ import mcoplib_mxbenchmark_op_wrapper
 #  Global Config: Supported Operators
 # =============================================================================
 SUPPORTED_OPERATORS = [
-    "apply_candidate_mask",
     "apply_repetition_penalties",
     "apply_rope_pos_ids_cos_sin_cache",
     "apply_shuffle_mul_sum",
@@ -107,7 +106,6 @@ SUPPORTED_OPERATORS = [
     "rms_norm_dynamic_per_group_quant_fp8",
     "rotary_embedding",
     "segment_packbits",
-    "select_candidate_blocks",
     "selective_scan_fwd",
     "sgl_rotary_embedding",
     "silu_and_mul",
@@ -401,7 +399,7 @@ def create_benchmark_wrapper(op_instance):
         try:
             for _ in range(10):
                 op_instance.run_verification(dev_id)
-            print(" Done.", flush=True)
+            print(" Done.")
         except Exception as e:
             print(f" (Failed: {e})", end="")
 
