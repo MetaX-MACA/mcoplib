@@ -1,9 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 """
 gumbel_sample 精度 + 性能测试
+新增：
+  - 强制覆盖三条 kernel 路径（单次遍历+reduce / 循环+单 split / 循环+reduce）
+  - 异常输入（NaN / -inf / +inf / NaN padding 行）下的 token id 越界检查
+    （vLLM 0.30 watermark 会把采样出的 token id 当作显存下标使用）
+  - all_greedy + logits_cache 路径的正确性
 """
 import argparse
-import importlib
+import contextlib
+from types import SimpleNamespace
 
 import torch
 import triton
@@ -20,12 +26,48 @@ parser.add_argument("--warmup", type=int, default=25)
 parser.add_argument("--rep", type=int, default=200)
 args = parser.parse_args()
 
-from mcoplib.triton_gumbel_sample import (
+import mcoplib.triton_gumbel_sample as gmod  # noqa: E402
+from mcoplib.triton_gumbel_sample import (  # noqa: E402
     gumbel_sample, tl_rand32, tl_rand64, _DRAFT_NOISE_SALT
 )
 
 SALT = _DRAFT_NOISE_SALT
 from vllm.triton_utils import tldevice  # noqa: E402
+
+
+# ============================================================================
+# 强制选择 kernel 路径：临时替换模块里的 _get_profile
+# ============================================================================
+_ORIG_GET_PROFILE = gmod._get_profile
+_PROFILE_FIELDS = ("num_cu", "programs_per_cu", "chunk_align", "num_warps",
+                   "random_use_split")
+
+# name -> profile 覆盖项（None 表示保持默认）
+PATHS = {
+    # random 默认路径：CHUNK==BLOCK 单次遍历，多 split + reduce kernel
+    "single_pass+reduce": dict(random_use_split=False),
+    # split 路径，target_programs=1 -> num_splits=1 -> 循环 + SINGLE_SPLIT
+    "loop+single_split": dict(random_use_split=True, num_cu=1, programs_per_cu=1),
+    # split 路径，target_programs=256 -> 每行 8 个 split -> 循环 + reduce
+    "loop+reduce": dict(random_use_split=True, num_cu=1, programs_per_cu=256),
+}
+
+
+@contextlib.contextmanager
+def force_path(name):
+    override = PATHS[name]
+
+    def patched(dev_idx):
+        p = _ORIG_GET_PROFILE(dev_idx)
+        f = {k: getattr(p, k) for k in _PROFILE_FIELDS}
+        f.update(override)
+        return SimpleNamespace(**f)
+
+    gmod._get_profile = patched
+    try:
+        yield
+    finally:
+        gmod._get_profile = _ORIG_GET_PROFILE
 
 
 # ============================================================================
@@ -65,6 +107,24 @@ def make_inputs(dtype=torch.float32, with_invalid_row=True):
     pos = torch.tensor(pos_list, dtype=torch.int64, device=DEVICE)
     cache_col = torch.tensor(col_list, dtype=torch.int32, device=DEVICE)
     return logits, expanded_idx_mapping, temperature, seed, pos, cache_col
+
+
+INF_ROW, INF_POS = 3, 12345  # 第 3 行（槽位 1，T=0.5）只有一个 +inf
+
+
+def make_abnormal_inputs(dtype=torch.float32):
+    """在正常输入上注入异常行，模拟 padding 行垃圾值 / bf16 溢出。"""
+    logits, m, t, s, p, col = make_inputs(dtype)
+    nan, inf = float("nan"), float("inf")
+    logits[0] = nan                         # 整行 NaN（槽位 0，T=0）
+    logits[1] = -inf                        # 整行 -inf（槽位 0，T=0）
+    logits[4, :1000] = nan                  # 部分 NaN（槽位 1，T=0.5）
+    logits[5, -1] = nan                     # 只有尾部最后一个元素是 NaN
+    logits[INF_ROW] = -inf
+    logits[INF_ROW, INF_POS] = inf          # 唯一 +inf -> 结果必须是 INF_POS
+    logits[7] = nan                         # 整行 NaN（槽位 2，T=1.0，有噪声）
+    logits[-1] = nan                        # padding 行（mapping=-1）填 NaN 垃圾
+    return logits, m, t, s, p, col
 
 
 # ============================================================================
@@ -108,14 +168,14 @@ def reference(logits, idx_map, temp, seed, pos, apply_temperature,
               is_drafting, use_fp64):
     out = torch.empty(logits.shape, device=DEVICE,
                       dtype=torch.float64 if use_fp64 else torch.float32)
-    BLOCK = 1024  # 必须与原实现一致（keys = 全局 token id，与 BLOCK 无关，但保持一致）
+    BLOCK = 1024
     grid = (logits.shape[0], triton.cdiv(logits.shape[1], BLOCK))
     _dump_scores_kernel[grid](out, out.stride(0), logits, logits.stride(0),
                               idx_map, seed, pos, temp, logits.shape[1],
                               BLOCK=BLOCK, IS_DRAFTING=is_drafting,
                               USE_FP64=use_fp64,
                               APPLY_TEMPERATURE=apply_temperature)
-    return out.argmax(dim=-1), out  # torch argmax：并列时取第一个，和 tl.max 一致
+    return out.argmax(dim=-1), out  # torch argmax：并列时取第一个
 
 
 # ============================================================================
@@ -126,52 +186,120 @@ def check(name, ok, extra=""):
     return ok
 
 
+def in_range(out):
+    """返回 (是否全部合法, min, max)。在 CPU 上判断，避免越界值再次触发设备错误。"""
+    o = out.detach().cpu()
+    return bool(((o >= 0) & (o < VOCAB_SIZE)).all()), int(o.min()), int(o.max())
+
+
+def bitwise_tests(path):
+    ok_all = True
+    with force_path(path):
+        for dtype in (torch.float32, torch.bfloat16):
+            for use_fp64 in (False, True):
+                for is_drafting in (False, True):
+                    logits, m, t, s, p, _ = make_inputs(dtype)
+                    out = gumbel_sample(logits, m, t, s, p, apply_temperature=True,
+                                        is_drafting=is_drafting, use_fp64=use_fp64)
+                    ref, _ = reference(logits, m, t, s, p, True, is_drafting, use_fp64)
+                    n_mis = (out != ref).sum().item()
+                    ok_all &= check(
+                        f"[{path:18s}] bitwise dtype={str(dtype)[6:]:8s} "
+                        f"fp64={use_fp64!s:5s} draft={is_drafting!s:5s}",
+                        n_mis == 0, f"mismatch={n_mis}/{NUM_TOKENS}")
+    return ok_all
+
+
+def abnormal_tests(path):
+    """异常输入：所有输出必须落在 [0, VOCAB)；唯一 +inf 行必须选中该位置。"""
+    ok_all = True
+    n_case, bad = 0, []
+    with force_path(path):
+        for dtype in (torch.float32, torch.bfloat16):
+            for use_fp64 in (False, True):
+                for is_drafting in (False, True):
+                    for use_cache in (False, True):
+                        for all_greedy in (False, True):
+                            if all_greedy and not use_cache:
+                                continue  # 该组合走 torch.argmax 快速路径，不进 kernel
+                            logits, m, t, s, p, col = make_abnormal_inputs(dtype)
+                            cache = (torch.zeros(MAX_NUM_REQS, 3, VOCAB_SIZE,
+                                                 dtype=dtype, device=DEVICE)
+                                     if use_cache else None)
+                            out = gumbel_sample(
+                                logits, m, t, s, p, True, is_drafting,
+                                logits_cache=cache,
+                                logits_cache_col=col if use_cache else None,
+                                use_fp64=use_fp64, all_greedy=all_greedy)
+                            torch.cuda.synchronize()
+                            n_case += 1
+                            ok, lo, hi = in_range(out)
+                            inf_ok = int(out[INF_ROW].item()) == INF_POS
+                            if not (ok and inf_ok):
+                                bad.append(
+                                    f"dtype={str(dtype)[6:]} fp64={use_fp64} "
+                                    f"draft={is_drafting} cache={use_cache} "
+                                    f"greedy={all_greedy} min={lo} max={hi} "
+                                    f"inf_row={int(out[INF_ROW].item())}")
+    ok_all &= check(f"[{path:18s}] 异常输入 token id ∈ [0, vocab) 且 +inf 行命中",
+                    not bad, f"cases={n_case} fail={len(bad)}")
+    for b in bad[:8]:
+        print(f"         -> {b}")
+    return ok_all
+
+
 def accuracy_tests():
     print("=" * 78)
     print("精度测试")
     print("=" * 78)
     all_ok = True
-    for dtype in (torch.float32, torch.bfloat16):
-        for use_fp64 in (False, True):
-            for is_drafting in (False, True):
-                logits, m, t, s, p, _ = make_inputs(dtype)
-                out = gumbel_sample(logits, m, t, s, p, apply_temperature=True,
-                                    is_drafting=is_drafting, use_fp64=use_fp64)
-                ref, _ = reference(logits, m, t, s, p, True, is_drafting, use_fp64)
-                n_mis = (out != ref).sum().item()
-                all_ok &= check(
-                    f"bitwise vs ref  dtype={str(dtype)[6:]:8s} fp64={use_fp64!s:5s} "
-                    f"draft={is_drafting!s:5s}", n_mis == 0,
-                    f"mismatch={n_mis}/{NUM_TOKENS}")
+
+    # 0) 三条 kernel 路径的逐位一致性
+    for path in PATHS:
+        all_ok &= bitwise_tests(path)
 
     logits, m, t, s, p, col = make_inputs()
     out1 = gumbel_sample(logits, m, t, s, p, True, False)
     out2 = gumbel_sample(logits, m, t, s, p, True, False)
     all_ok &= check("确定性（两次调用结果相同）", torch.equal(out1, out2))
 
-    # 2) 贪心行(T=0 或无效行) == torch.argmax
+    # 1) 贪心行(T=0 或无效行) == torch.argmax
     req = m.long()
     greedy = (req < 0) | (t[req.clamp(min=0)] == 0)
     greedy_ok = torch.equal(out1[greedy], logits.argmax(-1)[greedy])
     all_ok &= check("T=0 / 无效行 == torch.argmax", greedy_ok,
                     f"(rows={greedy.sum().item()})")
 
-    # 3) drafting 噪声与 target 不同
+    # 2) drafting 噪声与 target 不同
     out_d = gumbel_sample(logits, m, t, s, p, True, True)
     diff = (out_d != out1)[~greedy].float().mean().item()
     all_ok &= check("draft/target 噪声独立", diff > 0.5, f"diff_rate={diff:.2f}")
 
-    # 4) logits_cache 存的是未除温度的原始 logits，且无效行不写
-    cache = torch.full((MAX_NUM_REQS, 3, VOCAB_SIZE), 7.0, device=DEVICE)
-    gumbel_sample(logits, m, t, s, p, True, False, logits_cache=cache,
-                  logits_cache_col=col)
-    ok = True
-    for r in range(NUM_TOKENS):
-        rq = m[r].item()
-        if rq >= 0:
-            ok &= torch.equal(cache[rq, col[r].item()], logits[r])
-    ok &= bool((cache[15] == 7.0).all())  # 槽位 15 只对应无效行
-    all_ok &= check("logits_cache 内容正确", ok)
+    # 3) logits_cache 存的是未除温度的原始 logits，且无效行不写（三条路径都测）
+    for path in PATHS:
+        with force_path(path):
+            cache = torch.full((MAX_NUM_REQS, 3, VOCAB_SIZE), 7.0, device=DEVICE)
+            out_c = gumbel_sample(logits, m, t, s, p, True, False,
+                                  logits_cache=cache, logits_cache_col=col)
+        ok = torch.equal(out_c, out1)
+        for r in range(NUM_TOKENS):
+            rq = m[r].item()
+            if rq >= 0:
+                ok &= torch.equal(cache[rq, col[r].item()], logits[r])
+        ok &= bool((cache[15] == 7.0).all())  # 槽位 15 只对应无效行
+        all_ok &= check(f"[{path:18s}] logits_cache 内容正确 且 采样结果不受影响", ok)
+
+    # 4) all_greedy + cache：结果 == argmax，cache 依然写入
+    for path in PATHS:
+        with force_path(path):
+            cache = torch.full((MAX_NUM_REQS, 3, VOCAB_SIZE), 7.0, device=DEVICE)
+            out_g = gumbel_sample(logits, m, t, s, p, True, False,
+                                  logits_cache=cache, logits_cache_col=col,
+                                  all_greedy=True)
+        ok = torch.equal(out_g, logits.argmax(-1))
+        r0 = 0
+        ok &= torch.equal(cache[m[r0].item(), col[r0].item()], logits[r0])
+        all_ok &= check(f"[{path:18s}] all_greedy+cache == argmax 且 cache 写入", ok)
 
     # 5) fp32 vs fp64 一致率（不要求 100%）
     o32 = gumbel_sample(logits, m, t, s, p, True, False, use_fp64=False)
@@ -195,6 +323,12 @@ def accuracy_tests():
     all_ok &= check("分布 ≈ softmax(logits/T)", tv < 0.01, f"TV={tv:.4f}")
     del lgN
 
+    # 7) 【本次修复】异常输入不能产生越界 token id（三条路径）
+    print("-" * 78)
+    print("  异常输入（NaN / -inf / +inf / NaN padding 行）")
+    for path in PATHS:
+        all_ok &= abnormal_tests(path)
+
     print(f"\n精度结果: {'ALL PASS' if all_ok else 'HAS FAILURES'}\n")
     return all_ok
 
@@ -213,56 +347,52 @@ def bytes_moved(dtype, use_cache, use_fp64):
     return b
 
 
+def _bench_row(dtype, use_cache, use_fp64, all_greedy):
+    logits, m, t, s, p, col = make_inputs(dtype)
+    cache = (torch.empty(MAX_NUM_REQS, 3, VOCAB_SIZE, dtype=dtype, device=DEVICE)
+             if use_cache else None)
+    fn = lambda: gumbel_sample(  # noqa: E731
+        logits, m, t, s, p, True, False,
+        logits_cache=cache,
+        logits_cache_col=col if use_cache else None,
+        use_fp64=use_fp64, all_greedy=all_greedy)
+    # do_bench 每次计时前会清空 L2，避免 19MB logits 常驻 L2 导致带宽虚高
+    med, p20, p80 = do_bench(fn, warmup=args.warmup, rep=args.rep,
+                             quantiles=[0.5, 0.2, 0.8])
+    gbs = bytes_moved(dtype, use_cache, use_fp64) / (med * 1e-3) / 1e9
+    print(f"{str(dtype)[6:]:6s} {use_fp64!s:5s} {use_cache!s:5s} "
+          f"{all_greedy!s:6s} | {med*1e3:10.2f} {p20*1e3:9.2f} "
+          f"{p80*1e3:9.2f} | {gbs:8.1f}")
+
+
 def perf_tests():
     print("=" * 78)
     print(f"性能测试  num_tokens={NUM_TOKENS} vocab={VOCAB_SIZE}  "
           f"GPU={torch.cuda.get_device_name()}")
     print("=" * 78)
-    print(f"{'dtype':6s} {'fp64':5s} {'cache':5s} {'draft':5s} | "
-          f"{'median(us)':>10s} {'p20(us)':>9s} {'p80(us)':>9s} | {'GB/s':>8s}")
-    print("-" * 78)
-    for dtype in (torch.float32, torch.bfloat16):
-        for use_cache in (False, True):
-            for use_fp64 in (False, True):
-                logits, m, t, s, p, col = make_inputs(dtype)
-                cache = (torch.empty(MAX_NUM_REQS, 3, VOCAB_SIZE, dtype=dtype,
-                                     device=DEVICE) if use_cache else None)
-                fn = lambda: gumbel_sample(  # noqa: E731
-                    logits, m, t, s, p, True, False,
-                    logits_cache=cache,
-                    logits_cache_col=col if use_cache else None,
-                    use_fp64=use_fp64)
-                # do_bench 每次计时前会清空 L2，避免 19MB logits 常驻 L2 导致带宽虚高
-                ms = do_bench(fn, warmup=args.warmup, rep=args.rep,
-                              quantiles=[0.5, 0.2, 0.8])
-                med, p20, p80 = ms
-                gbs = bytes_moved(dtype, use_cache, use_fp64) / (med * 1e-3) / 1e9
-                print(f"{str(dtype)[6:]:6s} {use_fp64!s:5s} {use_cache!s:5s} "
-                      f"{'False':5s} | {med*1e3:10.2f} {p20*1e3:9.2f} "
-                      f"{p80*1e3:9.2f} | {gbs:8.1f}")
-    print("-" * 78)
-    print("all_greddy")
-    for dtype in (torch.float32, torch.bfloat16):
-        for use_cache in (False, True):
-            for use_fp64 in (False, True):
-                logits, m, t, s, p, col = make_inputs(dtype)
-                cache = (torch.empty(MAX_NUM_REQS, 3, VOCAB_SIZE, dtype=dtype,
-                                     device=DEVICE) if use_cache else None)
-                fn = lambda: gumbel_sample(  # noqa: E731
-                    logits, m, t, s, p, True, False,
-                    logits_cache=cache,
-                    logits_cache_col=col if use_cache else None,
-                    use_fp64=use_fp64, all_greedy=True)
-                # do_bench 每次计时前会清空 L2，避免 19MB logits 常驻 L2 导致带宽虚高
-                ms = do_bench(fn, warmup=args.warmup, rep=args.rep,
-                              quantiles=[0.5, 0.2, 0.8])
-                med, p20, p80 = ms
-                gbs = bytes_moved(dtype, use_cache, use_fp64) / (med * 1e-3) / 1e9
-                print(f"{str(dtype)[6:]:6s} {use_fp64!s:5s} {use_cache!s:5s} "
-                      f"{'False':5s} | {med*1e3:10.2f} {p20*1e3:9.2f} "
-                      f"{p80*1e3:9.2f} | {gbs:8.1f}")
+    header = (f"{'dtype':6s} {'fp64':5s} {'cache':5s} {'greedy':6s} | "
+              f"{'median(us)':>10s} {'p20(us)':>9s} {'p80(us)':>9s} | {'GB/s':>8s}")
+
+    for all_greedy in (False, True):
+        print(f"[all_greedy={all_greedy}]")
+        print(header)
+        print("-" * 78)
+        for dtype in (torch.float32, torch.bfloat16):
+            for use_cache in (False, True):
+                for use_fp64 in (False, True):
+                    _bench_row(dtype, use_cache, use_fp64, all_greedy)
+        print("-" * 78)
 
     # 基线：纯读 logits 的 torch.argmax，作为"访存上限"的参照
+    print("[baseline torch.argmax]")
+    for dtype in (torch.float32, torch.bfloat16):
+        logits = make_inputs(dtype)[0]
+        med = do_bench(lambda: logits.argmax(dim=-1), warmup=args.warmup,  # noqa: B023
+                       rep=args.rep, quantiles=[0.5])
+        med = med[0] if isinstance(med, (list, tuple)) else med
+        gbs = NUM_TOKENS * VOCAB_SIZE * logits.element_size() / (med * 1e-3) / 1e9
+        print(f"{str(dtype)[6:]:6s} argmax                | {med*1e3:10.2f} "
+              f"{'':9s} {'':9s} | {gbs:8.1f}")
     print("-" * 78)
 
 

@@ -285,7 +285,9 @@ __launch_bounds__(TPB) __global__ void moeTopK(
     const int num_rows = gridDim.x;
     const int block_row = blockIdx.x;
 
-    const bool row_is_active = finished ? !finished[block_row] : true;
+  
+    const bool row_is_active = (finished == nullptr || !finished[block_row]) &&
+                            (is_padding == nullptr || !is_padding[block_row]);
     const int thread_read_offset = blockIdx.x * num_experts;
     float selected_sum = 0.f;
     for (int k_idx = 0; k_idx < k; ++k_idx)
@@ -329,10 +331,8 @@ __launch_bounds__(TPB) __global__ void moeTopK(
             const bool is_pad_row = is_padding != nullptr && is_padding[block_row];
 
             const int idx = k * block_row + k_idx;
-            // Return the unbiased scores for output weights
-            output[idx] = inputs_after_softmax[thread_read_offset + expert];
-            indices[idx] = is_pad_row ? static_cast<IndType>(-1)
-                                       : (should_process_row ? (expert - start_expert) : num_experts);
+            output[idx] = should_process_row ? inputs_after_softmax[thread_read_offset + expert] : 0.0f;
+            indices[idx] = should_process_row ? static_cast<IndType>(expert - start_expert) : static_cast<IndType>(-1);
             assert(is_pad_row || indices[idx] >= 0);
             source_rows[idx] = k_idx * num_rows + block_row;
             if (renormalize) {
@@ -682,7 +682,7 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE_PARAM) __global__
             // single) thread per row of the input/output matrices.
             const int idx = k * thread_row + k_idx;
             output[idx] = should_process_row ? max_val : 0.0f;
-            indices[idx] = should_process_row ? static_cast<IndType>(expert - start_expert) : static_cast<IndType>(NUM_EXPERTS);
+            indices[idx] = should_process_row ? static_cast<IndType>(expert - start_expert) : static_cast<IndType>(-1);
             source_rows[idx] = k_idx * num_rows + thread_row;
             if (renormalize && should_process_row) {
                 selected_sum += max_val;
@@ -833,7 +833,7 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__
             // The lead thread from each sub-group will write out the final results to global memory. (This will be a
             // single) thread per row of the input/output matrices.
             const int idx = topk * thread_row + tid_in_row;
-            indices[idx] = should_process_row ? (expert_id_ordered - start_expert) : NUM_EXPERTS;
+            indices[idx] = should_process_row ? (expert_id_ordered - start_expert) : static_cast<index_t>(-1);
             source_rows[idx] = tid_in_row * num_rows + thread_row;
             if (renormalize) {
                 norm[row_in_block * topk + tid_in_row] = should_process_row ? static_cast<float>(max_val_ordered) : 0.0f;
@@ -971,7 +971,7 @@ __launch_bounds__(256) __global__
             const bool node_uses_expert = sel_expert >= start_expert && sel_expert < end_expert;
             const bool should = row_is_active && node_uses_expert;
             const int idx = topk * thread_row + lane;
-            indices[idx] = should ? (sel_expert - start_expert) : NUM_EXPERTS;
+            indices[idx] = should ? (sel_expert - start_expert) : static_cast<index_t>(-1);
             source_rows[idx] = lane * num_rows + thread_row;
             if (renormalize) {
                 s_norm[lane] = should ? sel_prob : 0.0f;
@@ -1087,7 +1087,7 @@ __global__ void topkGatingSigmoid288Opt(
             const bool should_process_row = row_is_active && node_uses_expert;
 
             const int idx = TOPK * thread_row + lane_id;
-            indices[idx] = should_process_row ? (expert_id_ordered - start_expert) : NUM_EXPERTS;
+            indices[idx] = should_process_row ? (expert_id_ordered - start_expert) : static_cast<IndType>(-1);
 
             if (renormalize) {
                 sm_norm_vals[row_in_block][lane_id] = should_process_row ? max_val_ordered : 0.0f;
@@ -1197,7 +1197,7 @@ __global__ void topkGatingSigmoidCommonOpt(const InputType* input, const bool* f
             // The lead thread from each sub-group will write out the final results to global memory. (This will be a
             // single) thread per row of the input/output matrices.
             const int idx = topk * thread_row + tid_in_row;
-            indices[idx] = should_process_row ? (expert_id_ordered - start_expert) : num_experts;
+            indices[idx] = should_process_row ? (expert_id_ordered - start_expert) : static_cast<IndType>(-1);
             
         // source_rows[idx] = tid_in_row * num_rows + thread_row;
             if (renormalize) {
@@ -1350,7 +1350,7 @@ __global__ void topkGatingSoftmaxCommonOpt(
             const bool node_uses_expert = eid >= start_expert && eid < end_expert;
             const bool should_process_row = row_is_active && node_uses_expert;
             const int idx = topk * thread_row + tid;
-            indices[idx] = should_process_row ? static_cast<IndType>(eid - start_expert) : static_cast<IndType>(num_experts);
+            indices[idx] = should_process_row ? static_cast<IndType>(eid - start_expert) : static_cast<IndType>(-1);
             if (token_expert_indices != nullptr) {
                 token_expert_indices[idx] = tid * num_rows + thread_row;
             }

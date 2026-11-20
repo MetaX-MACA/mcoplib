@@ -76,7 +76,7 @@ pip3 install mcoplib-0.1.0+maca3.0.0.8.torch2.6-cp310-cp310-linux_x86_64.whl
 ```
 ## mcoplib CV Op Kernel 编译打包
 ```shell
-#切换到源码目录（~/mcOplib/gerrit_mcoplib/mcoplib_dev/mcoplib）, 执行一下命令
+#切换到源码目录（~/mcoplib/gerrit_mcoplib/mcoplib_dev/mcoplib）, 执行一下命令
 source env.sh
 cd /path/source/code/dir/mcoplib/op/cv/
 #执行命令 配置 + 构建
@@ -109,11 +109,11 @@ root@lt-srv-10-2-182-63:~/mcoplib# tree
     `-- libmcoplib_cv.so
 ```
 
-### Mcoplib  cv Op kernel 测试
+### mcoplib  cv Op kernel 测试
 ```shell
 #mcoplib cv op kernel测试需要先安装mcoplib_cv-0.2.0-Linux.deb包, deb包安装后会/opt/maca-ai/mcoplib目录下存在mcoplib cv库及头文件
 dpkg -i mcoplib_cv-0.2.0-Linux.deb
-#切换到源码目录（~/mcOplib/gerrit_mcoplib/mcoplib_dev/mcoplib）, 执行一下命令
+#切换到源码目录（~/mcoplib/gerrit_mcoplib/mcoplib_dev/mcoplib）, 执行一下命令
 source env.sh
 cd  /path/source/code/dir/mcoplib/unit_test/cpp
 mkdir build
@@ -147,10 +147,6 @@ export BUILD_DEFAULT_OP_SUBMODULE=OFF
 #多个算子编译模块控制
 export BUILD_VLLM_SUBMODULE=OFF  BUILD_SGLANG_SUBMODULE=OFF BUILD_LMDEPLOY_SUBMODULE=OFF
 ```
-## 算子说明书
-[算子说明书](./docs/mcoplib算子说明书.md)
-
-[算子说明书网页版](./docs/mcoplib%20Operator%20Manual%20%28Web%20Version%29/index.html)
 
 ## mcoplib 分支及对应的vllm && sglang 版本
 | 版本 | vLLM | SGLang | 备注 |
@@ -163,7 +159,8 @@ export BUILD_VLLM_SUBMODULE=OFF  BUILD_SGLANG_SUBMODULE=OFF BUILD_LMDEPLOY_SUBMO
 | release/v0.4.12 | 0.27.0 | 0.5.17 | sglang 使用 MACA 3.9.0，VLLM release 使用 MACA 3.8.2 |
 | release/v0.4.13 | 0.28.0 | 0.5.17 | |
 | release/v0.4.14 | 0.29.0 | 0.5.19 | |
-| release/v0.4.15 | 0.30.0 | 0.5.21 | |
+| release/v0.4.15 | 0.30.0 | 0.5.21 && 0.5.19 | |
+| release/v0.4.16 | 0.32.0 | 0.5.22 && 0.5.21 | |
 ## 动态控制算子入参信息终端输出或参数dump到本地磁盘
 ### 一、功能概述
 
@@ -202,7 +199,7 @@ export MCOP_DEBUG_FILTER=all            # 指定功能 要调试哪些算子
 trace/dump两个开关用 `1` / `ON` / `on` 表示打开
 filter开关 `MCOP_DEBUG_FILTER` 详解
 
-​```bash
+```bash
 export MCOP_DEBUG_FILTER=all                  # 所有算子
 export MCOP_DEBUG_FILTER=fused_rope           # 函数名包含 "fused_rope" 的算子（子串匹配）
 export MCOP_DEBUG_FILTER=fused_rope,rms_norm  # 多个，逗号分隔，前后空格会被去掉

@@ -67,6 +67,13 @@ void fused_add_rms_norm(torch::Tensor& input,     // [..., hidden_size]
                         torch::Tensor& residual,  // [..., hidden_size]
                         std::optional<torch::Tensor> weight,
                         double epsilon, bool zero_centered = false);
+// Separate op: input_inplace and out independently select normalization outputs.
+void fused_add_rms_norm_out(torch::Tensor& input,
+                            torch::Tensor& residual,
+                            std::optional<torch::Tensor> weight,
+                            double epsilon, bool zero_centered = false,
+                            std::optional<torch::Tensor> out = std::nullopt,
+                            bool input_inplace = true);
 //Todo：fused_qk_norm_rope算子新增参数，部分依赖（async_util.cuh），先保持原样
 // void fused_qk_norm_rope(torch::Tensor& qkv, int64_t num_heads_q,
 //                         int64_t num_heads_k, int64_t num_heads_v,
@@ -177,6 +184,15 @@ void persistent_topk(const torch::Tensor& logits, const torch::Tensor& lengths,
 
 torch::Tensor region_topk_ids(const torch::Tensor& logits,
                               const torch::Tensor& lengths, int64_t topk);
+
+void prepare_topk_scores(const torch::Tensor& scores_in,
+                         const torch::Tensor& summary_valid,
+                         const torch::Tensor& row_starts,
+                         const torch::Tensor& row_ends,
+                         torch::Tensor& scores_out,
+                         int64_t num_regions,
+                         int64_t padded_regions,
+                         bool has_summary_valid);
 
 void stable_topk_gathered(torch::Tensor gathered, torch::Tensor out,
                           int64_t topk);
@@ -363,12 +379,10 @@ void dynamic_scaled_int8_quant(torch::Tensor& out, torch::Tensor const& input,
                                torch::Tensor& scales,
                                std::optional<torch::Tensor> const& azp);
 
-torch::Tensor gptq_gemm(torch::Tensor a, torch::Tensor b_q_weight,
-                        torch::Tensor b_gptq_qzeros,
-                        torch::Tensor b_gptq_scales, torch::Tensor b_g_idx,
-                        bool use_exllama, int64_t bit, int64_t group_size,
-                        torch::Tensor perm_space, torch::Tensor temp_space,
-                        bool dtype_bf16);
+torch::stable::Tensor gptq_gemm(
+    torch::stable::Tensor a, torch::stable::Tensor b_q_weight,
+    torch::stable::Tensor b_gptq_qzeros, torch::stable::Tensor b_gptq_scales,
+    bool use_exllama, bool use_v2_format, int64_t bit);
 
 void gptq_shuffle(torch::Tensor q_weight, torch::Tensor q_perm, int64_t bit);
 

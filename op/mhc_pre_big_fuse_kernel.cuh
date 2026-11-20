@@ -268,7 +268,8 @@ template <int HiddenBlock, int ResidualWarps, int Hidden, bool FuseNorm,
           bool SavePreMix, int CachedTailBlocks = 0, bool WriteAux = true,
           bool DecoupleControl = false, int PreMixMode = -1,
           bool PrefetchCarriedChunk = false,
-          bool ParallelNormEpilogue = false, bool BroadcastResidual = false>
+          bool ParallelNormEpilogue = false, bool BroadcastResidual = false,
+          int QuantMode = 0>
 __global__ void __launch_bounds__(64 * (1 + ResidualWarps), 1)
 mhc_pre_big_fuse_ext_kernel(
     float* __restrict__ comb_mix, const float* __restrict__ gemm_out_mul,
@@ -281,7 +282,18 @@ mhc_pre_big_fuse_ext_kernel(
     bfloat16_t* __restrict__ aux_out, int num_tokens, int n_splits,
     int gemm_last_dim, float rms_numel, float rms_eps, float hc_pre_eps,
     float hc_sinkhorn_eps, float hc_post_mult_value, float norm_eps,
-    bfloat16_t* __restrict__ residual_out) {
+    bfloat16_t* __restrict__ residual_out,
+    int8_t* __restrict__ quant_output,
+    float* __restrict__ quant_scales,
+    bfloat16_t* __restrict__ output_rms,
+    int8_t* __restrict__ output_quant_int8) {
+  static_assert(QuantMode >= 0 && QuantMode <= 2,
+                "quant mode must be BF16, INT8, or packed INT8");
+  static_assert(QuantMode == 0 || (FuseNorm && CachedTailBlocks == 0 &&
+                                   !ParallelNormEpilogue && !BroadcastResidual),
+                "quantized output requires the ordinary fused norm path");
+  static_assert(QuantMode == 0 || Hidden == 5120,
+                "quantized output is specialized for hidden size 5120");
   static_assert(ResidualWarps == 1,
                 "extended big-fuse currently supports one residual warp");
   static_assert(HiddenBlock == 64 * 8 * (ResidualWarps == 1 ? 2 : ResidualWarps),
@@ -518,6 +530,12 @@ mhc_pre_big_fuse_ext_kernel(
     uint4 cached_third_last0{};
     uint4 cached_third_last1{};
     float sumsq = 0.0f;
+    // QuantMode uses max(abs(BF16(collapsed) * weight)) before applying the
+    // positive per-token inv_rms.  This is mathematically equivalent to
+    // reducing max(abs(norm)) but lets the final epilogue normalize and
+    // quantize in one pass instead of round-tripping normalized BF16 through
+    // shared memory.
+    float weighted_amax = 0.0f;
 #pragma unroll
     for (int i0_h = 0; i0_h < Hidden / HiddenBlock; ++i0_h) {
 #pragma unroll
@@ -626,6 +644,22 @@ mhc_pre_big_fuse_ext_kernel(
               make_float2(acc[2 * i_pair], acc[2 * i_pair + 1]));
         }
         if constexpr (FuseNorm) {
+          if constexpr (QuantMode != 0) {
+            const uint4 packed_weight =
+                *reinterpret_cast<const uint4*>(norm_weight + hidden0);
+            const __maca_bfloat162* weight_values =
+                reinterpret_cast<const __maca_bfloat162*>(&packed_weight);
+#pragma unroll
+            for (int i_pair = 0; i_pair < 4; ++i_pair) {
+              const float2 rounded = __bfloat1622float2(values_out[i_pair]);
+              const float2 weight =
+                  __bfloat1622float2(weight_values[i_pair]);
+              weighted_amax =
+                  fmaxf(weighted_amax, fabsf(rounded.x * weight.x));
+              weighted_amax =
+                  fmaxf(weighted_amax, fabsf(rounded.y * weight.y));
+            }
+          }
           if constexpr (kCacheNormTail) {
             if (i0_h == Hidden / HiddenBlock - 1) {
               if (i_chunk == 0) {
@@ -719,12 +753,92 @@ mhc_pre_big_fuse_ext_kernel(
 #pragma unroll
       for (int i_offset = 32; i_offset > 0; i_offset >>= 1) {
         sumsq += __shfl_xor_sync(uint64_t(-1), sumsq, i_offset);
+        if constexpr (QuantMode != 0) {
+          weighted_amax = fmaxf(
+              weighted_amax,
+              __shfl_xor_sync(uint64_t(-1), weighted_amax, i_offset));
+        }
       }
       const float inv_rms =
           rsqrtf(sumsq / static_cast<float>(Hidden) + norm_eps);
       if constexpr (kParallelNormEpilogue) {
         if (lane == 0) {
           *sh_norm_inv = inv_rms;
+        }
+      } else if constexpr (QuantMode != 0) {
+        // The nonzero floor handles an all-zero token without dividing by 0.
+        const float scale =
+            fmaxf(weighted_amax * inv_rms / 127.0f, 1.1920929e-7f);
+        const float inv_scale = 1.0f / scale;
+        constexpr int kPackedRowBytes = ((Hidden + 4 + 511) / 512) * 512;
+        const int64_t row_bytes =
+            QuantMode == 2 ? kPackedRowBytes : Hidden;
+        int8_t* row_output = quant_output + static_cast<int64_t>(token) * row_bytes;
+        if (lane == 0) {
+          quant_scales[token] = scale;
+          if constexpr (QuantMode == 2) {
+            *reinterpret_cast<float*>(row_output + Hidden) = scale;
+          }
+        }
+        for (int hidden0 = lane * 8; hidden0 < Hidden; hidden0 += kLanes * 8) {
+          const uint4 packed_collapsed =
+              *reinterpret_cast<const uint4*>(sh_collapsed + hidden0);
+          const uint4 packed_weight =
+              *reinterpret_cast<const uint4*>(norm_weight + hidden0);
+          const __maca_bfloat162* collapsed_values =
+              reinterpret_cast<const __maca_bfloat162*>(&packed_collapsed);
+          const __maca_bfloat162* weight_values =
+              reinterpret_cast<const __maca_bfloat162*>(&packed_weight);
+          uint64_t packed_int8 = 0;
+          uint4 packed_norm_out;
+          __maca_bfloat162* norm_values =
+              reinterpret_cast<__maca_bfloat162*>(&packed_norm_out);
+#pragma unroll
+          for (int i_pair = 0; i_pair < 4; ++i_pair) {
+            const float2 collapsed =
+                __bfloat1622float2(collapsed_values[i_pair]);
+            const float2 weight =
+                __bfloat1622float2(weight_values[i_pair]);
+            const __maca_bfloat162 norm_pair = __float22bfloat162_rn(
+                make_float2(collapsed.x * inv_rms * weight.x,
+                            collapsed.y * inv_rms * weight.y));
+            if constexpr (QuantMode != 0) {
+              norm_values[i_pair] = norm_pair;
+            }
+            const float2 value = __bfloat1622float2(norm_pair);
+            int q0 = __float2int_rn(value.x * inv_scale);
+            int q1 = __float2int_rn(value.y * inv_scale);
+            q0 = max(-127, min(127, q0));
+            q1 = max(-127, min(127, q1));
+            packed_int8 |= static_cast<uint64_t>(static_cast<uint8_t>(q0))
+                           << (16 * i_pair);
+            packed_int8 |= static_cast<uint64_t>(static_cast<uint8_t>(q1))
+                           << (16 * i_pair + 8);
+          }
+          *reinterpret_cast<uint64_t*>(row_output + hidden0) = packed_int8;
+          if constexpr (QuantMode != 0) {
+            __stcs(reinterpret_cast<uint4*>(
+                       output_rms + static_cast<int64_t>(token) * Hidden +
+                       hidden0),
+                   packed_norm_out);
+          }
+          if constexpr (QuantMode == 2) {
+            *reinterpret_cast<uint64_t*>(
+                output_quant_int8 + static_cast<int64_t>(token) * Hidden +
+                hidden0) = packed_int8;
+          }
+        }
+        if constexpr (QuantMode == 2) {
+          // The embedded scale ends at byte Hidden+4.  Clear the 12-byte
+          // prefix up to the next uint4 boundary, then use 31 aligned vector
+          // stores for the remaining 496 padding bytes.
+          if (lane < 12) {
+            row_output[Hidden + 4 + lane] = 0;
+          }
+          if (lane < 31) {
+            *reinterpret_cast<uint4*>(row_output + Hidden + 16 + lane * 16) =
+                uint4{};
+          }
         }
       } else {
 #pragma unroll

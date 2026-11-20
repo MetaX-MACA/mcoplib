@@ -4,9 +4,14 @@
 #include "quantization/vectorization_utils.cuh"
 #include "type_convert.cuh"
 #include <c10/cuda/CUDAGuard.h>
+#include <ATen/cuda/CUDAContextLight.h>
 #include <torch/cuda.h>
+#include "ops.h"
 
 #include <cub/cub.cuh>
+#include <climits>
+#include <cstring>
+#include <type_traits>
 
 namespace vllm {
 template <typename scalar_t, int NUM_DIMS>
@@ -63,6 +68,52 @@ __device__ __forceinline__ float rms_weight(scalar_t w) {
   return wf;
 }
 
+// The float cast in the reference allocates aligned storage, even when the
+// original low-precision tensor has a storage offset or padded rows. Preserve
+// its logical packs while accessing the actual low-precision storage safely.
+template <typename scalar_t, typename weight_t, int VEC_SIZE>
+__device__ __forceinline__ vec_n_t<scalar_t, VEC_SIZE>
+rms_load_input(const scalar_t *ptr) {
+  using Vec = vec_n_t<scalar_t, VEC_SIZE>;
+  if constexpr (std::is_same_v<weight_t, float> &&
+                !std::is_same_v<scalar_t, float>) {
+    if (reinterpret_cast<std::uintptr_t>(ptr) % alignof(Vec) != 0) {
+      Vec value;
+#pragma unroll
+      for (int j = 0; j < VEC_SIZE; ++j) value.val[j] = ptr[j];
+      return value;
+    }
+  }
+  return *reinterpret_cast<const Vec *>(ptr);
+}
+
+template <typename scalar_t, typename weight_t, int VEC_SIZE>
+__device__ __forceinline__ void rms_store_output(
+    scalar_t *ptr, const vec_n_t<scalar_t, VEC_SIZE> &value) {
+  using Vec = vec_n_t<scalar_t, VEC_SIZE>;
+  if constexpr (std::is_same_v<weight_t, float> &&
+                !std::is_same_v<scalar_t, float>) {
+    if (reinterpret_cast<std::uintptr_t>(ptr) % alignof(Vec) != 0) {
+#pragma unroll
+      for (int j = 0; j < VEC_SIZE; ++j) ptr[j] = value.val[j];
+      return;
+    }
+  }
+  *reinterpret_cast<Vec *>(ptr) = value;
+}
+
+// MACA's packed float output arithmetic in the default and multirow kernels
+// produces positive exact zero. Match that before the final low-precision
+// conversion; a negative nonzero float that underflows must still yield -0.
+template <typename scalar_t, typename weight_t, int VEC_SIZE>
+__device__ __forceinline__ scalar_t rms_packed_result(float value) {
+  if constexpr (std::is_same_v<weight_t, float> &&
+                !std::is_same_v<scalar_t, float> && VEC_SIZE == 4) {
+    if (value == 0.0f) value = 0.0f;
+  }
+  return static_cast<scalar_t>(value);
+}
+
 // ===========================================================================
 // Warp-per-row RMSNorm for SMALL hidden sizes.
 template <typename scalar_t, typename weight_t, int VEC_SIZE, int NUM_DIMS, bool HAS_WEIGHT,
@@ -116,7 +167,7 @@ __global__ __launch_bounds__(BLOCK_SIZE) void rms_norm_warp_kernel(
   for (int it = 0; it < ITEMS_PER_LANE; ++it) {
     const int vidx = lane + it * WARP;
     Vec src{};
-    if (vidx < vec_count) src = input_vec[vidx];
+    if (vidx < vec_count) src = rms_load_input<scalar_t, weight_t, VEC_SIZE>(input_row + vidx * VEC_SIZE);
     cached[it] = src;
 #pragma unroll
     for (int j = 0; j < VEC_SIZE; ++j) {
@@ -156,7 +207,7 @@ __global__ __launch_bounds__(BLOCK_SIZE) void rms_norm_warp_kernel(
         if constexpr (HAS_WEIGHT) value *= rms_weight<ZERO_CENTERED, weight_t>(w.val[j]);
         dst.val[j] = static_cast<scalar_t>(value);
       }
-      output_vec[vidx] = dst;
+      rms_store_output<scalar_t, weight_t, VEC_SIZE>(out_row + vidx * VEC_SIZE, dst);
     }
   }
 }
@@ -210,7 +261,7 @@ __global__ __launch_bounds__(BLOCK_SIZE) void rms_norm_subwarp_kernel(
   for (int it = 0; it < ITEMS; ++it) {
     const int vidx = lane + it * LANES_PER_ROW;
     Vec s{};
-    if (vidx < vec_count) s = input_vec[vidx];
+    if (vidx < vec_count) s = rms_load_input<scalar_t, weight_t, VEC_SIZE>(input_row + vidx * VEC_SIZE);
     src[it] = s;
 #pragma unroll
     for (int j = 0; j < VEC_SIZE; ++j) {
@@ -267,7 +318,7 @@ __global__ __launch_bounds__(BLOCK_SIZE) void rms_norm_subwarp_kernel(
               static_cast<float>(src[it].val[j]) * s_variance);
         }
       }
-      output_vec[vidx] = dst;
+      rms_store_output<scalar_t, weight_t, VEC_SIZE>(out_row + vidx * VEC_SIZE, dst);
     }
   }
 }
@@ -309,8 +360,16 @@ __global__ void rms_norm_default_kernel(
     const float x = static_cast<float>(value);
     variance += x * x;
   };
-  vllm::vectorize_read_with_alignment<VEC_SIZE>(
-      input_row, hidden_size, threadIdx.x, blockDim.x, vec_op, scalar_op);
+  if constexpr (std::is_same_v<weight_t, float> &&
+                !std::is_same_v<scalar_t, float>) {
+    for (int i = threadIdx.x; i < hidden_size / VEC_SIZE; i += blockDim.x) {
+      vec_op(rms_load_input<scalar_t, weight_t, VEC_SIZE>(
+          input_row + i * VEC_SIZE));
+    }
+  } else {
+    vllm::vectorize_read_with_alignment<VEC_SIZE>(
+        input_row, hidden_size, threadIdx.x, blockDim.x, vec_op, scalar_op);
+  }
 
   using BlockReduce = cub::BlockReduce<float, 1024>;
   __shared__ typename BlockReduce::TempStorage reduce_store;
@@ -331,15 +390,15 @@ __global__ void rms_norm_default_kernel(
           reinterpret_cast<const vec_n_t<weight_t, VEC_SIZE> *>(weight);
       for (int i = threadIdx.x; i < hidden_size / VEC_SIZE; i += blockDim.x) {
         vec_n_t<scalar_t, VEC_SIZE> dst;
-        const vec_n_t<scalar_t, VEC_SIZE> src = input_vec[i];
+        const auto src = rms_load_input<scalar_t, weight_t, VEC_SIZE>(input_row + i * VEC_SIZE);
         const vec_n_t<weight_t, VEC_SIZE> w = weight_vec[i];
 #pragma unroll
         for (int j = 0; j < VEC_SIZE; ++j) {
           const float x = static_cast<float>(src.val[j]);
           const float wf = rms_weight<ZERO_CENTERED, weight_t>(w.val[j]);
-          dst.val[j] = static_cast<scalar_t>(x * s_variance * wf);
+          dst.val[j] = rms_packed_result<scalar_t, weight_t, VEC_SIZE>(x * s_variance * wf);
         }
-        output_vec[i] = dst;
+        rms_store_output<scalar_t, weight_t, VEC_SIZE>(out_row + i * VEC_SIZE, dst);
       }
     } else {
       const weight_t *token_weight = weight + batch_idx * weight_stride;
@@ -347,29 +406,29 @@ __global__ void rms_norm_default_kernel(
           reinterpret_cast<const vec_n_t<weight_t, VEC_SIZE> *>(token_weight);
       for (int i = threadIdx.x; i < hidden_size / VEC_SIZE; i += blockDim.x) {
         vec_n_t<scalar_t, VEC_SIZE> dst;
-        const vec_n_t<scalar_t, VEC_SIZE> src = input_vec[i];
+        const auto src = rms_load_input<scalar_t, weight_t, VEC_SIZE>(input_row + i * VEC_SIZE);
         const vec_n_t<weight_t, VEC_SIZE> w = weight_vec[i];
 #pragma unroll
         for (int j = 0; j < VEC_SIZE; ++j) {
           const float x = static_cast<float>(src.val[j]);
           const float wf = rms_weight<ZERO_CENTERED, weight_t>(w.val[j]);
           dst.val[j] =
-              static_cast<scalar_t>(x * s_variance * wf);
+              rms_packed_result<scalar_t, weight_t, VEC_SIZE>(x * s_variance * wf);
         }
-        output_vec[i] = dst;
+        rms_store_output<scalar_t, weight_t, VEC_SIZE>(out_row + i * VEC_SIZE, dst);
       }
     }
   }
   else {
     for (int i = threadIdx.x; i < hidden_size / VEC_SIZE; i += blockDim.x) {
       vec_n_t<scalar_t, VEC_SIZE> dst;
-      const vec_n_t<scalar_t, VEC_SIZE> src = input_vec[i];
+      const auto src = rms_load_input<scalar_t, weight_t, VEC_SIZE>(input_row + i * VEC_SIZE);
 #pragma unroll
       for (int j = 0; j < VEC_SIZE; ++j) {
         const float x = static_cast<float>(src.val[j]);
         dst.val[j] = static_cast<scalar_t>(x * s_variance);
       }
-      output_vec[i] = dst;
+      rms_store_output<scalar_t, weight_t, VEC_SIZE>(out_row + i * VEC_SIZE, dst);
     }
   }
 }
@@ -411,7 +470,7 @@ __global__ __launch_bounds__(BLOCK_SIZE) void rms_norm_cached_kernel(
     const int vec_idx = threadIdx.x + item * BLOCK_SIZE;
     Vec src{};
     if (vec_idx < vec_count)
-      src = input_vec[vec_idx];
+      src = rms_load_input<scalar_t, weight_t, VEC_SIZE>(input_row + vec_idx * VEC_SIZE);
     cached[item] = src;
 #pragma unroll
     for (int j = 0; j < VEC_SIZE; ++j) {
@@ -458,7 +517,7 @@ __global__ __launch_bounds__(BLOCK_SIZE) void rms_norm_cached_kernel(
         }
         dst.val[j] = static_cast<scalar_t>(value);
       }
-      output_vec[vec_idx] = dst;
+      rms_store_output<scalar_t, weight_t, VEC_SIZE>(out_row + vec_idx * VEC_SIZE, dst);
     }
   }
 }
@@ -502,7 +561,9 @@ __global__ __launch_bounds__(BLOCK_SIZE) void rms_norm_multirow_cached_kernel(
 
     Vec x[ITEMS_PER_THREAD];
 #pragma unroll
-    for (int it = 0; it < ITEMS_PER_THREAD; ++it) x[it] = src[tid + it * BLOCK_SIZE];
+    for (int it = 0; it < ITEMS_PER_THREAD; ++it)
+      x[it] = rms_load_input<scalar_t, weight_t, VEC_SIZE>(
+          input_row + (tid + it * BLOCK_SIZE) * VEC_SIZE);
 
     float var = 0.f;
 #pragma unroll
@@ -543,18 +604,206 @@ __global__ __launch_bounds__(BLOCK_SIZE) void rms_norm_multirow_cached_kernel(
         const WeightVec w = tw[vidx];
 #pragma unroll
         for (int j = 0; j < VEC_SIZE; ++j)
-          d.val[j] = static_cast<scalar_t>(static_cast<float>(x[it].val[j]) * inv *
+          d.val[j] = rms_packed_result<scalar_t, weight_t, VEC_SIZE>(static_cast<float>(x[it].val[j]) * inv *
                                            rms_weight<ZERO_CENTERED, weight_t>(w.val[j]));
       } else if constexpr (W_IN_REG) {
 #pragma unroll
         for (int j = 0; j < VEC_SIZE; ++j)
-          d.val[j] = static_cast<scalar_t>(static_cast<float>(x[it].val[j]) * inv * wreg[it][j]);
+          d.val[j] = rms_packed_result<scalar_t, weight_t, VEC_SIZE>(static_cast<float>(x[it].val[j]) * inv * wreg[it][j]);
       } else {
 #pragma unroll
         for (int j = 0; j < VEC_SIZE; ++j)
           d.val[j] = static_cast<scalar_t>(static_cast<float>(x[it].val[j]) * inv);
       }
-      dst[vidx] = d;
+      rms_store_output<scalar_t, weight_t, VEC_SIZE>(
+          out + static_cast<int64_t>(token) * hidden_size + vidx * VEC_SIZE, d);
+    }
+  }
+}
+
+// Preserve the fp32 kernel's virtual lanes while packing two of them into one
+// physical thread. This restores 16-byte low-precision I/O without changing the
+// per-lane accumulation or the order of the 256-thread fp32 reduction.
+template <typename scalar_t, int NUM_DIMS, bool ZERO_CENTERED>
+__global__ __launch_bounds__(128) void rms_norm_mixed_4096_kernel(
+    scalar_t *__restrict__ out, const scalar_t *__restrict__ input,
+    int64_t stride2, int64_t stride3, int64_t stride4,
+    int64_t shape2, int64_t shape3, const float *__restrict__ weight,
+    float epsilon, int num_tokens) {
+  using Vec = vec_n_t<scalar_t, 8>;
+  const int tid = threadIdx.x;
+  float wreg[4][8];
+#pragma unroll
+  for (int it = 0; it < 4; ++it) {
+    const auto *wv = reinterpret_cast<const vec_n_t<float, 4> *>(weight);
+#pragma unroll
+    for (int k = 0; k < 2; ++k) {
+      const auto w = wv[(tid + it * 128) * 2 + k];
+#pragma unroll
+      for (int j = 0; j < 4; ++j)
+        wreg[it][k * 4 + j] = rms_weight<ZERO_CENTERED>(w.val[j]);
+    }
+  }
+  __shared__ float red[2][4];
+  int parity = 0;
+  for (int token = blockIdx.x; token < num_tokens; token += gridDim.x) {
+    const scalar_t *row = rms_input_row<scalar_t, NUM_DIMS>(
+        input, token, stride2, stride3, stride4, shape2, shape3);
+    Vec x[4];
+    float v0 = 0.0f, v1 = 0.0f;
+#pragma unroll
+    for (int it = 0; it < 4; ++it) {
+      x[it] = reinterpret_cast<const Vec *>(row)[tid + it * 128];
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        const float a = static_cast<float>(x[it].val[j]);
+        const float b = static_cast<float>(x[it].val[j + 4]);
+        v0 += a * a;
+        v1 += b * b;
+      }
+    }
+    // Only the leader of each 32-thread group contributes to red. Its
+    // downward SIMD-16 reduction has exactly the same addition tree as the
+    // xor reduction, without the general shuffle overhead at offsets < 16.
+    v0 += __shfl_xor_sync(0xffffffffffffffffULL, v0, 16);
+    v1 += __shfl_xor_sync(0xffffffffffffffffULL, v1, 16);
+#pragma unroll
+    for (int off = 8; off > 0; off >>= 1) {
+      v0 += __shfl_down_sync_16(0xffffffffffffffffULL, v0, off);
+      v1 += __shfl_down_sync_16(0xffffffffffffffffULL, v1, off);
+    }
+    if ((tid & 31) == 0) red[parity][tid / 32] = v0 + v1;
+    __syncthreads();
+    float var = 0.0f;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) var += red[parity][k];
+    parity ^= 1;
+    const float inv = __builtin_mxc_rcpf(sqrtf(var * (1.0f / 4096) + epsilon));
+#pragma unroll
+    for (int it = 0; it < 4; ++it) {
+      Vec dst;
+#pragma unroll
+      for (int j = 0; j < 8; ++j)
+        dst.val[j] = rms_packed_result<scalar_t, float, 4>(
+            static_cast<float>(x[it].val[j]) * inv * wreg[it][j]);
+      reinterpret_cast<Vec *>(out + static_cast<int64_t>(token) * 4096)[tid + it * 128] = dst;
+    }
+  }
+}
+
+// Small batches retain all 256 reference lanes to reduce decode latency.
+template <typename scalar_t, int NUM_DIMS, bool ZERO_CENTERED>
+__global__ __launch_bounds__(256) void rms_norm_mixed_4096_decode_kernel(
+    scalar_t *__restrict__ out, const scalar_t *__restrict__ input,
+    int64_t stride2, int64_t stride3, int64_t stride4,
+    int64_t shape2, int64_t shape3, const float *__restrict__ weight,
+    float epsilon, int num_tokens) {
+  using Vec = vec_n_t<scalar_t, 4>;
+  const int tid = threadIdx.x;
+  float wreg[4][4];
+#pragma unroll
+  for (int it = 0; it < 4; ++it) {
+    const auto *wv = reinterpret_cast<const vec_n_t<float, 4> *>(weight);
+#pragma unroll
+    for (int k = 0; k < 1; ++k) {
+      const auto w = wv[tid + it * 256 + k];
+#pragma unroll
+      for (int j = 0; j < 4; ++j)
+        wreg[it][k * 4 + j] = rms_weight<ZERO_CENTERED>(w.val[j]);
+    }
+  }
+  __shared__ float red[2][4];
+  int parity = 0;
+  for (int token = blockIdx.x; token < num_tokens; token += gridDim.x) {
+    const scalar_t *row = rms_input_row<scalar_t, NUM_DIMS>(
+        input, token, stride2, stride3, stride4, shape2, shape3);
+    Vec x[4];
+    float v0 = 0.0f;
+#pragma unroll
+    for (int it = 0; it < 4; ++it) {
+      x[it] = reinterpret_cast<const Vec *>(row)[tid + it * 256];
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        const float a = static_cast<float>(x[it].val[j]);
+        v0 += a * a;
+      }
+    }
+    // Match the reference's 64-lane reduction; only group leaders write.
+    v0 += __shfl_xor_sync(0xffffffffffffffffULL, v0, 32);
+    v0 += __shfl_xor_sync(0xffffffffffffffffULL, v0, 16);
+#pragma unroll
+    for (int off = 8; off > 0; off >>= 1)
+      v0 += __shfl_down_sync_16(0xffffffffffffffffULL, v0, off);
+    if ((tid & 63) == 0) red[parity][tid / 64] = v0;
+    __syncthreads();
+    float var = 0.0f;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) var += red[parity][k];
+    parity ^= 1;
+    const float inv = __builtin_mxc_rcpf(sqrtf(var * (1.0f / 4096) + epsilon));
+#pragma unroll
+    for (int it = 0; it < 4; ++it) {
+      Vec dst;
+#pragma unroll
+      for (int j = 0; j < 4; ++j)
+        dst.val[j] = rms_packed_result<scalar_t, float, 4>(
+            static_cast<float>(x[it].val[j]) * inv * wreg[it][j]);
+      reinterpret_cast<Vec *>(out + static_cast<int64_t>(token) * 4096)[tid + it * 256] = dst;
+    }
+  }
+}
+
+// Four consecutive virtual fp32 lanes per physical lane. The reference's
+// shuffle offsets 32,16,8,4 become 8,4,2,1; offsets 2,1 are evaluated locally.
+// Thus 16 rows fit in a block without using the native lowp reduction tree.
+template <typename scalar_t, int NUM_DIMS, int HIDDEN, bool ZERO_CENTERED>
+__global__ __launch_bounds__(256) void rms_norm_mixed_small_kernel(
+    scalar_t *__restrict__ out, const scalar_t *__restrict__ input,
+    int64_t stride2, int64_t stride3, int64_t stride4,
+    int64_t shape2, int64_t shape3, const float *__restrict__ weight,
+    float epsilon, int num_tokens, int hidden_size) {
+  const int token = blockIdx.x * 16 + threadIdx.x / 16;
+  if (token >= num_tokens) return;
+  const int col = (threadIdx.x & 15) * 16;
+  const scalar_t *row = rms_input_row<scalar_t, NUM_DIMS>(
+      input, token, stride2, stride3, stride4, shape2, shape3);
+  using Vec = vec_n_t<scalar_t, 8>;
+  Vec x[2]{};
+  if (col < HIDDEN) {
+#pragma unroll
+    for (int i = 0; i < 2; ++i)
+      x[i] = reinterpret_cast<const Vec *>(row + col)[i];
+  }
+  float v[4]{};
+#pragma unroll
+  for (int k = 0; k < 4; ++k) {
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const float a = static_cast<float>(x[k / 2].val[(k % 2) * 4 + j]);
+      v[k] += a * a;
+    }
+  }
+#pragma unroll
+  for (int off = 8; off > 0; off >>= 1) {
+#pragma unroll
+    for (int k = 0; k < 4; ++k)
+      v[k] += __shfl_xor_sync(0xffffffffffffffffULL, v[k], off);
+  }
+  const float variance = (v[0] + v[2]) + (v[1] + v[3]);
+  const float inv = __builtin_mxc_rcpf(sqrtf(variance / hidden_size + epsilon));
+  if (col < HIDDEN) {
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+      Vec dst;
+#pragma unroll
+      for (int k = 0; k < 2; ++k) {
+        const auto w = reinterpret_cast<const vec_n_t<float, 4> *>(weight + col)[i * 2 + k];
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+          dst.val[k * 4 + j] = static_cast<scalar_t>(static_cast<float>(x[i].val[k * 4 + j]) * inv *
+              rms_weight<ZERO_CENTERED>(w.val[j]));
+      }
+      reinterpret_cast<Vec *>(out + static_cast<int64_t>(token) * HIDDEN + col)[i] = dst;
     }
   }
 }
@@ -921,7 +1170,22 @@ void rms_norm(torch::Tensor &out, torch::Tensor &input,
     input = input.contiguous();
   TORCH_CHECK(input.stride(-1) == 1);
   const bool has_weight = weight.has_value();
+  const bool mixed_fp32_weight =
+      has_weight && weight->scalar_type() == at::ScalarType::Float &&
+      (input.scalar_type() == at::ScalarType::Half ||
+       input.scalar_type() == at::ScalarType::BFloat16);
   const int hidden_size = input.size(-1);
+  if (mixed_fp32_weight) {
+    TORCH_CHECK(input.dim() >= 2 && input.dim() <= 4,
+                "rms_norm input must have 2, 3 or 4 dimensions");
+    TORCH_CHECK(hidden_size > 0, "rms_norm hidden size must be positive");
+    TORCH_CHECK(out.scalar_type() == input.scalar_type() &&
+                    out.sizes() == input.sizes(),
+                "rms_norm out must have the same dtype and shape as input");
+    TORCH_CHECK(out.device() == input.device() &&
+                    weight->device() == input.device(),
+                "rms_norm tensors must be on the same device");
+  }
   const int num_tokens = input.numel() / hidden_size;
   bool per_token_weight = false;
   int64_t weight_stride = 0;
@@ -948,6 +1212,9 @@ void rms_norm(torch::Tensor &out, torch::Tensor &input,
     }
   }
 
+  // No kernel may be launched with a zero-sized grid. Keep validation above
+  // the early return, including the existing non-contiguous out rejection.
+  if (num_tokens == 0) return;
 
   const int num_dims = input.dim();
   const int64_t input_stride_d2 = input.stride(-2);
@@ -968,10 +1235,66 @@ void rms_norm(torch::Tensor &out, torch::Tensor &input,
     VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "rms_norm_kernel", [&] {
       auto dispatch_weight = [&](auto weight_tag) {
         using weight_t = decltype(weight_tag);
+        constexpr bool mixed_storage = std::is_same_v<weight_t, float> &&
+                                       !std::is_same_v<scalar_t, float>;
         const weight_t *weight_ptr =
             has_weight ? weight->data_ptr<weight_t>() : nullptr;
-        const int vec_size =
-            std::gcd(static_cast<int>(16 / sizeof(scalar_t)), hidden_size);
+        // Mixed input must reproduce the float-input kernel's arithmetic
+        // grouping and reduction tree. Storage stays low precision, but the
+        // logical vector width and all launch decisions follow float input.
+        constexpr int full_vec_size =
+            16 / (std::is_same_v<weight_t, float> ? sizeof(float)
+                                                : sizeof(scalar_t));
+        const int vec_size = std::gcd(full_vec_size, hidden_size);
+        // These specializations emulate exactly the float dispatch below.
+        if constexpr (mixed_storage) {
+          if (is_c600 && has_weight && !per_token_weight &&
+              reinterpret_cast<std::uintptr_t>(weight_ptr) % 16 == 0 &&
+              reinterpret_cast<std::uintptr_t>(input.data_ptr()) % 16 == 0 &&
+              reinterpret_cast<std::uintptr_t>(out.data_ptr()) % 16 == 0 &&
+              vllm::rms_rows_are_vector_aligned(num_dims, 8, input_stride_d2,
+                                               input_stride_d3, input_stride_d4)) {
+            auto launch_mixed = [&](auto centered_tag) {
+              constexpr bool centered = decltype(centered_tag)::value;
+              if (hidden_size == 4096) {
+                const int blocks = std::min(num_tokens, prop.multiProcessorCount * 32);
+                if (num_tokens <= 64) {
+                  vllm::rms_norm_mixed_4096_decode_kernel<scalar_t, tensor_rank, centered>
+                      <<<blocks, 256, 0, stream>>>(out.data_ptr<scalar_t>(),
+                          input.data_ptr<scalar_t>(), input_stride_d2, input_stride_d3,
+                          input_stride_d4, input_shape_d2, input_shape_d3, weight_ptr,
+                          static_cast<float>(epsilon), num_tokens);
+                } else {
+                vllm::rms_norm_mixed_4096_kernel<scalar_t, tensor_rank, centered>
+                    <<<blocks, 128, 0, stream>>>(out.data_ptr<scalar_t>(),
+                        input.data_ptr<scalar_t>(), input_stride_d2, input_stride_d3,
+                        input_stride_d4, input_shape_d2, input_shape_d3, weight_ptr,
+                        static_cast<float>(epsilon), num_tokens);
+                }
+                return true;
+              }
+              if (num_tokens >= 1024 && (hidden_size == 192 || hidden_size == 256)) {
+                if (hidden_size == 192) {
+                vllm::rms_norm_mixed_small_kernel<scalar_t, tensor_rank, 192, centered>
+                    <<<(num_tokens + 15) / 16, 256, 0, stream>>>(out.data_ptr<scalar_t>(),
+                        input.data_ptr<scalar_t>(), input_stride_d2, input_stride_d3,
+                        input_stride_d4, input_shape_d2, input_shape_d3, weight_ptr,
+                        static_cast<float>(epsilon), num_tokens, hidden_size);
+                } else {
+                vllm::rms_norm_mixed_small_kernel<scalar_t, tensor_rank, 256, centered>
+                    <<<(num_tokens + 15) / 16, 256, 0, stream>>>(out.data_ptr<scalar_t>(),
+                        input.data_ptr<scalar_t>(), input_stride_d2, input_stride_d3,
+                        input_stride_d4, input_shape_d2, input_shape_d3, weight_ptr,
+                        static_cast<float>(epsilon), num_tokens, hidden_size);
+                }
+                return true;
+              }
+              return false;
+            };
+            if (zero_centered ? launch_mixed(std::true_type{})
+                              : launch_mixed(std::false_type{})) return;
+          }
+        }
         const bool batch_invariant_launch = vllm::vllm_is_batch_invariant();
         const int fallback_max_block =
             batch_invariant_launch ? 1024 : (num_tokens <= 256 ? 1024 : 256);
@@ -980,7 +1303,7 @@ void rms_norm(torch::Tensor &out, torch::Tensor &input,
 
         VLLM_DISPATCH_VEC_SIZE(vec_size, [&] {
           bool launched = false;
-          if constexpr (vec_size == 16 / sizeof(scalar_t)) {
+          if constexpr (vec_size == full_vec_size) {
             const int cached_block =
                 vllm::select_rms_cached_block(num_tokens, hidden_size);
             const int vec_count = hidden_size / vec_size;
@@ -990,10 +1313,9 @@ void rms_norm(torch::Tensor &out, torch::Tensor &input,
             constexpr size_t alignment = sizeof(scalar_t) * vec_size;
             constexpr size_t weight_alignment = sizeof(weight_t) * vec_size;
             const bool pointers_aligned =
-                reinterpret_cast<std::uintptr_t>(input.data_ptr()) % alignment ==
-                    0 &&
-                reinterpret_cast<std::uintptr_t>(out.data_ptr()) % alignment ==
-                    0 &&
+                (mixed_storage ||
+                 (reinterpret_cast<std::uintptr_t>(input.data_ptr()) % alignment == 0 &&
+                  reinterpret_cast<std::uintptr_t>(out.data_ptr()) % alignment == 0)) &&
                 (!has_weight ||
                 reinterpret_cast<std::uintptr_t>(weight_ptr) % weight_alignment == 0);
             // Route to the cached kernel only when the row fully utilizes the
@@ -1002,9 +1324,9 @@ void rms_norm(torch::Tensor &out, torch::Tensor &input,
                 cached_block != 0 && vec_count >= cached_block &&
                 items_per_thread >= 1 && items_per_thread <= 8 &&
                 pointers_aligned &&
-                vllm::rms_rows_are_vector_aligned(
+                (mixed_storage || vllm::rms_rows_are_vector_aligned(
                     num_dims, vec_size, input_stride_d2, input_stride_d3,
-                    input_stride_d4);
+                    input_stride_d4));
 
             // Warp-per-row path for SMALL hidden with enough rows to fill the
             // GPU. Each 64-lane warp reduces one row via pure register shuffle
@@ -1015,9 +1337,10 @@ void rms_norm(torch::Tensor &out, torch::Tensor &input,
             // row cached path yields a larger grid and higher occupancy, so we
             // restrict the warp path to the many-token regime.
             const int items_per_lane = (vec_count + 63) / 64;
-            const bool rows_aligned = vllm::rms_rows_are_vector_aligned(
-                num_dims, vec_size, input_stride_d2, input_stride_d3,
-                input_stride_d4);
+            const bool rows_aligned = mixed_storage ||
+                vllm::rms_rows_are_vector_aligned(
+                    num_dims, vec_size, input_stride_d2, input_stride_d3,
+                    input_stride_d4);
             const bool can_use_warp =
                 vec_count > 32 && vec_count <= 256 && items_per_lane <= 4 &&
                 num_tokens >= 1024 && pointers_aligned && rows_aligned;
@@ -1301,6 +1624,33 @@ template <> __device__ __forceinline__ void copy<1>(void *src, void *dst) {
   *ptr_dst = *ptr_src;
 }
 
+// Storage alignment must not change the fp32 compatibility reduction tree.
+template <typename T, int N>
+__device__ __forceinline__ vllm::vec_n_t<T, N>
+fused_norm_load(const T* ptr) {
+    using Vec = vllm::vec_n_t<T, N>;
+    if (reinterpret_cast<std::uintptr_t>(ptr) % alignof(Vec) == 0)
+        return *reinterpret_cast<const Vec*>(ptr);
+    Vec value;
+#pragma unroll
+    for (int j = 0; j < N; ++j) value.val[j] = ptr[j];
+    return value;
+}
+
+template <typename T, int N>
+__device__ __forceinline__ void fused_norm_store(
+    T* ptr, const vllm::vec_n_t<T, N>& value) {
+    using Vec = vllm::vec_n_t<T, N>;
+    if (reinterpret_cast<std::uintptr_t>(ptr) % alignof(Vec) == 0) {
+        *reinterpret_cast<Vec*>(ptr) = value;
+    } else {
+#pragma unroll
+        for (int j = 0; j < N; ++j) ptr[j] = value.val[j];
+    }
+}
+
+#include "fused_add_rms_norm_extended.cuh"
+
 template <uint32_t VEC_SIZE,
           uint32_t NUM_REG,
           typename T,
@@ -1318,6 +1668,7 @@ __global__ void FusedAddRMSNormKernelOpt(
     float weight_bias,
     float eps)
 {
+    constexpr bool mixed_fp32 = sizeof(T) == 2 && std::is_same_v<S, float>;
     float rms = 0;
 
     T *ptr_input = input + blockIdx.x * stride_input;
@@ -1334,12 +1685,23 @@ __global__ void FusedAddRMSNormKernelOpt(
 
     for (uint32_t i = tid; i < d; i += block_stride) {
         T local[VEC_SIZE];
-        copy<sizeof(T) * VEC_SIZE>((void *)(ptr_input + i), (void *)local);
+        if constexpr (mixed_fp32) {
+            const auto v = fused_norm_load<T, VEC_SIZE>(ptr_input + i);
+#pragma unroll
+            for (int j = 0; j < VEC_SIZE; ++j) local[j] = v.val[j];
+        } else {
+            copy<sizeof(T) * VEC_SIZE>((void *)(ptr_input + i), (void *)local);
+        }
 
         T reg_residual[VEC_SIZE];
-        copy<sizeof(T) * VEC_SIZE>(
-            (void *)(ptr_residual + i),
-            (void *)reg_residual);
+        if constexpr (mixed_fp32) {
+            const auto v = fused_norm_load<T, VEC_SIZE>(ptr_residual + i);
+#pragma unroll
+            for (int j = 0; j < VEC_SIZE; ++j) reg_residual[j] = v.val[j];
+        } else {
+            copy<sizeof(T) * VEC_SIZE>(
+                (void *)(ptr_residual + i), (void *)reg_residual);
+        }
 
 #pragma unroll VEC_SIZE
         for (uint32_t j = 0; j < VEC_SIZE; j++) {
@@ -1350,9 +1712,15 @@ __global__ void FusedAddRMSNormKernelOpt(
             reg_input[k][j] = x;
         }
 
-        copy<sizeof(T) * VEC_SIZE>(
-            (void *)reg_residual,
-            (void *)(ptr_residual + i));
+        if constexpr (mixed_fp32) {
+            vllm::vec_n_t<T, VEC_SIZE> v;
+#pragma unroll
+            for (int j = 0; j < VEC_SIZE; ++j) v.val[j] = reg_residual[j];
+            fused_norm_store<T, VEC_SIZE>(ptr_residual + i, v);
+        } else {
+            copy<sizeof(T) * VEC_SIZE>(
+                (void *)reg_residual, (void *)(ptr_residual + i));
+        }
 
         k++;
     }
@@ -1515,9 +1883,14 @@ __global__ void FusedAddRMSNormKernelOpt(
 
             S local_weight[VEC_SIZE];
 
-            copy<sizeof(S) * VEC_SIZE>(
-                (void *)(ptr_weight + i),
-                (void *)local_weight);
+            if constexpr (mixed_fp32) {
+                const auto w = fused_norm_load<S, VEC_SIZE>(ptr_weight + i);
+#pragma unroll
+                for (int j = 0; j < VEC_SIZE; ++j) local_weight[j] = w.val[j];
+            } else {
+                copy<sizeof(S) * VEC_SIZE>(
+                    (void *)(ptr_weight + i), (void *)local_weight);
+            }
 
 #pragma unroll VEC_SIZE
             for (uint32_t j = 0; j < VEC_SIZE; j++) {
@@ -1536,9 +1909,14 @@ __global__ void FusedAddRMSNormKernelOpt(
 
         k++;
 
-        copy<VEC_SIZE * sizeof(T)>(
-            (void *)reg_dst,
-            (void *)(ptr_input + i));
+        if constexpr (mixed_fp32) {
+            vllm::vec_n_t<T, VEC_SIZE> v;
+#pragma unroll
+            for (int j = 0; j < VEC_SIZE; ++j) v.val[j] = reg_dst[j];
+            fused_norm_store<T, VEC_SIZE>(ptr_input + i, v);
+        } else {
+            copy<VEC_SIZE * sizeof(T)>((void *)reg_dst, (void *)(ptr_input + i));
+        }
     }
 }
 
@@ -1548,7 +1926,8 @@ template <uint32_t VEC_SIZE,
           typename S,
           int NUM_THREADS,
           bool HasWeight,
-          bool ZERO_CENTERED>
+          bool ZERO_CENTERED,
+          bool ALIGNED_MIXED = false>
 __global__ __launch_bounds__(NUM_THREADS) void FusedAddRMSNormKernelMultiRow(
     T *__restrict__ input,
     T *__restrict__ residual,
@@ -1559,6 +1938,11 @@ __global__ __launch_bounds__(NUM_THREADS) void FusedAddRMSNormKernelMultiRow(
     const uint32_t batch_size,
     float eps)
 {
+    constexpr bool mixed_fp32 = sizeof(T) == 2 && std::is_same_v<S, float>;
+    // Same-dtype instantiations retain their original intermediate rounding.
+    // Mixed weights require the unrounded fp32 sum for both variance and output.
+    using ResidualT = std::conditional_t<mixed_fp32, float, T>;
+    using ResidualVec = vllm::vec_n_t<ResidualT, VEC_SIZE>;
     constexpr int WARP = 64;
     constexpr int NW = NUM_THREADS / WARP;
     using Vec = vllm::vec_n_t<T, VEC_SIZE>;
@@ -1572,7 +1956,9 @@ __global__ __launch_bounds__(NUM_THREADS) void FusedAddRMSNormKernelMultiRow(
         const WeightVec *wv = reinterpret_cast<const WeightVec *>(weight);
 #pragma unroll
         for (int k = 0; k < NUM_REG; ++k) {
-            const WeightVec w = wv[tid + k * NUM_THREADS];
+            const WeightVec w = mixed_fp32 && !ALIGNED_MIXED
+                ? fused_norm_load<S, VEC_SIZE>(weight + (tid + k * NUM_THREADS) * VEC_SIZE)
+                : wv[tid + k * NUM_THREADS];
 #pragma unroll
             for (int j = 0; j < VEC_SIZE; ++j)
                 wreg[k][j] = vllm::rms_weight<ZERO_CENTERED, S>(w.val[j]);
@@ -1586,11 +1972,30 @@ __global__ __launch_bounds__(NUM_THREADS) void FusedAddRMSNormKernelMultiRow(
         Vec *in_row  = reinterpret_cast<Vec *>(input + static_cast<int64_t>(row) * stride_input);
         Vec *res_row = reinterpret_cast<Vec *>(residual + static_cast<int64_t>(row) * stride_residual);
 
-        Vec a[NUM_REG], r[NUM_REG];
+        Vec a[NUM_REG];
+        ResidualVec r[NUM_REG];
 #pragma unroll
         for (int k = 0; k < NUM_REG; ++k) {
-            a[k] = in_row[tid + k * NUM_THREADS];
-            r[k] = res_row[tid + k * NUM_THREADS];
+            if constexpr (mixed_fp32) {
+                const int64_t offset = static_cast<int64_t>(row) * stride_input +
+                    (tid + k * NUM_THREADS) * VEC_SIZE;
+                const int64_t res_offset = static_cast<int64_t>(row) * stride_residual +
+                    (tid + k * NUM_THREADS) * VEC_SIZE;
+                Vec rv;
+                if constexpr (ALIGNED_MIXED) {
+                    a[k] = in_row[tid + k * NUM_THREADS];
+                    rv = res_row[tid + k * NUM_THREADS];
+                } else {
+                    a[k] = fused_norm_load<T, VEC_SIZE>(input + offset);
+                    rv = fused_norm_load<T, VEC_SIZE>(residual + res_offset);
+                }
+#pragma unroll
+                for (int j = 0; j < VEC_SIZE; ++j)
+                    r[k].val[j] = static_cast<float>(rv.val[j]);
+            } else {
+                a[k] = in_row[tid + k * NUM_THREADS];
+                r[k] = res_row[tid + k * NUM_THREADS];
+            }
         }
 
         float ss = 0.f;
@@ -1598,7 +2003,7 @@ __global__ __launch_bounds__(NUM_THREADS) void FusedAddRMSNormKernelMultiRow(
         for (int k = 0; k < NUM_REG; ++k)
 #pragma unroll
             for (int j = 0; j < VEC_SIZE; ++j) {
-                const T z = float_to_dstT<T>(static_cast<float>(a[k].val[j]) +
+                const ResidualT z = float_to_dstT<ResidualT>(static_cast<float>(a[k].val[j]) +
                                              static_cast<float>(r[k].val[j]));
                 r[k].val[j] = z;
                 const float zf = static_cast<float>(z);
@@ -1623,12 +2028,213 @@ __global__ __launch_bounds__(NUM_THREADS) void FusedAddRMSNormKernelMultiRow(
             Vec dst;
 #pragma unroll
             for (int j = 0; j < VEC_SIZE; ++j) {
-                float v = static_cast<float>(r[k].val[j]) * rms;
-                if constexpr (HasWeight) v *= wreg[k][j];
+                float v;
+                if constexpr (mixed_fp32) {
+                    // C600 fp32 oracle lowers both multiplies to pk_fma_f32
+                    // with a +0 addend. Scalar mul preserves -0 instead, so
+                    // explicitly match each operation before the final cast.
+                    v = __fmaf_rn(static_cast<float>(r[k].val[j]), rms, 0.0f);
+                    if constexpr (HasWeight)
+                        v = __fmaf_rn(v, wreg[k][j], 0.0f);
+                } else {
+                    v = static_cast<float>(r[k].val[j]) * rms;
+                    if constexpr (HasWeight) v *= wreg[k][j];
+                }
                 dst.val[j] = float_to_dstT<T>(v);
             }
-            res_row[tid + k * NUM_THREADS] = r[k];
-            in_row[tid + k * NUM_THREADS] = dst;
+            if constexpr (mixed_fp32) {
+                Vec residual_dst;
+#pragma unroll
+                for (int j = 0; j < VEC_SIZE; ++j)
+                    residual_dst.val[j] = float_to_dstT<T>(r[k].val[j]);
+                if constexpr (ALIGNED_MIXED) {
+                    res_row[tid + k * NUM_THREADS] = residual_dst;
+                    in_row[tid + k * NUM_THREADS] = dst;
+                } else {
+                    fused_norm_store<T, VEC_SIZE>(residual + static_cast<int64_t>(row) * stride_residual +
+                        (tid + k * NUM_THREADS) * VEC_SIZE, residual_dst);
+                    fused_norm_store<T, VEC_SIZE>(input + static_cast<int64_t>(row) * stride_input +
+                        (tid + k * NUM_THREADS) * VEC_SIZE, dst);
+                }
+            } else {
+                res_row[tid + k * NUM_THREADS] = r[k];
+                in_row[tid + k * NUM_THREADS] = dst;
+            }
+        }
+    }
+}
+
+// C600-U decode: paired 16B accesses, late weights and explicit +0 FMA.
+// One physical thread owns two adjacent logical C4 threads. This makes
+// activation accesses 16B wide while preserving each logical thread's sum order.
+template <bool ZERO_CENTERED>
+__global__ __launch_bounds__(128) void FusedAddRMSNormKernelPairedScalarFmaC600U(
+    maca_bfloat16* __restrict__ input,
+    maca_bfloat16* __restrict__ residual,
+    const float* __restrict__ weight,
+    const uint32_t d,
+    float eps)
+{
+    using WideVec = vllm::vec_n_t<maca_bfloat16, 8>;
+    using FloatVec = vllm::vec_n_t<float, 4>;
+    const int tid = threadIdx.x;
+    const float inv_d = 1.0f / static_cast<float>(d);
+    const int64_t row_offset = static_cast<int64_t>(blockIdx.x) * d;
+    auto* in_row = reinterpret_cast<WideVec*>(input + row_offset);
+    auto* res_row = reinterpret_cast<WideVec*>(residual + row_offset);
+    const auto* weights = reinterpret_cast<const FloatVec*>(weight);
+
+    FloatVec r0[4], r1[4];
+    float ss0 = 0.f;
+    float ss1 = 0.f;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const WideVec a = in_row[tid + k * 128];
+        const WideVec r = res_row[tid + k * 128];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const float z0 = static_cast<float>(a.val[j]) + static_cast<float>(r.val[j]);
+            const float z1 = static_cast<float>(a.val[j + 4]) + static_cast<float>(r.val[j + 4]);
+            r0[k].val[j] = z0;
+            r1[k].val[j] = z1;
+            ss0 += z0 * z0;
+            ss1 += z1 * z1;
+        }
+    }
+
+    // Logical lanes 2*tid and 2*tid+1 retain independent accumulators.
+    // Physical xor 16..1 reproduces logical xor 32..2 within each virtual
+    // 64-lane warp. The final register add reproduces logical xor 1 at its
+    // representative lane, including operand order.
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        ss0 += __shfl_xor_sync(0xffffffffffffffffULL, ss0, off, 32);
+        ss1 += __shfl_xor_sync(0xffffffffffffffffULL, ss1, off, 32);
+    }
+    __shared__ float red[4];
+    if ((tid & 31) == 0) red[tid >> 5] = ss0 + ss1;
+    __syncthreads();
+    float ss = 0.f;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) ss += red[k];
+    const float rms = __builtin_mxc_rcpf(sqrtf(ss * inv_d + eps));
+
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        FloatVec w0 = weights[2 * tid + k * 256];
+        FloatVec w1 = weights[2 * tid + 1 + k * 256];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            w0.val[j] = vllm::rms_weight<ZERO_CENTERED, float>(w0.val[j]);
+            w1.val[j] = vllm::rms_weight<ZERO_CENTERED, float>(w1.val[j]);
+        }
+        WideVec dst;
+        WideVec residual_dst;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            float v0 = __builtin_fmaf(r0[k].val[j], rms, 0.0f);
+            v0 = __builtin_fmaf(v0, w0.val[j], 0.0f);
+            float v1 = __builtin_fmaf(r1[k].val[j], rms, 0.0f);
+            v1 = __builtin_fmaf(v1, w1.val[j], 0.0f);
+            dst.val[j] = float_to_dstT<maca_bfloat16>(v0);
+            dst.val[j + 4] = float_to_dstT<maca_bfloat16>(v1);
+            residual_dst.val[j] = float_to_dstT<maca_bfloat16>(r0[k].val[j]);
+            residual_dst.val[j + 4] = float_to_dstT<maca_bfloat16>(r1[k].val[j]);
+        }
+        res_row[tid + k * 128] = residual_dst;
+        in_row[tid + k * 128] = dst;
+    }
+}
+
+// C600-U prefill: specialize the H4096 persistent launch address contract.
+// One physical thread owns two adjacent logical C4 threads. This makes
+// activation accesses 16B wide while preserving each logical thread's sum order.
+template <bool ZERO_CENTERED>
+__global__ __launch_bounds__(128) void FusedAddRMSNormKernelPairedLaunchContractC600U(
+    maca_bfloat16* __restrict__ input,
+    maca_bfloat16* __restrict__ residual,
+    const float* __restrict__ weight,
+    const uint32_t d,
+    const uint32_t batch_size,
+    const uint32_t row_step,
+    float eps)
+{
+    using WideVec = vllm::vec_n_t<maca_bfloat16, 8>;
+    using FloatVec = vllm::vec_n_t<float, 4>;
+    const int tid = threadIdx.x;
+    const float inv_d = 1.0f / static_cast<float>(d);
+    const auto* weights = reinterpret_cast<const FloatVec*>(weight);
+
+    FloatVec w0[4], w1[4];
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        w0[k] = weights[2 * tid + k * 256];
+        w1[k] = weights[2 * tid + 1 + k * 256];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            w0[k].val[j] = vllm::rms_weight<ZERO_CENTERED, float>(w0[k].val[j]);
+            w1[k].val[j] = vllm::rms_weight<ZERO_CENTERED, float>(w1[k].val[j]);
+        }
+    }
+
+    __shared__ float red[2][4];
+    int parity = 0;
+    for (uint32_t row = blockIdx.x; row < batch_size; row += row_step) {
+        const int64_t row_offset = static_cast<int64_t>(row) * 4096;
+        auto* in_row = reinterpret_cast<WideVec*>(input + row_offset);
+        auto* res_row = reinterpret_cast<WideVec*>(residual + row_offset);
+        FloatVec r0[4], r1[4];
+        float ss0 = 0.f;
+        float ss1 = 0.f;
+    #pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const WideVec a = in_row[tid + k * 128];
+            const WideVec r = res_row[tid + k * 128];
+    #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const float z0 = static_cast<float>(a.val[j]) + static_cast<float>(r.val[j]);
+                const float z1 = static_cast<float>(a.val[j + 4]) + static_cast<float>(r.val[j + 4]);
+                r0[k].val[j] = z0;
+                r1[k].val[j] = z1;
+                ss0 += z0 * z0;
+                ss1 += z1 * z1;
+            }
+        }
+
+        // Logical lanes 2*tid and 2*tid+1 retain independent accumulators.
+        // Physical xor 16..1 reproduces logical xor 32..2 within each virtual
+        // 64-lane warp. The final register add reproduces logical xor 1 at its
+        // representative lane, including operand order.
+    #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            ss0 += __shfl_xor_sync(0xffffffffffffffffULL, ss0, off, 32);
+            ss1 += __shfl_xor_sync(0xffffffffffffffffULL, ss1, off, 32);
+        }
+        if ((tid & 31) == 0) red[parity][tid >> 5] = ss0 + ss1;
+        __syncthreads();
+        float ss = 0.f;
+    #pragma unroll
+        for (int k = 0; k < 4; ++k) ss += red[parity][k];
+        parity ^= 1;
+        const float rms = __builtin_mxc_rcpf(sqrtf(ss * inv_d + eps));
+
+    #pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            WideVec dst;
+            WideVec residual_dst;
+    #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                float v0 = __builtin_fmaf(r0[k].val[j], rms, 0.0f);
+                v0 = __builtin_fmaf(v0, w0[k].val[j], 0.0f);
+                float v1 = __builtin_fmaf(r1[k].val[j], rms, 0.0f);
+                v1 = __builtin_fmaf(v1, w1[k].val[j], 0.0f);
+                dst.val[j] = float_to_dstT<maca_bfloat16>(v0);
+                dst.val[j + 4] = float_to_dstT<maca_bfloat16>(v1);
+                residual_dst.val[j] = float_to_dstT<maca_bfloat16>(r0[k].val[j]);
+                residual_dst.val[j + 4] = float_to_dstT<maca_bfloat16>(r1[k].val[j]);
+            }
+            res_row[tid + k * 128] = residual_dst;
+            in_row[tid + k * 128] = dst;
         }
     }
 }
@@ -1647,7 +2253,9 @@ int launch_fused_add_rms_norm_opt(
 {
     dim3 nblks(batch_size);
 
-    constexpr int N = 16 / sizeof(T);
+    constexpr bool mixed_fp32 = sizeof(T) == 2 && std::is_same_v<S, float>;
+    // Compatibility is defined by the fp32 oracle, not the storage byte width.
+    constexpr int N = mixed_fp32 ? 4 : 16 / sizeof(T);
 
     if ((d & (N - 1)) == 0) {
         int blocksize = 64;
@@ -1737,12 +2345,16 @@ int launch_fused_add_rms_norm_multirow(
     float eps = 1e-5,
     cudaStream_t stream = 0)
 {
-    constexpr int N = 16 / sizeof(T);
-    constexpr int MAX_REG = sizeof(T) == 2 ? 8 : 4;
+    constexpr bool mixed_fp32 = sizeof(T) == 2 && std::is_same_v<S, float>;
+    // Compatibility is defined by the fp32 oracle, not the storage byte width.
+    constexpr int N = mixed_fp32 ? 4 : 16 / sizeof(T);
+    constexpr int MAX_REG = mixed_fp32 ? 4 : (sizeof(T) == 2 ? 8 : 4);
 
     if (d % N != 0 || stride_input % N != 0 || stride_residual % N != 0) return -1;
-    if (reinterpret_cast<std::uintptr_t>(input) % 16 != 0 ||
-        reinterpret_cast<std::uintptr_t>(residual) % 16 != 0) return -1;
+    if constexpr (!mixed_fp32) {
+        if (reinterpret_cast<std::uintptr_t>(input) % 16 != 0 ||
+            reinterpret_cast<std::uintptr_t>(residual) % 16 != 0) return -1;
+    }
     if (HasWeight && reinterpret_cast<std::uintptr_t>(weight) % (sizeof(S) * N) != 0) return -1;
 
     const int vec_count = d / N;
@@ -1753,7 +2365,7 @@ int launch_fused_add_rms_norm_multirow(
     if (num_threads == 0) return -1;
     const int num_reg = vec_count / num_threads;
 
-    const int g = sizeof(T) == 2
+    const int g = !mixed_fp32 && sizeof(T) == 2
                       ? std::min<int>(batch_size, sm_count * (2048 / num_threads))
                       : static_cast<int>(batch_size);
     dim3 nblks(std::max(1, g));
@@ -1783,12 +2395,90 @@ int launch_fused_add_rms_norm_multirow(
     return -1;
 }
 
+// Compatibility fallback: no full-tensor temporary and no intermediate T rounding.
+template <typename T, bool ZERO_CENTERED>
+__global__ void fused_add_rms_norm_mixed_fallback(
+    T* __restrict__ input, T* __restrict__ residual,
+    const float* __restrict__ weight, int hidden_size, float epsilon) {
+    const int64_t row = static_cast<int64_t>(blockIdx.x) * hidden_size;
+    float variance = 0.0f;
+    for (int idx = threadIdx.x; idx < hidden_size; idx += blockDim.x) {
+        float z = static_cast<float>(input[row + idx]);
+        z += static_cast<float>(residual[row + idx]);
+        variance += z * z;
+    }
+    using BlockReduce = cub::BlockReduce<float, 1024>;
+    __shared__ typename BlockReduce::TempStorage reduceStore;
+    __shared__ float s_variance;
+    variance = BlockReduce(reduceStore).Reduce(variance, CubAddOp{}, blockDim.x);
+    if (threadIdx.x == 0) s_variance = rsqrtf(variance / hidden_size + epsilon);
+    __syncthreads();
+    for (int idx = threadIdx.x; idx < hidden_size; idx += blockDim.x) {
+        float z = static_cast<float>(input[row + idx]);
+        z += static_cast<float>(residual[row + idx]);
+        const float w = vllm::rms_weight<ZERO_CENTERED, float>(weight[idx]);
+        const float out = z * s_variance * w;
+        residual[row + idx] = float_to_dstT<T>(z);
+        input[row + idx] = float_to_dstT<T>(out);
+    }
+}
+
+void fused_add_rms_norm_out(
+    torch::Tensor& input,
+    torch::Tensor& residual,
+    std::optional<torch::Tensor> weight,
+    double epsilon, bool zero_centered,
+    std::optional<torch::Tensor> out, bool input_inplace)
+{
+    if (!out && input_inplace) {
+        // Preserve every legacy dispatch and rounding rule when out is absent.
+        fused_add_rms_norm(input, residual, weight, epsilon, zero_centered);
+    } else {
+        fused_add_rms_norm_extended(input, residual, weight, epsilon, zero_centered,
+                                   out, input_inplace);
+    }
+}
+
 void fused_add_rms_norm(
     torch::Tensor& input,
     torch::Tensor& residual,
     std::optional<torch::Tensor> weight,
     double epsilon, bool zero_centered)
 {
+
+    if (input.scalar_type() != residual.scalar_type()) {
+        fused_add_rms_norm_extended(input, residual, weight, epsilon, zero_centered, std::nullopt);
+        return;
+    }
+    const bool mixed_fp32 = weight.has_value() && weight->scalar_type() == at::ScalarType::Float &&
+        (input.scalar_type() == at::ScalarType::BFloat16 || input.scalar_type() == at::ScalarType::Half);
+    if (mixed_fp32) {
+        TORCH_CHECK(input.is_cuda() && residual.is_cuda() && weight->is_cuda() &&
+                    input.device() == residual.device() && input.device() == weight->device(),
+                    "fused_add_rms_norm mixed dtype requires tensors on the same CUDA device");
+        TORCH_CHECK(input.dim() == 2 && residual.sizes() == input.sizes(),
+                    "fused_add_rms_norm mixed dtype requires matching [T, H] shapes");
+        TORCH_CHECK(input.scalar_type() == residual.scalar_type(),
+                    "fused_add_rms_norm residual dtype must match input");
+        TORCH_CHECK(input.is_contiguous() && residual.is_contiguous(),
+                    "fused_add_rms_norm mixed dtype requires contiguous input and residual");
+        TORCH_CHECK(input.size(1) > 0 && input.size(1) <= INT_MAX && input.size(0) <= INT_MAX &&
+                    input.numel() <= UINT_MAX,
+                    "fused_add_rms_norm mixed dtype requires H > 0, dimensions <= INT_MAX and numel <= UINT_MAX");
+        TORCH_CHECK(weight->dim() == 1 && weight->size(0) == input.size(1) && weight->is_contiguous(),
+                    "fused_add_rms_norm mixed dtype requires contiguous weight[H]");
+        // restrict kernels require disjoint buffers; reject before any write.
+        const auto begin = reinterpret_cast<std::uintptr_t>(input.data_ptr());
+        const auto res_begin = reinterpret_cast<std::uintptr_t>(residual.data_ptr());
+        const auto wt_begin = reinterpret_cast<std::uintptr_t>(weight->data_ptr());
+        const auto bytes = input.numel() * input.element_size();
+        const auto wt_bytes = weight->numel() * weight->element_size();
+        TORCH_CHECK(bytes == 0 || ((begin + bytes <= res_begin || res_begin + bytes <= begin) &&
+                    (begin + bytes <= wt_begin || wt_begin + wt_bytes <= begin) &&
+                    (res_begin + bytes <= wt_begin || wt_begin + wt_bytes <= res_begin)),
+                    "fused_add_rms_norm mixed dtype requires non-overlapping buffers");
+        if (input.size(0) == 0) return;
+    }
     TORCH_CHECK(!zero_centered || weight.has_value(),
                 "rms_norm zero_centered requires weight");
     TORCH_CHECK(input.scalar_type() == residual.scalar_type());
@@ -1855,9 +2545,57 @@ void fused_add_rms_norm(
           epsilon,                                                                          \
           stream)
 
-    bool use_bf16 = (hidden_size % 8 == 0 && (input_stride & 7) == 0) &&
+    bool use_bf16 = (mixed_fp32 || (hidden_size % 8 == 0 && (input_stride & 7) == 0)) &&
                     (input.dtype() == at::ScalarType::BFloat16);
     
+    // Mixed H4096 specialization is selected independently of device model.
+    // The mixed entry has already checked contiguous, disjoint [T,H] buffers.
+    // H=4096 preserves 8B activation and 16B weight alignment for every access.
+    if (mixed_fp32 && use_bf16 && hidden_size == 4096 &&
+        input_stride == 4096 && residual_stride == 4096 &&
+        inp_ptr % 8 == 0 && res_ptr % 8 == 0 &&
+        reinterpret_cast<std::uintptr_t>(weight->data_ptr()) % 16 == 0) {
+        auto* x = static_cast<maca_bfloat16*>(input.data_ptr());
+        auto* r = static_cast<maca_bfloat16*>(residual.data_ptr());
+        auto* w = static_cast<float*>(weight->data_ptr());
+        // Paired single-row decode and persistent prefill weight reuse.
+        // Keep dtype, layout, alignment and workload-range guards.
+        if (inp_ptr % 16 == 0 && res_ptr % 16 == 0) {
+            if (num_tokens >= 128 && num_tokens <= 256) {
+                if (zero_centered) {
+                    FusedAddRMSNormKernelPairedScalarFmaC600U<true>
+                        <<<grid, 128, 0, stream>>>(x, r, w, hidden_size, epsilon);
+                } else {
+                    FusedAddRMSNormKernelPairedScalarFmaC600U<false>
+                        <<<grid, 128, 0, stream>>>(x, r, w, hidden_size, epsilon);
+                }
+                return;
+            }
+            const uint32_t sm = at::cuda::getDeviceProperties(input.get_device())->multiProcessorCount;
+            const uint32_t cap = sm * (2048 / 128);
+            if (num_tokens >= 2 * cap) {
+                if (zero_centered) {
+                    FusedAddRMSNormKernelPairedLaunchContractC600U<true>
+                        <<<cap, 128, 0, stream>>>(x, r, w, hidden_size, num_tokens, cap, epsilon);
+                } else {
+                    FusedAddRMSNormKernelPairedLaunchContractC600U<false>
+                        <<<cap, 128, 0, stream>>>(x, r, w, hidden_size, num_tokens, cap, epsilon);
+                }
+                return;
+            }
+        }
+        if (zero_centered) {
+            FusedAddRMSNormKernelMultiRow<4, 4, maca_bfloat16, float, 256, true, true, true>
+                <<<grid, 256, 0, stream>>>(x, r, w, hidden_size, input_stride,
+                                           residual_stride, num_tokens, epsilon);
+        } else {
+            FusedAddRMSNormKernelMultiRow<4, 4, maca_bfloat16, float, 256, true, false, true>
+                <<<grid, 256, 0, stream>>>(x, r, w, hidden_size, input_stride,
+                                           residual_stride, num_tokens, epsilon);
+        }
+        return;
+    }
+
     if (is_c600) {
       if (weight.has_value()) {
         bool weight_fp32 = (weight->dtype() == at::ScalarType::Float);
@@ -1927,6 +2665,21 @@ void fused_add_rms_norm(
     }
 
     if (status == 0) {
+        return;
+    }
+
+    if (mixed_fp32) {
+        VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "fused_add_rms_norm_mixed", [&] {
+            if (zero_centered) {
+                fused_add_rms_norm_mixed_fallback<scalar_t, true><<<grid, block, 0, stream>>>(
+                    input.data_ptr<scalar_t>(), residual.data_ptr<scalar_t>(),
+                    weight->data_ptr<float>(), hidden_size, epsilon);
+            } else {
+                fused_add_rms_norm_mixed_fallback<scalar_t, false><<<grid, block, 0, stream>>>(
+                    input.data_ptr<scalar_t>(), residual.data_ptr<scalar_t>(),
+                    weight->data_ptr<float>(), hidden_size, epsilon);
+            }
+        });
         return;
     }
 

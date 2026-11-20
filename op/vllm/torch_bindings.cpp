@@ -237,6 +237,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "fused_add_rms_norm(Tensor! input, Tensor! residual, Tensor? weight, "
       "float epsilon, bool zero_centered=False) -> ()");
   ops.impl("fused_add_rms_norm", torch::kCUDA, &fused_add_rms_norm);
+  // Separate output op preserves the old op's schema and mutation slots.
+  ops.def(
+      "fused_add_rms_norm_out(Tensor! input, Tensor! residual, Tensor? weight, "
+      "float epsilon, bool zero_centered=False, Tensor(a!)? out=None, "
+      "bool input_inplace=True) -> ()");
+  ops.impl("fused_add_rms_norm_out", torch::kCUDA, &fused_add_rms_norm_out);
   // Grouped concat_and_cache_mla across all layers (bf16 only). Each
   // layer's cache base pointer is read from kv_cache_ptrs.
   ops.def(
@@ -397,6 +403,14 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("region_topk_ids", torch::kCUDA, &region_topk_ids);
   
   ops.def(
+      "prepare_topk_scores("
+      "Tensor scores_in, Tensor summary_valid, Tensor row_starts, "
+      "Tensor row_ends, Tensor(a!) scores_out, int num_regions, "
+      "int padded_regions, bool has_summary_valid) -> ()");
+  ops.impl("prepare_topk_scores", torch::kCUDA,
+           &prepare_topk_scores);
+
+  ops.def(
       "stable_topk_gathered(Tensor gathered, Tensor! out, int topk) -> ()");
   ops.impl("stable_topk_gathered", torch::kCUDA, &stable_topk_gathered);
 
@@ -489,15 +503,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def("awq_to_gptq_4bit(Tensor qweight) -> Tensor");
   ops.impl("awq_to_gptq_4bit", torch::kCUDA, &awq_to_gptq_4bit);
 
-  // Quantized GEMM for GPTQ.
-  // Note: even though the C++ inferred schema is correct for this op, it seems
-  // to prevent the meta function registry.
-  ops.def(
-      "gptq_gemm(Tensor a, Tensor b_q_weight, Tensor b_gptq_qzeros, "
-      "Tensor b_gptq_scales, Tensor b_g_idx, bool use_exllama, int bit, int "
-      "group_size, Tensor perm_space, "
-      "Tensor temp_space, bool dtype_bf16)-> Tensor");
-  ops.impl("gptq_gemm", torch::kCUDA, &gptq_gemm);
+  // Quantized GEMM for GPTQ is registered through the stable facade below.
 
   // Post processing for GPTQ.
   ops.def("gptq_shuffle(Tensor! q_weight, Tensor q_perm, int bit) -> ()");
@@ -905,6 +911,11 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cuda_utils), cuda_utils) {
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)
 
 STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
+    ops.def(
+        "gptq_gemm(Tensor a, Tensor b_q_weight, Tensor b_gptq_qzeros, "
+        "Tensor b_gptq_scales, bool use_exllama, bool use_v2_format, "
+        "int bit) -> Tensor");
+
     //在 PyTorch 的 Schema 定义语言中（这与 Python 和 C++ 的函数传参规则完全一致）：一旦某个参数被赋予了默认值，那么它后面的所有参数都必须拥有默认值。不能出现“带默认值的参数”后面紧跟着“不带默认值的参数”
     ops.def(
       "per_token_group_fp8_quant(Tensor input, Tensor! output_q, Tensor! "
@@ -959,6 +970,7 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
 }
 
 STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
+    ops.impl("gptq_gemm", TORCH_BOX(&gptq_gemm));
       // Per-token group quantization
     ops.impl("per_token_group_fp8_quant", TORCH_BOX(&per_token_group_quant_fp8));
     ops.impl("per_token_group_fp8_quant_packed",

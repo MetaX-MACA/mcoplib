@@ -19,6 +19,7 @@
 #include <cassert>
 #include <map>
 #include <cfloat>
+#include <type_traits>
 #include <cstdlib>
 #include <vector>
 
@@ -617,6 +618,41 @@ __global__ void reshape_and_cache_flash_kernel(
   }
 }
 
+// Step5 prefill: one 32-thread group per token, eight tokens per CTA. Each active
+// lane copies eight BF16 elements and packs them with the hardware E4M3
+// converter. Keep the original reciprocal/multiply/clamp order for bit parity.
+__global__ void reshape_and_cache_flash_bf16_fp8_192_kernel(
+    const __nv_bfloat16* __restrict__ key,
+    const __nv_bfloat16* __restrict__ value,
+    uint8_t* __restrict__ key_cache, uint8_t* __restrict__ value_cache,
+    const int64_t* __restrict__ slot_mapping, const int num_tokens,
+    const float* k_scale, const float* v_scale) {
+  const int token = blockIdx.x * 8 + threadIdx.x / 32;
+  const int lane = threadIdx.x % 32;
+  if (token >= num_tokens || lane >= 24) return;
+  const int64_t slot = slot_mapping[token];
+  if (slot < 0) return;
+
+  const int64_t src = static_cast<int64_t>(token) * 192 + lane * 8;
+  const int64_t dst = slot * 192 + lane * 8;
+  const float ki = __builtin_mxc_rcpf(*k_scale);
+  const float vi = __builtin_mxc_rcpf(*v_scale);
+  alignas(16) __nv_bfloat16 k[8], v[8];
+  *reinterpret_cast<uint4*>(k) = *reinterpret_cast<const uint4*>(key + src);
+  *reinterpret_cast<uint4*>(v) = *reinterpret_cast<const uint4*>(value + src);
+  uint2 kp, vp;
+  kp.x = rc_pack4_fp8_e4m3(float(k[0]) * ki, float(k[1]) * ki,
+                         float(k[2]) * ki, float(k[3]) * ki);
+  kp.y = rc_pack4_fp8_e4m3(float(k[4]) * ki, float(k[5]) * ki,
+                         float(k[6]) * ki, float(k[7]) * ki);
+  vp.x = rc_pack4_fp8_e4m3(float(v[0]) * vi, float(v[1]) * vi,
+                         float(v[2]) * vi, float(v[3]) * vi);
+  vp.y = rc_pack4_fp8_e4m3(float(v[4]) * vi, float(v[5]) * vi,
+                         float(v[6]) * vi, float(v[7]) * vi);
+  *reinterpret_cast<uint2*>(key_cache + dst) = kp;
+  *reinterpret_cast<uint2*>(value_cache + dst) = vp;
+}
+
 template <typename scalar_t, typename cache_t, Fp8KVCacheDataType kv_dt>
 __global__ void concat_and_cache_mla_kernel(
     const scalar_t* __restrict__ kv_c,  // [num_tokens, kv_lora_rank]
@@ -832,8 +868,8 @@ __global__ void indexer_k_quant_and_cache_kernel(
     const int quant_block_size,                // quantization block size
     const int cache_block_size,                // cache block size
     const int cache_block_stride,  // stride for each block in kv_cache
-
-    const bool use_ue8m0  // use ue8m0 scale format
+    const bool use_ue8m0,    // use ue8m0 scale format
+    const bool use_mx_scale  // store the ue8m0 scale as packed MX bytes
 ) {
   constexpr int VEC_SIZE = 4;
   const int64_t token_idx = blockIdx.x;
@@ -849,12 +885,16 @@ __global__ void indexer_k_quant_and_cache_kernel(
     return;
   }
 
-  float2 k_val = (reinterpret_cast<const float2*>(
-      k))[(token_idx * head_dim + head_dim_idx) / VEC_SIZE];
-  scalar_t* k_val_ptr = reinterpret_cast<scalar_t*>(&k_val);
+  using load_t = std::conditional_t<sizeof(scalar_t) == 2, float2, float4>;
+  load_t k_val = reinterpret_cast<const load_t*>(k)[
+      (token_idx * head_dim + head_dim_idx) / VEC_SIZE];
+  const scalar_t* k_val_ptr = reinterpret_cast<const scalar_t*>(&k_val);
+  float k_val_f32[VEC_SIZE];
   float amax = 0.0f;
+#pragma unroll
   for (int i = 0; i < VEC_SIZE; i++) {
-    amax = fmaxf(amax, fabsf(float(k_val_ptr[i])));
+    k_val_f32[i] = to_float(k_val_ptr[i]);
+    amax = fmaxf(amax, fabsf(k_val_f32[i]));
   }
 
   // Reduced amax
@@ -868,22 +908,42 @@ __global__ void indexer_k_quant_and_cache_kernel(
 
   float scale = fmaxf(amax, 1e-4) / kFp8ScaleDivisor;
 
-  if (use_ue8m0) {
+  // MX stores only exponent bytes: quantization must use that same scale.
+  if (use_ue8m0 || use_mx_scale) {
     scale = exp2f(ceilf(log2f(scale)));
   }
 
   const int64_t dst_offset = block_idx * cache_block_stride +
                              block_offset * head_dim + head_dim_idx;
-  for (int i = 0; i < VEC_SIZE; i++) {
-    kv_cache[dst_offset + i] =
-        fp8::scaled_convert<cache_t, scalar_t, kv_dt>(k_val_ptr[i], scale);
+
+  if (use_ue8m0 || use_mx_scale) {
+#pragma unroll
+    for (int i = 0; i < VEC_SIZE; i++) {
+      k_val_f32[i] *= __builtin_mxc_rcpf(scale);
+    }
+  } else {
+    // Reciprocal multiplication can change FP8 midpoint rounding for FP32 scales.
+#pragma unroll
+    for (int i = 0; i < VEC_SIZE; i++) {
+      k_val_f32[i] /= scale;
+    }
   }
+  const uint32_t packed = rc_pack4_fp8_e4m3(
+      k_val_f32[0], k_val_f32[1], k_val_f32[2], k_val_f32[3]);
+  *reinterpret_cast<uint32_t*>(&kv_cache[dst_offset]) = packed;
   if (threadIdx.x == 0) {
     const int64_t dst_scale_idx =
         block_idx * cache_block_stride +
         cache_block_size * head_dim +
         (block_offset * head_dim + head_dim_idx) * 4 / quant_block_size;
-    reinterpret_cast<float*>(kv_cache)[dst_scale_idx / 4] = scale;
+
+    if (use_mx_scale) {
+      // One UE8M0 byte per 32 elements, all equal to the shared scale's.
+      reinterpret_cast<uint32_t*>(kv_cache)[dst_scale_idx / 4] =
+          ((__float_as_uint(scale) >> 23) & 0xFF) * 0x01010101u;
+    } else {
+      reinterpret_cast<float*>(kv_cache)[dst_scale_idx / 4] = scale;
+    }
   }
 }
 
@@ -1203,6 +1263,33 @@ void reshape_and_cache_flash(
   int64_t page_stride = key_cache.stride(1);
   int64_t head_stride = key_cache.stride(2);
   TORCH_CHECK(key_cache.stride(0) == value_cache.stride(0));
+
+  // Restrict the packed path to aligned, contiguous BF16 -> E4M3 prefill.
+  // Small decode batches and all other layouts/dtypes keep their existing path.
+  if (num_tokens >= 512 && num_heads == 1 && head_size == 192 &&
+      block_size == 16 && key.scalar_type() == at::ScalarType::BFloat16 &&
+      value.scalar_type() == at::ScalarType::BFloat16 &&
+      (kv_cache_dtype == "fp8" || kv_cache_dtype == "fp8_e4m3") &&
+      key.is_contiguous() && value.is_contiguous() &&
+      key_cache.is_contiguous() && value_cache.is_contiguous() &&
+      key_cache.element_size() == 1 && value_cache.element_size() == 1 &&
+      key_cache.size(2) == 1 && key_cache.size(3) == 192 &&
+      value_cache.sizes() == key_cache.sizes() &&
+      (reinterpret_cast<uintptr_t>(key.data_ptr()) % 16 == 0) &&
+      (reinterpret_cast<uintptr_t>(value.data_ptr()) % 16 == 0) &&
+      (reinterpret_cast<uintptr_t>(key_cache.data_ptr()) % 8 == 0) &&
+      (reinterpret_cast<uintptr_t>(value_cache.data_ptr()) % 8 == 0)) {
+    vllm::reshape_and_cache_flash_bf16_fp8_192_kernel
+        <<<(num_tokens + 7) / 8, 256, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(key.data_ptr()),
+            reinterpret_cast<const __nv_bfloat16*>(value.data_ptr()),
+            reinterpret_cast<uint8_t*>(key_cache.data_ptr()),
+            reinterpret_cast<uint8_t*>(value_cache.data_ptr()),
+            slot_mapping.data_ptr<int64_t>(), num_tokens,
+            reinterpret_cast<const float*>(k_scale.data_ptr()),
+            reinterpret_cast<const float*>(v_scale.data_ptr()));
+    return;
+  }
 
   dim3 grid(num_tokens);
   dim3 block(std::min(num_heads * head_size, 512));
@@ -2259,7 +2346,7 @@ void cp_gather_and_upconvert_nvfp4_kv_cache(
           reinterpret_cast<KV_T*>(k.data_ptr()),                        \
           reinterpret_cast<CACHE_T*>(kv_cache.data_ptr()),              \
           slot_mapping.data_ptr<int64_t>(), head_dim, quant_block_size, \
-          cache_block_size, cache_block_stride, use_ue8m0);
+          cache_block_size, cache_block_stride, use_ue8m0, use_mx_scale);
 
 void indexer_k_quant_and_cache(
     torch::Tensor& k,             // [num_tokens, head_dim]
@@ -2272,14 +2359,35 @@ void indexer_k_quant_and_cache(
   int cache_block_size = kv_cache.size(1);
   //int cache_stride = kv_cache.size(2);
   int64_t cache_block_stride = kv_cache.stride(0);
+  bool use_mx_scale = scale_fmt == "mxfp8";
   bool use_ue8m0 = scale_fmt == "ue8m0";
+  STD_TORCH_CHECK(!use_mx_scale || (head_dim == 128 && quant_block_size == 128),
+                  "mxfp8 scales require head_dim == quant_block_size == 128");
 
   TORCH_CHECK(k.device() == kv_cache.device(),
               "k and kv_cache must be on the same device");
   TORCH_CHECK(k.device() == slot_mapping.device(),
               "k and slot_mapping must be on the same device");
-  TORCH_CHECK(head_dim % quant_block_size == 0,
-              "head_dim must be divisible by quant_block_size");
+  TORCH_CHECK(quant_block_size == 128,
+              "indexer quant_block_size must be 128 (32 lanes x 4 values)");
+  TORCH_CHECK(head_dim > 0 && head_dim % quant_block_size == 0,
+              "head_dim must be a positive multiple of quant_block_size");
+  TORCH_CHECK(k.is_cuda() && k.is_contiguous(),
+              "k must be a contiguous CUDA tensor");
+  TORCH_CHECK(kv_cache.scalar_type() == at::kByte && kv_cache.dim() == 3 &&
+                  kv_cache.size(2) >= head_dim + head_dim * 4 / quant_block_size &&
+                  kv_cache.stride(2) == 1 &&
+                  kv_cache.stride(1) == kv_cache.size(2) &&
+                  cache_block_stride >= cache_block_size * kv_cache.size(2) &&
+                  cache_block_stride % 4 == 0,
+              "kv_cache must be a byte cache with packed data/scales and aligned pages");
+  TORCH_CHECK(slot_mapping.scalar_type() == at::kLong &&
+                  slot_mapping.is_contiguous() && slot_mapping.numel() == num_tokens,
+              "slot_mapping must contain one contiguous int64 entry per token");
+  TORCH_CHECK(cache_block_size > 0, "cache block size must be positive");
+  if (num_tokens == 0) {
+    return;
+  }
 
   constexpr int vec_size = 4;
   dim3 grid(num_tokens, (head_dim + quant_block_size * vec_size - 1) /

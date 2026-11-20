@@ -399,3 +399,38 @@ def test_reshape_and_cache_flash_api():
 
     assert torch.isfinite(key_cache).all()
     assert torch.isfinite(value_cache).all()
+
+@pytest.mark.parametrize("num_tokens", [511, 512, 513, 519, 8192])
+@pytest.mark.parametrize("kv_dtype", ["fp8", "fp8_e4m3"])
+def test_reshape_and_cache_flash_fp8_prefill_bits(num_tokens, kv_dtype):
+    """Exercise packed-path dispatch/tile tails with all BF16 bit patterns.
+
+    Power-of-two scales make the independent CPU reference exact. NaNs follow
+    the kernel's fmin/fmax clamp convention. Check full caches, including padding
+    and unused slots, by bytes instead of floating-point tolerances.
+    """
+    dim, block = 192, 16
+    num_blocks = (2 * num_tokens + block - 1) // block
+    shape = (num_blocks, block, 1, dim)
+    bits = torch.arange(num_tokens * dim, dtype=torch.int32).remainder(65536)
+    key_cpu = bits.to(torch.uint16).view(torch.bfloat16).reshape(num_tokens, 1, dim)
+    value_cpu = key_cpu.flip(0).contiguous()
+    key, value = key_cpu.cuda(), value_cpu.cuda()
+    generator = torch.Generator().manual_seed(20261116)
+    slots_cpu = torch.randperm(num_blocks * block, generator=generator)[:num_tokens]
+    slots_cpu[::8] = -1
+    slots = slots_cpu.cuda()
+    caches = [torch.empty(shape, device='cuda', dtype=torch.float8_e4m3fn,
+                          memory_format=torch.contiguous_format) for _ in range(2)]
+    for cache in caches:
+        cache.view(torch.uint8).fill_(165)
+    scales = [torch.tensor([s], dtype=torch.float32, device='cuda') for s in (.5, 2.)]
+    _reshape_and_cache_flash(key, value, *caches, slots, kv_dtype, *scales)
+    valid = slots_cpu >= 0
+    for source, cache, scale in zip((key_cpu, value_cpu), caches, (.5, 2.)):
+        ref = torch.full(shape, 165, dtype=torch.uint8)
+        values = (source.float() / scale).nan_to_num(nan=-448., posinf=448., neginf=-448.)
+        quantized = values.clamp(-448., 448.).to(torch.float8_e4m3fn).view(torch.uint8)
+        ref.reshape(-1, dim)[slots_cpu[valid]] = quantized.reshape(num_tokens, dim)[valid]
+        actual = cache.view(torch.uint8).cpu()
+        assert torch.equal(actual, ref), f"different bytes: {(actual != ref).sum().item()}"

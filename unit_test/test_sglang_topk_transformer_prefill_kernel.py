@@ -448,5 +448,55 @@ def test_topk_splitk_smem_trap_repro(bs: int, target_chunk: int, dist: str) -> N
         raise
 
 
+# These regressions exercise the fused interface's decode/split-K branch,
+# alongside the existing split-K and cross-stream tests in this file.
+@pytest.mark.parametrize("bs", [1, 6])
+@pytest.mark.parametrize("width", [2049, 1048640])
+@torch.inference_mode()
+def test_topk_splitk_negative_nan_boundary(bs: int, width: int) -> None:
+    from test_op_topk_transform_decode_kernel import _strict_check, _strict_inputs, _strict_launch
+
+    cpu, score, lengths, pages, dst, cu = _strict_inputs(bs, width, [width] * bs, "zero")
+    cpu.fill_(1.0)
+    # Raw 0xffc00000: a negative quiet NaN must outrank every finite score.
+    cpu[:, -1] = torch.tensor([-0x400000], dtype=torch.int32).view(torch.float32)[0]
+    score.copy_(cpu)
+    _strict_launch(score, lengths, dst, pages, cu)
+    torch.cuda.synchronize()
+    _strict_check(cpu, [width] * bs, dst, width, ("negative_nan_boundary", bs, width))
+
+
+@torch.inference_mode()
+def test_topk_splitk_concurrent_full_million() -> None:
+    from test_op_topk_transform_decode_kernel import _strict_check, _strict_inputs, _strict_launch
+
+    width = 1048640
+    batches = (1, 6)
+    streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+    inputs = [_strict_inputs(bs, width, [width] * bs, "random") for bs in batches]
+    ready = torch.cuda.Event()
+    ready.record()
+    for stream in streams:
+        stream.wait_event(ready)
+    # Keep all tensors alive until both streams have completed every launch.
+    for _ in range(10):
+        for stream, (_, score, lengths, pages, dst, cu) in zip(streams, inputs):
+            with torch.cuda.stream(stream):
+                _strict_launch(score, lengths, dst, pages, cu)
+        for stream in streams:
+            stream.synchronize()
+        for bs, (cpu, _, _, _, dst, _) in zip(batches, inputs):
+            _strict_check(cpu, [width] * bs, dst, width, ("concurrent_full_million", bs))
+
+
+@pytest.mark.parametrize("bs", [1, 6])
+@pytest.mark.parametrize("width", [2049, 4096, 66551, 107520])
+@torch.inference_mode()
+def test_topk_splitk_special_values_graph_replay(bs: int, width: int) -> None:
+    from test_op_topk_transform_decode_kernel import _strict_run
+
+    _strict_run(bs, width, [width] * bs, "special", graph=True)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))

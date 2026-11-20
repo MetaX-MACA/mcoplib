@@ -1,0 +1,26 @@
+* text=auto eol=lf
+*.cpp  text eol=lf
+*.cc   text eol=lf
+*.c    text eol=lf
+*.hpp  text eol=lf
+*.h    text eol=lf
+*.cu   text eol=lf
+*.cuh  text eol=lf
+*.py   text eol=lf
+*.sh   text eol=lf
+*.md   text eol=lf
+*.txt  text eol=lf
+*.cmake text eol=lf
+CMakeLists.txt text eol=lf
+*.so   binary
+*.a    binary
+*.o    binary
+*.bin  binary
+*.pt   binary
+*.pth  binary
+*.safetensors binary
+*.png  binary
+*.jpg  binary
+*.zip  binary
+*.gz   binary
+*.tar  binary

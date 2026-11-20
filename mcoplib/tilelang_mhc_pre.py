@@ -35,6 +35,8 @@ def mhc_pre_tilelang_optimized(
     rms_lanes: int = 8,
     mix_lanes_per_value: int = 2,
     residual_use_shared: bool = True,
+    use_norm: bool = False,
+    norm_eps: float = 1e-6,
 ) -> tilelang.JITKernel:
     num_tokens = T.dynamic("num_tokens")
     mhc_mult3 = mhc_mult * (2 + mhc_mult)
@@ -50,6 +52,7 @@ def mhc_pre_tilelang_optimized(
         post_mix: T.Tensor[(num_tokens, mhc_mult), T.float32],
         comb_mix: T.Tensor[(num_tokens, mhc_mult * mhc_mult), T.float32],
         layer_input: T.Tensor[(num_tokens, hidden_size), T.bfloat16],
+        norm_weight: T.Tensor[(hidden_size,), T.bfloat16],
     ) -> None:
         with T.Kernel(num_tokens, threads=128) as pid:
             rms_shared = T.alloc_shared(8, T.float32)
@@ -199,42 +202,135 @@ def mhc_pre_tilelang_optimized(
                         + mhc_pre_eps
                     )
 
-                for i0_h in T.Pipelined(
-                    hidden_size // hidden_block,
-                    num_stages=num_stages,
-                ):
-                    xl = T.alloc_fragment(
-                        (mhc_mult, hidden_block), T.float32
+                if use_norm:
+                    # Optional fused RMSNorm on layer_input, mirroring
+                    # mhc_norm.mhc_pre_big_fuse_with_norm_tilelang: stash the
+                    # un-normalized weighted sum as bf16, accumulate
+                    # sum(x^2) in fp32 from the pre-rounding values, then
+                    # rescale by rsqrt(sum / hidden + norm_eps) and the
+                    # per-channel norm_weight in a second sweep.  The stash
+                    # lives in a register fragment whose first dimension is
+                    # the block index, so both sweeps access it with the
+                    # same per-thread pattern, and residual / norm_weight
+                    # loads go straight to registers: the shared-memory
+                    # footprint stays at the no-norm path's.
+                    stash_bf = T.alloc_fragment(
+                        (
+                            hidden_size // hidden_block,
+                            hidden_block,
+                        ),
+                        T.bfloat16,
                     )
-                    if residual_use_shared:
-                        xs = T.alloc_shared(
-                            (mhc_mult, hidden_block), T.bfloat16
+                    sumsq_per_pos = T.alloc_fragment(
+                        hidden_block, T.float32
+                    )
+                    T.clear(sumsq_per_pos)
+
+                    for i0_h in T.Pipelined(
+                        hidden_size // hidden_block,
+                        num_stages=num_stages,
+                    ):
+                        xl = T.alloc_fragment(
+                            (mhc_mult, hidden_block), T.float32
                         )
-                        T.copy(
-                            residual[pid, 0, i0_h * hidden_block],
-                            xs,
-                            disable_tma=True,
-                        )
-                        T.copy(xs, xl, disable_tma=True)
-                    else:
                         T.copy(
                             residual[pid, 0, i0_h * hidden_block],
                             xl,
                             disable_tma=True,
                         )
 
-                    ol = T.alloc_fragment((hidden_block,), T.float32)
-                    T.clear(ol)
-                    for i_mhc in T.serial(mhc_mult):
-                        pre = rms_shared[i_mhc]
-                        for i1_h in T.Parallel(hidden_block):
-                            ol[i1_h] += pre * xl[i_mhc, i1_h]
+                        ol = T.alloc_fragment((hidden_block,), T.float32)
+                        T.clear(ol)
+                        for i_mhc in T.serial(mhc_mult):
+                            pre = rms_shared[i_mhc]
+                            for i1_h in T.Parallel(hidden_block):
+                                ol[i1_h] += pre * xl[i_mhc, i1_h]
 
-                    T.copy(
-                        ol,
-                        layer_input[pid, i0_h * hidden_block],
-                        disable_tma=True,
+                        for i1_h in T.Parallel(hidden_block):
+                            sumsq_per_pos[i1_h] += ol[i1_h] * ol[i1_h]
+                            stash_bf[i0_h, i1_h] = T.bfloat16(ol[i1_h])
+
+                    sumsq = T.alloc_fragment(1, T.float32)
+                    T.reduce_sum(sumsq_per_pos, sumsq, dim=0)
+                    rsqrt_norm = T.alloc_fragment(1, T.float32)
+                    rsqrt_norm[0] = T.rsqrt(
+                        sumsq[0] / hidden_size + norm_eps
                     )
+
+                    # Fully unrolled so that the block index is a compile-time
+                    # constant: the stash fragment is then statically indexed
+                    # (registers, no local-memory spill), and the compiler is
+                    # free to hoist each block's norm_weight load above the
+                    # previous block's store, hiding the load latency.
+                    for i0_h in T.unroll(
+                        hidden_size // hidden_block
+                    ):
+                        w_local = T.alloc_fragment(
+                            hidden_block, T.float32
+                        )
+                        T.copy(
+                            norm_weight[i0_h * hidden_block],
+                            w_local,
+                            disable_tma=True,
+                        )
+
+                        # Convert to a bf16 fragment before the store: a
+                        # bf16->bf16 fragment copy vectorizes the global
+                        # writes, whereas an fp32 fragment store emits
+                        # per-element convert+store traffic.
+                        ol_bf = T.alloc_fragment(
+                            (hidden_block,), T.bfloat16
+                        )
+                        for i1_h in T.Parallel(hidden_block):
+                            ol_bf[i1_h] = T.bfloat16(
+                                stash_bf[i0_h, i1_h]
+                                * rsqrt_norm[0]
+                                * w_local[i1_h]
+                            )
+                        T.copy(
+                            ol_bf,
+                            layer_input[pid, i0_h * hidden_block],
+                            disable_tma=True,
+                        )
+                else:
+                    for i0_h in T.Pipelined(
+                        hidden_size // hidden_block,
+                        num_stages=num_stages,
+                    ):
+                        xl = T.alloc_fragment(
+                            (mhc_mult, hidden_block), T.float32
+                        )
+                        if residual_use_shared:
+                            xs = T.alloc_shared(
+                                (mhc_mult, hidden_block), T.bfloat16
+                            )
+                            T.copy(
+                                residual[pid, 0, i0_h * hidden_block],
+                                xs,
+                                disable_tma=True,
+                            )
+                            T.copy(xs, xl, disable_tma=True)
+                        else:
+                            T.copy(
+                                residual[pid, 0, i0_h * hidden_block],
+                                xl,
+                                disable_tma=True,
+                            )
+
+                        ol = T.alloc_fragment(
+                            (hidden_block,), T.float32
+                        )
+                        T.clear(ol)
+                        for i_mhc in T.serial(mhc_mult):
+                            pre = rms_shared[i_mhc]
+                            for i1_h in T.Parallel(hidden_block):
+                                ol[i1_h] += pre * xl[i_mhc, i1_h]
+
+                        T.copy(
+                            ol,
+                            layer_input[pid, i0_h * hidden_block],
+                            disable_tma=True,
+                        )
 
     return mhc_pre_big_fuse_kernel
 
@@ -251,6 +347,9 @@ def mhc_pre(
     mhc_post_mult_value: float,
     sinkhorn_repeat: int,
     n_splits: int = 1,
+    *,
+    norm_weight: torch.Tensor | None = None,
+    norm_eps: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     assert residual.dtype == torch.bfloat16
     assert gemm_out_mul.dtype == torch.float32
@@ -282,61 +381,91 @@ def mhc_pre(
         num_tokens, hidden_size, dtype=torch.bfloat16, device=residual.device
     )
 
-    use_cuda_specialization = (
-        _default_op is not None
-        and hasattr(_default_op, "mhc_pre_big_fuse_out")
-        and hidden_size in (4096, 7168)
-        and mhc_mult == 4
-        and n_splits in (16, 64)
-        and rms_eps == 1e-6
-        and mhc_pre_eps == 1e-6
-        and mhc_sinkhorn_eps == 1e-6
-        and mhc_post_mult_value == 2.0
-        and sinkhorn_repeat == 20
-    )
-    if use_cuda_specialization:
-        _default_op.mhc_pre_big_fuse_out(
-            gemm_out_mul,
-            gemm_out_sqrsum,
-            mhc_scale,
-            mhc_base,
-            residual_flat,
-            post_mix,
-            comb_mix,
-            layer_input,
-            rms_eps,
-            mhc_pre_eps,
-            mhc_sinkhorn_eps,
-            mhc_post_mult_value,
-            sinkhorn_repeat,
-            n_splits,
+    if num_tokens > 0:
+        use_norm = norm_weight is not None
+        norm_weight_bf: torch.Tensor | None = None
+        if use_norm:
+            assert norm_eps is not None, (
+                "norm_eps is required when norm_weight is provided"
+            )
+            assert norm_weight.shape == (hidden_size,), (
+                f"norm_weight shape {tuple(norm_weight.shape)} does not "
+                f"match hidden_size={hidden_size}"
+            )
+            if norm_weight.dtype == torch.bfloat16:
+                norm_weight_bf = norm_weight
+            else:
+                norm_weight_bf = norm_weight.bfloat16()
+            if not norm_weight_bf.is_contiguous():
+                norm_weight_bf = norm_weight_bf.contiguous()
+
+        use_cuda_specialization = (
+            _default_op is not None
+            and hasattr(_default_op, "mhc_pre_big_fuse_out")
+            and norm_weight is None
+            and hidden_size in (4096, 7168)
+            and mhc_mult == 4
+            and n_splits in (16, 64)
+            and rms_eps == 1e-6
+            and mhc_pre_eps == 1e-6
+            and mhc_sinkhorn_eps == 1e-6
+            and mhc_post_mult_value == 2.0
+            and sinkhorn_repeat == 20
         )
-    else:
-        kernel = mhc_pre_tilelang_optimized(
-            hidden_size,
-            rms_eps,
-            mhc_pre_eps,
-            mhc_sinkhorn_eps,
-            mhc_post_mult_value,
-            sinkhorn_repeat,
-            n_splits=n_splits,
-            mhc_mult=mhc_mult,
-            hidden_block_size=512,
-            num_stages=1,
-            sinkhorn_unroll_factor=19,
-            mix_lanes_per_value=4 if n_splits == 64 else 2,
-            residual_use_shared=not (32 <= num_tokens <= 280),
-        )
-        kernel(
-            gemm_out_mul,
-            gemm_out_sqrsum,
-            mhc_scale,
-            mhc_base,
-            residual_flat,
-            post_mix,
-            comb_mix,
-            layer_input,
-        )
+        if use_cuda_specialization:
+            _default_op.mhc_pre_big_fuse_out(
+                gemm_out_mul,
+                gemm_out_sqrsum,
+                mhc_scale,
+                mhc_base,
+                residual_flat,
+                post_mix,
+                comb_mix,
+                layer_input,
+                rms_eps,
+                mhc_pre_eps,
+                mhc_sinkhorn_eps,
+                mhc_post_mult_value,
+                sinkhorn_repeat,
+                n_splits,
+            )
+        else:
+            if norm_weight_bf is None:
+                # Unused by the no-norm kernel trace; keeps the kernel
+                # signature fixed.
+                norm_weight_bf = torch.empty(
+                    hidden_size,
+                    dtype=torch.bfloat16,
+                    device=residual.device,
+                )
+            kernel = mhc_pre_tilelang_optimized(
+                hidden_size,
+                rms_eps,
+                mhc_pre_eps,
+                mhc_sinkhorn_eps,
+                mhc_post_mult_value,
+                sinkhorn_repeat,
+                n_splits=n_splits,
+                mhc_mult=mhc_mult,
+                hidden_block_size=512,
+                num_stages=1,
+                sinkhorn_unroll_factor=19,
+                mix_lanes_per_value=4 if n_splits == 64 else 2,
+                residual_use_shared=not (32 <= num_tokens <= 280),
+                use_norm=use_norm,
+                norm_eps=1e-6 if norm_eps is None else float(norm_eps),
+            )
+            kernel(
+                gemm_out_mul,
+                gemm_out_sqrsum,
+                mhc_scale,
+                mhc_base,
+                residual_flat,
+                post_mix,
+                comb_mix,
+                layer_input,
+                norm_weight_bf,
+            )
 
     post_mix = post_mix.view(*outer_shape, mhc_mult, 1)
     comb_mix = comb_mix.view(*outer_shape, mhc_mult, mhc_mult)

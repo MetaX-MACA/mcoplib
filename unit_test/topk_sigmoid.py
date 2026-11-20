@@ -6,36 +6,122 @@ try:
 except ImportError:
     print("Warning: 无法导入 mcoplib._moe_C，请确保算子已正确编译安装在环境中。")
 
+def debug_tensor_diff(
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    max_print: int = 50,
+    name: str = "tensor",
+):
+    """
+    对比两个 Tensor，输出差异位置和具体值。
 
-def cpu_topk_sigmoid_reference(gating_output, bias, topk, renormalize, routed_scaling_factor, is_padding=None):
+    actual:   实际输出 Tensor
+    expected: 期望输出 Tensor
+    max_print: 最多打印多少个差异位置
+    name:     Tensor 名称
+    """
+    print(f"\n========== {name} diff ==========")
+    print(f"actual.shape   = {actual.shape}")
+    print(f"expected.shape = {expected.shape}")
+    print(f"actual.dtype   = {actual.dtype}")
+    print(f"expected.dtype = {expected.dtype}")
+    print(f"actual.device   = {actual.device}")
+    print(f"expected.device = {expected.device}")
+
+    # 1. 检查 shape
+    if actual.shape != expected.shape:
+        print("❌ Shape 不一致，无法逐元素比较")
+        return
+
+    # 2. 对齐设备
+    expected = expected.to(actual.device)
+
+    # 3. 逐元素比较
+    diff_mask = actual != expected
+
+    # 对浮点数而言，NaN != NaN，因此单独将两边均为 NaN 的位置视为相同
+    if actual.is_floating_point() or actual.is_complex():
+        both_nan = torch.isnan(actual) & torch.isnan(expected)
+        diff_mask = diff_mask & ~both_nan
+
+    # 4. 统计差异数量
+    diff_count = diff_mask.sum().item()
+    total_count = actual.numel()
+
+    print(f"总元素数量: {total_count}")
+    print(f"差异元素数量: {diff_count}")
+    print(f"差异比例: {diff_count / max(total_count, 1):.6%}")
+
+    if diff_count == 0:
+        print("✅ 两个 Tensor 完全一致")
+        return
+
+    # 5. 找到差异坐标
+    coords = torch.nonzero(diff_mask, as_tuple=False)
+    print(f"\n差异位置数量: {coords.shape[0]}")
+    print(f"前 {min(max_print, diff_count)} 个差异位置:")
+
+    # 6. 打印坐标及对应值
+    for coord in coords[:max_print]:
+        idx = tuple(coord.tolist())
+        a = actual[idx].item()
+        e = expected[idx].item()
+        print(f"  index={idx}: actual={a}, expected={e}")
+
+    # 7. 额外统计数值差异（浮点数）
+    if actual.is_floating_point() or actual.is_complex():
+        if not actual.is_complex():
+            diff = (actual - expected).abs()
+            print(f"\n最大绝对误差: {diff.max().item()}")
+            print(f"平均绝对误差: {diff.mean().item()}")
+            
+def cpu_topk_sigmoid_reference(
+    gating_output: torch.Tensor,
+    bias: torch.Tensor | None,
+    topk: int,
+    renormalize: bool,
+    routed_scaling_factor: float,
+    is_padding: torch.Tensor | None = None,
+    indices_dtype: torch.dtype = torch.int32,  # 对应 CUDA 端的 int / uint32 / int64
+):
     gating_fp32 = gating_output.float()
     bias_fp32 = bias.float() if bias is not None else None
+    
+    # 1. Sigmoid 计算并与 CUDA 保持一致：将 NaN/Inf 钳制为 0.0f
+    # 对应 CUDA: if (isnan(sigmoid_val) || isinf(sigmoid_val)) sigmoid_val = 0.f;
     sigmoid_scores = torch.sigmoid(gating_fp32)
+    sigmoid_scores = torch.nan_to_num(sigmoid_scores, nan=0.0, posinf=0.0, neginf=0.0)
 
+    # 2. 叠加 Bias 用于选路由
     if bias_fp32 is not None:
         routing_scores = sigmoid_scores + bias_fp32
     else:
         routing_scores = sigmoid_scores
 
-    _, topk_indices = torch.topk(routing_scores, k=topk, dim=-1)
+    # 3. 严格对齐 CUDA 的 Tie-breaking（分数相同时，较小的 expert ID 优先）
+    # torch.topk 在 CPU/GPU 上对相同值的排序不保证稳定，用 stable=True 的 sort 可严格保证小索引优先
+    sorted_indices = torch.argsort(routing_scores, dim=-1, descending=True, stable=True)
+    topk_indices = sorted_indices[..., :topk]
+
+    # 4. 提取未加 bias 的原始 Sigmoid 权重
     topk_weights = torch.gather(sigmoid_scores, dim=-1, index=topk_indices)
 
+    # 5. Renormalize 归一化
     if renormalize:
         row_sum = topk_weights.sum(dim=-1, keepdim=True)
         row_sum = torch.where(row_sum > 0.0, row_sum, torch.ones_like(row_sum))
         topk_weights = topk_weights / row_sum
 
+    # 6. 缩放因子
     topk_weights = topk_weights * float(routed_scaling_factor)
 
+    # 7. 处理 is_padding：Padding 行的专家 ID 置为 -1，权重置为 0.0
     if is_padding is not None:
-        padding_mask = is_padding.to(torch.bool)
-        num_experts = gating_output.shape[-1]
-        topk_weights = torch.where(padding_mask.unsqueeze(-1), torch.zeros_like(topk_weights), topk_weights)
-        padding_indices = torch.full_like(topk_indices, num_experts)
-        topk_indices = torch.where(padding_mask.unsqueeze(-1), padding_indices, topk_indices)
+        padding_mask = is_padding.to(torch.bool).unsqueeze(-1)  # [num_tokens, 1]
+        topk_weights = torch.where(padding_mask, torch.zeros_like(topk_weights), topk_weights)
+        topk_indices = torch.where(padding_mask, torch.full_like(topk_indices, -1), topk_indices)
 
-    return topk_weights, topk_indices
-
+    return topk_weights, topk_indices.to(indices_dtype)
 
 def check_accuracy(gating_output, bias, cuda_topk_weights, cuda_topk_indices, cuda_token_expert_indices, topk, renormalize, routed_scaling_factor, is_padding):
     num_experts = gating_output.shape[-1]
@@ -136,10 +222,12 @@ def check_accuracy(gating_output, bias, cuda_topk_weights, cuda_topk_indices, cu
             padding_indices = cuda_topk_indices[padding_rows]
 
             expected_padding_weights = torch.zeros_like(padding_weights)
-            expected_padding_indices = torch.full_like(padding_indices, num_experts)
+            expected_padding_indices = torch.full_like(padding_indices, -1)
 
             if not torch.equal(padding_indices, expected_padding_indices):
-                raise AssertionError(f"❌ is_padding=True 的 token indices 不是严格 num_experts={num_experts}")
+                debug_tensor_diff(padding_indices,expected_padding_indices, max_print=100,
+        name="padding_indices",)
+                raise AssertionError(f"❌ is_padding=True 的 token indices 不是严格 num_experts={num_experts} expected_padding_indices:{expected_padding_indices} padding_indices:{padding_indices}")
 
             if not torch.allclose(padding_weights, expected_padding_weights, rtol=1e-5, atol=1e-5):
                 max_padding_weight = torch.max(torch.abs(padding_weights)).item()

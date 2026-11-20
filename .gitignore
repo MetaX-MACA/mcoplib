@@ -27,7 +27,6 @@ pip-delete-this-directory.txt
 *.out
 *.cuo
 *.ptx
-*.xlsx
 
 # VSCode 设置
 .vscode/

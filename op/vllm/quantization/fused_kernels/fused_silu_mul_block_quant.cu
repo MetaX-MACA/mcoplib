@@ -10,12 +10,12 @@
 
 // Output dispatch for swiglu_step_and_mul_per_block_quant: fp8, int8, and the
 // normalized bf16 path (scale = amax, out in [-1, 1]).
-#define SWIGLU_MCOP_CASE_OUT(...)                     \
+#define SWIGLU_MCOPLIB_CASE_OUT(...)                     \
   AT_DISPATCH_CASE(at::ScalarType::BFloat16, __VA_ARGS__) \
   VLLM_DISPATCH_CASE_QUANT_TYPES(__VA_ARGS__)
 
-#define SWIGLU_MCOP_DISPATCH_OUT(TYPE, NAME, ...) \
-  AT_DISPATCH_SWITCH(TYPE, NAME, SWIGLU_MCOP_CASE_OUT(__VA_ARGS__))
+#define SWIGLU_MCOPLIB_DISPATCH_OUT(TYPE, NAME, ...) \
+  AT_DISPATCH_SWITCH(TYPE, NAME, SWIGLU_MCOPLIB_CASE_OUT(__VA_ARGS__))
 
 namespace vllm {
 
@@ -57,143 +57,214 @@ static __device__ __forceinline__ float swiglu_min_scale() {
   }
 }
 
-// ---------------------------------------------------------------------------
-// swiglu_step_and_mul_per_block_quant
-//   result = min(SiLU_alpha(gate), limit) * (clamp(up, -limit, limit) + beta)
-//   SiLU_alpha(x) = x * sigmoid(alpha * x)
-//
-// Fast path (hidden % group_size == 0): flattened (token, group) dispatch,
-// 16 elements per thread from four 128-bit loads, absmax reduced over the
-// GROUP_SIZE/16 lanes of each group with XOR shuffles (offsets < 16, so the
-// whole reduction lives inside one native 16-lane shuffle subgroup on MACA —
-// no shared memory, no barriers), per-lane redundant scale computation, and
-// quantization straight from registers (SREG). Scales are written by lane 0.
-// ---------------------------------------------------------------------------
+
 template <typename scalar_t, typename scalar_out_t, bool is_scale_transposed,
           int32_t GROUP_SIZE, bool HAS_SCALE_UB, int32_t NUM_THREADS = 256,
           int32_t ELEMS = 32>
-__global__ __launch_bounds__(NUM_THREADS) void swiglu_step_fast_kernel(
-    scalar_out_t* __restrict__ out,   // [M, H]
-    float* __restrict__ scales,       // [M, G] or [G, M]
-    scalar_t const* __restrict__ input,  // [M, 2H]
-    float const* __restrict__ scale_ub,  // optional scalar upper bound
-    float const limit, float const alpha, float const beta,
-    int32_t const hidden_size, int32_t const groups_per_row,
-    int64_t const total_groups, int64_t const num_tokens) {
-  // ELEMS elements per thread from ELEMS/4 128-bit loads. LANES =
-  // GROUP_SIZE/ELEMS controls the shuffle-reduction depth. int8/fp8 use
-  // ELEMS=32 (deeper coalescing, one fewer reduction step); bf16 uses ELEMS=16
-  // because its 2-byte stores are store-BW-bound and the wider variant spills.
+__global__ __launch_bounds__(NUM_THREADS, 2) void swiglu_step_fast_kernel(
+    scalar_out_t* __restrict__ out,
+    float* __restrict__ scales,
+    scalar_t const* __restrict__ input,
+    float const* __restrict__ scale_ub,
+    float const limit,
+    float const alpha,
+    float const beta,
+    int32_t const hidden_size,
+    int32_t const groups_per_row,
+    int64_t const total_groups,
+    int64_t const num_tokens) {
+
+  static_assert(GROUP_SIZE % ELEMS == 0,
+                "GROUP_SIZE must be divisible by ELEMS");
+  static_assert(ELEMS % 8 == 0,
+                "ELEMS must be divisible by 8");
   constexpr int LANES = GROUP_SIZE / ELEMS;
+  static_assert((LANES & (LANES - 1)) == 0,
+                "LANES must be power of two");
+  static_assert(LANES <= 16,
+                "Logical group must fit in 16-lane shuffle subgroup");
+  static_assert(NUM_THREADS % LANES == 0,
+                "NUM_THREADS must be divisible by LANES");
   constexpr int GROUPS_PER_BLOCK = NUM_THREADS / LANES;
-  constexpr int NVEC = ELEMS / 4;           // number of float4 loads / lane
+
+  // 128-bit load:
+  // float4 = 16 bytes = 8 FP16/BF16 elements.
+  constexpr int ELEMS_PER_VEC = sizeof(float4) / sizeof(scalar_t);
+  constexpr int NVEC = ELEMS / ELEMS_PER_VEC;
+  // Each float4 load is converted into two FP32x4 register vectors.
+  constexpr int VEC4_PER_LOAD = ELEMS_PER_VEC / 4;
+  constexpr int VEC4_COUNT = ELEMS / 4;
   float const QMAX = swiglu_qmax<scalar_out_t>();
+  float const INV_QMAX = 1.0f / QMAX;
+  float const MIN_SCALE = swiglu_min_scale<scalar_out_t>();
+  using swiglu_v4f32 = float __attribute__((ext_vector_type(4)));
+  constexpr uint64_t FULL_MASK = 0xffffffffffffffffULL;
 
   int const tid = threadIdx.x;
   int const lane = tid & (LANES - 1);
-  int64_t gidx = (int64_t)blockIdx.x * GROUPS_PER_BLOCK + tid / LANES;
+  int64_t gidx = static_cast<int64_t>(blockIdx.x) * GROUPS_PER_BLOCK + (tid / LANES);
+
   bool const active = gidx < total_groups;
-  if (!active) gidx = total_groups - 1;
-  int64_t const token = gidx / groups_per_row;
-  int32_t const group = (int32_t)(gidx % groups_per_row);
+  // All threads must participate in shuffle operations.
+  if (!active) {
+    gidx = total_groups - 1;
+  }
 
-  int64_t const base = token * (int64_t)hidden_size * 2 +
-                       (int64_t)group * GROUP_SIZE + lane * ELEMS;
+  int64_t token;
+  int32_t group;
+
+  // Most practical serving workloads have total_groups within uint32 range.
+  // Use 32-bit integer arithmetic to avoid expensive 64-bit div/mod.
+  if (total_groups <= static_cast<int64_t>(0x7fffffff)) {
+
+    uint32_t const idx = static_cast<uint32_t>(gidx);
+    uint32_t q;
+    uint32_t r;
+    if (groups_per_row == 12) {
+      q = __umulhi(idx, 0xAAAAAAABu) >> 3;
+      r = idx - q * 12u;
+    } else {
+      uint32_t const divisor = static_cast<uint32_t>(groups_per_row);
+      q = idx / divisor;
+      r = idx - q * divisor;
+    }
+    token = static_cast<int64_t>(q);
+    group = static_cast<int32_t>(r);
+  } else {
+    // Large-index fallback.
+    token = gidx / groups_per_row;
+    group = static_cast<int32_t>(gidx - token * groups_per_row);
+  }
+  int64_t const base = token * static_cast<int64_t>(hidden_size) * 2 + static_cast<int64_t>(group) * GROUP_SIZE + lane * ELEMS;
   scalar_t const* pg = input + base;
-  scalar_t const* pu = input + base + hidden_size;
-
+  scalar_t const* pu = pg + hidden_size;
   float4 vg[NVEC];
   float4 vu[NVEC];
-#pragma unroll
-  for (int k = 0; k < NVEC; k++) {
-    vg[k] = *reinterpret_cast<float4 const*>(pg + k * 8);
-    vu[k] = *reinterpret_cast<float4 const*>(pu + k * 8);
-  }
-  scalar_t const* gp = reinterpret_cast<scalar_t const*>(vg);
-  scalar_t const* upp = reinterpret_cast<scalar_t const*>(vu);
 
-  float reg[ELEMS];
+#pragma unroll
+  for (int k = 0; k < NVEC; ++k) {
+    vg[k] = *reinterpret_cast<float4 const*>(pg + k * ELEMS_PER_VEC);
+    vu[k] = *reinterpret_cast<float4 const*>(pu + k * ELEMS_PER_VEC);
+  }
+  swiglu_v4f32 reg[VEC4_COUNT];
   float amax = 0.0f;
-#pragma unroll
-  for (int j = 0; j < ELEMS; j++) {
-    float const gate = (float)gp[j];
-    float const up = (float)upp[j];
-    float const act = gate * fast_sigmoid(alpha * gate);
-    float const g = fminf(act, limit);
-    float const u = fminf(fmaxf(up, -limit), limit) + beta;
-    float const r = g * u;
-    reg[j] = r;
-    amax = fmaxf(amax, fabsf(r));
-  }
+  float const neg_limit = -limit;
 
 #pragma unroll
-  for (int off = LANES / 2; off > 0; off >>= 1)
-    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffffffffffULL, amax, off, 16));
-
-  // Compute scale and its reciprocal once per logical group. The source lane
-  // is relative to the 16-lane shuffle segment because multiple logical
-  // groups can share one segment when LANES is 2, 4, or 8.
-  constexpr uint64_t FULL_MASK = 0xffffffffffffffffULL;
-  int const subgroup_lane = tid & 15;
-  int const group_lane0 = subgroup_lane & ~(LANES - 1);
-  float scale = 0.0f;
-  float inv = 0.0f;
-  if (lane == 0) {
-    scale = amax / QMAX;
-    if constexpr (HAS_SCALE_UB) scale = fminf(scale, *scale_ub);
-    scale = fmaxf(scale, swiglu_min_scale<scalar_out_t>());
-    inv = 1.0f / scale;
+  for (int k = 0; k < NVEC; ++k) {
+    scalar_t const* gp = reinterpret_cast<scalar_t const*>(&vg[k]);
+    scalar_t const* upp = reinterpret_cast<scalar_t const*>(&vu[k]);
+#pragma unroll
+    for (int v = 0; v < VEC4_PER_LOAD; ++v) {
+      swiglu_v4f32 r_vec;
+#pragma unroll
+      for (int t = 0; t < 4; ++t) {
+        int const idx = v * 4 + t;
+        float const gate = static_cast<float>(gp[idx]);
+        float const up = static_cast<float>(upp[idx]);
+        float const act = gate * fast_sigmoid(alpha * gate);
+        float const g = fminf(act, limit);
+        float const u = fminf(fmaxf(up, neg_limit), limit) + beta;
+        float const r = g * u;
+        r_vec[t] = r;
+        amax = fmaxf(amax, fabsf(r));
+      }
+      reg[k * VEC4_PER_LOAD + v] = r_vec;
+    }
   }
-  scale = __shfl_sync(FULL_MASK, scale, group_lane0, 16);
-  inv = __shfl_sync(FULL_MASK, inv, group_lane0, 16);
+#pragma unroll
+  for (int off = LANES / 2; off > 0; off >>= 1) {
+    amax = fmaxf( amax, __shfl_xor_sync(FULL_MASK, amax, off, 16));
+  }
+  float scale = amax * INV_QMAX;
+  if constexpr (HAS_SCALE_UB) {
+    scale = fminf(scale, *scale_ub);
+  }
+  scale = fmaxf(scale, MIN_SCALE);
+  float const inv = __builtin_mxc_rcpf(scale);
   if (lane == 0 && active) {
-    float* sp = is_scale_transposed
-                    ? scales + (int64_t)group * num_tokens + token
-                    : scales + (int64_t)token * groups_per_row + group;
+    float* sp =
+        is_scale_transposed
+            ? scales + static_cast<int64_t>(group) * num_tokens + token
+            : scales + token * groups_per_row + group;
     *sp = scale;
   }
-  if (!active) return;
-  scalar_out_t* op = out + token * (int64_t)hidden_size +
-                     (int64_t)group * GROUP_SIZE + lane * ELEMS;
+
+  if (!active) {
+    return;
+  }
+  scalar_out_t* op = out + token * static_cast<int64_t>(hidden_size) + static_cast<int64_t>(group) * GROUP_SIZE + lane * ELEMS;
   if constexpr (std::is_same_v<scalar_out_t, int8_t>) {
-    alignas(16) int8_t q[ELEMS];
 #pragma unroll
-    for (int j = 0; j < ELEMS; j++) q[j] = float_to_int8_rn_local(reg[j] * inv);
+    for (int k = 0; k < ELEMS / 16; ++k) {
+      alignas(16) int8_t q16[16];
 #pragma unroll
-    for (int k = 0; k < ELEMS / 16; k++)
-      __stcg(reinterpret_cast<uint4*>(op + k * 16),
-             *reinterpret_cast<uint4 const*>(q + k * 16));
-  } else if constexpr (std::is_same_v<scalar_out_t, at::BFloat16>) {
-    alignas(16) at::BFloat16 q[ELEMS];
+      for (int v = 0; v < 4; ++v) {
+        swiglu_v4f32 const r_vec = reg[k * 4 + v];
 #pragma unroll
-    for (int j = 0; j < ELEMS; j++) {
-      float r = reg[j] * inv;
-      q[j] = static_cast<at::BFloat16>(fminf(fmaxf(r, -1.0f), 1.0f));
-    }
-#pragma unroll
-    for (int k = 0; k < ELEMS / 8; k++)
-      __stcg(reinterpret_cast<uint4*>(op + k * 8),
-             *reinterpret_cast<uint4 const*>(q + k * 8));
-  } else {
-    using swiglu_v4f32 = float __attribute__((ext_vector_type(4)));
-    alignas(16) uint32_t packed[ELEMS / 4];
-#pragma unroll
-    for (int j = 0; j < ELEMS; j += 4) {
-      swiglu_v4f32 pk;
-#pragma unroll
-      for (int t = 0; t < 4; t++) {
-        float r = reg[j + t] * inv;
-        pk[t] = fminf(fmaxf(r, -QMAX), QMAX);
+        for (int t = 0; t < 4; ++t) {
+          float const r = r_vec[t] * inv;
+          int32_t dst = __float2int_rn(r);
+          if constexpr (HAS_SCALE_UB) {
+            dst = dst > 127 ? 127 : dst;
+            dst = dst < -127 ? -127 : dst;
+          }
+          q16[v * 4 + t] = static_cast<int8_t>(dst);
+        }
       }
-      packed[j / 4] = __builtin_mxc_cvt_pk4_f32tof8(pk);
+
+      // One 128-bit store for 16 INT8 elements.
+      __stcg(
+          reinterpret_cast<uint4*>(op + k * 16),
+          *reinterpret_cast<uint4 const*>(q16));
     }
+  }else if constexpr (
+      std::is_same_v<scalar_out_t, at::BFloat16>) {
 #pragma unroll
-    for (int k = 0; k < ELEMS / 16; k++)
-      __stcg(reinterpret_cast<uint4*>(op + k * 16),
-             *reinterpret_cast<uint4 const*>(packed + k * 4));
+    for (int k = 0; k < ELEMS / 8; ++k) {
+      alignas(16) at::BFloat16 q8[8];
+#pragma unroll
+      for (int v = 0; v < 2; ++v) {
+        swiglu_v4f32 const r_vec = reg[k * 2 + v];
+#pragma unroll
+        for (int t = 0; t < 4; ++t) {
+          float const r = r_vec[t] * inv;
+          q8[v * 4 + t] =
+              static_cast<at::BFloat16>(
+                  fminf(fmaxf(r, -1.0f), 1.0f));
+        }
+      }
+      __stcg(
+          reinterpret_cast<uint4*>(op + k * 8),
+          *reinterpret_cast<uint4 const*>(q8));
+    }
+  }else {
+#pragma unroll
+    for (int k = 0; k < ELEMS / 16; ++k) {
+      uint4 pack16;
+      uint32_t* packed_ptr = reinterpret_cast<uint32_t*>(&pack16);
+
+#pragma unroll
+      for (int v = 0; v < 4; ++v) {
+        int const vec_idx = k * 4 + v;
+#pragma unroll
+        for (int t = 0; t < 4; ++t) {
+          float r = reg[vec_idx][t] * inv;
+          if constexpr (HAS_SCALE_UB) {
+            r = fminf(fmaxf(r, -QMAX), QMAX);
+          }
+          // In-place scaling:
+          // no additional FP32 temporary array.
+          reg[vec_idx][t] = r;
+        }
+        packed_ptr[v] = __builtin_mxc_cvt_pk4_f32tof8(reg[vec_idx]);
+      }
+      __stcg(
+          reinterpret_cast<uint4*>(op + k * 16),
+          pack16);
+    }
   }
 }
-
 // ---------------------------------------------------------------------------
 // Generic path
 template <typename scalar_t, typename scalar_out_t, bool is_scale_transposed,
@@ -475,7 +546,7 @@ void swiglu_step_and_mul_per_block_quant(
       input.scalar_type(), "swiglu_step_and_mul_per_block_quant", [&] {
         using scalar_in_t = scalar_t;
 
-        SWIGLU_MCOP_DISPATCH_OUT(
+        SWIGLU_MCOPLIB_DISPATCH_OUT(
             out.scalar_type(), "swiglu_step_and_mul_per_block_quant", [&] {
               using scalar_out_t = scalar_t;
               float const l = (float)limit;

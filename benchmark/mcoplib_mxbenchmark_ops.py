@@ -401,7 +401,7 @@ def create_benchmark_wrapper(op_instance):
         try:
             for _ in range(10):
                 op_instance.run_verification(dev_id)
-            print(" Done.", flush=True)
+            print(" Done.")
         except Exception as e:
             print(f" (Failed: {e})", end="")
 

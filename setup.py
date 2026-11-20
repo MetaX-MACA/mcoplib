@@ -34,7 +34,7 @@ except Exception as e:
 
 #检测python版本
 if sys.version_info < (3, 9):
-    sys.stderr.write("ERROR: Mcoplib Building Python 3.9+ is required. Detected Python Version less than 3.9: "
+    sys.stderr.write("ERROR: mcoplib Building Python 3.9+ is required. Detected Python Version less than 3.9: "
                      f"{sys.version_info.major}.{sys.version_info.minor}\n")
     raise SystemExit(1)
 
@@ -812,7 +812,7 @@ def write_git_info_file(target_path):
     # 4. 写入 version 文件
     build_torch_version = torch.__version__
     content = (
-        f'Mcoplib_Version = {mcoplib_version!r}\n'
+        f'mcoplib_Version = {mcoplib_version!r}\n'
         f'Build_Maca_Version = {maca_version!r}\n'
         f'Build_Torch_Version = {build_torch_version!r}\n'
         f'Min_Compatibility_Maca_Version = {MIN_COMPATIBILITY_MACA_VERSION!r}\n'

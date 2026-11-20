@@ -39,6 +39,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 
 namespace cg = cooperative_groups;
 
@@ -60,7 +61,7 @@ constexpr size_t kSmem = 4 * 1024 * sizeof(uint32_t);  // 16KB (bytes); 2 buffer
 // keep the first `length` entries, set others to -1. Vectorized: int4 (128-bit)
 // streaming stores — dst rows are 16B-aligned (bid*TopK*4). src alignment is
 // unknown so loads stay scalar __ldg. 1024 threads, 512 int4 groups.
-__device__ __forceinline__ void decode_naive_topk_transform(
+__device__ void decode_naive_topk_transform(
     const float* __restrict__ score,
     int32_t length,
     int32_t* __restrict__ dst_page_table,
@@ -173,7 +174,7 @@ __device__ __forceinline__ void warp64_detect(
 }
 
 
-__device__ __forceinline__ void fast_topk_cuda_tl(
+__device__ void fast_topk_cuda_tl(
     const float* __restrict__ input, int32_t* __restrict__ index, int row_start, int length) {
   // ORIGINAL pasted body (topk.cu) — RESTORED for A/B perf measurement. Uses this file's
   // kSmem (16KB -> SMEM_INPUT_SIZE=2048) so ONLY the algorithm differs, not the smem size.
@@ -747,21 +748,30 @@ void setup_kernel_smem_once() {
 }
 
 // =========================================================================
-// Split-K: multi-CTA cooperative radix select for small B (B*2 <= SMs) with
+// Split-K: multi-CTA radix select for small B (B*4 <= SMs) with
 // long rows (length > TopK), ported from the vLLM persistent_topk multi-CTA
-// radix. Each row is handled by a group of G CTAs; every CTA stages its chunk
-// in shared memory as ordered uint32 keys; 4 rounds of 8-bit radix over
+// radix. Each row is handled by a group of G CTAs; chunks fitting the shared
+// key cache are staged, larger chunks are streamed; 4 rounds of 8-bit radix over
 // global histograms + group arrival barriers converge to the exact 32-bit
 // pivot; output collection reserves global ranges per CTA. Workspace comes
 // from the caller (at::zeros per launch, stream-ordered -> no cross-stream
 // UAF) and is zero-initialized.
 // =========================================================================
 constexpr int kSplitKRadix = 256;
-//   C600U (>=128KB): keep the historical 16384 (64KB dyn, ample headroom).
-//   C500  (<=64KB) : cap dynamic smem at 64KB*0.8 = 52428B -> 13056 elems
-//                    (13056*4 = 52224B; + 1044B static = 53268B < 65536B).
+// Leave room for two blocks per SM; actual residency is queried at launch.
+constexpr uint32_t kSplitKSuperMaxChunk = 7680;  // 30 KiB dynamic key cache
+constexpr uint32_t kSplitKSuperThreads = 512;
+
 constexpr uint32_t kSplitKMaxChunk = 16384;      // C600U ceiling (64KB dyn smem)
 constexpr uint32_t kSplitKMaxChunkC500 = 13056;  // C500 ceiling (52224B dyn smem)
+
+
+__device__ __forceinline__ uint32_t splitk_ordered_key(float x) {
+  const uint32_t bits = __float_as_uint(x);
+  // Match the test oracle's NaN-high policy for either sign and any payload.
+  if ((bits & 0x7fffffffu) > 0x7f800000u) return 0xffffffffu;
+  return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
+}
 
 struct SplitKRowState {
   uint32_t histogram[3][kSplitKRadix];
@@ -846,7 +856,7 @@ __global__ __launch_bounds__(kThreadsPerBlock)
   // fast-path probe.
   uint32_t my_p = 0, my_z = 0;
   const auto load_key = [&](float v) {
-    const uint32_t k = convert_to_uint32(v);
+    const uint32_t k = splitk_ordered_key(v);
     if (k > 0x80000000u) ++my_p;
     else if (k == 0x80000000u) ++my_z;
     return k;
@@ -1060,6 +1070,294 @@ __global__ __launch_bounds__(kThreadsPerBlock)
   }
 }
 
+template <uint32_t Threads>
+__global__ __launch_bounds__(Threads)
+    void topk_transform_super_length_splitk_kernel(
+        const float* __restrict__ input,
+        const int32_t* __restrict__ lengths,
+        int64_t input_stride,
+        int32_t* __restrict__ dst_page_table,
+        const int32_t* __restrict__ src_page_table,
+        int64_t src_stride,
+        uint32_t B,
+        uint32_t G,            // CTAs per row group
+        uint32_t chunk_size,   // logical elements per CTA (may exceed cache)
+        uint32_t cache_capacity,
+        SplitKRowState* __restrict__ state,
+        int32_t* __restrict__ row_output) {
+  const uint32_t group = blockIdx.x / G;
+  const uint32_t cta_in_group = blockIdx.x % G;
+  const uint32_t tx = threadIdx.x;
+  if (group >= B) return;
+
+  const int64_t len64 = lengths[group];
+  const uint32_t length = len64 > 0 ? static_cast<uint32_t>(len64) : 0;
+
+  const int32_t* src_page_entry = src_page_table + static_cast<int64_t>(group) * src_stride;
+  int32_t* dst_page_entry = dst_page_table + static_cast<int64_t>(group) * TopK;
+
+  if (length <= TopK) {
+    // Short row: the group leader alone performs the naive transform; the
+    // other CTAs of the group exit without touching any barrier state.
+    if (cta_in_group == 0) {
+      decode_naive_topk_transform(input + static_cast<int64_t>(group) * input_stride, length,
+                                  dst_page_entry, src_page_entry);
+    }
+    return;
+  }
+
+  SplitKRowState* st = state + group;
+  int32_t* out = row_output + static_cast<int64_t>(group) * TopK;
+  const float* row_input = input + static_cast<int64_t>(group) * input_stride;
+  const uint32_t my_chunk_start = cta_in_group * chunk_size;
+  const uint32_t my_chunk_end =
+      (my_chunk_start + chunk_size < length) ? (my_chunk_start + chunk_size) : length;
+  const uint32_t actual_chunk_size =
+      (my_chunk_start < length) ? (my_chunk_end - my_chunk_start) : 0;
+
+  const bool cache_chunk = chunk_size <= cache_capacity;
+  extern __shared__ uint32_t shared_ordered[];
+  __shared__ uint32_t s_scan_hist[kSplitKRadix];  // per-round local histogram
+  __shared__ uint32_t s_scratch[3];               // stage-3 cursor/base/eq-count
+  __shared__ uint32_t s_scalars[2];               // 0: prefix, 1: remaining_k
+
+  // -- Stage 1: load the chunk as ordered uint32 keys (vectorized float4) --
+  // Also counts exact positives (key > +0.0's key 0x80000000, i.e. every
+  // value strictly above +0.0 incl. +Inf/+NaN) and exact +0.0s for the zero
+  // fast-path probe.
+  uint32_t my_p = 0, my_z = 0;
+  const auto load_key = [&](float v) {
+    const uint32_t k = splitk_ordered_key(v);
+    if (k > 0x80000000u) ++my_p;
+    else if (k == 0x80000000u) ++my_z;
+    return k;
+  };
+  if ((reinterpret_cast<uintptr_t>(row_input + my_chunk_start) & 15u) == 0u) {
+    const uint32_t n4 = actual_chunk_size >> 2;
+    const float4* in4 = reinterpret_cast<const float4*>(row_input + my_chunk_start);
+    for (uint32_t v = tx; v < n4; v += Threads) {
+      const float4 f = in4[v];
+      const uint32_t key_x = load_key(f.x);
+      if (cache_chunk) shared_ordered[v * 4 + 0] = key_x;
+      const uint32_t key_y = load_key(f.y);
+      if (cache_chunk) shared_ordered[v * 4 + 1] = key_y;
+      const uint32_t key_z = load_key(f.z);
+      if (cache_chunk) shared_ordered[v * 4 + 2] = key_z;
+      const uint32_t key_w = load_key(f.w);
+      if (cache_chunk) shared_ordered[v * 4 + 3] = key_w;
+    }
+    for (uint32_t i = (n4 << 2) + tx; i < actual_chunk_size; i += Threads) {
+      const uint32_t key = load_key(row_input[my_chunk_start + i]);
+      if (cache_chunk) shared_ordered[i] = key;
+    }
+  } else {
+    for (uint32_t i = tx; i < actual_chunk_size; i += Threads) {
+      const uint32_t key = load_key(row_input[my_chunk_start + i]);
+      if (cache_chunk) shared_ordered[i] = key;
+    }
+  }
+  __syncthreads();
+
+  if (tx == 0) {
+    s_scalars[0] = 0;     // prefix
+    s_scalars[1] = TopK;  // remaining_k
+  }
+  __syncthreads();
+
+  // The workspace is zeroed by a prior op on the same stream and kernel
+  // launch boundaries fence memory, so all counters start at 0 with no
+  // initial barrier needed.
+  int arrival_target = 0;
+
+  // -- Probe: exact global positive/zero counts decide the zero fast path --
+  {
+    uint32_t wz = my_z, wp = my_p;
+#pragma unroll
+    for (int off = 32; off > 0; off >>= 1) {
+      wz += __shfl_down_sync(0xffffffffffffffffULL, wz, off);
+      wp += __shfl_down_sync(0xffffffffffffffffULL, wp, off);
+    }
+    if ((tx & 63) == 0) {
+      if (wz > 0) sk_red_release(&st->z_counter, static_cast<int>(wz));
+      if (wp > 0) sk_red_release(&st->p_counter, static_cast<int>(wp));
+    }
+  }
+  __syncthreads();  // p/z releases are fenced before the arrival release below
+  if (tx == 0) {
+    sk_red_release(&st->arrival_counter, 1);
+  }
+  arrival_target += static_cast<int>(G);
+  sk_wait_ge(&st->arrival_counter, arrival_target, static_cast<int>(tx));
+  if (tx == 0) {
+    s_scratch[0] = static_cast<uint32_t>(atomicAdd(&st->p_counter, 0));
+    s_scratch[1] = static_cast<uint32_t>(atomicAdd(&st->z_counter, 0));
+  }
+  __syncthreads();
+  const uint32_t P_g = s_scratch[0];
+  const uint32_t Z_g = s_scratch[1];
+  // Zero fast path (provably exact): P < TopK <= P + Z iff the K-th largest
+  // key is exactly +0.0's key: output = all positives + any TopK - P zeros.
+  // Skips all 4 radix rounds (collapsed real data keeps ~every staged key
+  // alive through every round with all-same-byte histograms).
+  const bool zero_fast =
+      P_g < static_cast<uint32_t>(TopK) && P_g + Z_g >= static_cast<uint32_t>(TopK);
+
+  // -- Stage 2: 4 rounds of 8-bit radix (exact 32-bit resolution) --
+  uint32_t ordered_pivot;
+  uint32_t total_gt;
+  if (zero_fast) {
+    ordered_pivot = 0x80000000u;
+    total_gt = P_g;
+  } else {
+  for (uint32_t round = 0; round < 4; ++round) {
+    const uint32_t shift = 24 - round * 8;
+    const uint32_t prefix = s_scalars[0];
+    const uint32_t remaining_k = s_scalars[1];
+    uint32_t* current_hist = st->histogram[round % 3];
+    uint32_t* next_hist = st->histogram[(round + 1) % 3];
+
+    for (uint32_t i = tx; i < kSplitKRadix; i += Threads) {
+      s_scan_hist[i] = 0;
+    }
+    __syncthreads();
+
+    const uint32_t mask = (round == 0) ? 0u : (~0u << (32 - round * 8));
+    for (uint32_t i = tx; i < actual_chunk_size; i += Threads) {
+      const uint32_t ordered = cache_chunk ? shared_ordered[i]
+                                          : splitk_ordered_key(row_input[my_chunk_start + i]);
+      if ((ordered & mask) == prefix) {
+        atomicAdd(&s_scan_hist[(ordered >> shift) & 0xFF], 1);
+      }
+    }
+    __syncthreads();
+
+    for (uint32_t i = tx; i < kSplitKRadix; i += Threads) {
+      if (s_scan_hist[i] > 0) {
+        atomicAdd(&current_hist[i], s_scan_hist[i]);
+      }
+    }
+    if (cta_in_group == 0) {
+      for (uint32_t i = tx; i < kSplitKRadix; i += Threads) {
+        next_hist[i] = 0;
+      }
+    }
+    __threadfence();
+    __syncthreads();
+    if (tx == 0) {
+      sk_red_release(&st->arrival_counter, 1);
+    }
+    arrival_target += static_cast<int>(G);
+    sk_wait_ge(&st->arrival_counter, arrival_target, static_cast<int>(tx));
+
+    // Warp 0 scans the 256-bin global histogram in place (4 bins per lane,
+    // 64-lane MACA warp, shuffle scan) and commits the new prefix /
+    // remaining_k. Exactly one lane matches the threshold bin.
+    if (tx < 64) {
+      const uint32_t base_b = tx * 4;
+      uint32_t local[4];
+      uint32_t lsum = 0;
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        local[j] = current_hist[base_b + j];
+        lsum += local[j];
+      }
+      uint32_t incl = lsum;
+#pragma unroll
+      for (int off = 1; off < 64; off <<= 1) {
+        const uint32_t up = __shfl_up_sync(0xffffffffffffffffULL, incl, off);
+        if (tx >= off) incl += up;
+      }
+      const uint32_t total = __shfl_sync(0xffffffffffffffffULL, incl, 63);
+      uint32_t cge = total - (incl - lsum);  // count >= first bin of this lane
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        const uint32_t cgt = cge - local[j];
+        if (cge >= remaining_k && cgt < remaining_k) {
+          s_scalars[0] = prefix | ((base_b + j) << shift);
+          s_scalars[1] = remaining_k - cgt;
+        }
+        cge = cgt;
+      }
+    }
+    __syncthreads();
+  }
+  ordered_pivot = s_scalars[0];
+  // Global count of elements strictly greater than the pivot is TopK minus
+  // the final k_in_bin, so the >pivot region is exactly out[0, total_gt) and
+  // ==pivot fills [total_gt, TopK) — no barrier needed between the two.
+  total_gt = TopK - s_scalars[1];
+  }
+
+  // -- Stage 3: collect top-k indices around the exact pivot --
+  if (tx == 0) s_scratch[0] = 0;
+  __syncthreads();
+
+  uint32_t my_gt_count = 0;
+  uint32_t my_eq_count = 0;
+  for (uint32_t i = tx; i < actual_chunk_size; i += Threads) {
+    const uint32_t ordered = cache_chunk ? shared_ordered[i]
+                                        : splitk_ordered_key(row_input[my_chunk_start + i]);
+    if (ordered > ordered_pivot) my_gt_count++;
+    else if (ordered == ordered_pivot) ++my_eq_count;
+  }
+  // MACA warp is 64 lanes: reduce within warp, commit per warp leader
+  for (int offset = 32; offset > 0; offset /= 2) {
+    my_gt_count += __shfl_down_sync(0xffffffffffffffffULL, my_gt_count, offset);
+  }
+  if (tx % 64 == 0 && my_gt_count > 0) {
+    atomicAdd(&s_scratch[0], my_gt_count);
+  }
+  __syncthreads();
+  const uint32_t local_gt_count = s_scratch[0];
+
+  if (tx == 0) {
+    s_scratch[1] = 0;
+    if (local_gt_count > 0) {
+      s_scratch[2] = static_cast<uint32_t>(atomicAdd(&st->output_counter, static_cast<int>(local_gt_count)));
+    }
+  }
+  __syncthreads();
+  for (uint32_t i = tx; i < actual_chunk_size; i += Threads) {
+    const uint32_t ordered = cache_chunk ? shared_ordered[i]
+                                        : splitk_ordered_key(row_input[my_chunk_start + i]);
+    if (ordered > ordered_pivot) {
+      const uint32_t local_pos = atomicAdd(&s_scratch[1], 1);
+      const int pos = static_cast<int>(s_scratch[2]) + static_cast<int>(local_pos);
+      if (pos >= 0 && pos < TopK) out[pos] = static_cast<int32_t>(my_chunk_start + i);
+    }
+  }
+
+  // fill the remaining slots from == pivot elements (bounded, tie-tolerant).
+  // Warp-ticketed slot reservation: one global atomic per warp instead of one
+  // per candidate (collapsed rows push ~every element through this path and
+  // the per-element atomicAdd on the single eq_counter serializes).
+  const uint32_t eq_base = warp64_ticket(&st->eq_counter, my_eq_count);
+  uint32_t run_eq = 0;
+  for (uint32_t i = tx; i < actual_chunk_size; i += Threads) {
+    const uint32_t ordered = cache_chunk ? shared_ordered[i]
+                                        : splitk_ordered_key(row_input[my_chunk_start + i]);
+    if (ordered == ordered_pivot) {
+      const uint32_t pos = total_gt + eq_base + run_eq++;
+      if (pos < TopK) out[pos] = static_cast<int32_t>(my_chunk_start + i);
+    }
+  }
+
+  // Publish every writer before the group arrival signal.
+  __threadfence();
+  __syncthreads();
+  if (tx == 0) {
+    sk_red_release(&st->arrival_counter, 1);
+  }
+  arrival_target += static_cast<int>(G);
+  sk_wait_ge(&st->arrival_counter, arrival_target, static_cast<int>(tx));
+
+  if (cta_in_group != 0) return;
+  for (int i = static_cast<int>(tx); i < TopK; i += Threads) {
+    const int idx = out[i];
+    dst_page_entry[i] = (idx >= 0 && idx < static_cast<int>(length)) ? src_page_entry[idx] : -1;
+  }
+}
+
 }  // namespace
 
 // Exported launcher. Cross-TU surface is raw pointers + scalars only (no shared
@@ -1146,136 +1444,219 @@ void fast_topk_transform_decode_splitk_launch(
     cudaStream_t stream) {
   TORCH_CHECK(workspace != nullptr && workspace_bytes >= fast_topk_splitk_workspace_bytes(B),
               "split-K workspace too small");
-  static const int kSMs = [] {
+  const uint64_t effective_width = (max_length_val > 0 && max_length_val < input_stride)
+                                  ? static_cast<uint64_t>(max_length_val)
+                                  : static_cast<uint64_t>(input_stride);
+  int pre_dev = 0, per_optin = 64 * 1024;
+  if (::cudaGetDevice(&pre_dev) == cudaSuccess)
+      ::cudaDeviceGetAttribute(&per_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, pre_dev);
+  //C500 或者C600 seq_len <= 450k
+  if((per_optin <= 64 * 1024) || (per_optin >= 128 * 1024 && effective_width <= 458752)){
+    //printf("======> per_optin:%d effective_width:%d\n", per_optin, effective_width );
+
+    static const int kSMs = [] {
     int dev = 0, sms = 32;
     if (::cudaGetDevice(&dev) == cudaSuccess)
       ::cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
     return sms > 0 ? sms : 32;
-  }();
+    }();
 
 
-  //   >=128KB (C600U): keep historical 16384 (64KB dyn, ample headroom).
-  //   <=64KB  (C500) : cap dynamic smem at 64KB*0.8 = 52428B -> 13056 elems
-  //                    (13056*4 = 52224B; + 1044B static = 53268B < 65536B).
-  //   otherwise      : general 80%-of-optin budget, aligned down to 128 elems.
-  static const auto kSmemBudget = [] {
-    int dev = 0, optin = 64 * 1024;
-    if (::cudaGetDevice(&dev) == cudaSuccess)
-      ::cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
-    if (optin <= 0) optin = 64 * 1024;
-    uint32_t chunk_cap;
-    if (optin >= 128 * 1024) {
-      chunk_cap = kSplitKMaxChunk;            // C600U: 16384
-    } else if (optin <= 64 * 1024) {
-      chunk_cap = kSplitKMaxChunkC500;        // C500: 13056
-    } else {
-      // General device: 80% of opt-in as dynamic smem, in uint32 elems, /128.
-      uint32_t budget = static_cast<uint32_t>((static_cast<uint64_t>(optin) * 8) / 10);
-      chunk_cap = (budget / sizeof(uint32_t)) & ~static_cast<uint32_t>(127);
-      if (chunk_cap == 0) chunk_cap = kSplitKMaxChunkC500;
+    //   >=128KB (C600U): keep historical 16384 (64KB dyn, ample headroom).
+    //   <=64KB  (C500) : cap dynamic smem at 64KB*0.8 = 52428B -> 13056 elems
+    //                    (13056*4 = 52224B; + 1044B static = 53268B < 65536B).
+    //   otherwise      : general 80%-of-optin budget, aligned down to 128 elems.
+    static const auto kSmemBudget = [] {
+      int dev = 0, optin = 64 * 1024;
+      if (::cudaGetDevice(&dev) == cudaSuccess)
+        ::cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+      if (optin <= 0) optin = 64 * 1024;
+      uint32_t chunk_cap;
+      if (optin >= 128 * 1024) {
+        chunk_cap = kSplitKMaxChunk;            // C600U: 16384
+      } else if (optin <= 64 * 1024) {
+        chunk_cap = kSplitKMaxChunkC500;        // C500: 13056
+      } else {
+        // General device: 80% of opt-in as dynamic smem, in uint32 elems, /128.
+        uint32_t budget = static_cast<uint32_t>((static_cast<uint64_t>(optin) * 8) / 10);
+        chunk_cap = (budget / sizeof(uint32_t)) & ~static_cast<uint32_t>(127);
+        if (chunk_cap == 0) chunk_cap = kSplitKMaxChunkC500;
+      }
+      struct Budget { uint32_t chunk_cap; size_t dyn_optin; };
+      return Budget{chunk_cap, static_cast<size_t>(chunk_cap) * sizeof(uint32_t)};
+    }();
+    const uint32_t chunk_cap = kSmemBudget.chunk_cap;
+    const size_t dyn_smem_optin = kSmemBudget.dyn_optin;
+
+    // Opt-in dynamic smem limit is a RUNTIME value (device-dependent), so we call
+    // cudaFuncSetAttribute directly instead of the compile-time
+    // setup_kernel_smem_once<> template. Set once per process.
+    static const cudaError_t smem_attr = [] {
+  #ifdef USE_ROCM
+      return ::cudaFuncSetAttribute(
+          reinterpret_cast<const void*>(topk_transform_splitk_kernel),
+          ::cudaFuncAttributeMaxDynamicSharedMemorySize,
+          static_cast<int>(kSmemBudget.dyn_optin));
+  #else
+      return ::cudaFuncSetAttribute(
+          topk_transform_splitk_kernel,
+          ::cudaFuncAttributeMaxDynamicSharedMemorySize,
+          static_cast<int>(kSmemBudget.dyn_optin));
+  #endif
+    }();
+    TORCH_CHECK(smem_attr == cudaSuccess,
+                "split-K smem opt-in failed: ", ::cudaGetErrorString(smem_attr));
+    (void)dyn_smem_optin;
+
+    // chunk cap one 1024-thread block already needs ~53KB, so only 1 block fits per
+    // SM (2 on C600U's 128KB). Query the real per-SM block count at THIS smem so the
+    // ceiling adapts to the device instead of assuming 1 block/SM.
+    static const int kMaxResidentBlocks = [] {
+      int blocks_per_sm = 1;
+      // a smaller launch only ever fits MORE blocks, so this is a safe lower bound.
+      const int probe_smem = static_cast<int>(kSmemBudget.dyn_optin);
+      if (::cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+              &blocks_per_sm, topk_transform_splitk_kernel,
+              static_cast<int>(kThreadsPerBlock), probe_smem) != cudaSuccess ||
+          blocks_per_sm < 1) {
+        blocks_per_sm = 1;
+      }
+      return blocks_per_sm;
+    }() * kSMs;
+    
+    // G: CTAs per row. At least 8 (measured best for B=4 and B=8 on C600U:
+    // shorter chunks cut per-round latency more than a second wave costs),
+    // capped by (a) the smem chunk budget and (b) the co-residency ceiling
+    // B*G <= kMaxResidentBlocks. Cap (b) is what prevents the deadlock the C500
+    // chunk-cap reduction would otherwise introduce for long rows at small B.
+    const uint64_t g_resident_cap = static_cast<uint64_t>(kMaxResidentBlocks) / B;
+
+    uint64_t g = kSMs / B;
+    if (g < 8) g = 8;
+    const uint64_t need = (effective_width + g - 1) / g;
+    uint32_t G =0;
+    uint32_t chunk =0;
+    //C500系列 or default
+    if (chunk_cap == kSplitKMaxChunkC500 || chunk_cap != kSplitKMaxChunk) {
+      if (need > chunk_cap) {
+        g = (effective_width + chunk_cap - 1) / chunk_cap;
+      }
+    
+
+      if (g > g_resident_cap) g = g_resident_cap;
+      if (g < 1) g = 1;
+      G = static_cast<uint32_t>(g);
+      chunk = static_cast<uint32_t>(
+          (effective_width + G - 1) / G);
+
+      //printf("kSplitKMaxChunkC500  @@@  kMaxResidentBlocks:%d dyn_smem_optin:%d chunk_cap:%d chunk:%d input_stride:%d g:%d G:%d kSMs:%d g_resident_cap:%d need:%d\n", kMaxResidentBlocks, dyn_smem_optin, chunk_cap, chunk \
+      //,input_stride
+      //, g,G,kSMs, g_resident_cap, need);
+      if (chunk > chunk_cap ) {
+        fast_topk_transform_decode_launch(input, lengths, input_stride, dst_page_table,
+                                          src_page_table, src_stride, B, stream);
+        return;
+      }
+    }else if(chunk_cap == kSplitKMaxChunk){ //c600 系列
+      if (need > kSplitKMaxChunk) {
+        g = (effective_width + kSplitKMaxChunk - 1) / kSplitKMaxChunk;
+      }
+      G = static_cast<uint32_t>(g);
+      chunk = static_cast<uint32_t>(
+          (effective_width + G - 1) / G);
+      TORCH_CHECK(chunk <= kSplitKMaxChunk, "split-K chunk exceeds smem budget");
+      TORCH_CHECK(
+      G <= kSMs,
+      "G must be <= kSMs, avoid dead lock, G=", G,
+      ", kSMs=", kSMs);
+      // printf("kSplitKMaxChunk  @@@  kMaxResidentBlocks:%d dyn_smem_optin:%d chunk_cap:%d chunk:%d input_stride:%d g:%d G:%d kSMs:%d g_resident_cap:%d need:%d max_length_val:%ld \n", kMaxResidentBlocks, dyn_smem_optin, chunk_cap, chunk \
+      // ,input_stride
+      // , g,G,kSMs, g_resident_cap, need, max_length_val);
     }
-    struct Budget { uint32_t chunk_cap; size_t dyn_optin; };
-    return Budget{chunk_cap, static_cast<size_t>(chunk_cap) * sizeof(uint32_t)};
-  }();
-  const uint32_t chunk_cap = kSmemBudget.chunk_cap;
-  const size_t dyn_smem_optin = kSmemBudget.dyn_optin;
 
-  // Opt-in dynamic smem limit is a RUNTIME value (device-dependent), so we call
-  // cudaFuncSetAttribute directly instead of the compile-time
-  // setup_kernel_smem_once<> template. Set once per process.
-  static const cudaError_t smem_attr = [] {
-#ifdef USE_ROCM
-    return ::cudaFuncSetAttribute(
-        reinterpret_cast<const void*>(topk_transform_splitk_kernel),
-        ::cudaFuncAttributeMaxDynamicSharedMemorySize,
-        static_cast<int>(kSmemBudget.dyn_optin));
-#else
-    return ::cudaFuncSetAttribute(
-        topk_transform_splitk_kernel,
-        ::cudaFuncAttributeMaxDynamicSharedMemorySize,
-        static_cast<int>(kSmemBudget.dyn_optin));
-#endif
-  }();
-  TORCH_CHECK(smem_attr == cudaSuccess,
-              "split-K smem opt-in failed: ", ::cudaGetErrorString(smem_attr));
-  (void)dyn_smem_optin;
+    const size_t state_bytes = ((sizeof(SplitKRowState) + 255) / 256) * 256;
+    auto* state = reinterpret_cast<SplitKRowState*>(workspace);
+    auto* row_output = reinterpret_cast<int32_t*>(
+        reinterpret_cast<uint8_t*>(workspace) + state_bytes * B);
 
-  // chunk cap one 1024-thread block already needs ~53KB, so only 1 block fits per
-  // SM (2 on C600U's 128KB). Query the real per-SM block count at THIS smem so the
-  // ceiling adapts to the device instead of assuming 1 block/SM.
-  static const int kMaxResidentBlocks = [] {
-    int blocks_per_sm = 1;
-    // a smaller launch only ever fits MORE blocks, so this is a safe lower bound.
-    const int probe_smem = static_cast<int>(kSmemBudget.dyn_optin);
-    if (::cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            &blocks_per_sm, topk_transform_splitk_kernel,
-            static_cast<int>(kThreadsPerBlock), probe_smem) != cudaSuccess ||
-        blocks_per_sm < 1) {
-      blocks_per_sm = 1;
+    const auto grid = dim3{static_cast<uint32_t>(B) * G};
+    const auto block = dim3{kThreadsPerBlock};
+    const size_t smem = static_cast<size_t>(chunk) * sizeof(uint32_t);
+    topk_transform_splitk_kernel<<<grid, block, smem, stream>>>(
+        input, lengths, input_stride, dst_page_table, src_page_table, src_stride, B, G, chunk,
+        state, row_output);
+    
+
+  }else { //C600系列，超长处理
+    if (B == 0) return;
+    int device = 0;
+    TORCH_CHECK(::cudaGetDevice(&device) == cudaSuccess, "split-K device query failed");
+    static thread_local int cached_device = -1, kSMs = 0, blocks_512 = 0, blocks_1024 = 0;
+    constexpr uint32_t chunk_cap = kSplitKSuperMaxChunk;
+    constexpr size_t dyn_smem_optin = chunk_cap * sizeof(uint32_t);
+    if (cached_device != device) {
+      TORCH_CHECK(::cudaDeviceGetAttribute(&kSMs, cudaDevAttrMultiProcessorCount, device) == cudaSuccess && kSMs > 0,
+                  "split-K SM query failed");
+      const auto setup = [&](auto kernel, int threads, int* blocks) {
+        const auto attr = ::cudaFuncSetAttribute(kernel, ::cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                static_cast<int>(dyn_smem_optin));
+        TORCH_CHECK(attr == cudaSuccess, "split-K smem opt-in failed: ", ::cudaGetErrorString(attr));
+        const auto occupancy = ::cudaOccupancyMaxActiveBlocksPerMultiprocessor(blocks, kernel, threads, dyn_smem_optin);
+        TORCH_CHECK(occupancy == cudaSuccess && *blocks > 0, "split-K occupancy query failed");
+      };
+      setup(topk_transform_super_length_splitk_kernel<512>, 512, &blocks_512);
+      setup(topk_transform_super_length_splitk_kernel<1024>, 1024, &blocks_1024);
+      cached_device = device;
     }
-    return blocks_per_sm;
-  }() * kSMs;
-  
-  // G: CTAs per row. At least 8 (measured best for B=4 and B=8 on C600U:
-  // shorter chunks cut per-round latency more than a second wave costs),
-  // capped by (a) the smem chunk budget and (b) the co-residency ceiling
-  // B*G <= kMaxResidentBlocks. Cap (b) is what prevents the deadlock the C500
-  // chunk-cap reduction would otherwise introduce for long rows at small B.
-  const uint64_t g_resident_cap = static_cast<uint64_t>(kMaxResidentBlocks) / B;
-
-
-  const uint64_t effective_width = (max_length_val > 0 && max_length_val < input_stride)
-                                    ? static_cast<uint64_t>(max_length_val)
-                                    : static_cast<uint64_t>(input_stride);
-  uint64_t g = kSMs / B;
-  if (g < 8) g = 8;
-  const uint64_t need = (effective_width + g - 1) / g;
-  uint32_t G =0;
-  uint32_t chunk =0;
-  //C500系列 or default
-  if (chunk_cap == kSplitKMaxChunkC500 || chunk_cap != kSplitKMaxChunk) {
-    if (need > chunk_cap) {
-      g = (effective_width + chunk_cap - 1) / chunk_cap;
-    }
-  
-
-    if (g > g_resident_cap) g = g_resident_cap;
-    if (g < 1) g = 1;
-    G = static_cast<uint32_t>(g);
-    chunk = static_cast<uint32_t>(
-        (effective_width + G - 1) / G);
-
-    //printf("kSplitKMaxChunkC500  @@@  kMaxResidentBlocks:%d dyn_smem_optin:%d chunk_cap:%d chunk:%d input_stride:%d g:%d G:%d kSMs:%d g_resident_cap:%d need:%d\n", kMaxResidentBlocks, dyn_smem_optin, chunk_cap, chunk \
-    //,input_stride
-    //, g,G,kSMs, g_resident_cap, need);
-    if (chunk > chunk_cap ) {
+    //const uint64_t effective_width = max_length_val > 0 ? max_length_val : input_stride;
+    // Preserve the original wide-block latency on short chunks fitting one wave.
+    const bool wide_block = static_cast<uint64_t>(B) * 8 <= static_cast<uint64_t>(kSMs) &&
+        effective_width <= static_cast<uint64_t>(kSMs / B) * chunk_cap;
+    const uint32_t threads = wide_block ? 1024 : kSplitKSuperThreads;
+    const int blocks_per_sm = wide_block ? blocks_1024 : blocks_512;
+    const uint64_t resident_cap = static_cast<uint64_t>(blocks_per_sm) * kSMs / B;
+    if (resident_cap == 0) {
       fast_topk_transform_decode_launch(input, lengths, input_stride, dst_page_table,
                                         src_page_table, src_stride, B, stream);
       return;
     }
-  }else if(chunk_cap == kSplitKMaxChunk){ //c600 系列
-    if (need > kSplitKMaxChunk) {
-      g = (effective_width + kSplitKMaxChunk - 1) / kSplitKMaxChunk;
+    uint64_t g = kSMs / B;
+    if (g < 8) g = 8;
+    const uint64_t cache_groups = (effective_width + chunk_cap - 1) / chunk_cap;
+    if (g < cache_groups) g = cache_groups;
+    if (g > resident_cap) g = resident_cap;
+    const uint32_t G = static_cast<uint32_t>(g);
+    const uint32_t chunk = static_cast<uint32_t>((effective_width + G - 1) / G);
+
+    const size_t state_bytes = ((sizeof(SplitKRowState) + 255) / 256) * 256;
+    auto* state = reinterpret_cast<SplitKRowState*>(workspace);
+    auto* row_output = reinterpret_cast<int32_t*>(
+        reinterpret_cast<uint8_t*>(workspace) + state_bytes * B);
+
+    const auto grid = dim3{static_cast<uint32_t>(B) * G};
+    const auto block = dim3{threads};
+    const size_t smem = static_cast<size_t>(chunk < chunk_cap ? chunk : chunk_cap) * sizeof(uint32_t);
+
+    static const bool diagnostics = std::getenv("MCOP_TOPK_SPLITK_DEBUG") != nullptr;
+    if (diagnostics) {
+      cudaFuncAttributes attr{};
+      if (wide_block) ::cudaFuncGetAttributes(&attr, topk_transform_super_length_splitk_kernel<1024>);
+      else ::cudaFuncGetAttributes(&attr, topk_transform_super_length_splitk_kernel<512>);
+      printf("[splitk_kernel] B=%u G=%u chunk=%u cache=%u grid=%u resident=%d threads=%u\n",
+            B, G, chunk, chunk_cap, B * G, blocks_per_sm * kSMs, threads);
+      printf("[splitk_kernel] numRegs=%d localBytes=%zu staticSmem=%zu dynSmem=%zu blocks/SM=%d\n",
+            attr.numRegs, attr.localSizeBytes, attr.sharedSizeBytes, smem, blocks_per_sm);
     }
-    G = static_cast<uint32_t>(g);
-    chunk = static_cast<uint32_t>(
-        (effective_width + G - 1) / G);
-    TORCH_CHECK(chunk <= kSplitKMaxChunk, "split-K chunk exceeds smem budget");
 
-    // printf("kSplitKMaxChunk  @@@  kMaxResidentBlocks:%d dyn_smem_optin:%d chunk_cap:%d chunk:%d input_stride:%d g:%d G:%d kSMs:%d g_resident_cap:%d need:%d max_length_val:%ld \n", kMaxResidentBlocks, dyn_smem_optin, chunk_cap, chunk \
-    // ,input_stride
-    // , g,G,kSMs, g_resident_cap, need, max_length_val);
-  }
+    if (wide_block) {
+      topk_transform_super_length_splitk_kernel<1024><<<grid, block, smem, stream>>>(
+          input, lengths, input_stride, dst_page_table, src_page_table, src_stride, B, G, chunk, chunk_cap,
+          state, row_output);
+    } else {
+      topk_transform_super_length_splitk_kernel<512><<<grid, block, smem, stream>>>(
+          input, lengths, input_stride, dst_page_table, src_page_table, src_stride, B, G, chunk, chunk_cap,
+          state, row_output);
+    }
+}
 
-  const size_t state_bytes = ((sizeof(SplitKRowState) + 255) / 256) * 256;
-  auto* state = reinterpret_cast<SplitKRowState*>(workspace);
-  auto* row_output = reinterpret_cast<int32_t*>(
-      reinterpret_cast<uint8_t*>(workspace) + state_bytes * B);
-
-  const auto grid = dim3{static_cast<uint32_t>(B) * G};
-  const auto block = dim3{kThreadsPerBlock};
-  const size_t smem = static_cast<size_t>(chunk) * sizeof(uint32_t);
-  topk_transform_splitk_kernel<<<grid, block, smem, stream>>>(
-      input, lengths, input_stride, dst_page_table, src_page_table, src_stride, B, G, chunk,
-      state, row_output);
 }

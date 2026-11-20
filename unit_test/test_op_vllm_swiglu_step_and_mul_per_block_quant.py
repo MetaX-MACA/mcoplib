@@ -53,7 +53,7 @@ SIM_THRESH = {"int8": 0.999, "fp8": 0.999, "bf16": 0.99999}
 # (num_tokens, hidden_size) from the SWiGLU-step request.
 SHAPES = [
     (128, 1024), (1024, 2048), (4096, 4096), (32, 1536), (1, 1536),
-    (128, 1536), (4096, 1536),(8192, 1536), (16392, 1536), (32784, 1536), (65544, 1536), (3, 1537), (64, 257), (1, 4096), (8, 4096),
+    (128, 1536), (4096, 1536),(8192, 1536), (16392, 1536), (32784, 1536), (65536, 1536), (65544, 1536), (3, 1537), (64, 257), (1, 4096), (8, 4096),
     (128, 4096), (1, 6144), (16, 6144), (128, 8192), (1, 11008),
     (32, 11008), (1024, 11008), (1, 14336), (64, 14336), (4096, 14336),
 ]
@@ -166,12 +166,11 @@ def effective_bytes(M, H, group_size, out_bytes):
 
 def bench_case(M, H, dst_name, group_size=128, is_scale_transposed=False,
                scale_ub=None, alpha=1.0, beta=0.0, input_dtype=torch.bfloat16,
-               warmup=10, rep=100):
+               warmup=10, rep=100, limit=8.0):
     dst_dtype, qmax, out_bytes = DST_DTYPES[dst_name]
     input = make_inputs(M, H, input_dtype)
     out, scales = alloc_outputs(M, H, group_size, dst_dtype,
                                 is_scale_transposed)
-    limit = 8.0
 
     run_op(input, out, scales, limit, group_size, dst_dtype, scale_ub,
            is_scale_transposed, alpha, beta)
@@ -210,7 +209,7 @@ def main():
     print(f"device_count={torch.cuda.device_count()}  "
           f"CUDA_VISIBLE_DEVICES={__import__('os').environ.get('CUDA_VISIBLE_DEVICES','')}")
     assert torch.cuda.is_available(), "CUDA not available"
-    print(f"config: 20 shapes x {len(DST_DTYPES)} dst (int8/fp8/bf16) x bf16-in; "
+    print(f"config: {len(SHAPES)} shapes x {len(DST_DTYPES)} dst (int8/fp8/bf16) x bf16-in; "
           f"plus gs=64 / transposed / alpha-beta / fp16 / scale_ub / generic-tail")
     print("=" * 100)
 
@@ -259,6 +258,16 @@ def main():
             ok, _ = bench_case(M, H, "fp8",
                                scale_ub=torch.tensor(ub, device=DEVICE))
             overall_pass &= ok
+
+    # Exact target case from the optimization request: fp8 e4m3fn out,
+    # input [65536, 3072] bf16, scales [65536, 12] fp32, limit=7.0,
+    # group_size=128, scale_ub=None, is_scale_transposed=False,
+    # alpha=1.0, beta=0.0.
+    ok, gbps = bench_case(65536, 1536, "fp8", limit=7.0)
+    overall_pass &= ok
+    print(f"     [target] fp8 M=65536 H=1536 limit=7.0 : {gbps:8.1f} GB/s")
+    p, dp = peaks["fp8"]
+    peaks["fp8"] = (max(p, gbps), dp and ok)
 
     print("=" * 100)
     for dst_name, (peak, dpass) in peaks.items():

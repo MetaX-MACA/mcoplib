@@ -30,6 +30,7 @@ that is not acceptable
 */
 #include <iostream>
 #include <algorithm>
+#include <cstdlib>
 
 #include <mc_runtime.h>
 #include <maca_fp16.h>
@@ -113,6 +114,18 @@ __global__ void clean_zero(float* data, size_t num_elem) {
   float zeros[4] = {0.0, 0.0, 0.0, 0.0};
   if (idx < num_elem) {
     *((b128VecType*)(&data[idx])) = *((b128VecType*)zeros);
+  }
+}
+
+template <const int THREADS, const int PACK_NUM>
+__global__ void all_reduce_fp16(float* in_data, half* out_data,
+                                size_t num_elem) {
+  int idx = (blockIdx.x * THREADS + threadIdx.x) * PACK_NUM;
+#pragma unroll
+  for (int i = 0; i < PACK_NUM; ++i) {
+    if (idx + i < num_elem) {
+      out_data[idx + i] = __float2half_rn(in_data[idx + i]);
+    }
   }
 }
 
@@ -627,48 +640,66 @@ __device__ __forceinline__ void dequant_gptq_8bits(const PackType& p,
   CVT_B0TOF32(p, a0.x);
   CVT_B1TOF32(p, a0.y);
   a0 = __builtin_mxc_pk_fma_f32(a0, scale, scale_zero);
-  out[0] = (scalar_t)a0.x;
-  out[1] = (scalar_t)a0.y;
+  if constexpr (std::is_same_v<scalar_t, __maca_bfloat16>) {
+    float tmp[2] = {a0.x, a0.y};
+    f32x2_cvt_bf16x2(*((uint32_t*)(out + 0)), tmp);
+  } else {
+    out[0] = (scalar_t)a0.x;
+    out[1] = (scalar_t)a0.y;
+  }
 
   CVT_B2TOF32(p, a0.x);
   CVT_B3TOF32(p, a0.y);
   a0 = __builtin_mxc_pk_fma_f32(a0, scale, scale_zero);
-  out[2] = (scalar_t)a0.x;
-  out[3] = (scalar_t)a0.y;
+  if constexpr (std::is_same_v<scalar_t, __maca_bfloat16>) {
+    float tmp[2] = {a0.x, a0.y};
+    f32x2_cvt_bf16x2(*((uint32_t*)(out + 2)), tmp);
+  } else {
+    out[2] = (scalar_t)a0.x;
+    out[3] = (scalar_t)a0.y;
+  }
 }
 
-// decompress zero
-__device__ __forceinline__ void decompress_zero_4bits(const PackType& zp,
-                                                      float (&out)[8]) {
-  v2f a0;
-  int p0 = zp & 0x0f0f0f0f;
-  CVT_B0TOF32(p0, a0.x);
-  CVT_B2TOF32(p0, a0.y);
-  out[0] = -a0.x;
-  out[1] = -a0.y;
+// Normalize raw K-packed INT4 words to the existing ExLlama MMA layout.
+__device__ __forceinline__ PackType shuffle_gptq_4bit_word(PackType raw) {
+  PackType shuffled = 0;
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    shuffled |= ((raw >> (i * 4)) & 0x0fu)
+                << ((i / 2) * 4 + (i & 1) * 16);
+  }
+  return shuffled;
+}
 
-  CVT_B1TOF32(p0, a0.x);
-  CVT_B3TOF32(p0, a0.y);
-  out[4] = -a0.x;
-  out[5] = -a0.y;
-
-  p0 = (zp >> 4) & 0x0f0f0f0f;
-  CVT_B0TOF32(p0, a0.x);
-  CVT_B2TOF32(p0, a0.y);
-  out[2] = -a0.x;
-  out[3] = -a0.y;
-
-  CVT_B1TOF32(p0, a0.x);
-  CVT_B3TOF32(p0, a0.y);
-  out[6] = -a0.x;
-  out[7] = -a0.y;
+// Zero fields use natural N order, independently of the weight layout.
+// Apply the GPTQv1 offset after extraction so 15/255 become 16/256.
+template <int BITS, bool USE_V2_FORMAT, bool LEGACY_AWQ>
+__device__ __forceinline__ void decompress_gptq_zeros(
+    const PackType& zp, float (&out)[32 / BITS]) {
+  static_assert(BITS == 4 || BITS == 8, "GPTQ zero bits must be 4 or 8");
+#pragma unroll
+  for (int i = 0; i < 32 / BITS; ++i) {
+    // Legacy AWQ interleaves zero fields just like the shuffled INT4 word.
+    int field = i;
+    if constexpr (BITS == 4) {
+      if constexpr (LEGACY_AWQ) field = i / 2 + (i & 1) * 4;
+    }
+    int zero = int((zp >> (field * BITS)) & ((1u << BITS) - 1));
+    out[i] = -float(zero + ((!LEGACY_AWQ && !USE_V2_FORMAT) ? 1 : 0));
+  }
 }
 
 namespace __hgemm_singular_blocks_k {
 template <typename scalar_t, const vllm::ScalarTypeId w_type_id, int THREADS,
           int BLOCKS_M, int BLOCKS_N, int BLOCKS_K, bool HAS_ACT, bool HAS_ZP,
-          bool HAS_M_PRED, bool HAS_NK_PRED>
+          bool HAS_M_PRED, bool HAS_NK_PRED, bool USE_EXLLAMA, bool USE_V2_FORMAT, bool LEGACY_AWQ>
 struct LoadingManager {
+  constexpr static int ZERO_BITS =
+      (w_type_id == vllm::kU8.id() || w_type_id == vllm::kU8B128.id()) ? 8 : 4;
+  constexpr static int ZERO_PACK_RATIO = 32 / ZERO_BITS;
+  static constexpr bool use_exllama = USE_EXLLAMA;
+  static constexpr bool use_v2_format = USE_V2_FORMAT;
+  static constexpr bool legacy_awq = LEGACY_AWQ;
   constexpr static int FragACount = 2;
   using FragA = PackType;
   constexpr static int FragBCount = 1;
@@ -729,13 +760,16 @@ struct LoadingManager {
   __device__ __forceinline__ void set_address(
       const PackTypeInt4* a, const PackTypeInt4* b, PackTypeInt4* c,
       PackTypeInt4* c_temp, const PackTypeInt4* scale_ptr,
-      const PackTypeInt4* zp_ptr = nullptr) {
+      const PackTypeInt4* zp_ptr,
+      bool _use_exllama, bool _use_v2_format, bool _legacy_awq) {
+
     A = (const FragA*)a;
     B = (const FragB*)b;
     C = (FragC*)c;
     C_temp = (float*)c_temp;
     scales = (const FragScaleLoading*)scale_ptr;
-    if constexpr (w_type_id == vllm::kU4.id()) {
+    if constexpr (w_type_id == vllm::kU4.id() ||
+                  w_type_id == vllm::kU8.id()) {
       zeros = (const FragZeroLoading*)zp_ptr;
     }
   }
@@ -854,6 +888,11 @@ struct LoadingManager {
 
   __device__ __forceinline__ void swap_b_cache(int i) {
     local_b[i] = local_b_cache[i];
+    if constexpr (w_type_id == vllm::kU4.id() ||
+                  w_type_id == vllm::kU4B8.id()) {
+      if constexpr (!USE_EXLLAMA && !LEGACY_AWQ)
+        local_b[i] = shuffle_gptq_4bit_word(local_b[i]);
+    }
   }
 
   __device__ __forceinline__ void ldg_scales() {
@@ -872,12 +911,13 @@ struct LoadingManager {
   }
 
   __device__ __forceinline__ void ldg_zp() {
-    if constexpr (w_type_id == vllm::kU4.id()) {
+    if constexpr (w_type_id == vllm::kU4.id() ||
+                  w_type_id == vllm::kU8.id()) {
       bool pred =
-          (tv.tid < TILE_N / PACK_RATIO_4BITS) && tile_manager.global_pred;
+          (tv.tid < TILE_N / ZERO_PACK_RATIO) && tile_manager.global_pred;
       if constexpr (HAS_NK_PRED) {
         pred = pred && tv.tid < ((n - tile_manager.tile_start_col * TILE_N) /
-                                 PACK_RATIO_4BITS);
+                                 ZERO_PACK_RATIO);
       }
       FragZeroLoading* gvm_addr = (FragZeroLoading*)zeros_loading + tv.tid;
       ldg_b32_reg_noasync(*((PackType*)&temp_zeros), gvm_addr, pred, true);
@@ -891,15 +931,16 @@ struct LoadingManager {
   }
 
   __device__ __forceinline__ void sts_zeros() {
-    if constexpr (w_type_id == vllm::kU4.id()) {
+    if constexpr (w_type_id == vllm::kU4.id() ||
+                  w_type_id == vllm::kU8.id()) {
       bool pred =
-          (tv.tid < TILE_N / PACK_RATIO_4BITS) && tile_manager.global_pred;
+          (tv.tid < TILE_N / ZERO_PACK_RATIO) && tile_manager.global_pred;
       if (pred) {
-        float temp[PACK_RATIO_4BITS];
-        decompress_zero_4bits(temp_zeros, temp);
+        float temp[ZERO_PACK_RATIO];
+        decompress_gptq_zeros<ZERO_BITS, USE_V2_FORMAT, LEGACY_AWQ>(temp_zeros, temp);
         float* scale_bsm =
-            (float*)(smem_base + 0x3000) + tv.tid * PACK_RATIO_4BITS;
-        for (int i = 0; i < PACK_RATIO_4BITS; i++) {
+            (float*)(smem_base + 0x3000) + tv.tid * ZERO_PACK_RATIO;
+        for (int i = 0; i < ZERO_PACK_RATIO; i++) {
           *(scale_bsm + i) = temp[i];
         }
       }
@@ -924,7 +965,8 @@ struct LoadingManager {
         local_scales[i] = {s, s};
         local_zeros[i] = {z, z};
       }
-    } else if constexpr (w_type_id == vllm::kU4.id()) {
+    } else if constexpr (w_type_id == vllm::kU4.id() ||
+                  w_type_id == vllm::kU8.id()) {
 #pragma unroll
       for (int i = 0; i < N_ITERS; i++) {
         float s;
@@ -946,8 +988,6 @@ struct LoadingManager {
         local_scales[i] = {s, s};
         local_zeros[i] = {z, z};
       }
-    } else if constexpr (w_type_id == vllm::kU8.id()) {
-      // should apply zeros
     }
   }
 
@@ -1042,10 +1082,11 @@ struct LoadingManager {
     scales_loading =
         scales + ((offset_k >> quant_group_power2) * n + offset_n) /
                      (sizeof(FragScaleLoading) / sizeof(scalar_t));
-    if constexpr (w_type_id == vllm::kU4.id()) {
+    if constexpr (w_type_id == vllm::kU4.id() ||
+                  w_type_id == vllm::kU8.id()) {
       zeros_loading =
           zeros +
-          ((offset_k >> quant_group_power2) * n + offset_n) / PACK_RATIO_4BITS;
+          ((offset_k >> quant_group_power2) * n + offset_n) / ZERO_PACK_RATIO;
     }
   }
 
@@ -1065,7 +1106,8 @@ struct LoadingManager {
     bsm_scales_ptr =
         (scalar_t*)(smem_base + 0x2000);  // use 128xsizeof(float)*2 = 1k
     bsm_scales_ptr += (tv.wave_idx * SLOT + tv.slot_tid) * N_ITERS;
-    if constexpr (w_type_id == vllm::kU4.id()) {
+    if constexpr (w_type_id == vllm::kU4.id() ||
+                  w_type_id == vllm::kU8.id()) {
       bsm_zeros_ptr = (float*)(smem_base + 0x3000);
       bsm_zeros_ptr += (tv.wave_idx * SLOT + tv.slot_tid) * N_ITERS;
     }
@@ -1078,7 +1120,10 @@ struct LoadingManager {
 #else
       atomicAdd(C + offset, (atomic_type)v);
 #endif
+    } else if (!legacy_awq && C_temp != nullptr) {
+      atomicAdd(C_temp + offset, v);
     } else {
+      // Legacy AWQ calls may not provide FP32 scratch.
       atomicAdd(C + offset, (scalar_t)v);
     }
   }
@@ -1303,9 +1348,9 @@ template <typename scalar_t, const vllm::ScalarTypeId w_type_id,
           const bool HAS_ZP,             // whether zero-points are enabled
           const bool HAS_M_PRED = true,  // If we should use predictors to load
                                          // m from gvm
-          const bool HAS_NK_PRED = true  // If we should use predictors to load
+          const bool HAS_NK_PRED = true,  // If we should use predictors to load
                                          // nk from gvm
-          >
+          bool USE_EXLLAMA = true, bool USE_V2_FORMAT = false, bool LEGACY_AWQ = false>
 __global__ void hgemm_gptq(
     const PackTypeInt4* __restrict__ A,  // fp16 input matrix of shape mxk
     const PackTypeInt4* __restrict__ B,  // 4bit quantized weight matrix of
@@ -1326,25 +1371,32 @@ __global__ void hgemm_gptq(
                              // 2^x where x >= 5
     int max_iters,           // max tile iterations for one block
     int* locks,              // extra global storage for barrier synchronization
-    bool use_fp32_reduce     // whether to use fp32 global reduce
+    bool use_fp32_reduce,     // whether to use fp32 global reduce
+    bool use_exllama, bool use_v2_format, bool legacy_awq
 ) {
   int bidx = blockIdx.x;
   __shared__ uint8_t smem_base[0x4000];  // 4x16x256 = 16Kbytes
   using LoadingManagerType =
       LoadingManager<scalar_t, w_type_id, THREADS, BLOCKS_M, BLOCKS_N, BLOCKS_K,
-                     HAS_ACT_ORDER, HAS_ZP, HAS_M_PRED, HAS_NK_PRED>;
+                     HAS_ACT_ORDER, HAS_ZP, HAS_M_PRED, HAS_NK_PRED, USE_EXLLAMA, USE_V2_FORMAT, LEGACY_AWQ>;
   LoadingManagerType loading_manager;
   A += blockIdx.y * (MAX_BLOCKS_M * SLICE_M) * prob_k /
        (sizeof(PackTypeInt4) / sizeof(scalar_t));
   C += blockIdx.y * (MAX_BLOCKS_M * SLICE_M) * prob_n /
        (sizeof(PackTypeInt4) / sizeof(scalar_t));
-#ifdef BF16_HIGH_PRECISION
-  if constexpr (std::is_same_v<scalar_t, __maca_bfloat16>) {
-    C_tmp += blockIdx.y * (MAX_BLOCKS_M * SLICE_M) * prob_n /
-             (sizeof(PackTypeInt4) / sizeof(float));
-  }
+#if defined(BF16_HIGH_PRECISION)
+  if constexpr (std::is_same_v<scalar_t, __maca_bfloat16> ||
+                std::is_same_v<scalar_t, half>) {
+#else
+  if constexpr (std::is_same_v<scalar_t, half>) {
 #endif
-  loading_manager.set_address(A, B, C, C_tmp, scales_ptr, zp_ptr);
+    if (C_tmp != nullptr) {
+      C_tmp += blockIdx.y * (MAX_BLOCKS_M * SLICE_M) * prob_n /
+               (sizeof(PackTypeInt4) / sizeof(float));
+    }
+  }
+  loading_manager.set_address(A, B, C, C_tmp, scales_ptr, zp_ptr,
+                              use_exllama, use_v2_format, legacy_awq);
   // loading_manager.init_address(prob_m, prob_n, prob_k, bidx, max_iters,
   // smem_base);
   loading_manager.init_address_pre(
@@ -1415,8 +1467,14 @@ __global__ void hgemm_gptq(
 namespace __hgemm_even_blocks_k {
 template <typename scalar_t, const vllm::ScalarTypeId w_type_id, int THREADS,
           int BLOCKS_M, int BLOCKS_N, int BLOCKS_K, bool HAS_ACT, bool HAS_ZP,
-          bool HAS_M_PRED, bool HAS_NK_PRED>
+          bool HAS_M_PRED, bool HAS_NK_PRED, bool USE_EXLLAMA, bool USE_V2_FORMAT, bool LEGACY_AWQ>
 struct LoadingManager {
+  constexpr static int ZERO_BITS =
+      (w_type_id == vllm::kU8.id() || w_type_id == vllm::kU8B128.id()) ? 8 : 4;
+  constexpr static int ZERO_PACK_RATIO = 32 / ZERO_BITS;
+  static constexpr bool use_exllama = USE_EXLLAMA;
+  static constexpr bool use_v2_format = USE_V2_FORMAT;
+  static constexpr bool legacy_awq = LEGACY_AWQ;
   constexpr static int FragACount = 4;
   using FragA = PackTypeInt2;
   constexpr static int FragBCount = 1;
@@ -1481,13 +1539,16 @@ struct LoadingManager {
   __device__ __forceinline__ void set_address(
       const PackTypeInt4* a, const PackTypeInt4* b, PackTypeInt4* c,
       PackTypeInt4* c_temp, const PackTypeInt4* scale_ptr,
-      const PackTypeInt4* zp_ptr = nullptr) {
+      const PackTypeInt4* zp_ptr,
+      bool _use_exllama, bool _use_v2_format, bool _legacy_awq) {
+
     A = (const FragA*)a;
     B = (const FragB*)b;
     C = (FragC*)c;
     C_temp = (float*)c_temp;
     scales = (const FragScaleLoading*)scale_ptr;
-    if constexpr (w_type_id == vllm::kU4.id()) {
+    if constexpr (w_type_id == vllm::kU4.id() ||
+                  w_type_id == vllm::kU8.id()) {
       zeros = (const FragZeroLoading*)zp_ptr;
     }
   }
@@ -1632,6 +1693,11 @@ struct LoadingManager {
 
   __device__ __forceinline__ void swap_b_cache(int i) {
     local_b[i] = local_b_cache[i];
+    if constexpr (w_type_id == vllm::kU4.id() ||
+                  w_type_id == vllm::kU4B8.id()) {
+      if constexpr (!USE_EXLLAMA && !LEGACY_AWQ)
+        local_b[i] = shuffle_gptq_4bit_word(local_b[i]);
+    }
   }
 
   __device__ __forceinline__ void ldg_scales() {
@@ -1650,12 +1716,13 @@ struct LoadingManager {
   }
 
   __device__ __forceinline__ void ldg_zp() {
-    if constexpr (w_type_id == vllm::kU4.id()) {
+    if constexpr (w_type_id == vllm::kU4.id() ||
+                  w_type_id == vllm::kU8.id()) {
       bool pred =
-          (tv.tid < TILE_N / PACK_RATIO_4BITS) && tile_manager.global_pred;
+          (tv.tid < TILE_N / ZERO_PACK_RATIO) && tile_manager.global_pred;
       if constexpr (HAS_NK_PRED) {
         pred = pred && tv.tid < ((n - tile_manager.tile_start_col * TILE_N) /
-                                 PACK_RATIO_4BITS);
+                                 ZERO_PACK_RATIO);
       }
       FragZeroLoading* gvm_addr = (FragZeroLoading*)zeros_loading + tv.tid;
       ldg_b32_reg_noasync(*((PackType*)&temp_zeros), gvm_addr, pred, true);
@@ -1669,15 +1736,16 @@ struct LoadingManager {
   }
 
   __device__ __forceinline__ void sts_zeros() {
-    if constexpr (w_type_id == vllm::kU4.id()) {
+    if constexpr (w_type_id == vllm::kU4.id() ||
+                  w_type_id == vllm::kU8.id()) {
       bool pred =
-          (tv.tid < TILE_N / PACK_RATIO_4BITS) && tile_manager.global_pred;
+          (tv.tid < TILE_N / ZERO_PACK_RATIO) && tile_manager.global_pred;
       if (pred) {
-        float temp[PACK_RATIO_4BITS];
-        decompress_zero_4bits(temp_zeros, temp);
+        float temp[ZERO_PACK_RATIO];
+        decompress_gptq_zeros<ZERO_BITS, USE_V2_FORMAT, LEGACY_AWQ>(temp_zeros, temp);
         float* zeros_bsm =
-            (float*)(smem_base + 0x3400) + tv.tid * PACK_RATIO_4BITS;
-        for (int i = 0; i < PACK_RATIO_4BITS; i++) {
+            (float*)(smem_base + 0x3400) + tv.tid * ZERO_PACK_RATIO;
+        for (int i = 0; i < ZERO_PACK_RATIO; i++) {
           *(zeros_bsm + i) = temp[i];
         }
       }
@@ -1702,7 +1770,8 @@ struct LoadingManager {
         local_scales[i] = {s, s};
         local_zeros[i] = {z, z};
       }
-    } else if constexpr (w_type_id == vllm::kU4.id()) {
+    } else if constexpr (w_type_id == vllm::kU4.id() ||
+                  w_type_id == vllm::kU8.id()) {
 #pragma unroll
       for (int i = 0; i < N_ITERS; i++) {
         float s;
@@ -1724,8 +1793,6 @@ struct LoadingManager {
         local_scales[i] = {s, s};
         local_zeros[i] = {z, z};
       }
-    } else if constexpr (w_type_id == vllm::kU8.id()) {
-      // should apply zeros
     }
   }
 
@@ -1817,10 +1884,11 @@ struct LoadingManager {
     scales_loading =
         scales + ((offset_k >> quant_group_power2) * n + offset_n) /
                      (sizeof(FragScaleLoading) / sizeof(scalar_t));
-    if constexpr (w_type_id == vllm::kU4.id()) {
+    if constexpr (w_type_id == vllm::kU4.id() ||
+                  w_type_id == vllm::kU8.id()) {
       zeros_loading =
           zeros +
-          ((offset_k >> quant_group_power2) * n + offset_n) / PACK_RATIO_4BITS;
+          ((offset_k >> quant_group_power2) * n + offset_n) / ZERO_PACK_RATIO;
     }
   }
 
@@ -1840,7 +1908,8 @@ struct LoadingManager {
     bsm_scales_ptr =
         (scalar_t*)(smem_base + 0x3000);  // use 128xsizeof(float)*2 = 1k
     bsm_scales_ptr += (tv.wave_idx * SLOT + tv.slot_tid) * N_ITERS;
-    if constexpr (w_type_id == vllm::kU4.id()) {
+    if constexpr (w_type_id == vllm::kU4.id() ||
+                  w_type_id == vllm::kU8.id()) {
       bsm_zeros_ptr =
           (float*)(smem_base + 0x3400);  // use 128xsizeof(float)*2 = 1k
       bsm_zeros_ptr += (tv.wave_idx * SLOT + tv.slot_tid) * N_ITERS;
@@ -1854,7 +1923,10 @@ struct LoadingManager {
 #else
       atomicAdd(C + offset, (atomic_type)v);
 #endif
+    } else if (!legacy_awq && C_temp != nullptr) {
+      atomicAdd(C_temp + offset, v);
     } else {
+      // Legacy AWQ calls may not provide FP32 scratch.
       atomicAdd(C + offset, (scalar_t)v);
     }
   }
@@ -2077,9 +2149,9 @@ template <typename scalar_t, const vllm::ScalarTypeId w_type_id,
           const bool HAS_ZP,             // whether zero-points are enabled
           const bool HAS_M_PRED = true,  // If we should use predictors to load
                                          // m from gvm
-          const bool HAS_NK_PRED = true  // If we should use predictors to load
+          const bool HAS_NK_PRED = true,  // If we should use predictors to load
                                          // nk from gvm
-          >
+          bool USE_EXLLAMA = true, bool USE_V2_FORMAT = false, bool LEGACY_AWQ = false>
 __global__ void hgemm_gptq(
     const PackTypeInt4* __restrict__ A,  // fp16 input matrix of shape mxk
     const PackTypeInt4* __restrict__ B,  // 4bit quantized weight matrix of
@@ -2098,25 +2170,32 @@ __global__ void hgemm_gptq(
     int quant_group_power2,
     int max_iters,        // max tile iterations for one block
     int* locks,           // extra global storage for barrier synchronization
-    bool use_fp32_reduce  // whether to use fp32 global reduce
+    bool use_fp32_reduce,  // whether to use fp32 global reduce
+    bool use_exllama, bool use_v2_format, bool legacy_awq
 ) {
   int bidx = blockIdx.x;
   __shared__ uint8_t smem_base[0x4000];  // 4x16x256 = 16Kbytes
   using LoadingManagerType =
       LoadingManager<scalar_t, w_type_id, THREADS, BLOCKS_M, BLOCKS_N, BLOCKS_K,
-                     HAS_ACT_ORDER, HAS_ZP, HAS_M_PRED, HAS_NK_PRED>;
+                     HAS_ACT_ORDER, HAS_ZP, HAS_M_PRED, HAS_NK_PRED, USE_EXLLAMA, USE_V2_FORMAT, LEGACY_AWQ>;
   LoadingManagerType loading_manager;
   A += blockIdx.y * (MAX_BLOCKS_M * SLICE_M) * prob_k /
        (sizeof(PackTypeInt4) / sizeof(scalar_t));
   C += blockIdx.y * (MAX_BLOCKS_M * SLICE_M) * prob_n /
        (sizeof(PackTypeInt4) / sizeof(scalar_t));
-#ifdef BF16_HIGH_PRECISION
-  if constexpr (std::is_same_v<scalar_t, __maca_bfloat16>) {
-    C_tmp += blockIdx.y * (MAX_BLOCKS_M * SLICE_M) * prob_n /
-             (sizeof(PackTypeInt4) / sizeof(float));
-  }
+#if defined(BF16_HIGH_PRECISION)
+  if constexpr (std::is_same_v<scalar_t, __maca_bfloat16> ||
+                std::is_same_v<scalar_t, half>) {
+#else
+  if constexpr (std::is_same_v<scalar_t, half>) {
 #endif
-  loading_manager.set_address(A, B, C, C_tmp, scales_ptr, zp_ptr);
+    if (C_tmp != nullptr) {
+      C_tmp += blockIdx.y * (MAX_BLOCKS_M * SLICE_M) * prob_n /
+               (sizeof(PackTypeInt4) / sizeof(float));
+    }
+  }
+  loading_manager.set_address(A, B, C, C_tmp, scales_ptr, zp_ptr,
+                              use_exllama, use_v2_format, legacy_awq);
   // loading_manager.init_address(prob_m, prob_n, prob_k, bidx, max_iters,
   // smem_base);
   loading_manager.init_address_pre(
@@ -2212,8 +2291,14 @@ __global__ void hgemm_gptq(
 }  // end of namespace __hgemm_even_blocks_k
 
 namespace __hgemm_singular_opt1_blocks_k {
-template<typename scalar_t, const vllm::ScalarTypeId w_type_id, int THREADS, int BLOCKS_M, int BLOCKS_N, int BLOCKS_K, bool HAS_ACT, bool HAS_ZP, bool HAS_M_PRED, bool HAS_NK_PRED>
+template<typename scalar_t, const vllm::ScalarTypeId w_type_id, int THREADS, int BLOCKS_M, int BLOCKS_N, int BLOCKS_K, bool HAS_ACT, bool HAS_ZP, bool HAS_M_PRED, bool HAS_NK_PRED, bool USE_EXLLAMA, bool USE_V2_FORMAT, bool LEGACY_AWQ>
 struct LoadingManager {
+  constexpr static int ZERO_BITS =
+      (w_type_id == vllm::kU8.id() || w_type_id == vllm::kU8B128.id()) ? 8 : 4;
+  constexpr static int ZERO_PACK_RATIO = 32 / ZERO_BITS;
+  static constexpr bool use_exllama = USE_EXLLAMA;
+  static constexpr bool use_v2_format = USE_V2_FORMAT;
+  static constexpr bool legacy_awq = LEGACY_AWQ;
     constexpr static int FragACount = 2;
     using FragA = PackType;
     constexpr static int FragBCount = 1;
@@ -2274,13 +2359,16 @@ struct LoadingManager {
         PackTypeInt4* c,
         PackTypeInt4* c_temp,
         const PackTypeInt4* scale_ptr,
-        const PackTypeInt4* zp_ptr = nullptr) {
+        const PackTypeInt4* zp_ptr,
+      bool _use_exllama, bool _use_v2_format, bool _legacy_awq) {
+
             A = (const FragA*)a;
             B = (const FragB*)b;
             C = (FragC*)c;
             C_temp = (float*)c_temp;
             scales = (const FragScaleLoading*)scale_ptr;
-            if constexpr(w_type_id == vllm::kU4.id()) {
+            if constexpr (w_type_id == vllm::kU4.id() ||
+                  w_type_id == vllm::kU8.id()) {
                 zeros = (const FragZeroLoading*)zp_ptr;
             }
     }
@@ -2381,6 +2469,11 @@ struct LoadingManager {
 
     __device__ __forceinline__ void swap_b_cache(int i) {
         local_b[i] = local_b_cache[i];
+    if constexpr (w_type_id == vllm::kU4.id() ||
+                  w_type_id == vllm::kU4B8.id()) {
+      if constexpr (!USE_EXLLAMA && !LEGACY_AWQ)
+        local_b[i] = shuffle_gptq_4bit_word(local_b[i]);
+    }
     }
 
     __device__ __forceinline__ void ldg_scales() {
@@ -2395,10 +2488,11 @@ struct LoadingManager {
     }
 
     __device__ __forceinline__ void ldg_zp() {
-        if constexpr(w_type_id == vllm::kU4.id()) {
-            bool pred = (tv.tid < TILE_N / PACK_RATIO_4BITS) && tile_manager.global_pred;
+        if constexpr (w_type_id == vllm::kU4.id() ||
+                  w_type_id == vllm::kU8.id()) {
+            bool pred = (tv.tid < TILE_N / ZERO_PACK_RATIO) && tile_manager.global_pred;
             if constexpr(HAS_NK_PRED) {
-                pred = pred && tv.tid < ((n - tile_manager.tile_start_col * TILE_N) / PACK_RATIO_4BITS);
+                pred = pred && tv.tid < ((n - tile_manager.tile_start_col * TILE_N) / ZERO_PACK_RATIO);
             }
             FragZeroLoading *gvm_addr = (FragZeroLoading*)zeros_loading + tv.tid;
             ldg_b32_reg_noasync(*((PackType*)&temp_zeros), gvm_addr, pred, true);
@@ -2411,13 +2505,14 @@ struct LoadingManager {
     }
 
     __device__ __forceinline__ void sts_zeros() {
-        if constexpr(w_type_id == vllm::kU4.id()) {
-            bool pred = (tv.tid < TILE_N / PACK_RATIO_4BITS) && tile_manager.global_pred;
+        if constexpr (w_type_id == vllm::kU4.id() ||
+                  w_type_id == vllm::kU8.id()) {
+            bool pred = (tv.tid < TILE_N / ZERO_PACK_RATIO) && tile_manager.global_pred;
             if (pred) {
-                float temp[PACK_RATIO_4BITS];
-                decompress_zero_4bits(temp_zeros, temp);
-                float *scale_bsm = (float*)(smem_base + 0x3000) + tv.tid * PACK_RATIO_4BITS;
-                for (int i = 0; i < PACK_RATIO_4BITS; i++) {
+                float temp[ZERO_PACK_RATIO];
+                decompress_gptq_zeros<ZERO_BITS, USE_V2_FORMAT, LEGACY_AWQ>(temp_zeros, temp);
+                float *scale_bsm = (float*)(smem_base + 0x3000) + tv.tid * ZERO_PACK_RATIO;
+                for (int i = 0; i < ZERO_PACK_RATIO; i++) {
                     *(scale_bsm + i) = temp[i];
                 }
             }
@@ -2442,7 +2537,8 @@ struct LoadingManager {
                 local_scales[i] = {s, s};
                 local_zeros[i] = {z, z};
             }
-        } else if constexpr(w_type_id == vllm::kU4.id()) {
+        } else if constexpr (w_type_id == vllm::kU4.id() ||
+                  w_type_id == vllm::kU8.id()) {
             #pragma unroll
             for (int i = 0; i < N_ITERS; i++) {
                 float s;
@@ -2464,8 +2560,6 @@ struct LoadingManager {
                 local_scales[i] = {s, s};
                 local_zeros[i] = {z, z};
             }
-        } else if constexpr(w_type_id == vllm::kU8.id()) {
-            // should apply zeros
         }
     }
 
@@ -2532,8 +2626,9 @@ struct LoadingManager {
             B_loading = B + (offset_k / PACK_RATIO_8BITS * n + offset_n) / (FragBCount) + tv.slot_idx * n * 2 + (tv.wave_idx * SLOT + tv.slot_tid)*N_ITERS;
         }
         scales_loading = scales + ((offset_k >> quant_group_power2) * n + offset_n) / (sizeof(FragScaleLoading)/sizeof(scalar_t));
-        if constexpr(w_type_id == vllm::kU4.id()) {
-            zeros_loading = zeros + ((offset_k >> quant_group_power2) * n + offset_n) / PACK_RATIO_4BITS;
+        if constexpr (w_type_id == vllm::kU4.id() ||
+                  w_type_id == vllm::kU8.id()) {
+            zeros_loading = zeros + ((offset_k >> quant_group_power2) * n + offset_n) / ZERO_PACK_RATIO;
         }
     }
 
@@ -2548,7 +2643,8 @@ struct LoadingManager {
         bsm_a_ptr += tv.slot_tid * (PAD_SLICE_K / (sizeof(PackTypeInt4) / sizeof(scalar_t))) + tv.slot_idx;
         bsm_scales_ptr = (scalar_t*)(smem_base + 0x2000);      //use 128xsizeof(float)*2 = 1k
         bsm_scales_ptr += (tv.wave_idx * SLOT + tv.slot_tid) * N_ITERS;
-        if constexpr(w_type_id == vllm::kU4.id()) {
+        if constexpr (w_type_id == vllm::kU4.id() ||
+                  w_type_id == vllm::kU8.id()) {
             bsm_zeros_ptr = (float*)(smem_base + 0x3000);
             bsm_zeros_ptr += (tv.wave_idx * SLOT + tv.slot_tid) * N_ITERS;
         }
@@ -2766,8 +2862,8 @@ template<typename scalar_t,
     const bool HAS_ACT_ORDER,   // whether act_order is enabled
     const bool HAS_ZP,          // whether zero-points are enabled
     const bool HAS_M_PRED = true,  //If we should use predictors to load m from gvm
-    const bool HAS_NK_PRED = true  //If we should use predictors to load nk from gvm
-    >
+    const bool HAS_NK_PRED = true,  //If we should use predictors to load nk from gvm
+    bool USE_EXLLAMA = true, bool USE_V2_FORMAT = false, bool LEGACY_AWQ = false>
 __global__ void hgemm_gptq(
     const PackTypeInt4* __restrict__ A,  // fp16 input matrix of shape mxk
     const PackTypeInt4* __restrict__ B,  // 4bit quantized weight matrix of shape kxn
@@ -2784,16 +2880,18 @@ __global__ void hgemm_gptq(
     int quant_group_power2, // quant group means how many quanted values share the same scale and zero, this value restricts to 2^x where x >= 5
     int max_iters,        // max tile iterations for one block
     int* locks,           // extra global storage for barrier synchronization
-    bool use_fp32_reduce  // whether to use fp32 global reduce
+    bool use_fp32_reduce,  // whether to use fp32 global reduce
+    bool use_exllama, bool use_v2_format, bool legacy_awq
 ) {
     int bidx = blockIdx.x;
     __shared__ uint8_t smem_base[0x4000]; //4x16x256 = 16Kbytes
-    using LoadingManagerType = LoadingManager<scalar_t, w_type_id, THREADS, BLOCKS_M, BLOCKS_N, BLOCKS_K, HAS_ACT_ORDER, HAS_ZP, HAS_M_PRED, HAS_NK_PRED>;
+    using LoadingManagerType = LoadingManager<scalar_t, w_type_id, THREADS, BLOCKS_M, BLOCKS_N, BLOCKS_K, HAS_ACT_ORDER, HAS_ZP, HAS_M_PRED, HAS_NK_PRED, USE_EXLLAMA, USE_V2_FORMAT, LEGACY_AWQ>;
     LoadingManagerType loading_manager;
     A += blockIdx.y * (MAX_BLOCKS_M * SLICE_M) * prob_k / (sizeof(PackTypeInt4) / sizeof(scalar_t));
     C += blockIdx.y * (MAX_BLOCKS_M * SLICE_M) * prob_n / (sizeof(PackTypeInt4) / sizeof(scalar_t));
   
-    loading_manager.set_address(A, B, C, C_tmp, scales_ptr, zp_ptr);
+    loading_manager.set_address(A, B, C, C_tmp, scales_ptr, zp_ptr,
+                              use_exllama, use_v2_format, legacy_awq);
     //loading_manager.init_address(prob_m, prob_n, prob_k, bidx, max_iters, smem_base);
     loading_manager.init_address_pre(std::min<int>(MAX_BLOCKS_M*SLICE_M, prob_m - blockIdx.y * (MAX_BLOCKS_M * SLICE_M)), prob_n, prob_k, quant_group_power2, bidx, max_iters, smem_base);
     loading_manager.clear_c();
@@ -2855,8 +2953,14 @@ __global__ void hgemm_gptq(
 } //end of namespace __hgemm_singular_opt1_blocks_k
 
 namespace __hgemm_even_opt1_blocks_k {
-template<typename scalar_t, const vllm::ScalarTypeId w_type_id, int THREADS, int BLOCKS_M, int BLOCKS_N, int BLOCKS_K, bool HAS_ACT, bool HAS_ZP, bool HAS_M_PRED, bool HAS_NK_PRED>
+template<typename scalar_t, const vllm::ScalarTypeId w_type_id, int THREADS, int BLOCKS_M, int BLOCKS_N, int BLOCKS_K, bool HAS_ACT, bool HAS_ZP, bool HAS_M_PRED, bool HAS_NK_PRED, bool USE_EXLLAMA, bool USE_V2_FORMAT, bool LEGACY_AWQ>
 struct LoadingManager {
+  constexpr static int ZERO_BITS =
+      (w_type_id == vllm::kU8.id() || w_type_id == vllm::kU8B128.id()) ? 8 : 4;
+  constexpr static int ZERO_PACK_RATIO = 32 / ZERO_BITS;
+  static constexpr bool use_exllama = USE_EXLLAMA;
+  static constexpr bool use_v2_format = USE_V2_FORMAT;
+  static constexpr bool legacy_awq = LEGACY_AWQ;
     constexpr static int FragACount = 4;
     using FragA = PackTypeInt2;
     constexpr static int FragBCount = 1;
@@ -2911,13 +3015,16 @@ struct LoadingManager {
         PackTypeInt4* c,
         PackTypeInt4* c_temp,
         const PackTypeInt4* scale_ptr,
-        const PackTypeInt4* zp_ptr = nullptr) {
+        const PackTypeInt4* zp_ptr,
+      bool _use_exllama, bool _use_v2_format, bool _legacy_awq) {
+
             A = (const FragA*)a;
             B = (const FragB*)b;
             C = (FragC*)c;
             C_temp = (float*)c_temp;
             scales = (const FragScaleLoading*)scale_ptr;
-            if constexpr(w_type_id == vllm::kU4.id()) {
+            if constexpr (w_type_id == vllm::kU4.id() ||
+                  w_type_id == vllm::kU8.id()) {
                 zeros = (const FragZeroLoading*)zp_ptr;
             }
     }
@@ -3042,6 +3149,11 @@ struct LoadingManager {
 
     __device__ __forceinline__ void swap_b_cache(int i) {
         local_b[i] = local_b_cache[i];
+    if constexpr (w_type_id == vllm::kU4.id() ||
+                  w_type_id == vllm::kU4B8.id()) {
+      if constexpr (!USE_EXLLAMA && !LEGACY_AWQ)
+        local_b[i] = shuffle_gptq_4bit_word(local_b[i]);
+    }
     }
 
     __device__ __forceinline__ void ldg_scales() {
@@ -3056,10 +3168,11 @@ struct LoadingManager {
     }
 
     __device__ __forceinline__ void ldg_zp() {
-        if constexpr(w_type_id == vllm::kU4.id()) {
-            bool pred = (tv.tid < TILE_N / PACK_RATIO_4BITS) && tile_manager.global_pred;
+        if constexpr (w_type_id == vllm::kU4.id() ||
+                  w_type_id == vllm::kU8.id()) {
+            bool pred = (tv.tid < TILE_N / ZERO_PACK_RATIO) && tile_manager.global_pred;
             if constexpr(HAS_NK_PRED) {
-                pred = pred && tv.tid < ((n - tile_manager.tile_start_col * TILE_N) / PACK_RATIO_4BITS);
+                pred = pred && tv.tid < ((n - tile_manager.tile_start_col * TILE_N) / ZERO_PACK_RATIO);
             }
             FragZeroLoading *gvm_addr = (FragZeroLoading*)zeros_loading + tv.tid;
             ldg_b32_reg_noasync(*((PackType*)&temp_zeros), gvm_addr, pred, true);
@@ -3072,13 +3185,14 @@ struct LoadingManager {
     }
 
     __device__ __forceinline__ void sts_zeros() {
-        if constexpr(w_type_id == vllm::kU4.id()) {
-            bool pred = (tv.tid < TILE_N / PACK_RATIO_4BITS) && tile_manager.global_pred;
+        if constexpr (w_type_id == vllm::kU4.id() ||
+                  w_type_id == vllm::kU8.id()) {
+            bool pred = (tv.tid < TILE_N / ZERO_PACK_RATIO) && tile_manager.global_pred;
             if (pred) {
-                float temp[PACK_RATIO_4BITS];
-                decompress_zero_4bits(temp_zeros, temp);
-                float *zeros_bsm = (float*)(smem_base + 0x3400) + tv.tid * PACK_RATIO_4BITS;
-                for (int i = 0; i < PACK_RATIO_4BITS; i++) {
+                float temp[ZERO_PACK_RATIO];
+                decompress_gptq_zeros<ZERO_BITS, USE_V2_FORMAT, LEGACY_AWQ>(temp_zeros, temp);
+                float *zeros_bsm = (float*)(smem_base + 0x3400) + tv.tid * ZERO_PACK_RATIO;
+                for (int i = 0; i < ZERO_PACK_RATIO; i++) {
                     *(zeros_bsm + i) = temp[i];
                 }
             }
@@ -3105,7 +3219,8 @@ struct LoadingManager {
                 local_scales[i] = {s, s};
                 local_zeros[i] = {z, z};
             }
-        } else if constexpr(w_type_id == vllm::kU4.id()) {
+        } else if constexpr (w_type_id == vllm::kU4.id() ||
+                  w_type_id == vllm::kU8.id()) {
             #pragma unroll
             for (int i = 0; i < N_ITERS; i++) {
                 float s;
@@ -3127,8 +3242,6 @@ struct LoadingManager {
                 local_scales[i] = {s, s};
                 local_zeros[i] = {z, z};
             }
-        } else if constexpr(w_type_id == vllm::kU8.id()) {
-            // should apply zeros
         }
     }
 
@@ -3194,8 +3307,9 @@ struct LoadingManager {
             B_loading = B + (offset_k / PACK_RATIO_8BITS * n + offset_n) / (FragBCount) + tv.slot_idx * n * 2 + (tv.wave_idx * SLOT + tv.slot_tid)*N_ITERS;
         }
         scales_loading = scales + ((offset_k >> quant_group_power2) * n + offset_n) / (sizeof(FragScaleLoading)/sizeof(scalar_t));
-        if constexpr(w_type_id == vllm::kU4.id()) {
-            zeros_loading = zeros + ((offset_k >> quant_group_power2) * n + offset_n) / PACK_RATIO_4BITS;
+        if constexpr (w_type_id == vllm::kU4.id() ||
+                  w_type_id == vllm::kU8.id()) {
+            zeros_loading = zeros + ((offset_k >> quant_group_power2) * n + offset_n) / ZERO_PACK_RATIO;
         }
     }
 
@@ -3210,7 +3324,8 @@ struct LoadingManager {
         bsm_a_ptr += tv.slot_tid * (DOUBLE_PAD_SLICE_K / (sizeof(PackTypeInt4) / sizeof(scalar_t))) + tv.slot_idx;
         bsm_scales_ptr = (scalar_t*)(smem_base + 0x3000);      //use 128xsizeof(float)*2 = 1k
         bsm_scales_ptr += (tv.wave_idx * SLOT + tv.slot_tid) * N_ITERS;
-        if constexpr(w_type_id == vllm::kU4.id()) {
+        if constexpr (w_type_id == vllm::kU4.id() ||
+                  w_type_id == vllm::kU8.id()) {
             bsm_zeros_ptr = (float*)(smem_base + 0x3400);      //use 128xsizeof(float)*2 = 1k
             bsm_zeros_ptr += (tv.wave_idx * SLOT + tv.slot_tid) * N_ITERS;
         }
@@ -3425,8 +3540,8 @@ template<typename scalar_t,
     const bool HAS_ACT_ORDER,   // whether act_order is enabled
     const bool HAS_ZP,          // whether zero-points are enabled
     const bool HAS_M_PRED = true,  //If we should use predictors to load m from gvm
-    const bool HAS_NK_PRED = true  //If we should use predictors to load nk from gvm
-    >
+    const bool HAS_NK_PRED = true,  //If we should use predictors to load nk from gvm
+    bool USE_EXLLAMA = true, bool USE_V2_FORMAT = false, bool LEGACY_AWQ = false>
 __global__ void hgemm_gptq(
     const PackTypeInt4* __restrict__ A,  // fp16 input matrix of shape mxk
     const PackTypeInt4* __restrict__ B,  // 4bit quantized weight matrix of shape kxn
@@ -3443,16 +3558,18 @@ __global__ void hgemm_gptq(
     int quant_group_power2,
     int max_iters,        // max tile iterations for one block
     int* locks,           // extra global storage for barrier synchronization
-    bool use_fp32_reduce  // whether to use fp32 global reduce
+    bool use_fp32_reduce,  // whether to use fp32 global reduce
+    bool use_exllama, bool use_v2_format, bool legacy_awq
 ) {
     int bidx = blockIdx.x;
     __shared__ uint8_t smem_base[0x4000]; //4x16x256 = 16Kbytes
-    using LoadingManagerType = LoadingManager<scalar_t, w_type_id, THREADS, BLOCKS_M, BLOCKS_N, BLOCKS_K, HAS_ACT_ORDER, HAS_ZP, HAS_M_PRED, HAS_NK_PRED>;
+    using LoadingManagerType = LoadingManager<scalar_t, w_type_id, THREADS, BLOCKS_M, BLOCKS_N, BLOCKS_K, HAS_ACT_ORDER, HAS_ZP, HAS_M_PRED, HAS_NK_PRED, USE_EXLLAMA, USE_V2_FORMAT, LEGACY_AWQ>;
     LoadingManagerType loading_manager;
     A += blockIdx.y * (MAX_BLOCKS_M * SLICE_M) * prob_k / (sizeof(PackTypeInt4) / sizeof(scalar_t));
     C += (blockIdx.y * (MAX_BLOCKS_M * SLICE_M) * prob_n) / (sizeof(PackTypeInt4) / sizeof(scalar_t));
 
-    loading_manager.set_address(A, B, C, C_tmp, scales_ptr, zp_ptr);
+    loading_manager.set_address(A, B, C, C_tmp, scales_ptr, zp_ptr,
+                              use_exllama, use_v2_format, legacy_awq);
     //loading_manager.init_address(prob_m, prob_n, prob_k, bidx, max_iters, smem_base);
     loading_manager.init_address_pre(std::min<int>(MAX_BLOCKS_M*SLICE_M, prob_m - blockIdx.y * (MAX_BLOCKS_M * SLICE_M)), prob_n, prob_k, quant_group_power2, bidx, max_iters, smem_base);
 
@@ -3540,6 +3657,40 @@ __global__ void hgemm_gptq(
 }
 } //end of namespace __hgemm_even_opt1_blocks_k
 
+// Launch implementations are compiled only by the five format translation units.
+#ifdef HGEMM_GPTQ_FORMAT_IMPLEMENTATION
+// Routing policy between the split-K fp32-atomic kernel (clean_zero + gemm +
+// all_reduce) and the no-atomic direct-store kernel (single launch).
+//
+// Default (env unset): the no-atomic kernel wins only where the 3-launch
+// chain (~3.8us per launch on C500, probe-verified) dominates the GEMM body
+// and the lost split-K parallelism is irrelevant:
+//   - decode regime (m <= 4, tiles_k <= 3, tiles_n*tiles_k <= 8): every
+//     swept shape wins 13.6-30.6%; the tile bound keeps the collapse free --
+//     while the whole grid is <= 8 CTAs it cannot fill the 104-SM device
+//     anyway, so the lost split-K parallelism costs nothing. Above that
+//     (e.g. 1x384x1024/gs128: 4*3=12 tiles) split-K parallelism starts to
+//     pay and the atomic path is kept (-2.3% regression otherwise);
+//   - small-k prefill tiles (m <= 64, tiles_k <= 2): -30.1% on the swept
+//     64x256x320/gs256 shape (grid too small for split-K to pay for the
+//     extra two launches).
+// tiles_k >= 4 keeps the atomic path: k-serialism collapses the no-atomic
+// grid (-110%..-238% in the sweep), and the atomic path preserves exact
+// fp32 split-K accumulation semantics (see the bitwise
+// split_k_fp32_cancellation test, tiles_k=4; the direct-store path deviates
+// by ~2^-13 on adversarial cancellation inputs).
+//
+// MCOP_GPTQ_NOATOMIC_MIN=<v> (probe/tuning override): restores the
+// historical criterion "tiles_n * chunks >= v" for every shape.
+inline bool gptq_prefer_no_atomic(int m, int tiles_k, int tiles_n, int chunks) {
+  const char* e = getenv("MCOP_GPTQ_NOATOMIC_MIN");
+  if (e) {
+    return tiles_n * std::max(chunks, 1) >= atoi(e);
+  }
+  return (m <= 4 && tiles_k <= 3 && tiles_n * tiles_k <= 8) ||
+         (m <= 64 && tiles_k <= 2);
+}
+
 template<typename scalar_t,
     const vllm::ScalarTypeId w_type_id,
     int THREADS,
@@ -3549,14 +3700,14 @@ template<typename scalar_t,
     bool HAS_ACT_ORDER,
     bool HAS_ZP,
     bool HAS_M_PRED,
-    bool HAS_NK_PRED>
+    bool HAS_NK_PRED, bool USE_EXLLAMA, bool USE_V2_FORMAT, bool LEGACY_AWQ>
 bool launch_gemm_gptq_no_atomic_kernel(const PackTypeInt4* A,
     const PackTypeInt4* B,
     PackTypeInt4* C,
     PackTypeInt4* C_temp,
     const PackTypeInt4* scales,
     const PackTypeInt4* zeros,
-    int* g_idx, int m, int n, int k, int quant_group, int chunks, cudaStream_t stream = nullptr) {
+    int* g_idx, int m, int n, int k, int quant_group, int chunks, cudaStream_t stream, bool use_exllama, bool use_v2_format, bool legacy_awq) {
     int tiles_m = div_ceil(m, TILE_M);
     int tiles_n = div_ceil(n, TILE_N);
     int tiles_k = div_ceil(k, TILE_K);
@@ -3575,15 +3726,15 @@ bool launch_gemm_gptq_no_atomic_kernel(const PackTypeInt4* A,
             w_type_id,
             THREADS,
             BLOCKS_M, BLOCKS_N, BLOCKS_K,
-            HAS_ACT_ORDER, HAS_ZP, HAS_M_PRED, HAS_NK_PRED
-            ><<<dim3(1, std::max(chunks,1), tiles_n), THREADS, 0, stream>>>(A, B, C, C_temp, scales, zeros, g_idx, m, n, k, get_power2(quant_group), tiles_k, nullptr, false);
+            HAS_ACT_ORDER, HAS_ZP, HAS_M_PRED, HAS_NK_PRED, USE_EXLLAMA, USE_V2_FORMAT, LEGACY_AWQ
+            ><<<dim3(1, std::max(chunks,1), tiles_n), THREADS, 0, stream>>>(A, B, C, C_temp, scales, zeros, g_idx, m, n, k, get_power2(quant_group), tiles_k, nullptr, false, use_exllama, use_v2_format, legacy_awq);
     } else {
         __hgemm_even_opt1_blocks_k::hgemm_gptq<scalar_t,
             w_type_id,
             THREADS,
             BLOCKS_M, BLOCKS_N, BLOCKS_K,
-            HAS_ACT_ORDER, HAS_ZP, HAS_M_PRED, HAS_NK_PRED
-            ><<<dim3(1, std::max(chunks,1), tiles_n), THREADS, 0, stream>>>(A, B, C, C_temp, scales, zeros, g_idx, m, n, k, get_power2(quant_group), tiles_k, nullptr, false);
+            HAS_ACT_ORDER, HAS_ZP, HAS_M_PRED, HAS_NK_PRED, USE_EXLLAMA, USE_V2_FORMAT, LEGACY_AWQ
+            ><<<dim3(1, std::max(chunks,1), tiles_n), THREADS, 0, stream>>>(A, B, C, C_temp, scales, zeros, g_idx, m, n, k, get_power2(quant_group), tiles_k, nullptr, false, use_exllama, use_v2_format, legacy_awq);
     }
 
     return true;
@@ -3591,13 +3742,13 @@ bool launch_gemm_gptq_no_atomic_kernel(const PackTypeInt4* A,
 
 template <typename scalar_t, const vllm::ScalarTypeId w_type_id, int THREADS,
           int BLOCKS_M, int BLOCKS_N, int BLOCKS_K, bool HAS_ACT_ORDER,
-          bool HAS_ZP, bool HAS_M_PRED, bool HAS_NK_PRED>
-bool launch_gemm_gptq_kernel(const PackTypeInt4* A, const PackTypeInt4* B,
+          bool HAS_ZP, bool HAS_M_PRED, bool HAS_NK_PRED, bool USE_EXLLAMA, bool USE_V2_FORMAT, bool LEGACY_AWQ>
+bool launch_gemm_gptq_kernel_impl(const PackTypeInt4* A, const PackTypeInt4* B,
                              PackTypeInt4* C, PackTypeInt4* C_temp,
                              const PackTypeInt4* scales,
                              const PackTypeInt4* zeros, int* g_idx, int m,
                              int n, int k, int quant_group, int chunks,
-                             cudaStream_t stream = nullptr) {
+                             cudaStream_t stream, bool use_exllama, bool use_v2_format, bool legacy_awq = false) {
   int tiles_m = div_ceil(m, TILE_M);
   int tiles_n = div_ceil(n, TILE_N);
   int tiles_k = div_ceil(k, TILE_K);
@@ -3607,8 +3758,9 @@ bool launch_gemm_gptq_kernel(const PackTypeInt4* A, const PackTypeInt4* B,
     return false;
   }
 
-  if(tiles_n * std::max(chunks,1) >= PEUS) return launch_gemm_gptq_no_atomic_kernel<scalar_t, w_type_id, THREADS, BLOCKS_M, BLOCKS_N, BLOCKS_K, HAS_ACT_ORDER,
-    HAS_ZP, HAS_M_PRED, HAS_NK_PRED>(A, B, C,C_temp, scales, zeros, g_idx, m, n, k, quant_group, chunks, stream);
+  if (gptq_prefer_no_atomic(m, tiles_k, tiles_n, chunks))
+    return launch_gemm_gptq_no_atomic_kernel<scalar_t, w_type_id, THREADS, BLOCKS_M, BLOCKS_N, BLOCKS_K, HAS_ACT_ORDER,
+    HAS_ZP, HAS_M_PRED, HAS_NK_PRED, USE_EXLLAMA, USE_V2_FORMAT, LEGACY_AWQ>(A, B, C,C_temp, scales, zeros, g_idx, m, n, k, quant_group, chunks, stream, use_exllama, use_v2_format, legacy_awq);
   
   int total_tiles = tiles_n * tiles_k;
   int blocks = PEUS;
@@ -3653,23 +3805,34 @@ bool launch_gemm_gptq_kernel(const PackTypeInt4* A, const PackTypeInt4* B,
     clean_zero<clean_kernel_thread_num, clean_kernel_pack_num>
         <<<clean_blocks, clean_kernel_thread_num, 0, stream>>>((float*)C_temp,
                                                                num_elem);
+  } else if constexpr (std::is_same_v<scalar_t, half>) {
+    if (!legacy_awq && C_temp != nullptr) {
+      size_t num_elem = size_t(m) * size_t(n);
+      size_t clean_blocks = std::max(
+          size_t(1),
+          (num_elem + clean_kernel_thread_num * clean_kernel_pack_num - 1) /
+              (clean_kernel_thread_num * clean_kernel_pack_num));
+      clean_zero<clean_kernel_thread_num, clean_kernel_pack_num>
+          <<<clean_blocks, clean_kernel_thread_num, 0, stream>>>(
+              (float*)C_temp, num_elem);
+    }
   }
 
   // It is better to do perm before launch kernel
   if constexpr (BLOCKS_K % 2 == 1) {
     __hgemm_singular_blocks_k::hgemm_gptq<
         scalar_t, w_type_id, THREADS, BLOCKS_M, BLOCKS_N, BLOCKS_K,
-        HAS_ACT_ORDER, HAS_ZP, HAS_M_PRED, HAS_NK_PRED>
+        HAS_ACT_ORDER, HAS_ZP, HAS_M_PRED, HAS_NK_PRED, USE_EXLLAMA, USE_V2_FORMAT, LEGACY_AWQ>
         <<<dim3(std::max(blocks, 1), std::max(chunks, 1), 1), THREADS, 0,
            stream>>>(A, B, C, C_temp, scales, zeros, g_idx, m, n, k,
-                     get_power2(quant_group), iters, nullptr, false);
+                     get_power2(quant_group), iters, nullptr, false, use_exllama, use_v2_format, legacy_awq);
   } else {
     __hgemm_even_blocks_k::hgemm_gptq<scalar_t, w_type_id, THREADS, BLOCKS_M,
                                       BLOCKS_N, BLOCKS_K, HAS_ACT_ORDER, HAS_ZP,
-                                      HAS_M_PRED, HAS_NK_PRED>
+                                      HAS_M_PRED, HAS_NK_PRED, USE_EXLLAMA, USE_V2_FORMAT, LEGACY_AWQ>
         <<<dim3(std::max(blocks, 1), std::max(chunks, 1), 1), THREADS, 0,
            stream>>>(A, B, C, C_temp, scales, zeros, g_idx, m, n, k,
-                     get_power2(quant_group), iters, nullptr, false);
+                     get_power2(quant_group), iters, nullptr, false, use_exllama, use_v2_format, legacy_awq);
   }
 
   if constexpr (std::is_same_v<scalar_t, __maca_bfloat16>) {
@@ -3681,9 +3844,89 @@ bool launch_gemm_gptq_kernel(const PackTypeInt4* A, const PackTypeInt4* B,
     all_reduce<reduce_kernel_thread_num, reduce_kernel_pack_num, false>
         <<<reduce_blocks, reduce_kernel_thread_num, 0, stream>>>(
             (float*)C_temp, (maca_bfloat16*)C, num_elem);
+  } else if constexpr (std::is_same_v<scalar_t, half>) {
+    if (!legacy_awq && C_temp != nullptr) {
+      size_t num_elem = size_t(m) * size_t(n);
+      size_t reduce_blocks = std::max(
+          size_t(1),
+          (num_elem + reduce_kernel_thread_num * reduce_kernel_pack_num - 1) /
+              (reduce_kernel_thread_num * reduce_kernel_pack_num));
+      all_reduce_fp16<reduce_kernel_thread_num, reduce_kernel_pack_num>
+          <<<reduce_blocks, reduce_kernel_thread_num, 0, stream>>>(
+              (float*)C_temp, (half*)C, num_elem);
+    }
   }
 
   return true;
+}
+
+#else
+template <typename scalar_t, const vllm::ScalarTypeId w_type_id, int THREADS,
+          int BLOCKS_M, int BLOCKS_N, int BLOCKS_K, bool HAS_ACT_ORDER,
+          bool HAS_ZP, bool HAS_M_PRED, bool HAS_NK_PRED, bool USE_EXLLAMA,
+          bool USE_V2_FORMAT, bool LEGACY_AWQ>
+bool launch_gemm_gptq_kernel_impl(
+    const PackTypeInt4* A, const PackTypeInt4* B, PackTypeInt4* C,
+    PackTypeInt4* C_temp, const PackTypeInt4* scales, const PackTypeInt4* zeros,
+    int* g_idx, int m, int n, int k, int quant_group, int chunks,
+    cudaStream_t stream, bool use_exllama, bool use_v2_format,
+    bool legacy_awq = false);
+
+#endif
+
+#include "hgemm_gptq_format_instances.cuh"
+#define HGEMM_EXTERN(T, W, BM, BN, BK, ZP, MP, NKP, S, V, A)   HGEMM_FORMAT_INSTANCE(extern template, T, W, BM, BN, BK, ZP, MP, NKP, S, V, A)
+HGEMM_FORMAT_CONFIGS(HGEMM_EXTERN, true, true, false)
+HGEMM_FORMAT_CONFIGS(HGEMM_EXTERN, true, false, false)
+HGEMM_FORMAT_CONFIGS(HGEMM_EXTERN, false, true, false)
+HGEMM_FORMAT_CONFIGS(HGEMM_EXTERN, false, false, false)
+HGEMM_LEGACY_CONFIGS(HGEMM_EXTERN)
+#undef HGEMM_EXTERN
+
+// Keep format selection on the host so the dequantization pipeline has no
+// runtime format branches. The AWQ overload below retains its original layout.
+template <typename scalar_t, const vllm::ScalarTypeId w_type_id, int THREADS,
+          int BLOCKS_M, int BLOCKS_N, int BLOCKS_K, bool HAS_ACT_ORDER,
+          bool HAS_ZP, bool HAS_M_PRED, bool HAS_NK_PRED>
+bool launch_gemm_gptq_kernel(const PackTypeInt4* A, const PackTypeInt4* B,
+                             PackTypeInt4* C, PackTypeInt4* C_temp,
+                             const PackTypeInt4* scales,
+                             const PackTypeInt4* zeros, int* g_idx, int m,
+                             int n, int k, int quant_group, int chunks,
+                             cudaStream_t stream, bool use_exllama,
+                             bool use_v2_format, bool legacy_awq = false) {
+#define LAUNCH_FORMAT(SHUFFLED, V2, AWQ)                                  \
+  return launch_gemm_gptq_kernel_impl<                                   \
+      scalar_t, w_type_id, THREADS, BLOCKS_M, BLOCKS_N, BLOCKS_K,          \
+      HAS_ACT_ORDER, HAS_ZP, HAS_M_PRED, HAS_NK_PRED, SHUFFLED, V2, AWQ>( \
+      A, B, C, C_temp, scales, zeros, g_idx, m, n, k, quant_group,         \
+      chunks, stream, SHUFFLED, V2, AWQ)
+  if (legacy_awq) { LAUNCH_FORMAT(true, true, true); }
+  if (use_exllama) {
+    if (use_v2_format) { LAUNCH_FORMAT(true, true, false); }
+    LAUNCH_FORMAT(true, false, false);
+  }
+  if (use_v2_format) { LAUNCH_FORMAT(false, true, false); }
+  LAUNCH_FORMAT(false, false, false);
+#undef LAUNCH_FORMAT
+}
+
+// Compatibility entry for AWQ callers predating GPTQ format flags.
+// AWQ uses shuffled weights and its original interleaved zero fields, with no +1.
+template <typename scalar_t, const vllm::ScalarTypeId w_type_id, int THREADS,
+          int BLOCKS_M, int BLOCKS_N, int BLOCKS_K, bool HAS_ACT_ORDER,
+          bool HAS_ZP, bool HAS_M_PRED, bool HAS_NK_PRED>
+bool launch_gemm_gptq_kernel(const PackTypeInt4* A, const PackTypeInt4* B,
+                             PackTypeInt4* C, PackTypeInt4* C_temp,
+                             const PackTypeInt4* scales,
+                             const PackTypeInt4* zeros, int* g_idx, int m,
+                             int n, int k, int quant_group, int chunks,
+                             cudaStream_t stream = nullptr) {
+  return launch_gemm_gptq_kernel_impl<
+      scalar_t, w_type_id, THREADS, BLOCKS_M, BLOCKS_N, BLOCKS_K,
+      HAS_ACT_ORDER, HAS_ZP, HAS_M_PRED, HAS_NK_PRED, true, true, true>(
+      A, B, C, C_temp, scales, zeros, g_idx, m, n, k, quant_group, chunks,
+      stream, true, true, true);
 }
 
 }  // namespace hgemm_marlin_gptq

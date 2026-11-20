@@ -7,7 +7,7 @@ import mcoplib._C
 # ==============================================================================
 # 1. 算子加载 (请根据实际的 C++ binding 路径进行调整)
 # ==============================================================================
-# 假设您的 C++ 扩展被编译为 torch.ops.mcop.rms_norm 或者 vllm._custom_ops.rms_norm
+# 假设您的 C++ 扩展被编译为 torch.ops.mcoplib.rms_norm 或者 vllm._custom_ops.rms_norm
 # 这里提供一个 Wrapper，如果在 vllm 环境中则直接调用，否则调用自定义库
 def run_cuda_rms_norm(x, weight, epsilon=1e-5, zero_centered=False):
     out = torch.empty_like(x)
@@ -16,7 +16,7 @@ def run_cuda_rms_norm(x, weight, epsilon=1e-5, zero_centered=False):
     except ImportError:
         try:
             # 适配 MCOP 库自定义加载
-            torch.ops.mcop.rms_norm(out, x, weight, epsilon, zero_centered)
+            torch.ops.mcoplib.rms_norm(out, x, weight, epsilon, zero_centered)
         except Exception:
             # Fallback 占位，如果没有任何库，这里为了演示不至于崩溃，跑 ref
             # 请在真实测试环境中确保这里调用的是上面的 cuda extension

@@ -72,6 +72,7 @@ if (USE_MACA)
     VLLM_ENABLE_KIMI_K3_ATTN_RES
     VLLM_ENABLE_FUSED_KDA_DECODE
     VLLM_ENABLE_FUSED_GDN_DECODE
+    ENABLE_FP8
   )
   message(STATUS "MACA version: ${MACA_VERSION_MAJOR}.${MACA_VERSION_MINOR}.${MACA_VERSION_PATCH}.${MACA_VERSION_BUILD}")
 
@@ -229,9 +230,15 @@ if (BUILD_VLLM_SUBMODULE)
     "${VLLM_SRC_DIR}/topk.cu"
     "${VLLM_SRC_DIR}/candidate_blocks.cu"
     "${VLLM_SRC_DIR}/region_topk_ids.cu"
+    "${VLLM_SRC_DIR}/prepare_topk_scores.cu"
     "${VLLM_SRC_DIR}/dsv3_fused_a_gemm.cu"
     "${VLLM_SRC_DIR}/cuda_view.cu"
     "${VLLM_SRC_DIR}/quantization/gptq/q_gemm.cu"
+    "${VLLM_SRC_DIR}/quantization/gptq/hgemm_gptq_format_awq_legacy.cu"
+    "${VLLM_SRC_DIR}/quantization/gptq/hgemm_gptq_format_exllama_v2.cu"
+    "${VLLM_SRC_DIR}/quantization/gptq/hgemm_gptq_format_exllama_v1.cu"
+    "${VLLM_SRC_DIR}/quantization/gptq/hgemm_gptq_format_plain_v2.cu"
+    "${VLLM_SRC_DIR}/quantization/gptq/hgemm_gptq_format_plain_v1.cu"
     "${VLLM_SRC_DIR}/quantization/compressed_tensors/int8_quant_kernels.cu"
     "${VLLM_SRC_DIR}/quantization/w8a8/fp8/common.cu"
     "${VLLM_SRC_DIR}/quantization/w8a8/fp8/per_token_group_quant.cu"
@@ -260,6 +267,11 @@ if (BUILD_VLLM_SUBMODULE)
     "${VLLM_SRC_DIR}/hisparse_kernels.cu"
     "${VLLM_SRC_DIR}/nvfp4_ds_mla_cache_kernels.cu"
     "${VLLM_SRC_DIR}/torch_bindings.cpp")
+
+  # Match the optimization level used by the validated reference kernel.
+  set_source_files_properties(
+    "${VLLM_SRC_DIR}/prepare_topk_scores.cu"
+    PROPERTIES COMPILE_OPTIONS "-O3")
     
 
 

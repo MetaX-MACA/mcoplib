@@ -73,14 +73,10 @@ __global__ void moe_align_block_size_kernel(
     if (pad_sorted_token_ids) {
       Vec fill_vec;
       fill_vec.x = fill_vec.y = fill_vec.z = fill_vec.w = numel;
-      // Do not let the last int4 store cross the logical allocation boundary.
-      int32_t total_vecs = max_num_tokens_padded / VEC_SIZE;
+      int32_t total_vecs = (max_num_tokens_padded + VEC_SIZE - 1) / VEC_SIZE;
       Vec* out_ptr = reinterpret_cast<Vec*>(sorted_token_ids);
       for (int32_t i = threadIdx.x; i < total_vecs; i += blockDim.x) {
         out_ptr[i] = fill_vec;
-      }
-      for (int32_t i = total_vecs * VEC_SIZE + threadIdx.x; i < max_num_tokens_padded; i += blockDim.x) {
-        sorted_token_ids[i] = numel;
       }
     }
     return;
@@ -213,9 +209,11 @@ __global__ void moe_align_block_size_kernel(
   __syncthreads();
 
   int offset = warp_sums[warp_id];
-  // Publish the final prefix directly before cross-warp expert lookup.
-  if (tid < num_experts) prefix[tid] = pre + offset;
+  if (tid < scan_size) scan_buf[tid] = pre + offset;
   __syncthreads();
+
+  // Write prefix[0..num_experts - 1] and cumsum
+  if (tid < num_experts) prefix[tid] = scan_buf[tid];
 #endif
 
   if (tid <= num_experts) {
@@ -225,16 +223,16 @@ __global__ void moe_align_block_size_kernel(
   const int32_t num_blocks = s_total_tokens_post_pad / block_size;
   for (int32_t i = tid; i < num_blocks; i += stride) {
     int32_t block_start = i * block_size;
-    uint32_t left = 0, right = num_experts;
+    int left = 0, right = num_experts;
     while (left < right) {
-      uint32_t mid = (left + right) >> 1;
+      int mid = (left + right) >> 1;
       if (prefix[mid] <= block_start) {
         left = mid + 1;
       } else {
         right = mid;
       }
     }
-    expert_ids[i] = static_cast<int32_t>(left) - 2;
+    expert_ids[i] = left - 2;
   }
 }
 

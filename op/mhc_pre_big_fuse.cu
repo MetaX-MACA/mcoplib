@@ -49,7 +49,10 @@ void mhc_pre_big_fuse_extended(
     const c10::optional<torch::Tensor>& pre_mix_in,
     const c10::optional<torch::Tensor>& pre_mix_out,
     const c10::optional<torch::Tensor>& aux_out,
-    const c10::optional<torch::Tensor>& residual_out, double rms_eps,
+    const c10::optional<torch::Tensor>& residual_out,
+    const c10::optional<torch::Tensor>& quant_scales,
+    const c10::optional<torch::Tensor>& output_rms,
+    const c10::optional<torch::Tensor>& output_quant_int8, double rms_eps,
     double hc_pre_eps, double hc_sinkhorn_eps, double hc_post_mult_value,
     int64_t sinkhorn_repeat, int64_t n_splits, double norm_eps,
     int64_t rms_numel) {
@@ -57,6 +60,12 @@ void mhc_pre_big_fuse_extended(
   const bool broadcast_residual = residual_out.has_value();
   const int64_t hidden_size =
       broadcast_residual ? residual.size(1) : residual.size(2);
+  constexpr int64_t kPackedRowBytes = ((5120 + 4 + 511) / 512) * 512;
+  constexpr int64_t kPackedRowElements = kPackedRowBytes / 2;
+  const int quant_mode =
+      layer_input.scalar_type() == at::kChar
+          ? 1
+          : (layer_input.size(1) == kPackedRowElements ? 2 : 0);
   if (num_tokens == 0) {
     return;
   }
@@ -82,9 +91,12 @@ void mhc_pre_big_fuse_extended(
               "post_mix must have shape [N, 4]");
   TORCH_CHECK(comb_mix.sizes() == torch::IntArrayRef({num_tokens, 16}),
               "comb_mix must have shape [N, 16]");
-  TORCH_CHECK(layer_input.sizes() ==
-                  torch::IntArrayRef({num_tokens, hidden_size}),
-              "layer_input must have shape [N, H]");
+  TORCH_CHECK(
+      layer_input.sizes() == torch::IntArrayRef(
+                                 {num_tokens, quant_mode == 2
+                                                  ? kPackedRowElements
+                                                  : hidden_size}),
+      "layer_input has an invalid shape for its output mode");
   const int64_t effective_rms_numel =
       rms_numel <= 0
           ? (broadcast_residual ? hidden_size : 4 * hidden_size)
@@ -96,6 +108,50 @@ void mhc_pre_big_fuse_extended(
   const bool use_pre_mix_in = pre_mix_in.has_value();
   const bool save_pre_mix = pre_mix_out.has_value();
   const bool write_aux = aux_out.has_value();
+  if (quant_mode != 0) {
+    TORCH_CHECK(fuse_norm,
+                "INT8 and packed INT8 mHC pre output require norm_weight");
+    TORCH_CHECK(!broadcast_residual,
+                "broadcast mHC pre does not support quantized output");
+    TORCH_CHECK(quant_scales.has_value(),
+                "quant_scales is required for quantized mHC pre output");
+    check_optional_tensor(quant_scales, at::kFloat, "quant_scales");
+    TORCH_CHECK(quant_scales->sizes() == torch::IntArrayRef({num_tokens}),
+                "quant_scales must have shape [N]");
+    TORCH_CHECK(quant_scales->device() == residual.device(),
+                "quant_scales must be on the same device as residual");
+  } else {
+    TORCH_CHECK(!quant_scales.has_value(),
+                "quant_scales requires INT8 or packed INT8 layer_input");
+  }
+  if (quant_mode != 0) {
+    TORCH_CHECK(output_rms.has_value(),
+                "quantized mHC pre output requires output_rms");
+    check_optional_tensor(output_rms, at::kBFloat16, "output_rms");
+    TORCH_CHECK(output_rms->sizes() ==
+                    torch::IntArrayRef({num_tokens, hidden_size}),
+                "output_rms must have shape [N, H]");
+    TORCH_CHECK(output_rms->device() == residual.device(),
+                "output_rms must be on the same device as residual");
+  } else {
+    TORCH_CHECK(!output_rms.has_value(),
+                "output_rms is only valid for quantized mHC pre output");
+  }
+  if (quant_mode == 2) {
+    TORCH_CHECK(output_quant_int8.has_value(),
+                "packed INT8 mHC pre output requires output_quant_int8");
+    check_optional_tensor(output_quant_int8, at::kChar,
+                          "output_quant_int8");
+    TORCH_CHECK(output_quant_int8->sizes() ==
+                    torch::IntArrayRef({num_tokens, hidden_size}),
+                "output_quant_int8 must have shape [N, H]");
+    TORCH_CHECK(output_quant_int8->device() == residual.device(),
+                "output_quant_int8 must be on the same device as residual");
+  } else {
+    TORCH_CHECK(!output_quant_int8.has_value(),
+                "output_quant_int8 is only valid for packed INT8 mHC pre "
+                "output");
+  }
 
   if (broadcast_residual) {
     check_optional_tensor(residual_out, at::kBFloat16, "residual_out");
@@ -153,6 +209,76 @@ void mhc_pre_big_fuse_extended(
                   !ranges_overlap(post_mix, layer_input) &&
                   !ranges_overlap(comb_mix, layer_input),
               "mHC pre hidden=5120 outputs must not alias each other");
+  if (quant_mode != 0) {
+    auto check_quant_extra_output = [&](const torch::Tensor& extra) {
+      for (const auto* in : inputs) {
+        TORCH_CHECK(!ranges_overlap(extra, *in),
+                    "quantized auxiliary outputs must not alias mHC pre "
+                    "inputs");
+      }
+      for (const auto* out : outputs) {
+        TORCH_CHECK(!ranges_overlap(extra, *out),
+                    "quantized auxiliary outputs must not alias other mHC "
+                    "pre outputs");
+      }
+      TORCH_CHECK(!ranges_overlap(extra, *quant_scales) &&
+                      !ranges_overlap(extra, *norm_weight),
+                  "quantized auxiliary outputs must not alias quant_scales "
+                  "or norm_weight");
+      if (use_pre_mix_in) {
+        TORCH_CHECK(!ranges_overlap(extra, *pre_mix_in),
+                    "quantized auxiliary outputs must not alias pre_mix_in");
+      }
+      if (save_pre_mix) {
+        TORCH_CHECK(!ranges_overlap(extra, *pre_mix_out),
+                    "quantized auxiliary outputs must not alias pre_mix_out");
+      }
+      if (write_aux) {
+        TORCH_CHECK(!ranges_overlap(extra, *aux_out),
+                    "quantized auxiliary outputs must not alias aux_out");
+      }
+    };
+    check_quant_extra_output(*output_rms);
+    if (quant_mode == 2) {
+      check_quant_extra_output(*output_quant_int8);
+      TORCH_CHECK(!ranges_overlap(*output_rms, *output_quant_int8),
+                  "output_rms and output_quant_int8 must not alias");
+    }
+  }
+  if (quant_mode != 0) {
+    for (const auto* in : inputs) {
+      TORCH_CHECK(!ranges_overlap(*quant_scales, *in),
+                  "quant_scales must not alias mHC pre inputs");
+    }
+    for (const auto* out : outputs) {
+      TORCH_CHECK(!ranges_overlap(*quant_scales, *out),
+                  "quant_scales must not alias mHC pre outputs");
+    }
+    if (fuse_norm) {
+      TORCH_CHECK(!ranges_overlap(*quant_scales, *norm_weight) &&
+                      !ranges_overlap(layer_input, *norm_weight),
+                  "quantized mHC pre outputs must not alias norm_weight");
+    }
+    if (use_pre_mix_in) {
+      TORCH_CHECK(!ranges_overlap(*quant_scales, *pre_mix_in) &&
+                      !ranges_overlap(layer_input, *pre_mix_in),
+                  "quantized mHC pre outputs must not alias pre_mix_in");
+    }
+    if (save_pre_mix) {
+      TORCH_CHECK(!ranges_overlap(*quant_scales, *pre_mix_out) &&
+                      !ranges_overlap(layer_input, *pre_mix_out),
+                  "quantized mHC pre outputs must not alias pre_mix_out");
+      if (use_pre_mix_in) {
+        TORCH_CHECK(!ranges_overlap(*pre_mix_in, *pre_mix_out),
+                    "pre_mix_in and pre_mix_out must not alias");
+      }
+    }
+    if (write_aux) {
+      TORCH_CHECK(!ranges_overlap(*quant_scales, *aux_out) &&
+                      !ranges_overlap(layer_input, *aux_out),
+                  "quantized mHC pre outputs must not alias aux_out");
+    }
+  }
   if (broadcast_residual) {
     const torch::Tensor* broadcast_outputs[] = {&post_mix, &comb_mix,
                                                  &layer_input, &*residual_out};
@@ -186,8 +312,21 @@ void mhc_pre_big_fuse_extended(
                 : nullptr;
   const bfloat16_t* residual_ptr = reinterpret_cast<const bfloat16_t*>(
       residual.data_ptr<at::BFloat16>());
-  bfloat16_t* layer_input_ptr =
-      reinterpret_cast<bfloat16_t*>(layer_input.data_ptr<at::BFloat16>());
+  bfloat16_t* layer_input_ptr = quant_mode == 0
+      ? reinterpret_cast<bfloat16_t*>(layer_input.data_ptr<at::BFloat16>())
+      : nullptr;
+  int8_t* quant_output_ptr = quant_mode != 0
+      ? reinterpret_cast<int8_t*>(layer_input.data_ptr())
+      : nullptr;
+  float* quant_scales_ptr = quant_mode != 0
+      ? quant_scales->data_ptr<float>()
+      : nullptr;
+  bfloat16_t* output_rms_ptr = quant_mode != 0
+      ? reinterpret_cast<bfloat16_t*>(output_rms->data_ptr<at::BFloat16>())
+      : nullptr;
+  int8_t* output_quant_int8_ptr = quant_mode == 2
+      ? output_quant_int8->data_ptr<int8_t>()
+      : nullptr;
   bfloat16_t* residual_out_ptr =
       broadcast_residual
           ? reinterpret_cast<bfloat16_t*>(
@@ -204,7 +343,7 @@ void mhc_pre_big_fuse_extended(
       std::strstr(at::cuda::getDeviceProperties(residual.get_device())->name,
                   "C500") != nullptr;
   const int collapsed_offset = compact_norm_header ? 128 : 1024;
-  const bool cache_norm_tail = compact_norm_header && save_pre_mix &&
+  const bool cache_norm_tail = quant_mode == 0 && compact_norm_header && save_pre_mix &&
                                !write_aux && n_splits == 16;
   constexpr int kCandidateCachedTailBlocks = 2;
   constexpr int kStream0CachedTailBlocks = 3;
@@ -275,7 +414,8 @@ void mhc_pre_big_fuse_extended(
             static_cast<float>(rms_eps), static_cast<float>(hc_pre_eps),
             static_cast<float>(hc_sinkhorn_eps),
             static_cast<float>(hc_post_mult_value),
-            static_cast<float>(norm_eps), nullptr);
+            static_cast<float>(norm_eps), nullptr, nullptr, nullptr, nullptr,
+            nullptr);
   };
 
   auto launch_broadcast = [&] {
@@ -292,10 +432,43 @@ void mhc_pre_big_fuse_extended(
             static_cast<float>(rms_eps), static_cast<float>(hc_pre_eps),
             static_cast<float>(hc_sinkhorn_eps),
             static_cast<float>(hc_post_mult_value),
-            static_cast<float>(norm_eps), residual_out_ptr);
+            static_cast<float>(norm_eps), residual_out_ptr, nullptr, nullptr,
+            nullptr, nullptr);
   };
 
-  if (broadcast_residual) {
+  auto launch_quant = [&](auto save_pre_mix_tag, auto quant_mode_tag) {
+    mhc_pre_big_fuse_ext_kernel<
+        1024, 1, 5120, true, decltype(save_pre_mix_tag)::value,
+        0, true, false, -1, false, false, false,
+        decltype(quant_mode_tag)::value>
+        <<<grid, threads, smem_bytes, stream>>>(
+            comb_mix.data_ptr<float>(), gemm_out_mul.data_ptr<float>(),
+            gemm_out_sqrsum.data_ptr<float>(), nullptr,
+            hc_base.data_ptr<float>(), hc_scale.data_ptr<float>(),
+            post_mix.data_ptr<float>(), residual_ptr, pre_mix_out_ptr,
+            pre_mix_in_ptr, norm_weight_ptr, aux_out_ptr, grid,
+            static_cast<int>(n_splits), last_dim,
+            static_cast<float>(effective_rms_numel),
+            static_cast<float>(rms_eps), static_cast<float>(hc_pre_eps),
+            static_cast<float>(hc_sinkhorn_eps),
+            static_cast<float>(hc_post_mult_value),
+            static_cast<float>(norm_eps), nullptr, quant_output_ptr,
+            quant_scales_ptr, output_rms_ptr, output_quant_int8_ptr);
+  };
+
+  if (quant_mode == 1) {
+    if (save_pre_mix) {
+      launch_quant(std::true_type{}, std::integral_constant<int, 1>{});
+    } else {
+      launch_quant(std::false_type{}, std::integral_constant<int, 1>{});
+    }
+  } else if (quant_mode == 2) {
+    if (save_pre_mix) {
+      launch_quant(std::true_type{}, std::integral_constant<int, 2>{});
+    } else {
+      launch_quant(std::false_type{}, std::integral_constant<int, 2>{});
+    }
+  } else if (broadcast_residual) {
     launch_broadcast();
   } else if (fuse_norm) {
     if (save_pre_mix) {
@@ -395,7 +568,10 @@ void mhc_pre_big_fuse_out(
     c10::optional<torch::Tensor> pre_mix_in,
     c10::optional<torch::Tensor> pre_mix_out,
     c10::optional<torch::Tensor> aux_out, double norm_eps,
-    int64_t rms_numel, c10::optional<torch::Tensor> residual_out) {
+    int64_t rms_numel, c10::optional<torch::Tensor> residual_out,
+    c10::optional<torch::Tensor> quant_scales,
+    c10::optional<torch::Tensor> output_rms,
+    c10::optional<torch::Tensor> output_quant_int8) {
   check_tensor(gemm_out_mul, at::kFloat, "gemm_out_mul");
   check_tensor(gemm_out_sqrsum, at::kFloat, "gemm_out_sqrsum");
   check_tensor(hc_scale, at::kFloat, "hc_scale");
@@ -403,7 +579,13 @@ void mhc_pre_big_fuse_out(
   check_tensor(residual, at::kBFloat16, "residual");
   check_tensor(post_mix, at::kFloat, "post_mix");
   check_tensor(comb_mix, at::kFloat, "comb_mix");
-  check_tensor(layer_input, at::kBFloat16, "layer_input");
+  TORCH_CHECK(layer_input.scalar_type() == at::kBFloat16 ||
+                  layer_input.scalar_type() == at::kChar,
+              "layer_input must be BF16 or INT8");
+  TORCH_CHECK(layer_input.is_cuda() && layer_input.is_contiguous(),
+              "layer_input must be a contiguous CUDA tensor");
+  TORCH_CHECK(layer_input.dim() == 2,
+              "layer_input must have shape [N, H] or [N, packed H]");
 
   const bool broadcast_residual = residual_out.has_value();
   if (broadcast_residual) {
@@ -420,15 +602,19 @@ void mhc_pre_big_fuse_out(
     mhc_pre_big_fuse_extended(
         gemm_out_mul, gemm_out_sqrsum, hc_scale, hc_base, residual, post_mix,
         comb_mix, layer_input, norm_weight, pre_mix_in, pre_mix_out, aux_out,
-        residual_out, rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value,
-        sinkhorn_repeat, n_splits, norm_eps, rms_numel);
+        residual_out, quant_scales, output_rms, output_quant_int8, rms_eps,
+        hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat,
+        n_splits, norm_eps, rms_numel);
     return;
   }
 
   // ---- legacy path: hidden 4096/7168, no delayed pre-mix, no RMSNorm ----
   TORCH_CHECK(!norm_weight.has_value() && !pre_mix_in.has_value() &&
                   !pre_mix_out.has_value() && !aux_out.has_value() &&
-                  !residual_out.has_value(),
+                  !residual_out.has_value() && !quant_scales.has_value() &&
+                  !output_rms.has_value() &&
+                  !output_quant_int8.has_value() &&
+                  layer_input.scalar_type() == at::kBFloat16,
               "extended mHC pre options require hidden_size=5120");
   const int64_t num_tokens = residual.size(0);
   TORCH_CHECK(num_tokens > 0, "num_tokens must be positive");

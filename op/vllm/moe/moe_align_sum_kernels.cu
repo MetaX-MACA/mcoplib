@@ -669,7 +669,7 @@ __global__ void moe_align_block_size_opt_128_expert_kernel(scalar_t* __restrict_
 
   for (int32_t i = start_idx; i < numel && i < start_idx + tokens_per_thread; ++i) {
     int32_t expert_id = topk_ids[i];
-    if(expert_id >= num_experts){
+    if(expert_id < 0 || expert_id >= num_experts){
       continue;
     }
     if(has_expert_map){
@@ -726,7 +726,7 @@ __global__ void moe_align_block_size_opt_128_expert_kernel(scalar_t* __restrict_
 
   for (int32_t i = start_idx; i < numel && i < start_idx + tokens_per_thread; ++i) {
     int32_t expert_id = topk_ids[i];
-    if (expert_id >= num_experts) {
+    if (expert_id < 0 || expert_id >= num_experts) {
         continue;
     }
     if (has_expert_map) {

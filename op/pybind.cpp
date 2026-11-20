@@ -47,18 +47,10 @@
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("mhc_post_cuda", &mhc_post_cuda,
-          "MHC post: BF16 activations and FP32 mixing weights",
           py::arg("x"), py::arg("residual"),
           py::arg("post_layer_mix"), py::arg("comb_res_mix"));
     m.def(
         "mhc_pre_big_fuse_out", &mhc_pre_big_fuse_out,
-        "Optimized mHC pre big-fuse kernel with preallocated outputs.  The "
-        "trailing optional arguments select the hidden=5120 delayed pre-mix / "
-        "fused RMSNorm contract: norm_weight enables fused RMSNorm, "
-        "pre_mix_in supplies a carried pre-mix (Path B), pre_mix_out saves the "
-        "next pre-mix (Path A when pre_mix_in is omitted), aux_out writes "
-        "the mean over the four residual streams, and residual_out selects "
-        "the first-layer [N,H] -> [N,4,H] broadcast contract.",
         py::arg("gemm_out_mul"), py::arg("gemm_out_sqrsum"),
         py::arg("hc_scale"), py::arg("hc_base"), py::arg("residual"),
         py::arg("post_mix"), py::arg("comb_mix"), py::arg("layer_input"),
@@ -70,7 +62,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("pre_mix_out") = py::none(),
         py::arg("aux_out") = py::none(), py::arg("norm_eps") = 1e-6,
         py::arg("rms_numel") = -1,
-        py::arg("residual_out") = py::none());
+        py::arg("residual_out") = py::none(),
+        py::arg("quant_scales") = py::none(),
+        py::arg("output_rms") = py::none(),
+        py::arg("output_quant_int8") = py::none());
     m.def("fused_bias_dropout", &fused_bias_dropout);
     m.def("fused_rope_fwd", &fused_rope_fwd);
     m.def("fused_rope_bwd", &fused_rope_bwd);
